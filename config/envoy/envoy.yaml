@@ -1,0 +1,123 @@
+# Envoy Configuration for Bouncer MITM Proxy
+#
+# This config sets up Envoy as a transparent TLS proxy that:
+# 1. Listens on port 15001 for redirected HTTPS traffic
+# 2. Terminates TLS using dynamically generated certificates
+# 3. Re-encrypts traffic to the original destination
+# 4. Uses SDS (Secret Discovery Service) for dynamic cert generation
+
+admin:
+  address:
+    socket_address:
+      address: 127.0.0.1
+      port_value: 15000
+  access_log_path: /dev/null
+
+node:
+  cluster: bouncer-sidecar
+  id: bouncer-sidecar-${POD_NAME}
+
+static_resources:
+  listeners:
+    - name: tls_intercept_listener
+      address:
+        socket_address:
+          address: 0.0.0.0
+          port_value: 15001
+      listener_filters:
+        - name: envoy.filters.listener.tls_inspector
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
+        - name: envoy.filters.listener.original_dst
+          typed_config:
+            "@type": type.googleapis.com/envoy.extensions.filters.listener.original_dst.v3.OriginalDst
+      filter_chains:
+        - filter_chain_match:
+            transport_protocol: tls
+          transport_socket:
+            name: envoy.transport_sockets.tls
+            typed_config:
+              "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.DownstreamTlsContext
+              common_tls_context:
+                tls_certificate_sds_secret_configs:
+                  - name: "bouncer-dynamic-cert"
+                    sds_config:
+                      api_config_source:
+                        api_type: GRPC
+                        transport_api_version: V3
+                        grpc_services:
+                          - envoy_grpc:
+                              cluster_name: sds_server
+          filters:
+            - name: envoy.filters.network.http_connection_manager
+              typed_config:
+                "@type": type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                stat_prefix: tls_intercept
+                codec_type: AUTO
+                http_filters:
+                  - name: envoy.filters.http.ext_proc
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.ext_proc.v3.ExternalProcessor
+                      grpc_service:
+                        envoy_grpc:
+                          cluster_name: ext_proc_server
+                        timeout: 1s
+                      processing_mode:
+                        request_header_mode: SEND
+                        response_header_mode: SKIP
+                  - name: envoy.filters.http.router
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+                route_config:
+                  name: passthrough_route
+                  virtual_hosts:
+                    - name: passthrough
+                      domains:
+                        - "*"
+                      routes:
+                        - match:
+                            prefix: "/"
+                          route:
+                            cluster: original_dst_cluster
+                            auto_host_rewrite: true
+
+  clusters:
+    # Original destination cluster - routes to where the connection was going
+    - name: original_dst_cluster
+      type: ORIGINAL_DST
+      lb_policy: CLUSTER_PROVIDED
+      original_dst_lb_config:
+        use_http_header: false
+      transport_socket:
+        name: envoy.transport_sockets.tls
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
+          sni: ""  # Will be set from original request
+
+    # SDS server cluster for dynamic certificate generation
+    - name: sds_server
+      type: STATIC
+      http2_protocol_options: {}
+      load_assignment:
+        cluster_name: sds_server
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 15002
+
+    # External processor server for header rewriting
+    - name: ext_proc_server
+      type: STATIC
+      http2_protocol_options: {}
+      load_assignment:
+        cluster_name: ext_proc_server
+        endpoints:
+          - lb_endpoints:
+              - endpoint:
+                  address:
+                    socket_address:
+                      address: 127.0.0.1
+                      port_value: 15003
