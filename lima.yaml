@@ -1,0 +1,78 @@
+# Lima VM configuration for eBPF development
+# Usage: limactl start --name=bouncer lima.yaml
+
+# Use Ubuntu for good eBPF support
+images:
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-amd64.img"
+    arch: "x86_64"
+  - location: "https://cloud-images.ubuntu.com/releases/24.04/release/ubuntu-24.04-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+# VM resources
+cpus: 4
+memory: "4GiB"
+disk: "20GiB"
+
+# Mount the project directory
+mounts:
+  - location: "~"
+    writable: true
+  - location: "/tmp/lima"
+    writable: true
+
+# Provision script to install build dependencies
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      
+      # Update packages
+      apt-get update
+      
+      # Install core eBPF build dependencies (avoid kernel-version-specific packages)
+      apt-get install -y \
+        clang \
+        llvm \
+        libbpf-dev \
+        build-essential \
+        pkg-config \
+        git \
+        curl
+      
+      # Try to install linux-tools-common (provides bpftool) - may fail but continue
+      apt-get install -y linux-tools-common || echo "linux-tools-common not available, skipping"
+      
+      # Install kernel-specific tools if available (ignore errors)
+      apt-get install -y linux-tools-$(uname -r) linux-headers-$(uname -r) 2>/dev/null || \
+        echo "Kernel-specific tools not available for $(uname -r), bpftool may not work"
+      
+      # Install Go
+      GO_VERSION="1.22.5"
+      ARCH=$(dpkg --print-architecture)
+      if [ ! -d /usr/local/go ]; then
+        echo "Installing Go ${GO_VERSION}..."
+        curl -fsSL "https://golang.org/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" -o /tmp/go.tar.gz
+        tar -C /usr/local -xzf /tmp/go.tar.gz
+        rm /tmp/go.tar.gz
+      fi
+      
+      # Create symlinks so go is available system-wide
+      ln -sf /usr/local/go/bin/go /usr/local/bin/go
+      ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+      
+      # Verify installations
+      echo "=== Installed versions ==="
+      go version
+      clang --version | head -1
+      echo "=== Provision complete ==="
+
+# Enable host resolver for DNS
+hostResolver:
+  enabled: true
+
+# Forward SSH agent
+ssh:
+  forwardAgent: true
+
+vmType: "qemu"
