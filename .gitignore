@@ -1,0 +1,29 @@
+# Binaries
+bin/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+
+# Go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# eBPF generated
+*.o
+*_bpfel.go
+*_bpfeb.go
+
+# Kubernetes
+kubeconfig
+*.kubeconfig
