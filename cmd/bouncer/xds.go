@@ -39,13 +39,38 @@ func runXDS(cmd *cobra.Command, args []string) {
 	log := ctrl.Log.WithName("xds")
 	log.Info("Starting Bouncer XDS server")
 
-	// Generate a CA for demo purposes (in production, load from Secret)
-	rootCA, err := ca.GenerateCA("Bouncer Root CA", 365*24*time.Hour)
-	if err != nil {
-		log.Error(err, "failed to generate CA")
-		os.Exit(1)
+	// Check if CA files exist
+	caCertPath := "/etc/bouncer/ca/tls.crt"
+	caKeyPath := "/etc/bouncer/ca/tls.key"
+	var rootCA *ca.CA
+	var err error
+
+	if _, err = os.Stat(caCertPath); err == nil {
+		log.Info("Loading CA from file", "path", caCertPath)
+		certPEM, err := os.ReadFile(caCertPath)
+		if err != nil {
+			log.Error(err, "failed to read CA cert")
+			os.Exit(1)
+		}
+		keyPEM, err := os.ReadFile(caKeyPath)
+		if err != nil {
+			log.Error(err, "failed to read CA key")
+			os.Exit(1)
+		}
+		rootCA, err = ca.LoadCA(certPEM, keyPEM)
+		if err != nil {
+			log.Error(err, "failed to parse CA")
+			os.Exit(1)
+		}
+	} else {
+		log.Info("CA file not found, generating new CA (for testing)")
+		rootCA, err = ca.GenerateCA("Bouncer Root CA", 365*24*time.Hour)
+		if err != nil {
+			log.Error(err, "failed to generate CA")
+			os.Exit(1)
+		}
 	}
-	log.Info("Generated Root CA", "cn", rootCA.Cert.Subject.CommonName)
+	log.Info("Root CA loaded/generated", "cn", rootCA.Cert.Subject.CommonName)
 
 	// Create storage
 	store := storage.NewMemory()

@@ -73,6 +73,12 @@ int cgroup_connect4(struct bpf_sock_addr *ctx) {
     return 1; // Allow - not a tracked pod
   }
 
+  // Exclude Envoy sidecar (UID 1337)
+  __u32 uid = bpf_get_current_uid_gid();
+  if (uid == 1337) {
+    return 1; // Allow Envoy traffic
+  }
+
   // Store original destination
   __u64 cookie = bpf_get_socket_cookie(ctx);
   struct orig_dst dst = {

@@ -48,3 +48,26 @@ spec:
         - name: bouncer-ca
           secret:
             secretName: bouncer-ca
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bouncer-xds
+  namespace: bouncer-system
+  labels:
+    app.kubernetes.io/name: bouncer
+    app.kubernetes.io/component: xds
+spec:
+  selector:
+    app.kubernetes.io/name: bouncer
+    app.kubernetes.io/component: xds
+  ports:
+    - name: sds
+      port: 15002
+      targetPort: 15002
+      protocol: TCP
+    - name: extproc
+      port: 15003
+      targetPort: 15003
+      protocol: TCP
+  type: ClusterIP
