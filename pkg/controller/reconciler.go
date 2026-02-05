@@ -36,18 +36,23 @@ type Reconciler struct {
 	Log           logr.Logger
 	Scheme        *runtime.Scheme
 	CgroupManager CgroupManager
+	CgroupRoot    string
 
 	// trackedPods maps pod UID -> cgroup ID
 	trackedPods map[string]uint64
 }
 
 // NewReconciler creates a new pod reconciler.
-func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, cgroupMgr CgroupManager) *Reconciler {
+func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, cgroupMgr CgroupManager, cgroupRoot string) *Reconciler {
+	if cgroupRoot == "" {
+		cgroupRoot = CgroupBasePath
+	}
 	return &Reconciler{
 		Client:        c,
 		Log:           log,
 		Scheme:        scheme,
 		CgroupManager: cgroupMgr,
+		CgroupRoot:    cgroupRoot,
 		trackedPods:   make(map[string]uint64),
 	}
 }
@@ -175,14 +180,18 @@ func (r *Reconciler) findCgroupPath(pod *corev1.Pod, containerID string) (string
 
 	patterns := []string{
 		// containerd pattern
-		filepath.Join(CgroupBasePath, "kubepods.slice", "kubepods-burstable.slice",
+		filepath.Join(r.CgroupRoot, "kubepods.slice", "kubepods-burstable.slice",
 			fmt.Sprintf("kubepods-burstable-pod%s.slice", podUIDUnderscored),
 			fmt.Sprintf("cri-containerd-%s.scope", containerID)),
+		// containerd pattern (BestEffort)
+		filepath.Join(r.CgroupRoot, "kubepods.slice", "kubepods-besteffort.slice",
+			fmt.Sprintf("kubepods-besteffort-pod%s.slice", podUIDUnderscored),
+			fmt.Sprintf("cri-containerd-%s.scope", containerID)),
 		// Alternative pattern
-		filepath.Join(CgroupBasePath, "kubepods", "burstable",
+		filepath.Join(r.CgroupRoot, "kubepods", "burstable",
 			fmt.Sprintf("pod%s", podUID), containerID),
 		// Best-effort pattern
-		filepath.Join(CgroupBasePath, "kubepods", "pod"+podUID),
+		filepath.Join(r.CgroupRoot, "kubepods", "pod"+podUID),
 	}
 
 	for _, path := range patterns {
