@@ -30,9 +30,6 @@ create_cluster() {
     echo ""
     echo "Creating Kind cluster..."
     
-    # Delete existing cluster if any
-    kind delete cluster --name bouncer-demo 2>/dev/null || true
-    
     # Create cluster
     kind create cluster --config "$SCRIPT_DIR/kind-cluster.yaml"
     
