@@ -1,20 +1,26 @@
 package main
 
 import (
-	"fmt"
+	"os"
+
+	"github.com/spf13/cobra"
 )
 
+var rootCmd = &cobra.Command{
+	Use:   "bouncer",
+	Short: "Bouncer - Kubernetes eBPF HTTPS Interceptor",
+	Long: `Bouncer transparently intercepts HTTPS traffic in Kubernetes pods,
+rewrites hashed headers to original values, and enables secure
+API key management without exposing secrets in plain text.`,
+}
+
+func init() {
+	rootCmd.AddCommand(controllerCmd)
+	rootCmd.AddCommand(webhookCmd)
+}
+
 func main() {
-	fmt.Println("Bouncer - Kubernetes eBPF HTTPS Interceptor")
-
-	// TODO: Initialize components in future iterations
-	// - eBPF loader
-	// - Kubernetes controller
-	// - XDS server
-	// - ext_proc server
-
-	fmt.Println("Starting bouncer controller...")
-
-	// Placeholder - will be replaced with actual server startup
-	select {}
+	if err := rootCmd.Execute(); err != nil {
+		os.Exit(1)
+	}
 }

@@ -1,0 +1,57 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: bouncer-system
+  labels:
+    app.kubernetes.io/name: bouncer
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: bouncer-controller
+  namespace: bouncer-system
+  labels:
+    app.kubernetes.io/name: bouncer
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: bouncer-controller
+  labels:
+    app.kubernetes.io/name: bouncer
+rules:
+  # Pod watching for controller
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+  # Secret management for CA
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "create", "update"]
+  # ConfigMap for Envoy config
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "create", "update"]
+  # Events for debugging
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+  # Leases for leader election
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: bouncer-controller
+  labels:
+    app.kubernetes.io/name: bouncer
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: bouncer-controller
+subjects:
+  - kind: ServiceAccount
+    name: bouncer-controller
+    namespace: bouncer-system

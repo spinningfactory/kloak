@@ -48,7 +48,7 @@ provision:
         echo "Kernel-specific tools not available for $(uname -r), bpftool may not work"
       
       # Install Go
-      GO_VERSION="1.22.5"
+      GO_VERSION="1.25"
       ARCH=$(dpkg --print-architecture)
       if [ ! -d /usr/local/go ]; then
         echo "Installing Go ${GO_VERSION}..."

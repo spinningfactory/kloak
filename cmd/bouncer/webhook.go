@@ -1,9 +1,10 @@
 package main
 
 import (
-	"flag"
 	"os"
+	"strings"
 
+	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -16,41 +17,48 @@ import (
 	webhookpkg "github.com/dhia/bouncer/pkg/webhook"
 )
 
+var webhookScheme = runtime.NewScheme()
+
+func init() {
+	utilruntime.Must(clientgoscheme.AddToScheme(webhookScheme))
+}
+
+var webhookCmd = &cobra.Command{
+	Use:   "webhook",
+	Short: "Run the Bouncer mutating admission webhook",
+	Long:  `Starts the admission webhook that injects Envoy sidecars and hashes environment variables.`,
+	Run:   runWebhook,
+}
+
 var (
-	scheme   = runtime.NewScheme()
-	setupLog = ctrl.Log.WithName("setup")
+	webhookProbeAddr  string
+	webhookCertDir    string
+	webhookEnvsToHash string
 )
 
 func init() {
-	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	webhookCmd.Flags().StringVar(&webhookProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	webhookCmd.Flags().StringVar(&webhookCertDir, "cert-dir", "/certs", "Directory containing TLS certs.")
+	webhookCmd.Flags().StringVar(&webhookEnvsToHash, "hash-envs", "API_KEY,SECRET_KEY,PASSWORD,TOKEN,OPENAI_API_KEY", "Comma-separated env var names to hash.")
 }
 
-func main() {
-	var metricsAddr string
-	var probeAddr string
-	var certDir string
-	var envsToHash string
-
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.StringVar(&certDir, "cert-dir", "/tmp/k8s-webhook-server/serving-certs", "Directory containing TLS certs.")
-	flag.StringVar(&envsToHash, "hash-envs", "API_KEY,SECRET_KEY,PASSWORD,TOKEN", "Comma-separated env var names to hash.")
-
+func runWebhook(cmd *cobra.Command, args []string) {
 	opts := zap.Options{Development: true}
-	opts.BindFlags(flag.CommandLine)
-	flag.Parse()
-
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
+	setupLog := ctrl.Log.WithName("setup")
+	setupLog.Info("Starting Bouncer webhook")
+
 	// Parse env vars to hash
-	envList := parseEnvList(envsToHash)
+	envList := parseEnvList(webhookEnvsToHash)
+	setupLog.Info("Will hash environment variables", "envs", envList)
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		HealthProbeBindAddress: probeAddr,
+		Scheme:                 webhookScheme,
+		HealthProbeBindAddress: webhookProbeAddr,
 		WebhookServer: webhook.NewServer(webhook.Options{
 			Port:    9443,
-			CertDir: certDir,
+			CertDir: webhookCertDir,
 		}),
 	})
 	if err != nil {
@@ -88,20 +96,5 @@ func parseEnvList(envs string) []string {
 	if envs == "" {
 		return nil
 	}
-	var result []string
-	current := ""
-	for _, c := range envs {
-		if c == ',' {
-			if current != "" {
-				result = append(result, current)
-				current = ""
-			}
-		} else {
-			current += string(c)
-		}
-	}
-	if current != "" {
-		result = append(result, current)
-	}
-	return result
+	return strings.Split(envs, ",")
 }
