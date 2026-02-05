@@ -41,6 +41,9 @@ spec:
             - name: bpf
               mountPath: /sys/fs/bpf
               readOnly: false
+            - name: btf
+              mountPath: /sys/kernel/btf
+              readOnly: true
           livenessProbe:
             httpGet:
               path: /healthz
@@ -81,3 +84,7 @@ spec:
           hostPath:
             path: /sys/fs/bpf
             type: DirectoryOrCreate
+        - name: btf
+          hostPath:
+            path: /sys/kernel/btf
+            type: Directory

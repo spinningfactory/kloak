@@ -1,23 +1,28 @@
-#!/bin/bash
-# Bouncer Demo Setup Script
-# Creates a Kind cluster and deploys the Bouncer demo
+#!/usr/bin/env bash
+# Bouncer Demo Setup Script (Lima + K3s)
+# Creates a Lima VM with K3s and deploys the Bouncer demo
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 CERT_DIR="/tmp/bouncer-certs"
+KUBECONFIG_PATH="/tmp/bouncer-k3s.yaml"
+LIMA_INSTANCE="bouncer"
 
 echo "================================"
-echo " Bouncer Demo Setup"
+echo " Bouncer Demo Setup (Lima + K3s)"
 echo "================================"
 echo ""
+echo "PATH: $PATH"
 
 # Check prerequisites
 check_prereqs() {
     echo "Checking prerequisites..."
-    for cmd in kind kubectl docker openssl; do
+    for cmd in limactl kubectl docker openssl; do
         if ! command -v $cmd &> /dev/null; then
+             echo "Debug: command -v $cmd failed"
+             echo "Debug: which $cmd: $(which $cmd)"
             echo "Error: $cmd is required but not installed."
             exit 1
         fi
@@ -25,18 +30,67 @@ check_prereqs() {
     echo "✓ Prerequisites OK"
 }
 
-# Create Kind cluster
+# Create/Start Lima VM with K3s
 create_cluster() {
     echo ""
-    echo "Creating Kind cluster..."
+    echo "Starting Lima VM with K3s..."
     
-    # Create cluster
-    kind create cluster --config "$SCRIPT_DIR/kind-cluster.yaml"
+    # Check if instance exists and has K3s
+    if limactl list -q | grep -q "^${LIMA_INSTANCE}$"; then
+        echo "Checking existing instance state..."
+        # If K3s is missing, it's likely the old VM without port forwarding.
+        if ! limactl shell "${LIMA_INSTANCE}" -- which k3s &>/dev/null; then
+            echo "Existing instance lacks K3s configuration (or port forwarding). Recreating..."
+            limactl delete -f "${LIMA_INSTANCE}"
+        else
+            echo "Instance '${LIMA_INSTANCE}' appears compatible."
+        fi
+    fi
+
+    # Create/Start
+    if ! limactl list -q | grep -q "^${LIMA_INSTANCE}$"; then
+        echo "Creating Lima instance '${LIMA_INSTANCE}' from lima.yaml..."
+        limactl start --name="${LIMA_INSTANCE}" "$ROOT_DIR/lima.yaml"
+    else
+        echo "Starting existing Lima instance '${LIMA_INSTANCE}'..."
+        limactl start "${LIMA_INSTANCE}"
+    fi
+
+    # Ensure K3s is installed (in case provision script skipped or failed)
+    echo "Ensuring K3s is installed..."
+    limactl shell "${LIMA_INSTANCE}" -- sudo sh -c 'if [ ! -f /usr/local/bin/k3s ]; then curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644 --disable traefik; fi'
+
+    # Wait for K3s service
+    echo "Waiting for K3s service..."
+    until limactl shell "${LIMA_INSTANCE}" -- sudo systemctl is-active k3s >/dev/null 2>&1; do
+         sleep 5
+         echo -n "."
+    done
+
+    # Wait for K3s kubeconfig
+    echo "Waiting for K3s kubeconfig..."
+    until limactl shell "${LIMA_INSTANCE}" -- sudo test -f /etc/rancher/k3s/k3s.yaml; do
+        sleep 5
+        echo -n "."
+    done
+    echo ""
+
+    # Fetch and fix kubeconfig
+    echo "Fetching kubeconfig..."
+    limactl shell "${LIMA_INSTANCE}" -- sudo cat /etc/rancher/k3s/k3s.yaml > "$KUBECONFIG_PATH"
+    # Ensure rights
+    chmod 600 "$KUBECONFIG_PATH"
+    # K3s uses 127.0.0.1:6443 which works via Lima port forwarding
     
-    echo "✓ Kind cluster created"
+    export KUBECONFIG="$KUBECONFIG_PATH"
+    echo "✓ K3s ready. Kubeconfig: $KUBECONFIG_PATH"
+    
+    # Wait for node ready
+    echo "Waiting for K3s node readiness..."
+    kubectl wait --for=condition=Ready node --all --timeout=60s
 }
 
-# Build images
+# Build images and import to K3s
 build_images() {
     echo ""
     echo "Building images..."
@@ -47,11 +101,16 @@ build_images() {
     # Build Bouncer controller
     docker build -t bouncer:latest "$ROOT_DIR"
     
-    # Load images into Kind
-    kind load docker-image bouncer-demo-python:latest --name bouncer-demo
-    kind load docker-image bouncer:latest --name bouncer-demo
+    echo "Importing images into K3s (this may take a moment)..."
+    # We pipeline docker save -> lima -> k3s ctr import
     
-    echo "✓ Images built and loaded"
+    echo "Importing bouncer-demo-python..."
+    docker save bouncer-demo-python:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
+    
+    echo "Importing bouncer..."
+    docker save bouncer:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
+    
+    echo "✓ Images built and imported"
 }
 
 # Generate TLS certificates
@@ -84,6 +143,7 @@ generate_certs() {
 
 # Deploy Bouncer components
 deploy_bouncer() {
+    export KUBECONFIG="$KUBECONFIG_PATH"
     echo ""
     echo "Deploying Bouncer..."
     
@@ -135,6 +195,7 @@ deploy_bouncer() {
 
 # Wait for Bouncer pods
 wait_for_bouncer() {
+    export KUBECONFIG="$KUBECONFIG_PATH"
     echo ""
     echo "Waiting for Bouncer pods to be ready..."
     
@@ -153,6 +214,7 @@ wait_for_bouncer() {
 
 # Deploy demo app
 deploy_demo() {
+    export KUBECONFIG="$KUBECONFIG_PATH"
     echo ""
     echo "Deploying demo application..."
     
@@ -170,6 +232,7 @@ deploy_demo() {
 
 # Wait for demo pod
 wait_for_demo() {
+    export KUBECONFIG="$KUBECONFIG_PATH"
     echo ""
     echo "Waiting for demo pod to be ready..."
     
@@ -188,6 +251,7 @@ wait_for_demo() {
 
 # Verify sidecar injection
 verify_injection() {
+    export KUBECONFIG="$KUBECONFIG_PATH"
     echo ""
     echo "Verifying sidecar injection..."
     
@@ -212,12 +276,15 @@ show_summary() {
     echo " Demo Setup Complete!"
     echo "================================"
     echo ""
+    echo "Environment:"
+    echo "  Kubeconfig:          $KUBECONFIG_PATH"
+    echo "  Metrics:             http://localhost:8080 (forwarded)"
+    echo ""
     echo "Commands:"
+    echo "  Use kubectl:         export KUBECONFIG=$KUBECONFIG_PATH"
     echo "  View demo logs:      kubectl logs -f demo-python -c demo-app"
     echo "  View sidecar logs:   kubectl logs -f demo-python -c envoy-sidecar"
     echo "  View webhook logs:   kubectl logs -n bouncer-system -l app.kubernetes.io/component=webhook"
-    echo "  View controller logs: kubectl logs -n bouncer-system -l app.kubernetes.io/component=controller"
-    echo "  Destroy demo:        $SCRIPT_DIR/destroy-demo.sh"
     echo ""
 }
 
