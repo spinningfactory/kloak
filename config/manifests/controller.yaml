@@ -34,6 +34,10 @@ spec:
               containerPort: 8080
             - name: health
               containerPort: 8081
+            - name: http-store
+              containerPort: 8090
+            - name: grpc-xds
+              containerPort: 15002
           volumeMounts:
             - name: cgroup
               mountPath: /host/sys/fs/cgroup
@@ -43,6 +47,9 @@ spec:
               readOnly: false
             - name: btf
               mountPath: /sys/kernel/btf
+              readOnly: true
+            - name: ca-certs
+              mountPath: /etc/bouncer/ca
               readOnly: true
           livenessProbe:
             httpGet:
@@ -88,3 +95,33 @@ spec:
           hostPath:
             path: /sys/kernel/btf
             type: Directory
+        - name: ca-certs
+          secret:
+            secretName: bouncer-ca
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bouncer-controller
+  namespace: bouncer-system
+  labels:
+    app.kubernetes.io/name: bouncer
+    app.kubernetes.io/component: controller
+spec:
+  ports:
+    - name: https-metrics
+      port: 8443
+      targetPort: 8443
+      protocol: TCP
+    - name: http-store
+      port: 8090
+      targetPort: 8090
+      protocol: TCP
+    - name: grpc-xds
+      port: 15002
+      targetPort: 15002
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: bouncer
+    app.kubernetes.io/component: controller

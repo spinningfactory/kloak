@@ -123,6 +123,28 @@ func (s *Server) handleRequestHeaders(ctx context.Context, headers *extprocv3.Ht
 					},
 				},
 			})
+		} else if strings.HasPrefix(value, "Bearer "+HeaderPrefix) {
+			// Handle Bearer token
+			token := strings.TrimPrefix(value, "Bearer ")
+			originalValue, found, err := s.storage.Lookup(ctx, token)
+			if err != nil || !found {
+				s.log.V(1).Info("hash not found in storage (bearer)", "hash", token, "header", header.Key)
+				continue
+			}
+
+			newValue := "Bearer " + originalValue
+			s.log.Info("rewriting bearer header", "header", header.Key, "hash", token[:min(20, len(token))]+"...", "original", originalValue[:min(20, len(originalValue))]+"...")
+
+			mutations = append(mutations, &extprocv3.HeaderMutation{
+				SetHeaders: []*corev3.HeaderValueOption{
+					{
+						Header: &corev3.HeaderValue{
+							Key:      header.Key,
+							RawValue: []byte(newValue),
+						},
+					},
+				},
+			})
 		}
 	}
 

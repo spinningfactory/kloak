@@ -115,7 +115,7 @@ static_resources:
               - endpoint:
                   address:
                     socket_address:
-                      address: bouncer-xds.bouncer-system.svc
+                      address: bouncer-controller.bouncer-system.svc
                       port_value: 15002
 
     # External processor server
@@ -129,5 +129,5 @@ static_resources:
               - endpoint:
                   address:
                     socket_address:
-                      address: bouncer-xds.bouncer-system.svc
+                      address: bouncer-controller.bouncer-system.svc
                       port_value: 15002
