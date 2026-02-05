@@ -67,6 +67,18 @@ provision:
       clang --version | head -1
       echo "=== Provision complete ==="
 
+  # Install K3s (Single Node Cluster)
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      if [ ! -f /usr/local/bin/k3s ]; then
+        echo "Installing K3s..."
+        curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644 --disable traefik
+      else
+        echo "K3s already installed"
+      fi
+
 # Enable host resolver for DNS
 hostResolver:
   enabled: true
@@ -75,4 +87,18 @@ hostResolver:
 ssh:
   forwardAgent: true
 
-vmType: "qemu"
+# Port forwarding for K3s API and services
+portForwards:
+  - guestPort: 6443
+    hostPort: 6443
+  # Forward common ports for Ingress/Services (NodePort range or LB)
+  - guestPort: 30443
+    hostPort: 30443
+
+# Use vz (Virtualization.framework) for better performance on macOS
+vmType: "vz"
+rosetta:
+  # Enable Rosetta for running x86_64 binaries on ARM64
+  enabled: true
+  binfmt: true
+mountType: "virtiofs"
