@@ -101,6 +101,7 @@ func runController(cmd *cobra.Command, args []string) {
 		ctrl.Log.WithName("controller").WithName("Pod"),
 		mgr.GetScheme(),
 		cgroupMgr,
+		cgroupPath,
 	)
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
