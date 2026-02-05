@@ -3,6 +3,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/dhia/bouncer/pkg/hash"
 	"github.com/dhia/bouncer/pkg/storage"
+	"github.com/go-logr/logr"
 )
 
 const (
@@ -42,21 +44,25 @@ const (
 
 // Handler handles pod mutation requests.
 type Handler struct {
-	client     client.Client
-	decoder    admission.Decoder
-	storage    storage.Storage
-	envsToHash []string // Environment variable names to hash
+	client         client.Client
+	decoder        admission.Decoder
+	storage        storage.Storage
+	envsToHash     []string // Environment variable names to hash
+	remoteStoreURL string   // URL to Controller Store API
+	log            logr.Logger
 }
 
 // NewHandler creates a new webhook handler.
-func NewHandler(c client.Client, store storage.Storage, envsToHash []string) *Handler {
+func NewHandler(c client.Client, store storage.Storage, envsToHash []string, remoteStoreURL string, log logr.Logger) *Handler {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	return &Handler{
-		client:     c,
-		storage:    store,
-		envsToHash: envsToHash,
-		decoder:    admission.NewDecoder(scheme),
+		client:         c,
+		storage:        store,
+		envsToHash:     envsToHash,
+		decoder:        admission.NewDecoder(scheme),
+		remoteStoreURL: remoteStoreURL,
+		log:            log,
 	}
 }
 
@@ -205,6 +211,11 @@ func (h *Handler) hashEnvVars(ctx context.Context, pod *corev1.Pod, podID string
 				// Store the mapping
 				_ = h.storage.Store(ctx, podID, hashedValue, originalValue)
 
+				// Send to Remote Store (Controller)
+				if h.remoteStoreURL != "" {
+					go h.sendToRemoteStore(hashedValue, originalValue)
+				}
+
 				// Replace value with hash
 				env.Value = hashedValue
 				hashedVars = append(hashedVars, env.Name)
@@ -229,6 +240,38 @@ func (h *Handler) shouldHash(name string) bool {
 		}
 	}
 	return false
+}
+
+func (h *Handler) sendToRemoteStore(hash, original string) {
+	fmt.Printf("DEBUG: Sending hash %s to %s\n", hash, h.remoteStoreURL)
+	if h.remoteStoreURL == "" {
+		fmt.Println("DEBUG: Remote URL is empty")
+		return
+	}
+
+	payload := map[string]string{
+		"hash":     hash,
+		"original": original,
+	}
+	data, _ := json.Marshal(payload)
+
+	// We ignore errors here.
+	// Use background context for goroutine
+	resp, err := http.Post(h.remoteStoreURL, "application/json", bytes.NewBuffer(data))
+	if err != nil {
+		fmt.Printf("DEBUG: Error sending hash: %v\n", err)
+		h.log.Error(err, "failed to send hash to remote store", "url", h.remoteStoreURL)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Printf("DEBUG: Remote store returned status: %s\n", resp.Status)
+		h.log.Info("remote store returned non-OK status", "status", resp.Status)
+	} else {
+		fmt.Printf("DEBUG: Successfully sent hash\n")
+		h.log.Info("successfully sent hash to remote store", "hash", hash)
+	}
 }
 
 func ptr[T any](v T) *T {

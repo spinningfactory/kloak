@@ -72,7 +72,7 @@ func runWebhook(cmd *cobra.Command, args []string) {
 	// Register webhook
 	hookServer := mgr.GetWebhookServer()
 	hookServer.Register("/mutate-pods", &webhook.Admission{
-		Handler: webhookpkg.NewHandler(mgr.GetClient(), store, envList),
+		Handler: webhookpkg.NewHandler(mgr.GetClient(), store, envList, "http://bouncer-controller.bouncer-system.svc:8090/store", setupLog),
 	})
 
 	// Add health checks

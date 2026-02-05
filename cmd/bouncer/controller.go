@@ -1,7 +1,9 @@
 package main
 
 import (
+	"context"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -11,7 +13,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	"github.com/dhia/bouncer/pkg/ca"
 	"github.com/dhia/bouncer/pkg/controller"
+	"github.com/dhia/bouncer/pkg/storage"
+	"github.com/dhia/bouncer/pkg/xds"
 )
 
 var (
@@ -65,12 +70,47 @@ func runController(cmd *cobra.Command, args []string) {
 	setupLog := ctrl.Log.WithName("setup")
 	setupLog.Info("Starting Bouncer controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath)
 
+	// Create shared storage
+	store := storage.NewMemory()
+
+	// Load or Generate CA
+	// Check if CA files exist
+	caCertPath := "/etc/bouncer/ca/tls.crt"
+	caKeyPath := "/etc/bouncer/ca/tls.key"
+	var rootCA *ca.CA
+	var err error
+
+	if _, err = os.Stat(caCertPath); err == nil {
+		setupLog.Info("Loading CA from file", "path", caCertPath)
+		certPEM, err := os.ReadFile(caCertPath)
+		if err != nil {
+			setupLog.Error(err, "failed to read CA cert")
+			os.Exit(1)
+		}
+		keyPEM, err := os.ReadFile(caKeyPath)
+		if err != nil {
+			setupLog.Error(err, "failed to read CA key")
+			os.Exit(1)
+		}
+		rootCA, err = ca.LoadCA(certPEM, keyPEM)
+		if err != nil {
+			setupLog.Error(err, "failed to parse CA")
+			os.Exit(1)
+		}
+	} else {
+		setupLog.Info("CA file not found, generating new CA (for testing)")
+		rootCA, err = ca.GenerateCA("Bouncer Root CA", 365*24*time.Hour)
+		if err != nil {
+			setupLog.Error(err, "failed to generate CA")
+			os.Exit(1)
+		}
+	}
+
 	// Create cgroup manager
 	var cgroupMgr controller.CgroupManager
 	var ebpfMgr *EBPFCgroupManager
 
 	if enableEBPF {
-		var err error
 		ebpfMgr, err = NewEBPFCgroupManager(cgroupPath)
 		if err != nil {
 			setupLog.Error(err, "failed to initialize eBPF, falling back to mock")
@@ -94,6 +134,29 @@ func runController(cmd *cobra.Command, args []string) {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
+
+	// Create XDS Server
+	xdsServer := xds.NewServer(rootCA, store, ctrl.Log.WithName("xds"))
+	if err := mgr.Add(runnableFunc(func(ctx context.Context) error {
+		return xdsServer.Start(ctx, ":15002")
+	})); err != nil {
+		setupLog.Error(err, "unable to add XDS server")
+		os.Exit(1)
+	}
+
+	// Create HTTP Server
+	httpServer := controller.NewServer(store, ctrl.Log.WithName("http"))
+
+	// Start HTTP server immediately in goroutine (don't wait for leader election)
+	// This ensures webhook can send hashes during pod admission
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		setupLog.Info("starting HTTP server immediately (before leader election)")
+		if err := httpServer.Start(ctx, ":8090"); err != nil {
+			setupLog.Error(err, "HTTP server failed")
+		}
+	}()
 
 	// Create pod reconciler
 	reconciler := controller.NewReconciler(
@@ -132,4 +195,11 @@ func runController(cmd *cobra.Command, args []string) {
 	if ebpfMgr != nil {
 		ebpfMgr.Close()
 	}
+}
+
+// runnableFunc helper for manager.Runnable
+type runnableFunc func(context.Context) error
+
+func (r runnableFunc) Start(ctx context.Context) error {
+	return r(ctx)
 }
