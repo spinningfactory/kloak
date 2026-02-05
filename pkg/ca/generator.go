@@ -149,9 +149,21 @@ func LoadCA(certPEM, keyPEM []byte) (*CA, error) {
 		return nil, fmt.Errorf("failed to decode private key PEM")
 	}
 
-	key, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("parsing private key: %w", err)
+	var key *rsa.PrivateKey
+	var ok bool
+
+	// Try identifying the key type by the PEM header if possible, or just try both parsers
+	if parsedKey, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes); err == nil {
+		key = parsedKey
+	} else {
+		// Try PKCS8
+		if parsedKey8, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes); err == nil {
+			if key, ok = parsedKey8.(*rsa.PrivateKey); !ok {
+				return nil, fmt.Errorf("private key is not RSA")
+			}
+		} else {
+			return nil, fmt.Errorf("failed to parse private key (tried PKCS1 and PKCS8): %w", err)
+		}
 	}
 
 	return &CA{

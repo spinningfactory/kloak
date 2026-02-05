@@ -83,15 +83,19 @@ func (s *Server) handleRequest(ctx context.Context, req *discovery.DiscoveryRequ
 		domain := resourceName
 		if domain == "" || domain == "bouncer-dynamic-cert" {
 			// Default cert request - we'll use a placeholder
-			domain = "localhost"
+			domain = "httpbin.org"
 		}
 
-		secret, err := s.getOrCreateCert(domain)
+		secretPtr, err := s.getOrCreateCert(domain)
 		if err != nil {
 			return nil, fmt.Errorf("generating cert for %s: %w", domain, err)
 		}
 
-		anySecret, err := anypb.New(secret)
+		// Create a shallow copy to update the Name to match the requested resource name
+		secret := *secretPtr
+		secret.Name = resourceName
+
+		anySecret, err := anypb.New(&secret)
 		if err != nil {
 			return nil, fmt.Errorf("marshaling secret: %w", err)
 		}
@@ -117,8 +121,10 @@ func (s *Server) getOrCreateCert(domain string) (*tls.Secret, error) {
 	s.log.Info("generating certificate", "domain", domain)
 	certPEM, keyPEM, err := s.ca.GenerateServerCert(domain, s.certTTL)
 	if err != nil {
+		s.log.Error(err, "failed to generate certificate", "domain", domain)
 		return nil, err
 	}
+	s.log.Info("certificate generated successfully", "domain", domain)
 
 	secret := &tls.Secret{
 		Name: domain,
@@ -137,6 +143,7 @@ func (s *Server) getOrCreateCert(domain string) (*tls.Secret, error) {
 			},
 		},
 	}
+	s.log.Info("returning secret", "secret_name", secret.Name)
 
 	// Cache it
 	s.cacheMu.Lock()

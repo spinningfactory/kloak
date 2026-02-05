@@ -133,6 +133,10 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 			"-c", "/etc/envoy/envoy.yaml",
 			"--log-level", "info",
 		},
+		SecurityContext: &corev1.SecurityContext{
+			RunAsUser:  ptr(int64(1337)),
+			RunAsGroup: ptr(int64(1337)),
+		},
 	}
 
 	// Add Envoy container
@@ -225,4 +229,8 @@ func (h *Handler) shouldHash(name string) bool {
 		}
 	}
 	return false
+}
+
+func ptr[T any](v T) *T {
+	return &v
 }

@@ -3,7 +3,7 @@
 # This config sets up Envoy as a transparent TLS proxy that:
 # 1. Listens on port 15001 for redirected HTTPS traffic
 # 2. Terminates TLS using dynamically generated certificates
-# 3. Re-encrypts traffic to the original destination
+# 3. Uses DFP (Dynamic Forward Proxy) to route based on Host header
 # 4. Uses SDS (Secret Discovery Service) for dynamic cert generation
 
 admin:
@@ -28,9 +28,6 @@ static_resources:
         - name: envoy.filters.listener.tls_inspector
           typed_config:
             "@type": type.googleapis.com/envoy.extensions.filters.listener.tls_inspector.v3.TlsInspector
-        - name: envoy.filters.listener.original_dst
-          typed_config:
-            "@type": type.googleapis.com/envoy.extensions.filters.listener.original_dst.v3.OriginalDst
       filter_chains:
         - filter_chain_match:
             transport_protocol: tls
@@ -65,6 +62,12 @@ static_resources:
                       processing_mode:
                         request_header_mode: SEND
                         response_header_mode: SKIP
+                  - name: envoy.filters.http.dynamic_forward_proxy
+                    typed_config:
+                      "@type": type.googleapis.com/envoy.extensions.filters.http.dynamic_forward_proxy.v3.FilterConfig
+                      dns_cache_config:
+                        name: dynamic_forward_proxy_cache_config
+                        dns_lookup_family: V4_ONLY
                   - name: envoy.filters.http.router
                     typed_config:
                       "@type": type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
@@ -78,25 +81,32 @@ static_resources:
                         - match:
                             prefix: "/"
                           route:
-                            cluster: original_dst_cluster
+                            cluster: dynamic_forward_proxy_cluster
                             auto_host_rewrite: true
 
   clusters:
-    # Original destination cluster - routes to where the connection was going
-    - name: original_dst_cluster
-      type: ORIGINAL_DST
+    # Dynamic Forward Proxy Cluster
+    - name: dynamic_forward_proxy_cluster
       lb_policy: CLUSTER_PROVIDED
-      original_dst_lb_config:
-        use_http_header: false
+      cluster_type:
+        name: envoy.clusters.dynamic_forward_proxy
+        typed_config:
+          "@type": type.googleapis.com/envoy.extensions.clusters.dynamic_forward_proxy.v3.ClusterConfig
+          dns_cache_config:
+            name: dynamic_forward_proxy_cache_config
+            dns_lookup_family: V4_ONLY
       transport_socket:
         name: envoy.transport_sockets.tls
         typed_config:
           "@type": type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.UpstreamTlsContext
-          sni: ""  # Will be set from original request
+          common_tls_context:
+            validation_context:
+              trusted_ca:
+                filename: /etc/ssl/certs/ca-certificates.crt
 
-    # SDS server cluster for dynamic certificate generation
+    # SDS server cluster
     - name: sds_server
-      type: STATIC
+      type: LOGICAL_DNS
       http2_protocol_options: {}
       load_assignment:
         cluster_name: sds_server
@@ -105,12 +115,12 @@ static_resources:
               - endpoint:
                   address:
                     socket_address:
-                      address: 127.0.0.1
+                      address: bouncer-xds.bouncer-system.svc
                       port_value: 15002
 
-    # External processor server for header rewriting
+    # External processor server
     - name: ext_proc_server
-      type: STATIC
+      type: LOGICAL_DNS
       http2_protocol_options: {}
       load_assignment:
         cluster_name: ext_proc_server
@@ -119,5 +129,5 @@ static_resources:
               - endpoint:
                   address:
                     socket_address:
-                      address: 127.0.0.1
-                      port_value: 15003
+                      address: bouncer-xds.bouncer-system.svc
+                      port_value: 15002

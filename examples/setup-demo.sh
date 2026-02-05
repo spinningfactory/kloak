@@ -128,6 +128,8 @@ generate_certs() {
         -days 365 -nodes \
         -subj "/CN=bouncer-webhook.bouncer-system.svc" \
         -addext "subjectAltName=DNS:bouncer-webhook.bouncer-system.svc,DNS:bouncer-webhook.bouncer-system.svc.cluster.local,DNS:bouncer-webhook,DNS:localhost" \
+        -addext "keyUsage=digitalSignature,keyEncipherment" \
+        -addext "extendedKeyUsage=serverAuth" \
         2>/dev/null
     
     # Generate Root CA for MITM
@@ -136,6 +138,10 @@ generate_certs() {
         -out "$CERT_DIR/ca.crt" \
         -days 3650 -nodes \
         -subj "/CN=Bouncer Root CA" \
+        -addext "basicConstraints=critical,CA:TRUE" \
+        -addext "keyUsage=critical,keyCertSign,cRLSign" \
+        -addext "subjectKeyIdentifier=hash" \
+        -addext "authorityKeyIdentifier=keyid:always,issuer" \
         2>/dev/null
     
     echo "✓ TLS certificates generated"
