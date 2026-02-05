@@ -19,6 +19,7 @@ spec:
         app.kubernetes.io/component: controller
     spec:
       serviceAccountName: bouncer-controller
+      hostPID: true  # Required for cgroup access
       containers:
         - name: controller
           image: bouncer:latest
@@ -26,11 +27,20 @@ spec:
           command: ["/bouncer", "controller"]
           args:
             - --leader-elect=true
+            - --enable-ebpf=true
+            - --cgroup-path=/host/sys/fs/cgroup
           ports:
             - name: metrics
               containerPort: 8080
             - name: health
               containerPort: 8081
+          volumeMounts:
+            - name: cgroup
+              mountPath: /host/sys/fs/cgroup
+              readOnly: false
+            - name: bpf
+              mountPath: /sys/fs/bpf
+              readOnly: false
           livenessProbe:
             httpGet:
               path: /healthz
@@ -46,12 +56,28 @@ spec:
           resources:
             limits:
               cpu: 500m
-              memory: 128Mi
+              memory: 256Mi
             requests:
               cpu: 10m
               memory: 64Mi
           securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            runAsNonRoot: true
-            runAsUser: 65532
+            privileged: true  # Required for eBPF
+            runAsGroup: 0 
+            runAsUser: 0 
+            appArmorProfile:
+              type: Unconfined
+            capabilities:
+              add:
+                - BPF
+                - NET_ADMIN
+                - SYS_ADMIN
+                - SYS_RESOURCE
+      volumes:
+        - name: cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
+        - name: bpf
+          hostPath:
+            path: /sys/fs/bpf
+            type: DirectoryOrCreate

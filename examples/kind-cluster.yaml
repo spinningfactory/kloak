@@ -1,16 +1,19 @@
 # Kind cluster configuration for Bouncer demo
+# Uses a recent Kind node image with kernel 5.15+ for BTF support
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-name: bouncer-demo
+name: bouncer-demo-1
 nodes:
   - role: control-plane
+    # Use Kind 1.32 node image (stable)
+    image: kindest/node:v1.35.0
     # Expose webhook port
     extraPortMappings:
       - containerPort: 30443
         hostPort: 30443
         protocol: TCP
-    # Mount cgroups v2 for eBPF
+    # Mount BPF filesystem for eBPF map pinning
     extraMounts:
-      - hostPath: /sys/fs/cgroup
-        containerPath: /sys/fs/cgroup
+      - hostPath: /sys/fs/bpf
+        containerPath: /sys/fs/bpf
         readOnly: false

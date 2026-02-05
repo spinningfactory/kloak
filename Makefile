@@ -91,6 +91,7 @@ generate-ebpf: $(BPF_SOURCES) $(BPF_DIR)/vmlinux.h lima-ensure
 		echo "Using Lima VM for eBPF generation..."; \
 		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR)/$(EBPF_PKG) && go generate"; \
 	fi
+	@echo "eBPF generation complete."
 
 # Generate vmlinux.h from kernel BTF - depends on Lima
 $(BPF_DIR)/vmlinux.h: lima-ensure

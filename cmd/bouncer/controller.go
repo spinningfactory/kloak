@@ -22,16 +22,16 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 }
 
-// MockCgroupManager is a placeholder - in production this would interface with eBPF
+// MockCgroupManager is used when eBPF is disabled or not available.
 type MockCgroupManager struct{}
 
 func (m *MockCgroupManager) AddCgroup(cgroupID uint64) error {
-	ctrl.Log.Info("would add cgroup", "cgroupID", cgroupID)
+	ctrl.Log.Info("mock: would add cgroup", "cgroupID", cgroupID)
 	return nil
 }
 
 func (m *MockCgroupManager) RemoveCgroup(cgroupID uint64) error {
-	ctrl.Log.Info("would remove cgroup", "cgroupID", cgroupID)
+	ctrl.Log.Info("mock: would remove cgroup", "cgroupID", cgroupID)
 	return nil
 }
 
@@ -46,12 +46,16 @@ var (
 	controllerMetricsAddr string
 	controllerProbeAddr   string
 	enableLeaderElection  bool
+	enableEBPF            bool
+	cgroupPath            string
 )
 
 func init() {
 	controllerCmd.Flags().StringVar(&controllerMetricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	controllerCmd.Flags().StringVar(&controllerProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	controllerCmd.Flags().BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
+	controllerCmd.Flags().BoolVar(&enableEBPF, "enable-ebpf", false, "Enable eBPF traffic redirection (requires Linux + CAP_BPF).")
+	controllerCmd.Flags().StringVar(&cgroupPath, "cgroup-path", "/sys/fs/cgroup", "Path to cgroup v2 filesystem.")
 }
 
 func runController(cmd *cobra.Command, args []string) {
@@ -59,7 +63,26 @@ func runController(cmd *cobra.Command, args []string) {
 	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
 
 	setupLog := ctrl.Log.WithName("setup")
-	setupLog.Info("Starting Bouncer controller")
+	setupLog.Info("Starting Bouncer controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath)
+
+	// Create cgroup manager
+	var cgroupMgr controller.CgroupManager
+	var ebpfMgr *EBPFCgroupManager
+
+	if enableEBPF {
+		var err error
+		ebpfMgr, err = NewEBPFCgroupManager(cgroupPath)
+		if err != nil {
+			setupLog.Error(err, "failed to initialize eBPF, falling back to mock")
+			cgroupMgr = &MockCgroupManager{}
+		} else {
+			cgroupMgr = ebpfMgr
+			setupLog.Info("eBPF traffic redirection enabled")
+		}
+	} else {
+		setupLog.Info("eBPF disabled, using mock cgroup manager")
+		cgroupMgr = &MockCgroupManager{}
+	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
@@ -77,7 +100,7 @@ func runController(cmd *cobra.Command, args []string) {
 		mgr.GetClient(),
 		ctrl.Log.WithName("controller").WithName("Pod"),
 		mgr.GetScheme(),
-		&MockCgroupManager{},
+		cgroupMgr,
 	)
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
@@ -98,6 +121,14 @@ func runController(cmd *cobra.Command, args []string) {
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
+		if ebpfMgr != nil {
+			ebpfMgr.Close()
+		}
 		os.Exit(1)
+	}
+
+	// Cleanup
+	if ebpfMgr != nil {
+		ebpfMgr.Close()
 	}
 }
