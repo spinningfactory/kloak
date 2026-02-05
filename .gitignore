@@ -27,3 +27,4 @@ bin/
 # Kubernetes
 kubeconfig
 *.kubeconfig
+./bouncer

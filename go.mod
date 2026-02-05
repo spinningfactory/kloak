@@ -6,6 +6,7 @@ require (
 	github.com/cilium/ebpf v0.20.0
 	github.com/envoyproxy/go-control-plane/envoy v1.32.4
 	github.com/go-logr/logr v1.4.3
+	github.com/spf13/cobra v1.10.2
 	google.golang.org/grpc v1.72.2
 	google.golang.org/protobuf v1.36.8
 	k8s.io/api v0.35.0
@@ -32,6 +33,7 @@ require (
 	github.com/google/gnostic-models v0.7.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
 	github.com/google/uuid v1.6.0 // indirect
+	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
