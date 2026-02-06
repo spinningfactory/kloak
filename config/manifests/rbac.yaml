@@ -24,10 +24,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
-  # Secret management for CA
+  # Secret management for CA and SecretReconciler
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "create", "update"]
+    verbs: ["get", "list", "watch", "create", "update"]
   # ConfigMap for Envoy config
   - apiGroups: [""]
     resources: ["configmaps"]

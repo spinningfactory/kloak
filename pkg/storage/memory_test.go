@@ -9,22 +9,26 @@ func TestMemory_StoreAndLookup(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemory()
 
-	// Store a value
-	err := store.Store(ctx, "pod-1", "abc123", "secret-value")
+	// Test Store and Lookup
+	entry := Entry{Value: "secret-value", AllowedHosts: []string{"*"}}
+	err := store.Store(ctx, "pod-1", "hash-1", entry)
 	if err != nil {
 		t.Fatalf("Store failed: %v", err)
 	}
 
 	// Lookup the value
-	value, found, err := store.Lookup(ctx, "abc123")
+	gotEntry, found, err := store.Lookup(ctx, "hash-1")
 	if err != nil {
 		t.Fatalf("Lookup failed: %v", err)
 	}
 	if !found {
-		t.Fatal("Expected to find hash")
+		t.Error("Lookup failed to find stored hash")
 	}
-	if value != "secret-value" {
-		t.Fatalf("Expected 'secret-value', got '%s'", value)
+	if gotEntry.Value != "secret-value" {
+		t.Errorf("Expected %s, got %s", "secret-value", gotEntry.Value)
+	}
+	if len(gotEntry.AllowedHosts) != 1 || gotEntry.AllowedHosts[0] != "*" {
+		t.Errorf("Expected AllowedHosts to be ['*'], got %v", gotEntry.AllowedHosts)
 	}
 
 	// Lookup non-existent hash
@@ -42,9 +46,9 @@ func TestMemory_Delete(t *testing.T) {
 	store := NewMemory()
 
 	// Store values for two pods
-	store.Store(ctx, "pod-1", "hash1", "value1")
-	store.Store(ctx, "pod-1", "hash2", "value2")
-	store.Store(ctx, "pod-2", "hash3", "value3")
+	store.Store(ctx, "pod-1", "hash1", Entry{Value: "value1"})
+	store.Store(ctx, "pod-1", "hash2", Entry{Value: "value2"})
+	store.Store(ctx, "pod-2", "hash3", Entry{Value: "value3"})
 
 	// Delete pod-1
 	err := store.Delete(ctx, "pod-1")
@@ -63,12 +67,12 @@ func TestMemory_Delete(t *testing.T) {
 	}
 
 	// Verify pod-2 hash is still there
-	value, found, _ := store.Lookup(ctx, "hash3")
+	entry, found, _ := store.Lookup(ctx, "hash3")
 	if !found {
 		t.Fatal("hash3 should still exist")
 	}
-	if value != "value3" {
-		t.Fatalf("Expected 'value3', got '%s'", value)
+	if entry.Value != "value3" {
+		t.Fatalf("Expected 'value3', got '%s'", entry.Value)
 	}
 }
 
@@ -76,8 +80,8 @@ func TestMemory_List(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemory()
 
-	store.Store(ctx, "pod-1", "hash1", "value1")
-	store.Store(ctx, "pod-2", "hash2", "value2")
+	store.Store(ctx, "pod-1", "hash1", Entry{Value: "value1"})
+	store.Store(ctx, "pod-2", "hash2", Entry{Value: "value2"})
 
 	all, err := store.List(ctx)
 	if err != nil {
@@ -86,8 +90,8 @@ func TestMemory_List(t *testing.T) {
 	if len(all) != 2 {
 		t.Fatalf("Expected 2 entries, got %d", len(all))
 	}
-	if all["hash1"] != "value1" || all["hash2"] != "value2" {
-		t.Fatal("Unexpected values in list")
+	if all["hash1"].Value != "value1" || all["hash2"].Value != "value2" {
+		t.Error("Stored values do not match")
 	}
 }
 
@@ -95,16 +99,24 @@ func TestMemory_ListByPod(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemory()
 
-	store.Store(ctx, "pod-1", "hash1", "value1")
-	store.Store(ctx, "pod-1", "hash2", "value2")
-	store.Store(ctx, "pod-2", "hash3", "value3")
+	store.Store(ctx, "pod-1", "hash-1", Entry{Value: "value1"})
+	store.Store(ctx, "pod-1", "hash-2", Entry{Value: "value2"})
+	store.Store(ctx, "pod-2", "hash-3", Entry{Value: "value3"})
 
-	pod1Hashes, err := store.ListByPod(ctx, "pod-1")
+	// ListByPod pod-1 should return 2 items
+	items, err := store.ListByPod(ctx, "pod-1")
 	if err != nil {
 		t.Fatalf("ListByPod failed: %v", err)
 	}
-	if len(pod1Hashes) != 2 {
-		t.Fatalf("Expected 2 entries for pod-1, got %d", len(pod1Hashes))
+	if len(items) != 2 {
+		t.Errorf("Expected 2 items for pod-1, got %d", len(items))
+	}
+
+	if items["hash-1"].Value != "value1" {
+		t.Errorf("Expected value1, got %s", items["hash-1"].Value)
+	}
+	if items["hash-2"].Value != "value2" {
+		t.Errorf("Expected value2, got %s", items["hash-2"].Value)
 	}
 
 	// Non-existent pod returns empty map

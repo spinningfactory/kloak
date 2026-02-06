@@ -13,17 +13,25 @@ spec:
       image: bouncer-demo-python:latest
       imagePullPolicy: Never
       env:
-        - name: API_KEY_FILE
-          value: "/etc/secrets/api-key"
+        - name: SECRET_ALLOWED_FILE
+          value: "/etc/secrets/allowed/api-key"
+        - name: SECRET_BLOCKED_FILE
+          value: "/etc/secrets/blocked/api-key"
         - name: TARGET_URL
           value: "https://httpbin.org/headers"
         - name: REQUEST_INTERVAL
           value: "5"
       volumeMounts:
-        - name: secret-vol
-          mountPath: "/etc/secrets"
+        - name: secret-allowed-vol
+          mountPath: "/etc/secrets/allowed"
+          readOnly: true
+        - name: secret-blocked-vol
+          mountPath: "/etc/secrets/blocked"
           readOnly: true
   volumes:
-    - name: secret-vol
+    - name: secret-allowed-vol
       secret:
-        secretName: demo-secret
+        secretName: secret-allowed
+    - name: secret-blocked-vol
+      secret:
+        secretName: secret-blocked

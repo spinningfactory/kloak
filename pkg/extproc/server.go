@@ -97,6 +97,20 @@ func (s *Server) handleRequest(ctx context.Context, req *extprocv3.ProcessingReq
 func (s *Server) handleRequestHeaders(ctx context.Context, headers *extprocv3.HttpHeaders) (*extprocv3.ProcessingResponse, error) {
 	var mutations []*extprocv3.HeaderMutation
 
+	// 1. Extract Host/Authority
+	host := ""
+	for _, header := range headers.Headers.Headers {
+		k := strings.ToLower(header.Key)
+		if k == ":authority" || k == "host" {
+			v := string(header.RawValue)
+			if v == "" {
+				v = header.Value
+			}
+			host = v
+			break // Prefer :authority (usually comes first or satisfied)
+		}
+	}
+
 	for _, header := range headers.Headers.Headers {
 		value := string(header.RawValue)
 		if value == "" {
@@ -105,20 +119,26 @@ func (s *Server) handleRequestHeaders(ctx context.Context, headers *extprocv3.Ht
 
 		// Check if value is a bouncer hash
 		if strings.HasPrefix(value, HeaderPrefix) {
-			originalValue, found, err := s.storage.Lookup(ctx, value)
+			entry, found, err := s.storage.Lookup(ctx, value)
 			if err != nil || !found {
 				s.log.V(1).Info("hash not found in storage", "hash", value, "header", header.Key)
 				continue
 			}
 
-			s.log.Info("rewriting header", "header", header.Key, "hash", value[:min(20, len(value))]+"...", "original", originalValue[:min(20, len(originalValue))]+"...")
+			// Validate Host
+			if !isHostAllowed(host, entry.AllowedHosts) {
+				s.log.Info("secret replacement denied for host", "host", host, "allowed", entry.AllowedHosts)
+				continue
+			}
+
+			s.log.Info("rewriting header", "header", header.Key, "hash", value[:min(20, len(value))]+"...", "host", host)
 
 			mutations = append(mutations, &extprocv3.HeaderMutation{
 				SetHeaders: []*corev3.HeaderValueOption{
 					{
 						Header: &corev3.HeaderValue{
 							Key:      header.Key,
-							RawValue: []byte(originalValue),
+							RawValue: []byte(entry.Value),
 						},
 					},
 				},
@@ -126,14 +146,20 @@ func (s *Server) handleRequestHeaders(ctx context.Context, headers *extprocv3.Ht
 		} else if strings.HasPrefix(value, "Bearer "+HeaderPrefix) {
 			// Handle Bearer token
 			token := strings.TrimPrefix(value, "Bearer ")
-			originalValue, found, err := s.storage.Lookup(ctx, token)
+			entry, found, err := s.storage.Lookup(ctx, token)
 			if err != nil || !found {
 				s.log.V(1).Info("hash not found in storage (bearer)", "hash", token, "header", header.Key)
 				continue
 			}
 
-			newValue := "Bearer " + originalValue
-			s.log.Info("rewriting bearer header", "header", header.Key, "hash", token[:min(20, len(token))]+"...", "original", originalValue[:min(20, len(originalValue))]+"...")
+			// Validate Host
+			if !isHostAllowed(host, entry.AllowedHosts) {
+				s.log.Info("secret replacement denied for host (bearer)", "host", host, "allowed", entry.AllowedHosts)
+				continue
+			}
+
+			newValue := "Bearer " + entry.Value
+			s.log.Info("rewriting bearer header", "header", header.Key, "hash", token[:min(20, len(token))]+"...", "host", host)
 
 			mutations = append(mutations, &extprocv3.HeaderMutation{
 				SetHeaders: []*corev3.HeaderValueOption{
@@ -181,6 +207,23 @@ func (s *Server) handleRequestHeaders(ctx context.Context, headers *extprocv3.Ht
 	}
 
 	return resp, nil
+}
+
+// isHostAllowed checks if the request host matches any allowed pattern.
+func isHostAllowed(requestHost string, allowedHosts []string) bool {
+	for _, pattern := range allowedHosts {
+		// "*" allows any host
+		if pattern == "*" {
+			return true
+		}
+		// Exact match (case insensitive for domains usually, but let's be strict or equalFold)
+		if strings.EqualFold(pattern, requestHost) {
+			return true
+		}
+		// NOTE: User requirement didn't explicitly ask for *.example.com wildcard support, only "*" or "list of hosts".
+		// We stick to simple matching.
+	}
+	return false
 }
 
 // min returns the minimum of two ints.

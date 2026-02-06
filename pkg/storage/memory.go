@@ -9,8 +9,8 @@ import (
 // Thread-safe for concurrent access.
 type Memory struct {
 	mu sync.RWMutex
-	// hashToValue maps hash → original value
-	hashToValue map[string]string
+	// hashToEntry maps hash → Entry
+	hashToEntry map[string]Entry
 	// podToHashes maps podID → set of hashes
 	podToHashes map[string]map[string]struct{}
 	// hashToPod maps hash → podID (for reverse lookup)
@@ -20,19 +20,19 @@ type Memory struct {
 // NewMemory creates a new in-memory storage.
 func NewMemory() *Memory {
 	return &Memory{
-		hashToValue: make(map[string]string),
+		hashToEntry: make(map[string]Entry),
 		podToHashes: make(map[string]map[string]struct{}),
 		hashToPod:   make(map[string]string),
 	}
 }
 
-// Store saves a hash→value mapping for a pod.
-func (m *Memory) Store(ctx context.Context, podID, hash, value string) error {
+// Store saves a hash→Entry mapping for a pod.
+func (m *Memory) Store(ctx context.Context, podID, hash string, entry Entry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Store hash → value
-	m.hashToValue[hash] = value
+	// Store hash → Entry
+	m.hashToEntry[hash] = entry
 
 	// Track hash → pod relationship
 	m.hashToPod[hash] = podID
@@ -46,13 +46,13 @@ func (m *Memory) Store(ctx context.Context, podID, hash, value string) error {
 	return nil
 }
 
-// Lookup retrieves the original value for a hash.
-func (m *Memory) Lookup(ctx context.Context, hash string) (string, bool, error) {
+// Lookup retrieves the original Entry for a hash.
+func (m *Memory) Lookup(ctx context.Context, hash string) (Entry, bool, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	value, found := m.hashToValue[hash]
-	return value, found, nil
+	entry, found := m.hashToEntry[hash]
+	return entry, found, nil
 }
 
 // Delete removes all mappings for a pod.
@@ -68,7 +68,7 @@ func (m *Memory) Delete(ctx context.Context, podID string) error {
 
 	// Remove each hash
 	for hash := range hashes {
-		delete(m.hashToValue, hash)
+		delete(m.hashToEntry, hash)
 		delete(m.hashToPod, hash)
 	}
 
@@ -78,33 +78,33 @@ func (m *Memory) Delete(ctx context.Context, podID string) error {
 	return nil
 }
 
-// List returns all hash→value mappings.
-func (m *Memory) List(ctx context.Context) (map[string]string, error) {
+// List returns all hash→Entry mappings.
+func (m *Memory) List(ctx context.Context) (map[string]Entry, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	// Return a copy to prevent external modification
-	result := make(map[string]string, len(m.hashToValue))
-	for k, v := range m.hashToValue {
+	result := make(map[string]Entry, len(m.hashToEntry))
+	for k, v := range m.hashToEntry {
 		result[k] = v
 	}
 	return result, nil
 }
 
-// ListByPod returns all hash→value mappings for a specific pod.
-func (m *Memory) ListByPod(ctx context.Context, podID string) (map[string]string, error) {
+// ListByPod returns all hash→Entry mappings for a specific pod.
+func (m *Memory) ListByPod(ctx context.Context, podID string) (map[string]Entry, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
 	hashes, exists := m.podToHashes[podID]
 	if !exists {
-		return map[string]string{}, nil
+		return map[string]Entry{}, nil
 	}
 
-	result := make(map[string]string, len(hashes))
+	result := make(map[string]Entry, len(hashes))
 	for hash := range hashes {
-		if value, ok := m.hashToValue[hash]; ok {
-			result[hash] = value
+		if entry, ok := m.hashToEntry[hash]; ok {
+			result[hash] = entry
 		}
 	}
 	return result, nil

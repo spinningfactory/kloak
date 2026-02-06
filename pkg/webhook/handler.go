@@ -270,7 +270,8 @@ func (h *Handler) hashEnvVars(ctx context.Context, pod *corev1.Pod, podID string
 				hashedValue := hash.GenerateWithPrefix(originalValue)
 
 				// Store the mapping
-				_ = h.storage.Store(ctx, podID, hashedValue, originalValue)
+				entry := storage.Entry{Value: originalValue, AllowedHosts: []string{"*"}}
+				_ = h.storage.Store(ctx, podID, hashedValue, entry)
 
 				// Send to Remote Store (Controller)
 				if h.remoteStoreURL != "" {
@@ -310,9 +311,10 @@ func (h *Handler) sendToRemoteStore(hash, original string) {
 		return
 	}
 
-	payload := map[string]string{
-		"hash":     hash,
-		"original": original,
+	payload := map[string]interface{}{
+		"hash":          hash,
+		"original":      original,
+		"allowed_hosts": []string{"*"},
 	}
 	data, _ := json.Marshal(payload)
 

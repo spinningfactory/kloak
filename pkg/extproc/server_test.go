@@ -15,10 +15,11 @@ func TestHandleRequestHeaders(t *testing.T) {
 	store := storage.NewMemory()
 	ctx := context.Background()
 
-	// Store a hash mapping
-	hash := "bouncer:abc123def456"
-	originalValue := "sk-secret-api-key-12345"
-	_ = store.Store(ctx, "test-pod", hash, originalValue)
+	// Setup storage with a known hash
+	originalValue := "my-secret-value"
+	hash := "bouncer:12345"
+	entry := storage.Entry{Value: originalValue, AllowedHosts: []string{"*"}}
+	store.Store(context.Background(), "pod-1", hash, entry)
 
 	server := NewServer(store, logr.Discard())
 
