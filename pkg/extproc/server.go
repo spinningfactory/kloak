@@ -14,12 +14,12 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 
-	"github.com/dhia/bouncer/pkg/storage"
+	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
 const (
 	// HeaderPrefix is the prefix for hashed header values.
-	HeaderPrefix = "bouncer:"
+	HeaderPrefix = "kloak:"
 )
 
 // Server implements the Envoy External Processor service.
@@ -117,7 +117,7 @@ func (s *Server) handleRequestHeaders(ctx context.Context, headers *extprocv3.Ht
 			value = header.Value
 		}
 
-		// Check if value is a bouncer hash
+		// Check if value is a kloak hash
 		if strings.HasPrefix(value, HeaderPrefix) {
 			entry, found, err := s.storage.Lookup(ctx, value)
 			if err != nil || !found {

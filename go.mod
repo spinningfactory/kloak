@@ -1,4 +1,4 @@
-module github.com/dhia/bouncer
+module github.com/spinningfactory/kloak
 
 go 1.25.0
 

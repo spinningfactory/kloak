@@ -1,10 +1,10 @@
-# Bouncer
+# Kloak
 
 Kubernetes eBPF HTTPS Interceptor with Envoy Sidecar Injection.
 
 ## Overview
 
-Bouncer transparently intercepts HTTPS traffic from labeled Kubernetes pods, bypasses SSL verification via eBPF, and routes through an Envoy sidecar that can rewrite headers using a hash-to-value conversion table.
+Kloak transparently intercepts HTTPS traffic from labeled Kubernetes pods, bypasses SSL verification via eBPF, and routes through an Envoy sidecar that can rewrite headers using a hash-to-value conversion table.
 
 ## Quick Start
 

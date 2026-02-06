@@ -8,7 +8,7 @@ import (
 	extprocv3 "github.com/envoyproxy/go-control-plane/envoy/service/ext_proc/v3"
 	"github.com/go-logr/logr"
 
-	"github.com/dhia/bouncer/pkg/storage"
+	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
 func TestHandleRequestHeaders(t *testing.T) {
@@ -17,7 +17,7 @@ func TestHandleRequestHeaders(t *testing.T) {
 
 	// Setup storage with a known hash
 	originalValue := "my-secret-value"
-	hash := "bouncer:12345"
+	hash := "kloak:12345"
 	entry := storage.Entry{Value: originalValue, AllowedHosts: []string{"*"}}
 	store.Store(context.Background(), "pod-1", hash, entry)
 

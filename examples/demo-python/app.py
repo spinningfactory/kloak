@@ -1,12 +1,12 @@
 """
-Demo Python Application for Bouncer - Host Restriction Demo
+Demo Python Application for Kloak - Host Restriction Demo
 
 This app demonstrates the host restriction feature by using TWO secrets:
-1. secret-allowed: Configured with bouncer.io/hosts=httpbin.org (will be replaced)
-2. secret-blocked: Configured with bouncer.io/hosts=example.com (will NOT be replaced)
+1. secret-allowed: Configured with getkloak.io/hosts=httpbin.org (will be replaced)
+2. secret-blocked: Configured with getkloak.io/hosts=example.com (will NOT be replaced)
 
 When making requests to httpbin.org:
-- X-Secret-Allowed header will show the ORIGINAL value (replaced by Bouncer)
+- X-Secret-Allowed header will show the ORIGINAL value (replaced by Kloak)
 - X-Secret-Blocked header will show the UUID (NOT replaced, wrong host)
 """
 
@@ -36,11 +36,11 @@ def main():
     target_url = os.getenv("TARGET_URL", "https://httpbin.org/headers")
 
     print("=" * 60)
-    print("Bouncer Demo: Host Restriction Feature")
+    print("Kloak Demo: Host Restriction Feature")
     print("=" * 60)
     print(f"Target URL: {target_url}")
     print()
-    print("Secrets (as seen by the app - these are UUIDs if Bouncer is working):")
+    print("Secrets (as seen by the app - these are UUIDs if Kloak is working):")
     print(f"  Secret Allowed (httpbin.org): {key_allowed[:30]}...")
     print(f"  Secret Blocked (example.com): {key_blocked[:30]}...")
     print()
@@ -49,13 +49,13 @@ def main():
     print("  - X-Secret-Blocked: Should show UUID in response (not replaced)")
     print("=" * 60)
 
-    # Check for Bouncer CA
+    # Check for Kloak CA
     ca_path = os.getenv("SSL_CERT_FILE")
     if ca_path and os.path.exists(ca_path):
-        print(f"✓ Bouncer CA found at {ca_path}")
+        print(f"✓ Kloak CA found at {ca_path}")
         verify = ca_path
     else:
-        print("✗ Bouncer CA not found, using system CAs")
+        print("✗ Kloak CA not found, using system CAs")
         verify = True
 
     # Make requests in a loop

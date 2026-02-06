@@ -7,8 +7,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	"github.com/dhia/bouncer/pkg/storage"
 	"github.com/go-logr/logr"
+	"github.com/spinningfactory/kloak/pkg/storage"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -105,8 +105,8 @@ func TestMountRootCA(t *testing.T) {
 		t.Fatalf("Expected 1 volume, got %d", len(pod.Spec.Volumes))
 	}
 
-	if pod.Spec.Volumes[0].Name != "bouncer-data" {
-		t.Errorf("Expected volume name 'bouncer-data', got '%s'", pod.Spec.Volumes[0].Name)
+	if pod.Spec.Volumes[0].Name != "kloak-data" {
+		t.Errorf("Expected volume name 'kloak-data', got '%s'", pod.Spec.Volumes[0].Name)
 	}
 
 	// Check mount was added to app container
@@ -115,8 +115,8 @@ func TestMountRootCA(t *testing.T) {
 	}
 
 	mount := pod.Spec.Containers[0].VolumeMounts[0]
-	if mount.MountPath != "/etc/bouncer-data" {
-		t.Errorf("Expected mount path '/etc/bouncer-data', got '%s'", mount.MountPath)
+	if mount.MountPath != "/etc/kloak-data" {
+		t.Errorf("Expected mount path '/etc/kloak-data', got '%s'", mount.MountPath)
 	}
 }
 
@@ -145,13 +145,13 @@ func TestHashEnvVars(t *testing.T) {
 
 	h.hashEnvVars(context.Background(), pod, "test/pod")
 
-	// Check API_KEY was hashed (starts with bouncer:)
+	// Check API_KEY was hashed (starts with kloak:)
 	env := pod.Spec.Containers[0].Env
 	if env[0].Value == "secret-key-123" {
 		t.Error("API_KEY should have been hashed")
 	}
-	if env[0].Value[:8] != "bouncer:" {
-		t.Errorf("Hashed value should start with 'bouncer:', got '%s'", env[0].Value)
+	if env[0].Value[:6] != "kloak:" {
+		t.Errorf("Hashed value should start with 'kloak:', got '%s'", env[0].Value)
 	}
 
 	// Check DEBUG was NOT hashed
@@ -188,7 +188,7 @@ func TestRewriteSecretVolumes(t *testing.T) {
 			Name:      "my-secret",
 			Namespace: "default",
 			Labels: map[string]string{
-				"bouncer.io/enabled": "true",
+				"getkloak.io/enabled": "true",
 			},
 		},
 	}
@@ -247,9 +247,9 @@ func TestRewriteSecretVolumes(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// Verify "my-secret" rewrote to "my-secret-bouncer"
-	if pod.Spec.Volumes[0].Secret.SecretName != "my-secret-bouncer" {
-		t.Errorf("Expected my-secret-bouncer, got %s", pod.Spec.Volumes[0].Secret.SecretName)
+	// Verify "my-secret" rewrote to "my-secret-kloak"
+	if pod.Spec.Volumes[0].Secret.SecretName != "my-secret-kloak" {
+		t.Errorf("Expected my-secret-kloak, got %s", pod.Spec.Volumes[0].Secret.SecretName)
 	}
 
 	// Verify "other-secret" stayed same

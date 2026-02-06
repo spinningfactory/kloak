@@ -1,29 +1,29 @@
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: bouncer-webhook
-  namespace: bouncer-system
+  name: kloak-webhook
+  namespace: kloak-system
   labels:
-    app.kubernetes.io/name: bouncer
+    app.kubernetes.io/name: kloak
     app.kubernetes.io/component: webhook
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app.kubernetes.io/name: bouncer
+      app.kubernetes.io/name: kloak
       app.kubernetes.io/component: webhook
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: bouncer
+        app.kubernetes.io/name: kloak
         app.kubernetes.io/component: webhook
     spec:
-      serviceAccountName: bouncer-controller
+      serviceAccountName: kloak-controller
       containers:
         - name: webhook
-          image: bouncer:latest
+          image: kloak:latest
           imagePullPolicy: IfNotPresent
-          command: ["/bouncer", "webhook"]
+          command: ["/kloak", "webhook"]
           args:
             - --cert-dir=/certs
             - --hash-envs=API_KEY,SECRET_KEY,PASSWORD,TOKEN,OPENAI_API_KEY
@@ -58,15 +58,15 @@ spec:
       volumes:
         - name: webhook-certs
           secret:
-            secretName: bouncer-webhook-certs
+            secretName: kloak-webhook-certs
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: bouncer-webhook
-  namespace: bouncer-system
+  name: kloak-webhook
+  namespace: kloak-system
   labels:
-    app.kubernetes.io/name: bouncer
+    app.kubernetes.io/name: kloak
     app.kubernetes.io/component: webhook
 spec:
   ports:
@@ -74,23 +74,23 @@ spec:
       targetPort: webhook
       protocol: TCP
   selector:
-    app.kubernetes.io/name: bouncer
+    app.kubernetes.io/name: kloak
     app.kubernetes.io/component: webhook
 ---
 apiVersion: admissionregistration.k8s.io/v1
 kind: MutatingWebhookConfiguration
 metadata:
-  name: bouncer-mutating-webhook
+  name: kloak-mutating-webhook
   labels:
-    app.kubernetes.io/name: bouncer
+    app.kubernetes.io/name: kloak
 webhooks:
-  - name: pod.mutate.bouncer.io
+  - name: pod.mutate.getkloak.io
     admissionReviewVersions: ["v1"]
     sideEffects: None
     clientConfig:
       service:
-        namespace: bouncer-system
-        name: bouncer-webhook
+        namespace: kloak-system
+        name: kloak-webhook
         path: /mutate-pods
       # CA bundle injected by cert-manager or manually
       caBundle: ""
@@ -101,7 +101,7 @@ webhooks:
         resources: ["pods"]
     namespaceSelector:
       matchExpressions:
-        - key: bouncer.io/enabled
+        - key: getkloak.io/enabled
           operator: In
           values: ["true"]
     failurePolicy: Ignore

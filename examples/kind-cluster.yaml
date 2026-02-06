@@ -1,8 +1,8 @@
-# Kind cluster configuration for Bouncer demo
+# Kind cluster configuration for Kloak demo
 # Uses a recent Kind node image with kernel 5.15+ for BTF support
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
-name: bouncer-demo-1
+name: kloak-demo-1
 nodes:
   - role: control-plane
     # Use Kind 1.32 node image (stable)

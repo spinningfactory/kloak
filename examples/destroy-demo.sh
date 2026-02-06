@@ -1,14 +1,14 @@
 #!/bin/bash
-# Bouncer Demo Destroy Script
+# Kloak Demo Destroy Script
 # Completely removes the Kind cluster and cleans up resources
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CERT_DIR="/tmp/bouncer-certs"
+CERT_DIR="/tmp/kloak-certs"
 
 echo "================================"
-echo " Bouncer Demo Cleanup"
+echo " Kloak Demo Cleanup"
 echo "================================"
 echo ""
 
@@ -16,8 +16,8 @@ echo ""
 delete_cluster() {
     echo "Deleting Kind cluster..."
     
-    if kind get clusters 2>/dev/null | grep -q "bouncer-demo"; then
-        kind delete cluster --name bouncer-demo
+    if kind get clusters 2>/dev/null | grep -q "kloak-demo"; then
+        kind delete cluster --name kloak-demo
         echo "✓ Kind cluster deleted"
     else
         echo "✓ Kind cluster not found (already deleted)"
@@ -44,8 +44,8 @@ cleanup_images() {
     echo
     
     if [[ $REPLY =~ ^[Yy]$ ]]; then
-        docker rmi bouncer:latest 2>/dev/null || true
-        docker rmi bouncer-demo-python:latest 2>/dev/null || true
+        docker rmi kloak:latest 2>/dev/null || true
+        docker rmi kloak-demo-python:latest 2>/dev/null || true
         echo "✓ Docker images removed"
     else
         echo "✓ Docker images kept"

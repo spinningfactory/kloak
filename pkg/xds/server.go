@@ -6,12 +6,12 @@ import (
 	"net"
 	"time"
 
-	"github.com/dhia/bouncer/pkg/ca"
-	"github.com/dhia/bouncer/pkg/extproc"
-	"github.com/dhia/bouncer/pkg/lds"
-	"github.com/dhia/bouncer/pkg/sds"
-	"github.com/dhia/bouncer/pkg/storage"
 	"github.com/go-logr/logr"
+	"github.com/spinningfactory/kloak/pkg/ca"
+	"github.com/spinningfactory/kloak/pkg/extproc"
+	"github.com/spinningfactory/kloak/pkg/lds"
+	"github.com/spinningfactory/kloak/pkg/sds"
+	"github.com/spinningfactory/kloak/pkg/storage"
 	"google.golang.org/grpc"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
@@ -28,7 +28,7 @@ import (
 	server "github.com/envoyproxy/go-control-plane/pkg/server/v3"
 )
 
-// Server implements the xDS server for Bouncer.
+// Server implements the xDS server for Kloak.
 type Server struct {
 	server.Server
 	snapshotCache cache.SnapshotCache

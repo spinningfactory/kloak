@@ -15,19 +15,19 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/dhia/bouncer/pkg/storage"
+	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
 const (
-	// AnnotationSecretEnabled is the label/annotation to enable Bouncer secret replication.
-	AnnotationSecretEnabled = "bouncer.io/enabled"
+	// AnnotationSecretEnabled is the label/annotation to enable Kloak secret replication.
+	AnnotationSecretEnabled = "getkloak.io/enabled"
 
 	// ShadowSecretSuffix is the suffix appended to the name of the shadow secret.
-	ShadowSecretSuffix = "-bouncer"
+	ShadowSecretSuffix = "-kloak"
 
 	// ValuePrefix is the prefix for generated UUID values.
 	// Must match what ExtProc expects (see pkg/extproc/server.go).
-	ValuePrefix = "bouncer:"
+	ValuePrefix = "kloak:"
 )
 
 // SecretReconciler reconciles a Secret object
@@ -140,7 +140,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	for shadowVal, originalVal := range newMappings {
 		// Parse allowed hosts
 		allowedHosts := []string{"*"}
-		if hostsLabel, ok := secret.Labels["bouncer.io/hosts"]; ok && hostsLabel != "" {
+		if hostsLabel, ok := secret.Labels["getkloak.io/hosts"]; ok && hostsLabel != "" {
 			// Split by comma and trim spaces
 			parts := strings.Split(hostsLabel, ",")
 			allowedHosts = make([]string, 0, len(parts))
@@ -168,8 +168,8 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			Name:      shadowName,
 			Namespace: secret.Namespace,
 			Labels: map[string]string{
-				"bouncer.io/managed": "true",
-				"bouncer.io/owner":   secret.Name,
+				"getkloak.io/managed": "true",
+				"getkloak.io/owner":   secret.Name,
 			},
 			OwnerReferences: []metav1.OwnerReference{
 				{
