@@ -80,8 +80,8 @@ func TestInjectEnvoySidecar(t *testing.T) {
 	}
 
 	// Check volumes were added
-	if len(pod.Spec.Volumes) != 2 {
-		t.Errorf("Expected 2 volumes, got %d", len(pod.Spec.Volumes))
+	if len(pod.Spec.Volumes) != 1 {
+		t.Errorf("Expected 1 volumes, got %d", len(pod.Spec.Volumes))
 	}
 }
 

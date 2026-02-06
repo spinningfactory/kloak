@@ -144,24 +144,7 @@ generate_certs() {
         -addext "authorityKeyIdentifier=keyid:always,issuer" \
         2>/dev/null
     
-    # Generate server certificate for TLS termination (signed by CA)
-    # Using a generic CN with a wildcard-like approach for demo purposes
-    openssl req -newkey rsa:2048 -nodes \
-        -keyout "$CERT_DIR/server.key" \
-        -out "$CERT_DIR/server.csr" \
-        -subj "/CN=bouncer-mitm/O=Bouncer Generated" \
-        2>/dev/null
-    
-    # Sign the server certificate with CA
-    openssl x509 -req \
-        -in "$CERT_DIR/server.csr" \
-        -CA "$CERT_DIR/ca.crt" \
-        -CAkey "$CERT_DIR/ca.key" \
-        -CAcreateserial \
-        -out "$CERT_DIR/server.crt" \
-        -days 365 \
-        -extfile <(printf "subjectAltName=DNS:httpbin.org,DNS:*.httpbin.org,DNS:api.github.com,DNS:*.github.com,DNS:*.googleapis.com,DNS:*.google.com,DNS:localhost\nkeyUsage=digitalSignature,keyEncipherment\nextendedKeyUsage=serverAuth") \
-        2>/dev/null
+
     
     echo "✓ TLS certificates generated"
 }
@@ -195,11 +178,7 @@ deploy_bouncer() {
         --from-file=ca.crt="$CERT_DIR/ca.crt" \
         -n default --dry-run=client -o yaml | kubectl apply -f -
     
-    # Create server cert secret for Envoy sidecar TLS termination
-    kubectl create secret tls bouncer-server-certs \
-        --cert="$CERT_DIR/server.crt" \
-        --key="$CERT_DIR/server.key" \
-        -n default --dry-run=client -o yaml | kubectl apply -f -
+
     
     # Create Envoy config
     kubectl create configmap bouncer-envoy-config \
