@@ -89,7 +89,15 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 	// 2. Mount Root CA certificate
 	h.mountRootCA(mutatedPod)
 
-	// 3. Hash sensitive environment variables
+	// 3. Rewrite Secret volumes (swap with shadow secrets)
+	if err := h.rewriteSecretVolumes(ctx, mutatedPod, req.Namespace); err != nil {
+		h.log.Error(err, "failed to rewrite secret volumes")
+		// We log error but don't fail admission? Or should we fail?
+		// Failing is safer if we intend to protect secrets.
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+
+	// 4. Hash sensitive environment variables
 	podID := fmt.Sprintf("%s/%s", req.Namespace, req.Name)
 	if req.Name == "" {
 		podID = fmt.Sprintf("%s/%s", req.Namespace, mutatedPod.GenerateName)
@@ -329,4 +337,41 @@ func (h *Handler) sendToRemoteStore(hash, original string) {
 
 func ptr[T any](v T) *T {
 	return &v
+}
+
+// rewriteSecretVolumes checks volume mounts and swaps enabled secrets with shadow secrets.
+func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, namespace string) error {
+	for i := range pod.Spec.Volumes {
+		vol := &pod.Spec.Volumes[i]
+		if vol.Secret != nil {
+			secretName := vol.Secret.SecretName
+
+			// Resolve namespace (pod namespace usually)
+			ns := namespace
+			if ns == "" {
+				ns = "default" // Fallback
+			}
+
+			// Check if secret is enabled
+			var secret corev1.Secret
+			err := h.client.Get(ctx, client.ObjectKey{Name: secretName, Namespace: ns}, &secret)
+			if err != nil {
+				// If not found or error, just skip rewriting (safest default? or fail?)
+				// If we can't find it, we can't verify label.
+				// Pod admission will likely fail downstream if secret is missing anyway.
+				h.log.V(1).Info("failed to look up secret for volume rewriting", "name", secretName, "error", err)
+				continue
+			}
+
+			// Check annotation/label
+			enabled := secret.Labels[AnnotationEnabled] == "true" || secret.Annotations[AnnotationEnabled] == "true"
+			if enabled {
+				shadowName := secretName + "-bouncer"
+				h.log.Info("Rewriting volume to use shadow secret", "original", secretName, "shadow", shadowName)
+				vol.Secret.SecretName = shadowName
+			}
+		}
+	}
+	// TODO: Handle EnvFrom? User specifically mentioned "mount".
+	return nil
 }

@@ -8,7 +8,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 CERT_DIR="/tmp/bouncer-certs"
 KUBECONFIG_PATH="/tmp/bouncer-k3s.yaml"
+CERT_DIR="/tmp/bouncer-certs"
+KUBECONFIG_PATH="/tmp/bouncer-k3s.yaml"
 LIMA_INSTANCE="bouncer"
+DEMO_NAMESPACE="bouncer-demo"
 
 echo "================================"
 echo " Bouncer Demo Setup (Lima + K3s)"
@@ -173,17 +176,22 @@ deploy_bouncer() {
         --key="$CERT_DIR/ca.key" \
         -n bouncer-system --dry-run=client -o yaml | kubectl apply -f -
     
+    # Create Demo Namespace
+    echo "Creating demo namespace: $DEMO_NAMESPACE"
+    kubectl create namespace "$DEMO_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+    # Label demo namespace to enable webhook
+    kubectl label namespace "$DEMO_NAMESPACE" bouncer.io/enabled=true --overwrite
+
     # Create CA ConfigMap for app pods (to trust our CA)
     kubectl create configmap bouncer-ca-cert \
         --from-file=ca.crt="$CERT_DIR/ca.crt" \
-        -n default --dry-run=client -o yaml | kubectl apply -f -
-    
-
+        -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
     
     # Create Envoy config
     kubectl create configmap bouncer-envoy-config \
         --from-file="$ROOT_DIR/config/envoy/envoy.yaml" \
-        -n default --dry-run=client -o yaml | kubectl apply -f -
+        -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
     
     # Apply controller and webhook deployments
     kubectl apply -f "$ROOT_DIR/config/manifests/controller.yaml"
@@ -196,8 +204,8 @@ deploy_bouncer() {
     kubectl patch mutatingwebhookconfiguration bouncer-mutating-webhook \
         --type='json' -p="[{\"op\": \"replace\", \"path\": \"/webhooks/0/clientConfig/caBundle\", \"value\": \"${CA_BUNDLE}\"}]"
     
-    # Label default namespace to enable webhook
-    kubectl label namespace default bouncer.io/enabled=true --overwrite
+    # Remove default namespace label if it exists (cleanup)
+    kubectl label namespace default bouncer.io/enabled- --overwrite 2>/dev/null || true
     
     echo "✓ Bouncer components deployed"
 }
@@ -225,16 +233,24 @@ wait_for_bouncer() {
 deploy_demo() {
     export KUBECONFIG="$KUBECONFIG_PATH"
     echo ""
-    echo "Deploying demo application..."
+    echo "Deploying demo application to $DEMO_NAMESPACE..."
     
     # Delete any existing demo pod first
-    kubectl delete pod demo-python --ignore-not-found 2>/dev/null || true
+    kubectl delete pod demo-python -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
+    
+    # Create demo secret with Bouncer enabled
+    echo "Creating demo secret..."
+    kubectl create secret generic demo-secret \
+        --from-literal=api-key="super-secret-password-123" \
+        -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | \
+        kubectl label -f - bouncer.io/enabled="true" --local -o yaml | \
+        kubectl apply -f -
     
     # Wait a moment for cleanup
     sleep 2
     
     # Apply the demo pod (webhook should inject sidecar)
-    kubectl apply -f "$SCRIPT_DIR/demo-python/pod.yaml"
+    kubectl apply -f "$SCRIPT_DIR/demo-python/pod.yaml" -n "$DEMO_NAMESPACE"
     
     echo "✓ Demo application deployed"
 }
@@ -245,17 +261,17 @@ wait_for_demo() {
     echo ""
     echo "Waiting for demo pod to be ready..."
     
-    kubectl wait --for=condition=Ready pod/demo-python --timeout=120s || {
+    kubectl wait --for=condition=Ready pod/demo-python -n "$DEMO_NAMESPACE" --timeout=120s || {
         echo "Warning: Demo pod may not be ready"
     }
     
     echo ""
     echo "Demo pod status:"
-    kubectl get pod demo-python -o wide
+    kubectl get pod demo-python -n "$DEMO_NAMESPACE" -o wide
     
     echo ""
     echo "Containers in demo pod:"
-    kubectl get pod demo-python -o jsonpath='{.spec.containers[*].name}' && echo ""
+    kubectl get pod demo-python -n "$DEMO_NAMESPACE" -o jsonpath='{.spec.containers[*].name}' && echo ""
 }
 
 # Verify sidecar injection
@@ -264,7 +280,7 @@ verify_injection() {
     echo ""
     echo "Verifying sidecar injection..."
     
-    CONTAINERS=$(kubectl get pod demo-python -o jsonpath='{.spec.containers[*].name}' 2>/dev/null || echo "")
+    CONTAINERS=$(kubectl get pod demo-python -n "$DEMO_NAMESPACE" -o jsonpath='{.spec.containers[*].name}' 2>/dev/null || echo "")
     
     if echo "$CONTAINERS" | grep -q "envoy-sidecar"; then
         echo "✓ Envoy sidecar successfully injected!"
@@ -291,9 +307,15 @@ show_summary() {
     echo ""
     echo "Commands:"
     echo "  Use kubectl:         export KUBECONFIG=$KUBECONFIG_PATH"
-    echo "  View demo logs:      kubectl logs -f demo-python -c demo-app"
-    echo "  View sidecar logs:   kubectl logs -f demo-python -c envoy-sidecar"
+    echo "  View demo logs:      kubectl logs -f demo-python -n $DEMO_NAMESPACE -c demo-app"
+    echo "  View sidecar logs:   kubectl logs -f demo-python -n $DEMO_NAMESPACE -c envoy-sidecar"
     echo "  View webhook logs:   kubectl logs -n bouncer-system -l app.kubernetes.io/component=webhook"
+    echo ""
+    echo "Verification:"
+    echo "  1. Check demo logs:  kubectl logs demo-python -n $DEMO_NAMESPACE | grep 'API Key'"
+    echo "     (Should show 'bouncer:...' UUID)"
+    echo "  2. Check response:   kubectl logs demo-python -n $DEMO_NAMESPACE | grep 'Authorization'"
+    echo "     (Should show 'Bearer super-secret-password-123')"
     echo ""
 }
 

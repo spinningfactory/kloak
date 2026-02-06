@@ -2,7 +2,6 @@ apiVersion: v1
 kind: Pod
 metadata:
   name: demo-python
-  namespace: default
   labels:
     app: demo-python
   annotations:
@@ -14,9 +13,17 @@ spec:
       image: bouncer-demo-python:latest
       imagePullPolicy: Never
       env:
-        - name: API_KEY
-          value: "sk-secret-api-key-should-be-hashed"
+        - name: API_KEY_FILE
+          value: "/etc/secrets/api-key"
         - name: TARGET_URL
           value: "https://httpbin.org/headers"
         - name: REQUEST_INTERVAL
           value: "5"
+      volumeMounts:
+        - name: secret-vol
+          mountPath: "/etc/secrets"
+          readOnly: true
+  volumes:
+    - name: secret-vol
+      secret:
+        secretName: demo-secret
