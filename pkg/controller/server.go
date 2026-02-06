@@ -46,8 +46,9 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 }
 
 type StoreRequest struct {
-	Hash     string `json:"hash"`
-	Original string `json:"original"`
+	Hash         string   `json:"hash"`
+	Original     string   `json:"original"`
+	AllowedHosts []string `json:"allowed_hosts"`
 }
 
 func (s *Server) handleStore(w http.ResponseWriter, r *http.Request) {
@@ -67,8 +68,19 @@ func (s *Server) handleStore(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.log.Info("storing hash", "hash", req.Hash, "original", req.Original)
-	s.store.Store(r.Context(), "manual-http-store", req.Hash, req.Original)
+	// Default to allow all hosts if not specified
+	allowed := req.AllowedHosts
+	if len(allowed) == 0 {
+		allowed = []string{"*"}
+	}
+
+	s.log.Info("storing hash", "hash", req.Hash, "original", req.Original, "hosts", allowed)
+
+	entry := storage.Entry{
+		Value:        req.Original,
+		AllowedHosts: allowed,
+	}
+	s.store.Store(r.Context(), "manual-http-store", req.Hash, entry)
 
 	w.WriteHeader(http.StatusOK)
 }

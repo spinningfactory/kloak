@@ -138,7 +138,25 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	for shadowVal, originalVal := range newMappings {
-		if err := r.Storage.Store(ctx, secretID, shadowVal, originalVal); err != nil {
+		// Parse allowed hosts
+		allowedHosts := []string{"*"}
+		if hostsLabel, ok := secret.Labels["bouncer.io/hosts"]; ok && hostsLabel != "" {
+			// Split by comma and trim spaces
+			parts := strings.Split(hostsLabel, ",")
+			allowedHosts = make([]string, 0, len(parts))
+			for _, p := range parts {
+				if trimmed := strings.TrimSpace(p); trimmed != "" {
+					allowedHosts = append(allowedHosts, trimmed)
+				}
+			}
+		}
+
+		// Store mapping (uuid -> original + hosts)
+		entry := storage.Entry{
+			Value:        string(originalVal),
+			AllowedHosts: allowedHosts,
+		}
+		if err := r.Storage.Store(ctx, secretID, shadowVal, entry); err != nil {
 			log.Error(err, "failed to store mapping", "shadow", shadowVal)
 			return ctrl.Result{}, err
 		}

@@ -238,12 +238,20 @@ deploy_demo() {
     # Delete any existing demo pod first
     kubectl delete pod demo-python -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
     
-    # Create demo secret with Bouncer enabled
-    echo "Creating demo secret..."
-    kubectl create secret generic demo-secret \
-        --from-literal=api-key="super-secret-password-123" \
+    # Create SECRET 1: Allowed for httpbin.org
+    echo "Creating secret-allowed (hosts=httpbin.org)..."
+    kubectl create secret generic secret-allowed \
+        --from-literal=api-key="REAL-ALLOWED-KEY-12345" \
         -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | \
-        kubectl label -f - bouncer.io/enabled="true" --local -o yaml | \
+        kubectl label -f - bouncer.io/enabled="true" bouncer.io/hosts="httpbin.org" --local -o yaml | \
+        kubectl apply -f -
+    
+    # Create SECRET 2: Blocked for httpbin.org (only allowed for example.com)
+    echo "Creating secret-blocked (hosts=example.com)..."
+    kubectl create secret generic secret-blocked \
+        --from-literal=api-key="REAL-BLOCKED-KEY-67890" \
+        -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | \
+        kubectl label -f - bouncer.io/enabled="true" bouncer.io/hosts="example.com" --local -o yaml | \
         kubectl apply -f -
     
     # Wait a moment for cleanup
@@ -312,10 +320,11 @@ show_summary() {
     echo "  View webhook logs:   kubectl logs -n bouncer-system -l app.kubernetes.io/component=webhook"
     echo ""
     echo "Verification:"
-    echo "  1. Check demo logs:  kubectl logs demo-python -n $DEMO_NAMESPACE | grep 'API Key'"
-    echo "     (Should show 'bouncer:...' UUID)"
-    echo "  2. Check response:   kubectl logs demo-python -n $DEMO_NAMESPACE | grep 'Authorization'"
-    echo "     (Should show 'Bearer super-secret-password-123')"
+    echo "  1. Check demo logs:  kubectl logs demo-python -n $DEMO_NAMESPACE -c demo-app | head -30"
+    echo "     (Should show 'bouncer:...' UUIDs for both secrets)"
+    echo "  2. Check response:   kubectl logs demo-python -n $DEMO_NAMESPACE -c demo-app | grep -A20 'Response headers'"
+    echo "     X-Secret-Allowed: Should show 'REAL-ALLOWED-KEY-12345' (replaced)"
+    echo "     X-Secret-Blocked: Should show 'bouncer:...' UUID (NOT replaced - wrong host)"
     echo ""
 }
 

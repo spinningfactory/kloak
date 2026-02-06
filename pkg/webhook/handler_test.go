@@ -169,6 +169,13 @@ func TestHashEnvVars(t *testing.T) {
 	if len(all) != 2 {
 		t.Errorf("Expected 2 stored mappings, got %d", len(all))
 	}
+
+	// Check content of one entry (optional, but good for verification)
+	for _, entry := range all {
+		if entry.AllowedHosts[0] != "*" {
+			t.Errorf("Expected allowed host '*', got %v", entry.AllowedHosts)
+		}
+	}
 }
 
 func TestRewriteSecretVolumes(t *testing.T) {
