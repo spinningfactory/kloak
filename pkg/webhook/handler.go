@@ -32,8 +32,8 @@ const (
 	// EnvoyPort is the port Envoy listens on for intercepted traffic.
 	EnvoyPort = 15001
 
-	// CAMountPath is where the Root CA certificate is mounted.
-	CAMountPath = "/etc/ssl/certs/bouncer-ca.crt"
+	// CACertFile matches the key in the ConfigMap
+	CACertFile = "root-ca.crt"
 
 	// CAVolumeName is the name of the volume containing the CA.
 	CAVolumeName = "bouncer-ca"
@@ -131,11 +131,6 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 				MountPath: "/etc/envoy",
 				ReadOnly:  true,
 			},
-			{
-				Name:      "bouncer-server-certs",
-				MountPath: "/etc/bouncer",
-				ReadOnly:  true,
-			},
 		},
 		Args: []string{
 			"-c", "/etc/envoy/envoy.yaml",
@@ -182,15 +177,6 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 		},
 	})
 
-	// Add server certs volume from secret for TLS termination
-	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-		Name: "bouncer-server-certs",
-		VolumeSource: corev1.VolumeSource{
-			Secret: &corev1.SecretVolumeSource{
-				SecretName: "bouncer-server-certs",
-			},
-		},
-	})
 }
 
 // mountRootCA injects the Root CA using an init container and shared volume.
