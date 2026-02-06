@@ -92,7 +92,7 @@ int cgroup_connect4(struct bpf_sock_addr *ctx) {
   ctx->user_ip4 = bpf_htonl(0x7f000001); // 127.0.0.1
   ctx->user_port = bpf_htons(ENVOY_PORT);
 
-  bpf_printk("bouncer: redirected %pI4:%d -> 127.0.0.1:%d", &dst.ip4, dst_port,
+  bpf_printk("kloak: redirected %pI4:%d -> 127.0.0.1:%d", &dst.ip4, dst_port,
              ENVOY_PORT);
 
   return 1; // Allow (with modified destination)

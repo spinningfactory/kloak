@@ -15,7 +15,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/anypb"
 
-	"github.com/dhia/bouncer/pkg/ca"
+	"github.com/spinningfactory/kloak/pkg/ca"
 )
 
 // Server implements the xDS Secret Discovery Service for dynamic certs.
@@ -88,7 +88,7 @@ func (s *Server) DeltaSecrets(stream secret.SecretDiscoveryService_DeltaSecretsS
 			domain := resourceName
 
 			// Handle default cert name
-			if domain == "bouncer-default-cert" || domain == "" {
+			if domain == "kloak-default-cert" || domain == "" {
 				s.log.Info("generating default certificate", "requested_name", resourceName)
 				domain = "localhost"
 			} else {
@@ -143,7 +143,7 @@ func (s *Server) handleRequest(ctx context.Context, req *discovery.DiscoveryRequ
 		domain := resourceName
 
 		// Handle predefined certificate names (fallback for default filter chain)
-		if domain == "bouncer-default-cert" || domain == "bouncer-dynamic-cert" || domain == "default" {
+		if domain == "kloak-default-cert" || domain == "kloak-dynamic-cert" || domain == "default" {
 			// Default catch-all: use a localhost certificate since we don't have SNI
 			s.log.Info("generating default certificate for unknown SNI", "requested_name", domain)
 			domain = "localhost"

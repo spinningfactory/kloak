@@ -12,7 +12,7 @@ import (
 
 const (
 	// SecretName is the name of the Kubernetes Secret storing the CA.
-	SecretName = "bouncer-ca"
+	SecretName = "kloak-ca"
 
 	// CertKey is the key for the certificate in the Secret data.
 	CertKey = "ca.crt"
@@ -63,7 +63,7 @@ func (s *Store) GetOrCreate(ctx context.Context) (*CA, error) {
 	}
 
 	// Secret doesn't exist, create new CA
-	ca, err := GenerateCA("Bouncer Root CA", DefaultValidDuration)
+	ca, err := GenerateCA("Kloak Root CA", DefaultValidDuration)
 	if err != nil {
 		return nil, fmt.Errorf("generating CA: %w", err)
 	}
@@ -73,7 +73,7 @@ func (s *Store) GetOrCreate(ctx context.Context) (*CA, error) {
 		Name:      SecretName,
 		Namespace: s.namespace,
 		Labels: map[string]string{
-			"app.kubernetes.io/name":      "bouncer",
+			"app.kubernetes.io/name":      "kloak",
 			"app.kubernetes.io/component": "ca",
 		},
 	}

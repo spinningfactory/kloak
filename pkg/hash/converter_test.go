@@ -28,16 +28,16 @@ func TestGenerate(t *testing.T) {
 func TestGenerateWithPrefix(t *testing.T) {
 	hash := GenerateWithPrefix("my-secret")
 
-	if len(hash) != 72 { // 8 (prefix) + 64 (hash)
-		t.Fatalf("Expected 72 char hash with prefix, got %d", len(hash))
+	if len(hash) != 70 { // 6 (prefix "kloak:") + 64 (hash)
+		t.Fatalf("Expected 70 char hash with prefix, got %d", len(hash))
 	}
 
-	if hash[:8] != "bouncer:" {
-		t.Fatalf("Expected 'bouncer:' prefix, got '%s'", hash[:8])
+	if hash[:6] != "kloak:" {
+		t.Fatalf("Expected 'kloak:' prefix, got '%s'", hash[:6])
 	}
 }
 
-func TestIsBouncerHash(t *testing.T) {
+func TestIsKloakHash(t *testing.T) {
 	tests := []struct {
 		input    string
 		expected bool
@@ -50,9 +50,9 @@ func TestIsBouncerHash(t *testing.T) {
 	}
 
 	for _, tc := range tests {
-		result := IsBouncerHash(tc.input)
+		result := IsKloakHash(tc.input)
 		if result != tc.expected {
-			t.Errorf("IsBouncerHash(%q) = %v, want %v", tc.input, result, tc.expected)
+			t.Errorf("IsKloakHash(%q) = %v, want %v", tc.input, result, tc.expected)
 		}
 	}
 }

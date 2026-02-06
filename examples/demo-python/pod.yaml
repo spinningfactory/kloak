@@ -5,12 +5,12 @@ metadata:
   labels:
     app: demo-python
   annotations:
-    # Enable Bouncer for this pod
-    bouncer.io/enabled: "true"
+    # Enable Kloak for this pod
+    getkloak.io/enabled: "true"
 spec:
   containers:
     - name: demo-app
-      image: bouncer-demo-python:latest
+      image: kloak-demo-python:latest
       imagePullPolicy: Never
       env:
         - name: SECRET_ALLOWED_FILE

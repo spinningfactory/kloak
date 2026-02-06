@@ -11,8 +11,8 @@ GOMOD=$(GOCMD) mod
 GOGENERATE=$(GOCMD) generate
 
 # Binary names
-BINARY_NAME=bouncer
-WEBHOOK_BINARY=bouncer-webhook
+BINARY_NAME=kloak
+WEBHOOK_BINARY=kloak-webhook
 
 # Build directories
 BUILD_DIR=bin
@@ -26,11 +26,11 @@ BPF_SOURCES=$(wildcard $(BPF_DIR)/*.c $(BPF_DIR)/*.h)
 EBPF_GENERATED=$(EBPF_PKG)/redirect_bpfel.go $(EBPF_PKG)/redirect_bpfeb.go
 
 # Docker
-DOCKER_IMAGE=bouncer
+DOCKER_IMAGE=kloak
 DOCKER_TAG=latest
 
 # Lima VM
-LIMA_VM=bouncer
+LIMA_VM=kloak
 LIMA_WORKDIR=$(shell pwd)
 LIMA_CONFIG=lima.yaml
 
@@ -45,14 +45,14 @@ build: deps $(BUILD_DIR)/$(BINARY_NAME)
 
 $(BUILD_DIR)/$(BINARY_NAME): $(GO_SOURCES)
 	@mkdir -p $(BUILD_DIR)
-	$(GOBUILD) -o $(BUILD_DIR)/$(BINARY_NAME) ./$(CMD_DIR)/bouncer
+	$(GOBUILD) -o $(BUILD_DIR)/$(BINARY_NAME) ./$(CMD_DIR)/kloak
 
 # Build for Linux (cross-compile or via Lima)
 build-linux: lima-ensure
 	@if [ "$$(uname)" = "Linux" ]; then \
-		GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/bouncer; \
+		GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak; \
 	else \
-		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go build -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/bouncer"; \
+		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go build -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak"; \
 	fi
 
 test: deps
@@ -157,10 +157,10 @@ lima-exec: lima-ensure
 # ============================================================================
 
 help:
-	@echo "Bouncer Makefile - Kubernetes eBPF HTTPS Interceptor"
+	@echo "Kloak Makefile - Kubernetes eBPF HTTPS Interceptor"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  build           - Build the bouncer binary (native)"
+	@echo "  build           - Build the kloak binary (native)"
 	@echo "  build-linux     - Build for Linux (uses Lima on macOS)"
 	@echo "  test            - Run tests"
 	@echo "  test-linux      - Run tests in Linux VM"

@@ -6,7 +6,7 @@ import (
 
 	"github.com/go-logr/logr"
 
-	"github.com/dhia/bouncer/pkg/ca"
+	"github.com/spinningfactory/kloak/pkg/ca"
 )
 
 func TestGetOrCreateCert(t *testing.T) {

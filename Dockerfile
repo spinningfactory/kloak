@@ -14,7 +14,7 @@ RUN go mod download
 COPY . .
 
 # Build single binary
-RUN CGO_ENABLED=0 go build -o /bouncer ./cmd/bouncer
+RUN CGO_ENABLED=0 go build -o /kloak ./cmd/kloak
 
 # Runtime stage
 FROM alpine:3.19
@@ -23,10 +23,10 @@ FROM alpine:3.19
 RUN apk add --no-cache ca-certificates
 
 # Copy binary
-COPY --from=builder /bouncer /bouncer
+COPY --from=builder /kloak /kloak
 
 # Run as non-root (UID 65532 = nonroot, matches K8s manifest)
-RUN adduser -D -u 65532 bouncer
+RUN adduser -D -u 65532 kloak
 USER 65532
 
-ENTRYPOINT ["/bouncer"]
+ENTRYPOINT ["/kloak"]

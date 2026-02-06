@@ -27,4 +27,4 @@ bin/
 # Kubernetes
 kubeconfig
 *.kubeconfig
-./bouncer
+./kloak

@@ -6,14 +6,14 @@ import (
 )
 
 func TestGenerateCA(t *testing.T) {
-	ca, err := GenerateCA("Bouncer Test CA", 24*time.Hour)
+	ca, err := GenerateCA("Kloak Test CA", 24*time.Hour)
 	if err != nil {
 		t.Fatalf("GenerateCA failed: %v", err)
 	}
 
 	// Verify certificate properties
-	if ca.Cert.Subject.CommonName != "Bouncer Test CA" {
-		t.Errorf("Expected CN 'Bouncer Test CA', got '%s'", ca.Cert.Subject.CommonName)
+	if ca.Cert.Subject.CommonName != "Kloak Test CA" {
+		t.Errorf("Expected CN 'Kloak Test CA', got '%s'", ca.Cert.Subject.CommonName)
 	}
 
 	if !ca.Cert.IsCA {

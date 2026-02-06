@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Bouncer Demo Setup Script (Lima + K3s)
-# Creates a Lima VM with K3s and deploys the Bouncer demo
+# Kloak Demo Setup Script (Lima + K3s)
+# Creates a Lima VM with K3s and deploys the Kloak demo
 
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(dirname "$SCRIPT_DIR")"
-CERT_DIR="/tmp/bouncer-certs"
-KUBECONFIG_PATH="/tmp/bouncer-k3s.yaml"
-CERT_DIR="/tmp/bouncer-certs"
-KUBECONFIG_PATH="/tmp/bouncer-k3s.yaml"
-LIMA_INSTANCE="bouncer"
-DEMO_NAMESPACE="bouncer-demo"
+CERT_DIR="/tmp/kloak-certs"
+KUBECONFIG_PATH="/tmp/kloak-k3s.yaml"
+CERT_DIR="/tmp/kloak-certs"
+KUBECONFIG_PATH="/tmp/kloak-k3s.yaml"
+LIMA_INSTANCE="kloak"
+DEMO_NAMESPACE="kloak-demo"
 
 echo "================================"
-echo " Bouncer Demo Setup (Lima + K3s)"
+echo " Kloak Demo Setup (Lima + K3s)"
 echo "================================"
 echo ""
 echo "PATH: $PATH"
@@ -99,19 +99,19 @@ build_images() {
     echo "Building images..."
     
     # Build demo Python app
-    docker build -t bouncer-demo-python:latest "$SCRIPT_DIR/demo-python"
+    docker build -t kloak-demo-python:latest "$SCRIPT_DIR/demo-python"
     
-    # Build Bouncer controller
-    docker build -t bouncer:latest "$ROOT_DIR"
+    # Build Kloak controller
+    docker build -t kloak:latest "$ROOT_DIR"
     
     echo "Importing images into K3s (this may take a moment)..."
     # We pipeline docker save -> lima -> k3s ctr import
     
-    echo "Importing bouncer-demo-python..."
-    docker save bouncer-demo-python:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
+    echo "Importing kloak-demo-python..."
+    docker save kloak-demo-python:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
     
-    echo "Importing bouncer..."
-    docker save bouncer:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
+    echo "Importing kloak..."
+    docker save kloak:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
     
     echo "✓ Images built and imported"
 }
@@ -129,8 +129,8 @@ generate_certs() {
         -keyout "$CERT_DIR/webhook-tls.key" \
         -out "$CERT_DIR/webhook-tls.crt" \
         -days 365 -nodes \
-        -subj "/CN=bouncer-webhook.bouncer-system.svc" \
-        -addext "subjectAltName=DNS:bouncer-webhook.bouncer-system.svc,DNS:bouncer-webhook.bouncer-system.svc.cluster.local,DNS:bouncer-webhook,DNS:localhost" \
+        -subj "/CN=kloak-webhook.kloak-system.svc" \
+        -addext "subjectAltName=DNS:kloak-webhook.kloak-system.svc,DNS:kloak-webhook.kloak-system.svc.cluster.local,DNS:kloak-webhook,DNS:localhost" \
         -addext "keyUsage=digitalSignature,keyEncipherment" \
         -addext "extendedKeyUsage=serverAuth" \
         2>/dev/null
@@ -140,7 +140,7 @@ generate_certs() {
         -keyout "$CERT_DIR/ca.key" \
         -out "$CERT_DIR/ca.crt" \
         -days 3650 -nodes \
-        -subj "/CN=Bouncer Root CA" \
+        -subj "/CN=Kloak Root CA" \
         -addext "basicConstraints=critical,CA:TRUE" \
         -addext "keyUsage=critical,keyCertSign,cRLSign" \
         -addext "subjectKeyIdentifier=hash" \
@@ -152,44 +152,44 @@ generate_certs() {
     echo "✓ TLS certificates generated"
 }
 
-# Deploy Bouncer components
-deploy_bouncer() {
+# Deploy Kloak components
+deploy_kloak() {
     export KUBECONFIG="$KUBECONFIG_PATH"
     echo ""
-    echo "Deploying Bouncer..."
+    echo "Deploying Kloak..."
     
     # Apply RBAC first (creates namespace)
     kubectl apply -f "$ROOT_DIR/config/manifests/rbac.yaml"
     
     # Wait for namespace to be ready
-    kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/bouncer-system --timeout=30s
+    kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/kloak-system --timeout=30s
     
     # Create webhook TLS secret
-    kubectl create secret tls bouncer-webhook-certs \
+    kubectl create secret tls kloak-webhook-certs \
         --cert="$CERT_DIR/webhook-tls.crt" \
         --key="$CERT_DIR/webhook-tls.key" \
-        -n bouncer-system --dry-run=client -o yaml | kubectl apply -f -
+        -n kloak-system --dry-run=client -o yaml | kubectl apply -f -
     
     # Create CA secret for XDS
-    kubectl create secret tls bouncer-ca \
+    kubectl create secret tls kloak-ca \
         --cert="$CERT_DIR/ca.crt" \
         --key="$CERT_DIR/ca.key" \
-        -n bouncer-system --dry-run=client -o yaml | kubectl apply -f -
+        -n kloak-system --dry-run=client -o yaml | kubectl apply -f -
     
     # Create Demo Namespace
     echo "Creating demo namespace: $DEMO_NAMESPACE"
     kubectl create namespace "$DEMO_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
     # Label demo namespace to enable webhook
-    kubectl label namespace "$DEMO_NAMESPACE" bouncer.io/enabled=true --overwrite
+    kubectl label namespace "$DEMO_NAMESPACE" getkloak.io/enabled=true --overwrite
 
     # Create CA ConfigMap for app pods (to trust our CA)
-    kubectl create configmap bouncer-ca-cert \
+    kubectl create configmap kloak-ca-cert \
         --from-file=ca.crt="$CERT_DIR/ca.crt" \
         -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
     
     # Create Envoy config
-    kubectl create configmap bouncer-envoy-config \
+    kubectl create configmap kloak-envoy-config \
         --from-file="$ROOT_DIR/config/envoy/envoy.yaml" \
         -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
     
@@ -201,32 +201,32 @@ deploy_bouncer() {
     CA_BUNDLE=$(base64 < "$CERT_DIR/webhook-tls.crt" | tr -d '\n')
     
     # Patch MutatingWebhookConfiguration with CA bundle
-    kubectl patch mutatingwebhookconfiguration bouncer-mutating-webhook \
+    kubectl patch mutatingwebhookconfiguration kloak-mutating-webhook \
         --type='json' -p="[{\"op\": \"replace\", \"path\": \"/webhooks/0/clientConfig/caBundle\", \"value\": \"${CA_BUNDLE}\"}]"
     
     # Remove default namespace label if it exists (cleanup)
-    kubectl label namespace default bouncer.io/enabled- --overwrite 2>/dev/null || true
+    kubectl label namespace default getkloak.io/enabled- --overwrite 2>/dev/null || true
     
-    echo "✓ Bouncer components deployed"
+    echo "✓ Kloak components deployed"
 }
 
-# Wait for Bouncer pods
-wait_for_bouncer() {
+# Wait for Kloak pods
+wait_for_kloak() {
     export KUBECONFIG="$KUBECONFIG_PATH"
     echo ""
-    echo "Waiting for Bouncer pods to be ready..."
+    echo "Waiting for Kloak pods to be ready..."
     
     kubectl wait --for=condition=Ready pod \
-        -l app.kubernetes.io/name=bouncer \
-        -n bouncer-system \
+        -l app.kubernetes.io/name=kloak \
+        -n kloak-system \
         --timeout=120s || {
-        echo "Warning: Some Bouncer pods may not be ready"
-        kubectl get pods -n bouncer-system
+        echo "Warning: Some Kloak pods may not be ready"
+        kubectl get pods -n kloak-system
     }
     
     echo ""
-    echo "Bouncer pods status:"
-    kubectl get pods -n bouncer-system
+    echo "Kloak pods status:"
+    kubectl get pods -n kloak-system
 }
 
 # Deploy demo app
@@ -243,7 +243,7 @@ deploy_demo() {
     kubectl create secret generic secret-allowed \
         --from-literal=api-key="REAL-ALLOWED-KEY-12345" \
         -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | \
-        kubectl label -f - bouncer.io/enabled="true" bouncer.io/hosts="httpbin.org" --local -o yaml | \
+        kubectl label -f - getkloak.io/enabled="true" getkloak.io/hosts="httpbin.org" --local -o yaml | \
         kubectl apply -f -
     
     # Create SECRET 2: Blocked for httpbin.org (only allowed for example.com)
@@ -251,7 +251,7 @@ deploy_demo() {
     kubectl create secret generic secret-blocked \
         --from-literal=api-key="REAL-BLOCKED-KEY-67890" \
         -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | \
-        kubectl label -f - bouncer.io/enabled="true" bouncer.io/hosts="example.com" --local -o yaml | \
+        kubectl label -f - getkloak.io/enabled="true" getkloak.io/hosts="example.com" --local -o yaml | \
         kubectl apply -f -
     
     # Wait a moment for cleanup
@@ -298,7 +298,7 @@ verify_injection() {
         echo "  Containers: $CONTAINERS"
         echo ""
         echo "Checking webhook logs..."
-        kubectl logs -n bouncer-system -l app.kubernetes.io/component=webhook --tail=10 2>/dev/null || true
+        kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook --tail=10 2>/dev/null || true
     fi
 }
 
@@ -317,14 +317,14 @@ show_summary() {
     echo "  Use kubectl:         export KUBECONFIG=$KUBECONFIG_PATH"
     echo "  View demo logs:      kubectl logs -f demo-python -n $DEMO_NAMESPACE -c demo-app"
     echo "  View sidecar logs:   kubectl logs -f demo-python -n $DEMO_NAMESPACE -c envoy-sidecar"
-    echo "  View webhook logs:   kubectl logs -n bouncer-system -l app.kubernetes.io/component=webhook"
+    echo "  View webhook logs:   kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook"
     echo ""
     echo "Verification:"
     echo "  1. Check demo logs:  kubectl logs demo-python -n $DEMO_NAMESPACE -c demo-app | head -30"
-    echo "     (Should show 'bouncer:...' UUIDs for both secrets)"
+    echo "     (Should show 'kloak:...' UUIDs for both secrets)"
     echo "  2. Check response:   kubectl logs demo-python -n $DEMO_NAMESPACE -c demo-app | grep -A20 'Response headers'"
     echo "     X-Secret-Allowed: Should show 'REAL-ALLOWED-KEY-12345' (replaced)"
-    echo "     X-Secret-Blocked: Should show 'bouncer:...' UUID (NOT replaced - wrong host)"
+    echo "     X-Secret-Blocked: Should show 'kloak:...' UUID (NOT replaced - wrong host)"
     echo ""
 }
 
@@ -334,8 +334,8 @@ main() {
     create_cluster
     build_images
     generate_certs
-    deploy_bouncer
-    wait_for_bouncer
+    deploy_kloak
+    wait_for_kloak
     deploy_demo
     wait_for_demo
     verify_injection

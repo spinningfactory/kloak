@@ -1,5 +1,5 @@
 # Lima VM configuration for eBPF development
-# Usage: limactl start --name=bouncer lima.yaml
+# Usage: limactl start --name=kloak lima.yaml
 
 # Use Ubuntu for good eBPF support
 images:

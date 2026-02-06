@@ -15,18 +15,18 @@ func Generate(value string) string {
 }
 
 // GenerateWithPrefix creates a SHA256 hash with a prefix for identification.
-// The prefix helps identify bouncer-managed values during debugging.
+// The prefix helps identify kloak-managed values during debugging.
 func GenerateWithPrefix(value string) string {
-	return "bouncer:" + Generate(value)
+	return "kloak:" + Generate(value)
 }
 
-// IsBouncerHash checks if a value looks like a bouncer-generated hash.
-func IsBouncerHash(value string) bool {
-	if len(value) < 8 {
+// IsKloakHash checks if a value looks like a kloak-generated hash.
+func IsKloakHash(value string) bool {
+	if len(value) < 6 {
 		return false
 	}
-	// Check for prefix
-	if len(value) == 72 && value[:8] == "bouncer:" {
+	// Check for prefix ("kloak:" = 6 chars + 64 hash = 70 total)
+	if len(value) == 70 && value[:6] == "kloak:" {
 		return true
 	}
 	// Check for raw SHA256 (64 hex chars)

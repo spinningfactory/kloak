@@ -14,17 +14,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	"github.com/dhia/bouncer/pkg/hash"
-	"github.com/dhia/bouncer/pkg/storage"
 	"github.com/go-logr/logr"
+	"github.com/spinningfactory/kloak/pkg/hash"
+	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
 const (
-	// AnnotationEnabled is the annotation to enable Bouncer on a pod.
-	AnnotationEnabled = "bouncer.io/enabled"
+	// AnnotationEnabled is the annotation to enable Kloak on a pod.
+	AnnotationEnabled = "getkloak.io/enabled"
 
 	// AnnotationHashedEnvs lists env vars that were hashed.
-	AnnotationHashedEnvs = "bouncer.io/hashed-envs"
+	AnnotationHashedEnvs = "getkloak.io/hashed-envs"
 
 	// EnvoyImage is the default Envoy sidecar image.
 	EnvoyImage = "envoyproxy/envoy:v1.37-latest"
@@ -36,10 +36,10 @@ const (
 	CACertFile = "root-ca.crt"
 
 	// CAVolumeName is the name of the volume containing the CA.
-	CAVolumeName = "bouncer-ca"
+	CAVolumeName = "kloak-ca"
 
 	// CAConfigMapName is the name of the ConfigMap containing the CA cert.
-	CAConfigMapName = "bouncer-ca-cert"
+	CAConfigMapName = "kloak-ca-cert"
 )
 
 // Handler handles pod mutation requests.
@@ -75,9 +75,9 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
-	// Check if Bouncer is enabled for this pod
+	// Check if Kloak is enabled for this pod
 	if !h.isEnabled(pod) {
-		return admission.Allowed("bouncer not enabled")
+		return admission.Allowed("kloak not enabled")
 	}
 
 	// Create a copy to mutate
@@ -113,7 +113,7 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 	return admission.PatchResponseFromRaw(req.Object.Raw, marshaledPod)
 }
 
-// isEnabled checks if Bouncer should process this pod.
+// isEnabled checks if Kloak should process this pod.
 func (h *Handler) isEnabled(pod *corev1.Pod) bool {
 	if pod.Annotations == nil {
 		return false
@@ -142,8 +142,8 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 		},
 		Args: []string{
 			"-c", "/etc/envoy/envoy.yaml",
-			"--service-cluster", "bouncer-sidecar",
-			"--service-node", "bouncer-sidecar-$(POD_NAME)",
+			"--service-cluster", "kloak-sidecar",
+			"--service-node", "kloak-sidecar-$(POD_NAME)",
 			"--log-level", "debug",
 		},
 		Env: []corev1.EnvVar{
@@ -179,7 +179,7 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 		VolumeSource: corev1.VolumeSource{
 			ConfigMap: &corev1.ConfigMapVolumeSource{
 				LocalObjectReference: corev1.LocalObjectReference{
-					Name: "bouncer-envoy-config",
+					Name: "kloak-envoy-config",
 				},
 			},
 		},
@@ -190,8 +190,8 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 // mountRootCA injects the Root CA using an init container and shared volume.
 func (h *Handler) mountRootCA(pod *corev1.Pod) {
 	const (
-		SharedVolName = "bouncer-data"
-		SharedVolPath = "/etc/bouncer-data"
+		SharedVolName = "kloak-data"
+		SharedVolPath = "/etc/kloak-data"
 		CACertFile    = "root-ca.crt" // Filename in the shared volume
 	)
 
@@ -210,7 +210,7 @@ func (h *Handler) mountRootCA(pod *corev1.Pod) {
 	cmd := fmt.Sprintf("printf '%%s' '%s' > %s/%s", caContent, SharedVolPath, CACertFile)
 
 	initContainer := corev1.Container{
-		Name:  "bouncer-init-ca",
+		Name:  "kloak-init-ca",
 		Image: "busybox", // Rely on busybox being available
 		Command: []string{
 			"sh", "-c", cmd,
@@ -368,7 +368,7 @@ func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, nam
 			// Check annotation/label
 			enabled := secret.Labels[AnnotationEnabled] == "true" || secret.Annotations[AnnotationEnabled] == "true"
 			if enabled {
-				shadowName := secretName + "-bouncer"
+				shadowName := secretName + "-kloak"
 				h.log.Info("Rewriting volume to use shadow secret", "original", secretName, "shadow", shadowName)
 				vol.Secret.SecretName = shadowName
 			}

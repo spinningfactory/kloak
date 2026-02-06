@@ -7,10 +7,10 @@ import (
 
 	"github.com/go-logr/logr"
 
-	"github.com/dhia/bouncer/pkg/storage"
+	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
-// Server provides the HTTP API for the Bouncer controller.
+// Server provides the HTTP API for the Kloak controller.
 type Server struct {
 	store storage.Storage
 	log   logr.Logger

@@ -1,5 +1,5 @@
 // Package ca provides utilities for generating and managing
-// the Bouncer Root CA used for MITM-style SSL interception.
+// the Kloak Root CA used for MITM-style SSL interception.
 package ca
 
 import (
@@ -21,7 +21,7 @@ type CA struct {
 	KeyPEM  []byte
 }
 
-// GenerateCA creates a new self-signed Root CA for Bouncer.
+// GenerateCA creates a new self-signed Root CA for Kloak.
 // The CA is valid for the specified duration (e.g., 10 years).
 func GenerateCA(commonName string, validFor time.Duration) (*CA, error) {
 	// Generate RSA private key
@@ -41,7 +41,7 @@ func GenerateCA(commonName string, validFor time.Duration) (*CA, error) {
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			CommonName:   commonName,
-			Organization: []string{"Bouncer"},
+			Organization: []string{"Kloak"},
 		},
 		NotBefore:             now,
 		NotAfter:              now.Add(validFor),
@@ -102,7 +102,7 @@ func (ca *CA) GenerateServerCert(domain string, validFor time.Duration) (certPEM
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
 			CommonName:   domain,
-			Organization: []string{"Bouncer Generated"},
+			Organization: []string{"Kloak Generated"},
 		},
 		NotBefore:   now,
 		NotAfter:    now.Add(validFor),

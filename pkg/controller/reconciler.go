@@ -17,8 +17,8 @@ import (
 )
 
 const (
-	// AnnotationEnabled is the annotation that enables Bouncer for a pod.
-	AnnotationEnabled = "bouncer.io/enabled"
+	// AnnotationEnabled is the annotation that enables Kloak for a pod.
+	AnnotationEnabled = "getkloak.io/enabled"
 
 	// CgroupBasePath is the base path for cgroups v2.
 	CgroupBasePath = "/sys/fs/cgroup"
@@ -71,7 +71,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return r.handleDelete(req.NamespacedName.String())
 	}
 
-	// Check if Bouncer is enabled
+	// Check if Kloak is enabled
 	if !r.isEnabled(pod) {
 		// If was tracked before, clean up
 		if _, tracked := r.trackedPods[string(pod.UID)]; tracked {
@@ -132,7 +132,7 @@ func (r *Reconciler) handleDelete(podKey string) (ctrl.Result, error) {
 	return ctrl.Result{}, nil
 }
 
-// isEnabled checks if Bouncer should process this pod.
+// isEnabled checks if Kloak should process this pod.
 func (r *Reconciler) isEnabled(pod *corev1.Pod) bool {
 	if pod.Annotations == nil {
 		return false
