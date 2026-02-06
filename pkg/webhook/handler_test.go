@@ -80,8 +80,8 @@ func TestInjectEnvoySidecar(t *testing.T) {
 	}
 
 	// Check volumes were added
-	if len(pod.Spec.Volumes) != 1 {
-		t.Errorf("Expected 1 volume, got %d", len(pod.Spec.Volumes))
+	if len(pod.Spec.Volumes) != 2 {
+		t.Errorf("Expected 2 volumes, got %d", len(pod.Spec.Volumes))
 	}
 }
 
@@ -102,8 +102,8 @@ func TestMountRootCA(t *testing.T) {
 		t.Fatalf("Expected 1 volume, got %d", len(pod.Spec.Volumes))
 	}
 
-	if pod.Spec.Volumes[0].Name != CAVolumeName {
-		t.Errorf("Expected volume name '%s', got '%s'", CAVolumeName, pod.Spec.Volumes[0].Name)
+	if pod.Spec.Volumes[0].Name != "bouncer-data" {
+		t.Errorf("Expected volume name 'bouncer-data', got '%s'", pod.Spec.Volumes[0].Name)
 	}
 
 	// Check mount was added to app container
@@ -112,8 +112,8 @@ func TestMountRootCA(t *testing.T) {
 	}
 
 	mount := pod.Spec.Containers[0].VolumeMounts[0]
-	if mount.MountPath != CAMountPath {
-		t.Errorf("Expected mount path '%s', got '%s'", CAMountPath, mount.MountPath)
+	if mount.MountPath != "/etc/bouncer-data" {
+		t.Errorf("Expected mount path '/etc/bouncer-data', got '%s'", mount.MountPath)
 	}
 }
 

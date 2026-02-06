@@ -43,20 +43,22 @@ func (s *Store) GetOrCreate(ctx context.Context) (*CA, error) {
 		Name:      SecretName,
 	}, secret)
 
-	if err == nil {
-		// Secret exists, load CA
-		certPEM, ok := secret.Data[CertKey]
-		if !ok {
-			return nil, fmt.Errorf("secret missing %s key", CertKey)
-		}
-		keyPEM, ok := secret.Data[KeyKey]
-		if !ok {
-			return nil, fmt.Errorf("secret missing %s key", KeyKey)
-		}
-		return LoadCA(certPEM, keyPEM)
-	}
+	secretFound := false
 
-	if !errors.IsNotFound(err) {
+	if err == nil {
+		secretFound = true
+		// Secret exists, try to load CA
+		certPEM, okCert := secret.Data[CertKey]
+		keyPEM, okKey := secret.Data[KeyKey]
+
+		if okCert && okKey {
+			return LoadCA(certPEM, keyPEM)
+		}
+
+		// If keys are missing, we fall through to regenerate
+		// But first, we need to delete the invalid secret or just update it?
+		// Update is safer. We will overwrite the data.
+	} else if !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("getting secret: %w", err)
 	}
 
@@ -66,27 +68,33 @@ func (s *Store) GetOrCreate(ctx context.Context) (*CA, error) {
 		return nil, fmt.Errorf("generating CA: %w", err)
 	}
 
-	// Create secret
-	secret = &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      SecretName,
-			Namespace: s.namespace,
-			Labels: map[string]string{
-				"app.kubernetes.io/name":      "bouncer",
-				"app.kubernetes.io/component": "ca",
-			},
-		},
-		Type: corev1.SecretTypeTLS,
-		Data: map[string][]byte{
-			CertKey:                 ca.CertPEM,
-			KeyKey:                  ca.KeyPEM,
-			corev1.TLSCertKey:       ca.CertPEM, // Also store as tls.crt for compatibility
-			corev1.TLSPrivateKeyKey: ca.KeyPEM,  // Also store as tls.key
+	// Create or Update secret
+	secret.ObjectMeta = metav1.ObjectMeta{
+		Name:      SecretName,
+		Namespace: s.namespace,
+		Labels: map[string]string{
+			"app.kubernetes.io/name":      "bouncer",
+			"app.kubernetes.io/component": "ca",
 		},
 	}
+	secret.Type = corev1.SecretTypeTLS
+	secret.Data = map[string][]byte{
+		CertKey:                 ca.CertPEM,
+		KeyKey:                  ca.KeyPEM,
+		corev1.TLSCertKey:       ca.CertPEM, // Also store as tls.crt for compatibility
+		corev1.TLSPrivateKeyKey: ca.KeyPEM,  // Also store as tls.key
+	}
 
-	if err := s.client.Create(ctx, secret); err != nil {
-		return nil, fmt.Errorf("creating secret: %w", err)
+	if secretFound {
+		// Secret existed but was invalid, so we update it
+		if err := s.client.Update(ctx, secret); err != nil {
+			return nil, fmt.Errorf("updating secret: %w", err)
+		}
+	} else {
+		// Secret didn't exist, create it
+		if err := s.client.Create(ctx, secret); err != nil {
+			return nil, fmt.Errorf("creating secret: %w", err)
+		}
 	}
 
 	return ca, nil

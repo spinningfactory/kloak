@@ -92,7 +92,7 @@ func runXDS(cmd *cobra.Command, args []string) {
 	}()
 
 	log.Info("Starting XDS server", "addr", xdsAddr)
-	if err := server.Start(ctx, xdsAddr); err != nil {
+	if err := server.Run(ctx, xdsAddr); err != nil {
 		log.Error(err, "XDS server failed")
 		os.Exit(1)
 	}
