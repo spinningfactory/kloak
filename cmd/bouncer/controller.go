@@ -161,6 +161,19 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	// Create secret reconciler
+	secretReconciler := &controller.SecretReconciler{
+		Client:  mgr.GetClient(),
+		Log:     ctrl.Log.WithName("controller").WithName("Secret"),
+		Scheme:  mgr.GetScheme(),
+		Storage: store,
+	}
+
+	if err := secretReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "Secret")
+		os.Exit(1)
+	}
+
 	// Add health checks
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")

@@ -12,8 +12,14 @@ import time
 import requests
 
 def main():
-    # API key from environment (will be hashed by Bouncer webhook)
-    api_key = os.getenv("API_KEY", "demo-api-key-12345")
+    # API key from environment or file (hashed/replaced by Bouncer)
+    api_key_file = os.getenv("API_KEY_FILE")
+    if api_key_file and os.path.exists(api_key_file):
+        with open(api_key_file, 'r') as f:
+            api_key = f.read().strip()
+        print(f"Read API Key from file: {api_key_file}")
+    else:
+        api_key = os.getenv("API_KEY", "demo-api-key-12345")
     
     # Target URL (can be overridden)
     target_url = os.getenv("TARGET_URL", "https://httpbin.org/headers")

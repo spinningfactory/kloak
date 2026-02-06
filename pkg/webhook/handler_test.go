@@ -8,6 +8,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/dhia/bouncer/pkg/storage"
+	"github.com/go-logr/logr"
+	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestIsEnabled(t *testing.T) {
@@ -165,5 +168,85 @@ func TestHashEnvVars(t *testing.T) {
 	all, _ := store.List(context.Background())
 	if len(all) != 2 {
 		t.Errorf("Expected 2 stored mappings, got %d", len(all))
+	}
+}
+
+func TestRewriteSecretVolumes(t *testing.T) {
+	// Setup fake client
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	enabledSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "my-secret",
+			Namespace: "default",
+			Labels: map[string]string{
+				"bouncer.io/enabled": "true",
+			},
+		},
+	}
+
+	disabledSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "other-secret",
+			Namespace: "default",
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(enabledSecret, disabledSecret).Build()
+
+	// Use discard logger
+	h := &Handler{
+		client: fakeClient,
+		log:    logr.Discard(),
+	}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+		},
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{
+					Name: "vol-enabled",
+					VolumeSource: corev1.VolumeSource{
+						Secret: &corev1.SecretVolumeSource{
+							SecretName: "my-secret",
+						},
+					},
+				},
+				{
+					Name: "vol-disabled",
+					VolumeSource: corev1.VolumeSource{
+						Secret: &corev1.SecretVolumeSource{
+							SecretName: "other-secret",
+						},
+					},
+				},
+				{
+					Name: "vol-missing",
+					VolumeSource: corev1.VolumeSource{
+						Secret: &corev1.SecretVolumeSource{
+							SecretName: "missing-secret",
+						},
+					},
+				},
+			},
+		},
+	}
+
+	err := h.rewriteSecretVolumes(context.Background(), pod, "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Verify "my-secret" rewrote to "my-secret-bouncer"
+	if pod.Spec.Volumes[0].Secret.SecretName != "my-secret-bouncer" {
+		t.Errorf("Expected my-secret-bouncer, got %s", pod.Spec.Volumes[0].Secret.SecretName)
+	}
+
+	// Verify "other-secret" stayed same
+	if pod.Spec.Volumes[1].Secret.SecretName != "other-secret" {
+		t.Errorf("Expected other-secret, got %s", pod.Spec.Volumes[1].Secret.SecretName)
 	}
 }
