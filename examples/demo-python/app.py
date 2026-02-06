@@ -24,9 +24,9 @@ def main():
     print(f"API Key (first 10 chars): {api_key[:10]}...")
     print()
     
-    # Check if Bouncer CA is mounted
-    ca_path = "/etc/ssl/certs/bouncer-ca.crt"
-    if os.path.exists(ca_path):
+    # Check if Bouncer CA is available (via SSL_CERT_FILE env var set by webhook)
+    ca_path = os.getenv("SSL_CERT_FILE")
+    if ca_path and os.path.exists(ca_path):
         print(f"✓ Bouncer CA found at {ca_path}")
         # Use the custom CA for verification
         verify = ca_path

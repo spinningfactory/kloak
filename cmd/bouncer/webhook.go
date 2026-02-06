@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"strings"
 
@@ -9,10 +10,12 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	"github.com/dhia/bouncer/pkg/ca"
 	"github.com/dhia/bouncer/pkg/storage"
 	webhookpkg "github.com/dhia/bouncer/pkg/webhook"
 )
@@ -69,10 +72,34 @@ func runWebhook(cmd *cobra.Command, args []string) {
 	// Create storage (in-memory for now)
 	store := storage.NewMemory()
 
+	// Load Root CA to inject into pods
+	// We need a direct client to access Secrets before the manager cache is started
+	k8sConfig := ctrl.GetConfigOrDie()
+	directClient, err := client.New(k8sConfig, client.Options{Scheme: webhookScheme})
+	if err != nil {
+		setupLog.Error(err, "failed to create direct client for CA loading")
+		os.Exit(1)
+	}
+
+	namespace := os.Getenv("POD_NAMESPACE")
+	if namespace == "" {
+		namespace = "bouncer-system"
+	}
+
+	caStore := ca.NewStore(directClient, namespace)
+	// Use Get to enforce Controller ownership of CA.
+	// Webhook will crash-loop until Controller has created the CA.
+	rootCA, err := caStore.Get(context.Background())
+	if err != nil {
+		setupLog.Error(err, "failed to load Root CA - ensure Controller is running first")
+		os.Exit(1)
+	}
+	setupLog.Info("Loaded Root CA for injection", "commonName", rootCA.Cert.Subject.CommonName)
+
 	// Register webhook
 	hookServer := mgr.GetWebhookServer()
 	hookServer.Register("/mutate-pods", &webhook.Admission{
-		Handler: webhookpkg.NewHandler(mgr.GetClient(), store, envList, "http://bouncer-controller.bouncer-system.svc:8090/store", setupLog),
+		Handler: webhookpkg.NewHandler(mgr.GetClient(), store, envList, "http://bouncer-controller.bouncer-system.svc:8090/store", rootCA.CertPEM, setupLog),
 	})
 
 	// Add health checks

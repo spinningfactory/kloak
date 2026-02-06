@@ -3,13 +3,13 @@ package main
 import (
 	"context"
 	"os"
-	"time"
 
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -73,38 +73,27 @@ func runController(cmd *cobra.Command, args []string) {
 	// Create shared storage
 	store := storage.NewMemory()
 
-	// Load or Generate CA
-	// Check if CA files exist
-	caCertPath := "/etc/bouncer/ca/tls.crt"
-	caKeyPath := "/etc/bouncer/ca/tls.key"
-	var rootCA *ca.CA
-	var err error
-
-	if _, err = os.Stat(caCertPath); err == nil {
-		setupLog.Info("Loading CA from file", "path", caCertPath)
-		certPEM, err := os.ReadFile(caCertPath)
-		if err != nil {
-			setupLog.Error(err, "failed to read CA cert")
-			os.Exit(1)
-		}
-		keyPEM, err := os.ReadFile(caKeyPath)
-		if err != nil {
-			setupLog.Error(err, "failed to read CA key")
-			os.Exit(1)
-		}
-		rootCA, err = ca.LoadCA(certPEM, keyPEM)
-		if err != nil {
-			setupLog.Error(err, "failed to parse CA")
-			os.Exit(1)
-		}
-	} else {
-		setupLog.Info("CA file not found, generating new CA (for testing)")
-		rootCA, err = ca.GenerateCA("Bouncer Root CA", 365*24*time.Hour)
-		if err != nil {
-			setupLog.Error(err, "failed to generate CA")
-			os.Exit(1)
-		}
+	// Load or Generate CA using K8s Secret
+	namespace := os.Getenv("POD_NAMESPACE")
+	if namespace == "" {
+		namespace = "bouncer-system"
 	}
+
+	// We need a direct client to access Secrets before the manager cache is started
+	k8sConfig := ctrl.GetConfigOrDie()
+	directClient, err := client.New(k8sConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "failed to create direct client")
+		os.Exit(1)
+	}
+
+	caStore := ca.NewStore(directClient, namespace)
+	rootCA, err := caStore.GetOrCreate(context.Background())
+	if err != nil {
+		setupLog.Error(err, "failed to get or create CA")
+		os.Exit(1)
+	}
+	setupLog.Info("CA loaded successfully", "commonName", rootCA.Cert.Subject.CommonName)
 
 	// Create cgroup manager
 	var cgroupMgr controller.CgroupManager
@@ -138,7 +127,7 @@ func runController(cmd *cobra.Command, args []string) {
 	// Create XDS Server
 	xdsServer := xds.NewServer(rootCA, store, ctrl.Log.WithName("xds"))
 	if err := mgr.Add(runnableFunc(func(ctx context.Context) error {
-		return xdsServer.Start(ctx, ":15002")
+		return xdsServer.Run(ctx, ":15002")
 	})); err != nil {
 		setupLog.Error(err, "unable to add XDS server")
 		os.Exit(1)

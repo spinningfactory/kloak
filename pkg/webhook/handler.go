@@ -27,7 +27,7 @@ const (
 	AnnotationHashedEnvs = "bouncer.io/hashed-envs"
 
 	// EnvoyImage is the default Envoy sidecar image.
-	EnvoyImage = "envoyproxy/envoy:v1.29-latest"
+	EnvoyImage = "envoyproxy/envoy:v1.37-latest"
 
 	// EnvoyPort is the port Envoy listens on for intercepted traffic.
 	EnvoyPort = 15001
@@ -49,11 +49,12 @@ type Handler struct {
 	storage        storage.Storage
 	envsToHash     []string // Environment variable names to hash
 	remoteStoreURL string   // URL to Controller Store API
+	caPEM          []byte   // Root CA certificate PEM
 	log            logr.Logger
 }
 
 // NewHandler creates a new webhook handler.
-func NewHandler(c client.Client, store storage.Storage, envsToHash []string, remoteStoreURL string, log logr.Logger) *Handler {
+func NewHandler(c client.Client, store storage.Storage, envsToHash []string, remoteStoreURL string, caPEM []byte, log logr.Logger) *Handler {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	return &Handler{
@@ -62,6 +63,7 @@ func NewHandler(c client.Client, store storage.Storage, envsToHash []string, rem
 		envsToHash:     envsToHash,
 		decoder:        admission.NewDecoder(scheme),
 		remoteStoreURL: remoteStoreURL,
+		caPEM:          caPEM,
 		log:            log,
 	}
 }
@@ -130,14 +132,34 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 				ReadOnly:  true,
 			},
 			{
-				Name:      CAVolumeName,
+				Name:      "bouncer-server-certs",
 				MountPath: "/etc/bouncer",
 				ReadOnly:  true,
 			},
 		},
 		Args: []string{
 			"-c", "/etc/envoy/envoy.yaml",
-			"--log-level", "info",
+			"--service-cluster", "bouncer-sidecar",
+			"--service-node", "bouncer-sidecar-$(POD_NAME)",
+			"--log-level", "debug",
+		},
+		Env: []corev1.EnvVar{
+			{
+				Name: "POD_NAME",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{
+						FieldPath: "metadata.name",
+					},
+				},
+			},
+			{
+				Name: "POD_NAMESPACE",
+				ValueFrom: &corev1.EnvVarSource{
+					FieldRef: &corev1.ObjectFieldSelector{
+						FieldPath: "metadata.namespace",
+					},
+				},
+			},
 		},
 		SecurityContext: &corev1.SecurityContext{
 			RunAsUser:  ptr(int64(1337)),
@@ -159,34 +181,79 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 			},
 		},
 	})
-}
 
-// mountRootCA adds the Root CA certificate volume to the pod.
-func (h *Handler) mountRootCA(pod *corev1.Pod) {
-	// Add CA volume
+	// Add server certs volume from secret for TLS termination
 	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-		Name: CAVolumeName,
+		Name: "bouncer-server-certs",
 		VolumeSource: corev1.VolumeSource{
-			ConfigMap: &corev1.ConfigMapVolumeSource{
-				LocalObjectReference: corev1.LocalObjectReference{
-					Name: CAConfigMapName,
-				},
+			Secret: &corev1.SecretVolumeSource{
+				SecretName: "bouncer-server-certs",
 			},
 		},
 	})
+}
 
-	// Mount CA into all app containers (not the Envoy sidecar)
+// mountRootCA injects the Root CA using an init container and shared volume.
+func (h *Handler) mountRootCA(pod *corev1.Pod) {
+	const (
+		SharedVolName = "bouncer-data"
+		SharedVolPath = "/etc/bouncer-data"
+		CACertFile    = "root-ca.crt" // Filename in the shared volume
+	)
+
+	// 1. Add shared emptyDir volume
+	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+		Name: SharedVolName,
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		},
+	})
+
+	// 2. Add Init Container to write CA cert
+	// Use explicit printf to avoid shell escaping issues with newlines
+	// We run as root in init container usually, or match security context
+	caContent := string(h.caPEM)
+	cmd := fmt.Sprintf("printf '%%s' '%s' > %s/%s", caContent, SharedVolPath, CACertFile)
+
+	initContainer := corev1.Container{
+		Name:  "bouncer-init-ca",
+		Image: "busybox", // Rely on busybox being available
+		Command: []string{
+			"sh", "-c", cmd,
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      SharedVolName,
+				MountPath: SharedVolPath,
+			},
+		},
+		Resources: corev1.ResourceRequirements{}, // minimal
+	}
+	pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
+
+	// 3. Mount shared volume to all containers and inject env var
 	for i := range pod.Spec.Containers {
-		if pod.Spec.Containers[i].Name == "envoy-sidecar" {
-			continue
-		}
+		// Determine mount path
+		mountPath := SharedVolPath
+
 		pod.Spec.Containers[i].VolumeMounts = append(
 			pod.Spec.Containers[i].VolumeMounts,
 			corev1.VolumeMount{
-				Name:      CAVolumeName,
-				MountPath: CAMountPath,
-				SubPath:   "ca.crt",
+				Name:      SharedVolName,
+				MountPath: mountPath,
 				ReadOnly:  true,
+			},
+		)
+
+		// Inject SSL_CERT_FILE env var for App containers (skip Envoy if desired, but user asked for injection)
+		// For Envoy, we just mount it. Envoy doesn't use SSL_CERT_FILE env var by default but it doesn't hurt.
+		// The App needs it.
+		fullPath := fmt.Sprintf("%s/%s", mountPath, CACertFile)
+		pod.Spec.Containers[i].Env = append(
+			pod.Spec.Containers[i].Env,
+			corev1.EnvVar{
+				Name:  "SSL_CERT_FILE",
+				Value: fullPath,
 			},
 		)
 	}

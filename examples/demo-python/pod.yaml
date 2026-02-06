@@ -19,4 +19,4 @@ spec:
         - name: TARGET_URL
           value: "https://httpbin.org/headers"
         - name: REQUEST_INTERVAL
-          value: "30"
+          value: "5"

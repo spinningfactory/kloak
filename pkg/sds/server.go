@@ -69,9 +69,69 @@ func (s *Server) FetchSecrets(ctx context.Context, req *discovery.DiscoveryReque
 	return s.handleRequest(ctx, req)
 }
 
-// DeltaSecrets implements the delta xDS API (not used).
+// DeltaSecrets implements the delta xDS API for on-demand certificate fetching.
 func (s *Server) DeltaSecrets(stream secret.SecretDiscoveryService_DeltaSecretsServer) error {
-	return fmt.Errorf("delta secrets not implemented")
+	for {
+		req, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+
+		s.log.Info("delta SDS request",
+			"subscribed", req.ResourceNamesSubscribe,
+			"unsubscribed", req.ResourceNamesUnsubscribe,
+			"node", req.Node.GetId())
+
+		// Process subscribed resources (new certificate requests)
+		var resources []*discovery.Resource
+		for _, resourceName := range req.ResourceNamesSubscribe {
+			domain := resourceName
+
+			// Handle default cert name
+			if domain == "bouncer-default-cert" || domain == "" {
+				s.log.Info("generating default certificate", "requested_name", resourceName)
+				domain = "localhost"
+			} else {
+				s.log.Info("generating certificate for domain (delta)", "domain", domain)
+			}
+
+			secretPtr, err := s.getOrCreateCert(domain)
+			if err != nil {
+				s.log.Error(err, "failed to generate cert", "domain", domain)
+				continue
+			}
+
+			// Create a Secret with the requested name
+			secretMsg := &tls.Secret{
+				Name: resourceName,
+				Type: &tls.Secret_TlsCertificate{
+					TlsCertificate: secretPtr.GetTlsCertificate(),
+				},
+			}
+
+			anySecret, err := anypb.New(secretMsg)
+			if err != nil {
+				s.log.Error(err, "failed to marshal secret", "domain", domain)
+				continue
+			}
+
+			resources = append(resources, &discovery.Resource{
+				Name:     resourceName,
+				Resource: anySecret,
+			})
+		}
+
+		// Send response with the requested certificates
+		resp := &discovery.DeltaDiscoveryResponse{
+			TypeUrl:          "type.googleapis.com/envoy.extensions.transport_sockets.tls.v3.Secret",
+			Resources:        resources,
+			RemovedResources: req.ResourceNamesUnsubscribe,
+		}
+
+		if err := stream.Send(resp); err != nil {
+			return err
+		}
+	}
 }
 
 // handleRequest processes an SDS request and returns certificates.
@@ -79,11 +139,20 @@ func (s *Server) handleRequest(ctx context.Context, req *discovery.DiscoveryRequ
 	var resources []*anypb.Any
 
 	for _, resourceName := range req.ResourceNames {
-		// resourceName is typically the SNI (domain name)
+		// resourceName is the SDS secret name, which should be the domain
 		domain := resourceName
-		if domain == "" || domain == "bouncer-dynamic-cert" {
-			// Default cert request - we'll use a placeholder
-			domain = "httpbin.org"
+
+		// Handle predefined certificate names (fallback for default filter chain)
+		if domain == "bouncer-default-cert" || domain == "bouncer-dynamic-cert" || domain == "default" {
+			// Default catch-all: use a localhost certificate since we don't have SNI
+			s.log.Info("generating default certificate for unknown SNI", "requested_name", domain)
+			domain = "localhost"
+		} else if domain == "" || domain == "DOWNSTREAM_TLS_SERVER_NAME" {
+			// Fallback for when Envoy doesn't provide actual SNI
+			return nil, fmt.Errorf("empty/invalid cert request")
+		} else {
+			// Domain-specific request - generate certificate for this domain
+			s.log.Info("generating certificate for domain", "domain", domain)
 		}
 
 		secretPtr, err := s.getOrCreateCert(domain)
@@ -91,11 +160,16 @@ func (s *Server) handleRequest(ctx context.Context, req *discovery.DiscoveryRequ
 			return nil, fmt.Errorf("generating cert for %s: %w", domain, err)
 		}
 
-		// Create a shallow copy to update the Name to match the requested resource name
-		secret := *secretPtr
-		secret.Name = resourceName
+		// Create a new Secret based on the cached one, but with the requested name.
+		// We CANNOT simply copy the struct (*secretPtr) because it contains a mutex (MessageState).
+		secret := &tls.Secret{
+			Name: resourceName,
+			Type: &tls.Secret_TlsCertificate{
+				TlsCertificate: secretPtr.GetTlsCertificate(),
+			},
+		}
 
-		anySecret, err := anypb.New(&secret)
+		anySecret, err := anypb.New(secret)
 		if err != nil {
 			return nil, fmt.Errorf("marshaling secret: %w", err)
 		}
@@ -126,13 +200,17 @@ func (s *Server) getOrCreateCert(domain string) (*tls.Secret, error) {
 	}
 	s.log.Info("certificate generated successfully", "domain", domain)
 
+	// Build full certificate chain (leaf + CA)
+	// This ensures clients can verify the chain even if they only have the root CA
+	fullChain := append(certPEM, s.ca.CertPEM...)
+
 	secret := &tls.Secret{
 		Name: domain,
 		Type: &tls.Secret_TlsCertificate{
 			TlsCertificate: &tls.TlsCertificate{
 				CertificateChain: &core.DataSource{
 					Specifier: &core.DataSource_InlineBytes{
-						InlineBytes: certPEM,
+						InlineBytes: fullChain,
 					},
 				},
 				PrivateKey: &core.DataSource{
