@@ -1,3 +1,0 @@
-# Cloudflare Pages Configuration
-name = "kloak-website"
-pages_build_output_dir = "."
