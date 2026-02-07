@@ -1,0 +1,52 @@
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    - errcheck
+    - gosimple
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gofmt
+    - goimports
+    - misspell
+    - unconvert
+    - unparam
+    - gocritic
+
+linters-settings:
+  goimports:
+    local-prefixes: github.com/spinningfactory/kloak
+
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - style
+      - performance
+
+  misspell:
+    locale: US
+
+issues:
+  exclude-rules:
+    # Exclude some linters from running on test files
+    - path: _test\.go
+      linters:
+        - unparam
+        - gocritic
+
+    # Exclude generated files
+    - path: ".*\\.pb\\.go"
+      linters:
+        - all
+
+    - path: ".*_bpfel\\.go"
+      linters:
+        - all
+
+    - path: ".*_bpfeb\\.go"
+      linters:
+        - all
