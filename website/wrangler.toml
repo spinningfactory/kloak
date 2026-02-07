@@ -1,0 +1,45 @@
+# Cloudflare Pages Configuration
+# See: https://developers.cloudflare.com/pages/configuration/wrangler-configuration/
+
+name = "kloak-website"
+pages_build_output_dir = "."
+
+# No build command needed - static site
+[build]
+command = ""
+
+# Redirects
+[[redirects]]
+from = "/github"
+to = "https://github.com/spinningfactory/kloak"
+status = 302
+
+[[redirects]]
+from = "/docs"
+to = "https://github.com/spinningfactory/kloak#readme"
+status = 302
+
+# Security headers
+[[headers]]
+for = "/*"
+[headers.values]
+X-Frame-Options = "DENY"
+X-Content-Type-Options = "nosniff"
+Referrer-Policy = "strict-origin-when-cross-origin"
+
+# Cache static assets (1 hour - reduce after initial development)
+[[headers]]
+for = "*.css"
+[headers.values]
+Cache-Control = "public, max-age=3600"
+
+[[headers]]
+for = "*.js"
+[headers.values]
+Cache-Control = "public, max-age=3600"
+
+# Don't cache HTML (always fresh)
+[[headers]]
+for = "*.html"
+[headers.values]
+Cache-Control = "public, max-age=0, must-revalidate"
