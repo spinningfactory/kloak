@@ -13,6 +13,8 @@ import (
 	"github.com/spinningfactory/kloak/pkg/sds"
 	"github.com/spinningfactory/kloak/pkg/storage"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/health"
+	healthpb "google.golang.org/grpc/health/grpc_health_v1"
 
 	core "github.com/envoyproxy/go-control-plane/envoy/config/core/v3"
 	cluster "github.com/envoyproxy/go-control-plane/envoy/service/cluster/v3"
@@ -88,6 +90,11 @@ func (s *Server) Run(ctx context.Context, addr string) error {
 
 	// Register ExtProc server
 	s.extProcServer.Register(grpcServer)
+
+	// Register gRPC health check server for Kubernetes probes
+	healthServer := health.NewServer()
+	healthpb.RegisterHealthServer(grpcServer, healthServer)
+	healthServer.SetServingStatus("", healthpb.HealthCheckResponse_SERVING)
 
 	lis, err := net.Listen("tcp", addr)
 	if err != nil {

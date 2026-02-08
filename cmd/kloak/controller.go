@@ -2,9 +2,13 @@ package main
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"os"
 
+	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -16,7 +20,7 @@ import (
 	"github.com/spinningfactory/kloak/pkg/ca"
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/storage"
-	"github.com/spinningfactory/kloak/pkg/xds"
+	"github.com/spinningfactory/kloak/pkg/sync"
 )
 
 var (
@@ -43,13 +47,21 @@ func (m *MockCgroupManager) RemoveCgroup(cgroupID uint64) error {
 var controllerCmd = &cobra.Command{
 	Use:   "controller",
 	Short: "Run the Kloak controller",
-	Long:  `Starts the Kubernetes controller that watches pods and manages eBPF programs.`,
-	Run:   runController,
+	Long: `Starts the Kubernetes controller that watches pods and secrets,
+manages eBPF programs, and serves the gRPC sync API for agents.
+
+The controller is responsible for:
+- Watching K8s Secrets with kloak.io/managed label
+- Managing the Root CA for TLS interception
+- Managing eBPF cgroup tracking for labeled pods
+- Serving the sync gRPC API so agents can receive secret updates`,
+	Run: runController,
 }
 
 var (
 	controllerMetricsAddr string
 	controllerProbeAddr   string
+	controllerSyncAddr    string
 	enableLeaderElection  bool
 	enableEBPF            bool
 	cgroupPath            string
@@ -58,6 +70,7 @@ var (
 func init() {
 	controllerCmd.Flags().StringVar(&controllerMetricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	controllerCmd.Flags().StringVar(&controllerProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	controllerCmd.Flags().StringVar(&controllerSyncAddr, "sync-address", ":9090", "The address the gRPC sync server binds to.")
 	controllerCmd.Flags().BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 	controllerCmd.Flags().BoolVar(&enableEBPF, "enable-ebpf", false, "Enable eBPF traffic redirection (requires Linux + CAP_BPF).")
 	controllerCmd.Flags().StringVar(&cgroupPath, "cgroup-path", "/sys/fs/cgroup", "Path to cgroup v2 filesystem.")
@@ -124,22 +137,24 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Create XDS Server
-	xdsServer := xds.NewServer(rootCA, store, ctrl.Log.WithName("xds"))
-	if err := mgr.Add(runnableFunc(func(ctx context.Context) error {
-		return xdsServer.Run(ctx, ":15002")
-	})); err != nil {
-		setupLog.Error(err, "unable to add XDS server")
-		os.Exit(1)
-	}
+	// Create gRPC Sync Server (replaces XDS in controller)
+	syncServer := sync.NewServer(store, ctrl.Log.WithName("sync"))
 
-	// Create HTTP Server
+	// Start gRPC server
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	go func() {
+		if err := startSyncServer(ctx, controllerSyncAddr, syncServer, setupLog); err != nil {
+			setupLog.Error(err, "sync server failed")
+		}
+	}()
+
+	// Create HTTP Server for webhook to store hashes (legacy, will migrate to gRPC)
 	httpServer := controller.NewServer(store, ctrl.Log.WithName("http"))
 
 	// Start HTTP server immediately in goroutine (don't wait for leader election)
 	// This ensures webhook can send hashes during pod admission
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	go func() {
 		setupLog.Info("starting HTTP server immediately (before leader election)")
 		if err := httpServer.Start(ctx, ":8090"); err != nil {
@@ -161,12 +176,13 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Create secret reconciler
+	// Create secret reconciler with sync server for notifications
 	secretReconciler := &controller.SecretReconciler{
-		Client:  mgr.GetClient(),
-		Log:     ctrl.Log.WithName("controller").WithName("Secret"),
-		Scheme:  mgr.GetScheme(),
-		Storage: store,
+		Client:     mgr.GetClient(),
+		Log:        ctrl.Log.WithName("controller").WithName("Secret"),
+		Scheme:     mgr.GetScheme(),
+		Storage:    store,
+		SyncServer: syncServer,
 	}
 
 	if err := secretReconciler.SetupWithManager(mgr); err != nil {
@@ -194,9 +210,30 @@ func runController(cmd *cobra.Command, args []string) {
 	}
 
 	// Cleanup
+	cancel()
 	if ebpfMgr != nil {
 		ebpfMgr.Close()
 	}
+}
+
+// startSyncServer starts the gRPC sync server.
+func startSyncServer(ctx context.Context, addr string, syncServer *sync.Server, log logr.Logger) error {
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %w", addr, err)
+	}
+
+	grpcServer := grpc.NewServer()
+	syncServer.Register(grpcServer)
+
+	log.Info("starting gRPC sync server", "addr", addr)
+
+	go func() {
+		<-ctx.Done()
+		grpcServer.GracefulStop()
+	}()
+
+	return grpcServer.Serve(lis)
 }
 
 // runnableFunc helper for manager.Runnable

@@ -36,8 +36,8 @@ spec:
               containerPort: 8081
             - name: http-store
               containerPort: 8090
-            - name: grpc-xds
-              containerPort: 15002
+            - name: grpc-sync
+              containerPort: 9090
           volumeMounts:
             - name: cgroup
               mountPath: /host/sys/fs/cgroup
@@ -118,9 +118,9 @@ spec:
       port: 8090
       targetPort: 8090
       protocol: TCP
-    - name: grpc-xds
-      port: 15002
-      targetPort: 15002
+    - name: grpc-sync
+      port: 9090
+      targetPort: 9090
       protocol: TCP
   selector:
     app.kubernetes.io/name: kloak

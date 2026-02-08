@@ -124,13 +124,14 @@ generate_certs() {
     rm -rf "$CERT_DIR"
     mkdir -p "$CERT_DIR"
     
-    # Generate webhook TLS certificate
+    # Generate webhook TLS certificate (server cert, NOT CA)
     openssl req -x509 -newkey rsa:2048 \
         -keyout "$CERT_DIR/webhook-tls.key" \
         -out "$CERT_DIR/webhook-tls.crt" \
         -days 365 -nodes \
         -subj "/CN=kloak-webhook.kloak-system.svc" \
         -addext "subjectAltName=DNS:kloak-webhook.kloak-system.svc,DNS:kloak-webhook.kloak-system.svc.cluster.local,DNS:kloak-webhook,DNS:localhost" \
+        -addext "basicConstraints=critical,CA:FALSE" \
         -addext "keyUsage=digitalSignature,keyEncipherment" \
         -addext "extendedKeyUsage=serverAuth" \
         2>/dev/null
@@ -193,8 +194,9 @@ deploy_kloak() {
         --from-file="$ROOT_DIR/config/envoy/envoy.yaml" \
         -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
     
-    # Apply controller and webhook deployments
+    # Apply controller, agent, and webhook deployments
     kubectl apply -f "$ROOT_DIR/config/manifests/controller.yaml"
+    kubectl apply -f "$ROOT_DIR/config/manifests/agent.yaml"
     kubectl apply -f "$ROOT_DIR/config/manifests/webhook.yaml"
     
     # Get the webhook CA bundle (same as the webhook cert for self-signed)
@@ -207,7 +209,7 @@ deploy_kloak() {
     # Remove default namespace label if it exists (cleanup)
     kubectl label namespace default getkloak.io/enabled- --overwrite 2>/dev/null || true
     
-    echo "✓ Kloak components deployed"
+    echo "✓ Kloak components deployed (controller, agent, webhook)"
 }
 
 # Wait for Kloak pods

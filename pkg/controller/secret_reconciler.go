@@ -16,6 +16,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/spinningfactory/kloak/pkg/storage"
+	"github.com/spinningfactory/kloak/pkg/sync"
 )
 
 const (
@@ -33,9 +34,10 @@ const (
 // SecretReconciler reconciles a Secret object
 type SecretReconciler struct {
 	client.Client
-	Log     logr.Logger
-	Scheme  *runtime.Scheme
-	Storage storage.Storage
+	Log        logr.Logger
+	Scheme     *runtime.Scheme
+	Storage    storage.Storage
+	SyncServer *sync.Server // Optional: notify agents of changes
 }
 
 // Reconcile handles Secret events.

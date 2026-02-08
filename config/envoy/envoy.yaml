@@ -1,5 +1,5 @@
 # Envoy Bootstrap Configuration using xDS
-# Points to Kloak Controller for dynamic configuration (LDS/SDS)
+# Points to Kloak Agent for dynamic configuration (LDS/SDS/ExtProc)
 
 admin:
   address:
@@ -43,7 +43,7 @@ static_resources:
         - endpoint:
             address:
               socket_address:
-                address: kloak-controller.kloak-system.svc
+                address: kloak-agent.kloak-system.svc
                 port_value: 15002
 
   # Management Server for SDS (referenced by LDS config)
@@ -62,7 +62,7 @@ static_resources:
         - endpoint:
             address:
               socket_address:
-                address: kloak-controller.kloak-system.svc
+                address: kloak-agent.kloak-system.svc
                 port_value: 15002
 
   # Dynamic Forward Proxy Cluster (specific config requirement)
@@ -117,5 +117,5 @@ static_resources:
         - endpoint:
             address:
               socket_address:
-                address: kloak-controller.kloak-system.svc
+                address: kloak-agent.kloak-system.svc
                 port_value: 15002

@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kloak-agent
+  namespace: kloak-system
+  labels:
+    app.kubernetes.io/name: kloak
+    app.kubernetes.io/component: agent
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kloak
+      app.kubernetes.io/component: agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kloak
+        app.kubernetes.io/component: agent
+    spec:
+      serviceAccountName: kloak-controller
+      containers:
+        - name: agent
+          image: kloak:latest
+          imagePullPolicy: IfNotPresent
+          command: ["/kloak", "agent"]
+          args:
+            - --xds-addr=:15002
+            - --controller-addr=kloak-controller.kloak-system.svc:9090
+          ports:
+            - name: grpc-xds
+              containerPort: 15002
+              protocol: TCP
+          volumeMounts:
+            - name: ca-certs
+              mountPath: /etc/kloak/ca
+              readOnly: true
+          livenessProbe:
+            grpc:
+              port: 15002
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            grpc:
+              port: 15002
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            limits:
+              cpu: 500m
+              memory: 256Mi
+            requests:
+              cpu: 10m
+              memory: 64Mi
+      volumes:
+        - name: ca-certs
+          secret:
+            secretName: kloak-ca
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: kloak-agent
+  namespace: kloak-system
+  labels:
+    app.kubernetes.io/name: kloak
+    app.kubernetes.io/component: agent
+spec:
+  # Use ClusterIP for internal communication from Envoy sidecars
+  type: ClusterIP
+  ports:
+    - name: grpc-xds
+      port: 15002
+      targetPort: 15002
+      protocol: TCP
+  selector:
+    app.kubernetes.io/name: kloak
+    app.kubernetes.io/component: agent
