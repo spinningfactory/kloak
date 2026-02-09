@@ -116,13 +116,21 @@ build_images() {
     echo "✓ Images built and imported"
 }
 
-# Generate TLS certificates
+# Generate TLS certificates (only if they don't exist)
 generate_certs() {
     echo ""
-    echo "Generating TLS certificates..."
+    echo "Checking TLS certificates..."
     
-    rm -rf "$CERT_DIR"
     mkdir -p "$CERT_DIR"
+    
+    # Check if all required certs exist
+    if [[ -f "$CERT_DIR/webhook-tls.crt" && -f "$CERT_DIR/webhook-tls.key" && \
+          -f "$CERT_DIR/ca.crt" && -f "$CERT_DIR/ca.key" ]]; then
+        echo "✓ TLS certificates already exist, skipping generation"
+        return 0
+    fi
+    
+    echo "Generating TLS certificates..."
     
     # Generate webhook TLS certificate (server cert, NOT CA)
     openssl req -x509 -newkey rsa:2048 \
@@ -147,8 +155,6 @@ generate_certs() {
         -addext "subjectKeyIdentifier=hash" \
         -addext "authorityKeyIdentifier=keyid:always,issuer" \
         2>/dev/null
-    
-
     
     echo "✓ TLS certificates generated"
 }
