@@ -162,6 +162,11 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			log.Error(err, "failed to store mapping", "shadow", shadowVal)
 			return ctrl.Result{}, err
 		}
+
+		// Notify agents of the update
+		if r.SyncServer != nil {
+			r.SyncServer.NotifyUpdate(shadowVal, entry, secret.Namespace)
+		}
 	}
 
 	// Create or Update Shadow Secret

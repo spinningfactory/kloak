@@ -24,14 +24,18 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
+  # Namespace watching for CA reconciler (to sync ConfigMap to labeled namespaces)
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
   # Secret management for CA and SecretReconciler
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create", "update"]
-  # ConfigMap for Envoy config
+  # ConfigMap for Envoy config and CA distribution
   - apiGroups: [""]
     resources: ["configmaps"]
-    verbs: ["get", "list", "create", "update"]
+    verbs: ["get", "list", "watch", "create", "update"]
   # Events for debugging
   - apiGroups: [""]
     resources: ["events"]

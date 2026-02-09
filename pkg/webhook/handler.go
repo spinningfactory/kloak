@@ -49,12 +49,11 @@ type Handler struct {
 	storage        storage.Storage
 	envsToHash     []string // Environment variable names to hash
 	remoteStoreURL string   // URL to Controller Store API
-	caPEM          []byte   // Root CA certificate PEM
 	log            logr.Logger
 }
 
 // NewHandler creates a new webhook handler.
-func NewHandler(c client.Client, store storage.Storage, envsToHash []string, remoteStoreURL string, caPEM []byte, log logr.Logger) *Handler {
+func NewHandler(c client.Client, store storage.Storage, envsToHash []string, remoteStoreURL string, log logr.Logger) *Handler {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	return &Handler{
@@ -63,7 +62,6 @@ func NewHandler(c client.Client, store storage.Storage, envsToHash []string, rem
 		envsToHash:     envsToHash,
 		decoder:        admission.NewDecoder(scheme),
 		remoteStoreURL: remoteStoreURL,
-		caPEM:          caPEM,
 		log:            log,
 	}
 }
@@ -187,62 +185,43 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 
 }
 
-// mountRootCA injects the Root CA using an init container and shared volume.
+// mountRootCA mounts the CA certificate ConfigMap as a volume.
+// Uses ConfigMap volume mount for automatic updates when CA changes.
 func (h *Handler) mountRootCA(pod *corev1.Pod) {
 	const (
-		SharedVolName = "kloak-data"
-		SharedVolPath = "/etc/kloak-data"
-		CACertFile    = "root-ca.crt" // Filename in the shared volume
+		CAVolName   = "kloak-ca"
+		CAVolPath   = "/etc/kloak-ca"
+		CACertFile  = "ca.crt" // Key in the ConfigMap
+		CAConfigMap = "kloak-ca-cert"
 	)
 
-	// 1. Add shared emptyDir volume
+	// 1. Add ConfigMap volume for CA certificate
+	// This volume auto-updates when the ConfigMap changes (~60s kubelet sync)
 	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-		Name: SharedVolName,
+		Name: CAVolName,
 		VolumeSource: corev1.VolumeSource{
-			EmptyDir: &corev1.EmptyDirVolumeSource{},
+			ConfigMap: &corev1.ConfigMapVolumeSource{
+				LocalObjectReference: corev1.LocalObjectReference{
+					Name: CAConfigMap,
+				},
+				Optional: ptr(true), // Don't fail pod if ConfigMap doesn't exist yet
+			},
 		},
 	})
 
-	// 2. Add Init Container to write CA cert
-	// Use explicit printf to avoid shell escaping issues with newlines
-	// We run as root in init container usually, or match security context
-	caContent := string(h.caPEM)
-	cmd := fmt.Sprintf("printf '%%s' '%s' > %s/%s", caContent, SharedVolPath, CACertFile)
-
-	initContainer := corev1.Container{
-		Name:  "kloak-init-ca",
-		Image: "busybox", // Rely on busybox being available
-		Command: []string{
-			"sh", "-c", cmd,
-		},
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      SharedVolName,
-				MountPath: SharedVolPath,
-			},
-		},
-		Resources: corev1.ResourceRequirements{}, // minimal
-	}
-	pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
-
-	// 3. Mount shared volume to all containers and inject env var
+	// 2. Mount volume to all containers and inject env var
 	for i := range pod.Spec.Containers {
-		// Determine mount path
-		mountPath := SharedVolPath
-
 		pod.Spec.Containers[i].VolumeMounts = append(
 			pod.Spec.Containers[i].VolumeMounts,
 			corev1.VolumeMount{
-				Name:      SharedVolName,
-				MountPath: mountPath,
+				Name:      CAVolName,
+				MountPath: CAVolPath,
 				ReadOnly:  true,
 			},
 		)
 
-		// Inject SSL_CERT_FILE env var for App containers (skip Envoy if desired, but user asked for injection)
-		// For Envoy, we just mount it. Envoy doesn't use SSL_CERT_FILE env var by default but it doesn't hurt.
-		// The App needs it.
-		fullPath := fmt.Sprintf("%s/%s", mountPath, CACertFile)
+		// Inject SSL_CERT_FILE env var pointing to the CA cert
+		fullPath := fmt.Sprintf("%s/%s", CAVolPath, CACertFile)
 		pod.Spec.Containers[i].Env = append(
 			pod.Spec.Containers[i].Env,
 			corev1.EnvVar{

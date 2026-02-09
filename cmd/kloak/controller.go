@@ -190,6 +190,22 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	// Create CA reconciler to sync ConfigMap to labeled namespaces
+	caProvider := ca.NewProvider(rootCA, ctrl.Log.WithName("ca-provider"))
+	caReconciler := &ca.Reconciler{
+		Client:         mgr.GetClient(),
+		Provider:       caProvider,
+		Namespace:      namespace,
+		Log:            ctrl.Log.WithName("controller").WithName("CA"),
+		SyncNamespaces: true, // Enable ConfigMap sync to labeled namespaces
+	}
+
+	if err := caReconciler.SetupWithManager(mgr); err != nil {
+		setupLog.Error(err, "unable to create controller", "controller", "CA")
+		os.Exit(1)
+	}
+	setupLog.Info("CA reconciler configured", "syncNamespaces", true)
+
 	// Add health checks
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")

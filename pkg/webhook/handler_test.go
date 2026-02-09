@@ -105,8 +105,16 @@ func TestMountRootCA(t *testing.T) {
 		t.Fatalf("Expected 1 volume, got %d", len(pod.Spec.Volumes))
 	}
 
-	if pod.Spec.Volumes[0].Name != "kloak-data" {
-		t.Errorf("Expected volume name 'kloak-data', got '%s'", pod.Spec.Volumes[0].Name)
+	if pod.Spec.Volumes[0].Name != "kloak-ca" {
+		t.Errorf("Expected volume name 'kloak-ca', got '%s'", pod.Spec.Volumes[0].Name)
+	}
+
+	// Check ConfigMap volume source
+	if pod.Spec.Volumes[0].ConfigMap == nil {
+		t.Fatal("Expected ConfigMap volume source, got nil")
+	}
+	if pod.Spec.Volumes[0].ConfigMap.Name != "kloak-ca-cert" {
+		t.Errorf("Expected ConfigMap name 'kloak-ca-cert', got '%s'", pod.Spec.Volumes[0].ConfigMap.Name)
 	}
 
 	// Check mount was added to app container
@@ -115,8 +123,19 @@ func TestMountRootCA(t *testing.T) {
 	}
 
 	mount := pod.Spec.Containers[0].VolumeMounts[0]
-	if mount.MountPath != "/etc/kloak-data" {
-		t.Errorf("Expected mount path '/etc/kloak-data', got '%s'", mount.MountPath)
+	if mount.MountPath != "/etc/kloak-ca" {
+		t.Errorf("Expected mount path '/etc/kloak-ca', got '%s'", mount.MountPath)
+	}
+
+	// Check SSL_CERT_FILE env var was added
+	if len(pod.Spec.Containers[0].Env) != 1 {
+		t.Fatalf("Expected 1 env var, got %d", len(pod.Spec.Containers[0].Env))
+	}
+	if pod.Spec.Containers[0].Env[0].Name != "SSL_CERT_FILE" {
+		t.Errorf("Expected env var 'SSL_CERT_FILE', got '%s'", pod.Spec.Containers[0].Env[0].Name)
+	}
+	if pod.Spec.Containers[0].Env[0].Value != "/etc/kloak-ca/ca.crt" {
+		t.Errorf("Expected SSL_CERT_FILE='/etc/kloak-ca/ca.crt', got '%s'", pod.Spec.Containers[0].Env[0].Value)
 	}
 }
 
