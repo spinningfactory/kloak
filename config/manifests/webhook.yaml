@@ -118,4 +118,4 @@ webhooks:
         - key: getkloak.io/enabled
           operator: In
           values: ["true"]
-    failurePolicy: Ignore
+    failurePolicy: Fail

@@ -73,13 +73,25 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Errored(http.StatusBadRequest, err)
 	}
 
-	// Check if Kloak is enabled for this pod
-	if !h.isEnabled(pod) {
+	// Check if Kloak is enabled for this pod (explicitly or via namespace inheritance)
+	enabled, err := h.isEnabled(ctx, pod, req.Namespace)
+	if err != nil {
+		h.log.Error(err, "failed to check if pod is enabled")
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+	if !enabled {
 		return admission.Allowed("kloak not enabled")
 	}
 
 	// Create a copy to mutate
 	mutatedPod := pod.DeepCopy()
+
+	// Ensure the enabled annotation is present on the mutated pod
+	// This allows the controller (DaemonSet) to see that it's enabled even if it was inherited from the Namespace
+	if mutatedPod.Annotations == nil {
+		mutatedPod.Annotations = make(map[string]string)
+	}
+	mutatedPod.Annotations[AnnotationEnabled] = "true"
 
 	// 1. Inject Envoy sidecar
 	h.injectEnvoySidecar(mutatedPod)
@@ -112,11 +124,27 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 }
 
 // isEnabled checks if Kloak should process this pod.
-func (h *Handler) isEnabled(pod *corev1.Pod) bool {
-	if pod.Annotations == nil {
-		return false
+// It checks for the explicit pod annotation first, then falls back to the namespace label.
+func (h *Handler) isEnabled(ctx context.Context, pod *corev1.Pod, namespace string) (bool, error) {
+	// 1. Check explicit Pod annotation
+	if pod.Annotations != nil {
+		if val, ok := pod.Annotations[AnnotationEnabled]; ok {
+			return val == "true", nil
+		}
 	}
-	return pod.Annotations[AnnotationEnabled] == "true"
+
+	// 2. Check Namespace label (inheritance)
+	// We need to fetch the namespace object to check labels
+	ns := &corev1.Namespace{}
+	if err := h.client.Get(ctx, client.ObjectKey{Name: namespace}, ns); err != nil {
+		return false, err
+	}
+
+	if ns.Labels != nil && ns.Labels[AnnotationEnabled] == "true" {
+		return true, nil
+	}
+
+	return false, nil
 }
 
 // injectEnvoySidecar adds the Envoy sidecar container to the pod.

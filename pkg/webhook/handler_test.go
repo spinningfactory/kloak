@@ -14,20 +14,45 @@ import (
 )
 
 func TestIsEnabled(t *testing.T) {
-	h := &Handler{}
+	// Setup fake client with namespaces
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	nsDefault := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "default",
+		},
+	}
+	nsEnabled := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "enabled-ns",
+			Labels: map[string]string{
+				AnnotationEnabled: "true",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nsDefault, nsEnabled).Build()
+
+	h := &Handler{
+		client: fakeClient,
+		log:    logr.Discard(),
+	}
 
 	tests := []struct {
-		name     string
-		pod      *corev1.Pod
-		expected bool
+		name      string
+		pod       *corev1.Pod
+		namespace string
+		expected  bool
 	}{
 		{
-			name:     "no annotations",
-			pod:      &corev1.Pod{},
-			expected: false,
+			name:      "no annotations, default ns",
+			pod:       &corev1.Pod{},
+			namespace: "default",
+			expected:  false,
 		},
 		{
-			name: "enabled=true",
+			name: "explicit enabled=true",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
@@ -35,10 +60,11 @@ func TestIsEnabled(t *testing.T) {
 					},
 				},
 			},
-			expected: true,
+			namespace: "default",
+			expected:  true,
 		},
 		{
-			name: "enabled=false",
+			name: "explicit enabled=false",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
@@ -46,13 +72,35 @@ func TestIsEnabled(t *testing.T) {
 					},
 				},
 			},
-			expected: false,
+			namespace: "default",
+			expected:  false,
+		},
+		{
+			name:      "inheritance from enabled namespace",
+			pod:       &corev1.Pod{},
+			namespace: "enabled-ns",
+			expected:  true,
+		},
+		{
+			name: "disabled pod in enabled namespace",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						AnnotationEnabled: "false",
+					},
+				},
+			},
+			namespace: "enabled-ns",
+			expected:  false,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result := h.isEnabled(tc.pod)
+			result, err := h.isEnabled(context.Background(), tc.pod, tc.namespace)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			if result != tc.expected {
 				t.Errorf("isEnabled() = %v, want %v", result, tc.expected)
 			}
