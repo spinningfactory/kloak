@@ -77,11 +77,6 @@ func (s *Server) DeltaSecrets(stream secret.SecretDiscoveryService_DeltaSecretsS
 			return err
 		}
 
-		s.log.Info("delta SDS request",
-			"subscribed", req.ResourceNamesSubscribe,
-			"unsubscribed", req.ResourceNamesUnsubscribe,
-			"node", req.Node.GetId())
-
 		// Process subscribed resources (new certificate requests)
 		var resources []*discovery.Resource
 		for _, resourceName := range req.ResourceNamesSubscribe {
