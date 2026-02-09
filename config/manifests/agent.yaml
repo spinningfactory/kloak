@@ -55,6 +55,7 @@ spec:
         - name: ca-certs
           secret:
             secretName: kloak-ca
+            optional: true
 ---
 apiVersion: v1
 kind: Service

@@ -28,6 +28,9 @@ spec:
             - --enable-ebpf=true
             - --cgroup-path=/host/sys/fs/cgroup
           env:
+            # Certificate mode: auto (generate if missing) or provided (expect existing secrets)
+            - name: KLOAK_CERT_MODE
+              value: "auto"
             # Node name for filtering pods to only those on this node
             - name: NODE_NAME
               valueFrom:
@@ -106,6 +109,7 @@ spec:
         - name: ca-certs
           secret:
             secretName: kloak-ca
+            optional: true
 
 ---
 apiVersion: v1

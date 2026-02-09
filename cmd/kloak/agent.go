@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
@@ -104,24 +105,37 @@ func runAgent(cmd *cobra.Command, args []string) {
 	}
 }
 
-// loadAgentCA loads the CA from files or generates one for testing.
+// loadAgentCA loads the CA from files, waiting for them to appear if necessary.
 func loadAgentCA(log logr.Logger) (*ca.CA, error) {
 	caCertPath := "/etc/kloak/ca/tls.crt"
 	caKeyPath := "/etc/kloak/ca/tls.key"
 
-	if _, err := os.Stat(caCertPath); err == nil {
-		log.Info("Loading CA from file", "path", caCertPath)
-		certPEM, err := os.ReadFile(caCertPath)
-		if err != nil {
-			return nil, err
-		}
-		keyPEM, err := os.ReadFile(caKeyPath)
-		if err != nil {
-			return nil, err
-		}
-		return ca.LoadCA(certPEM, keyPEM)
-	}
+	// Wait up to 2 minutes for CA certs to appear (created by controller)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
 
-	log.Info("CA file not found, generating new CA (for testing)")
-	return ca.GenerateCA("Kloak Root CA", 365*24*time.Hour)
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		if _, err := os.Stat(caCertPath); err == nil {
+			log.Info("Loading CA from file", "path", caCertPath)
+			certPEM, err := os.ReadFile(caCertPath)
+			if err != nil {
+				return nil, err
+			}
+			keyPEM, err := os.ReadFile(caKeyPath)
+			if err != nil {
+				return nil, err
+			}
+			return ca.LoadCA(certPEM, keyPEM)
+		}
+
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("timed out waiting for CA file at %s", caCertPath)
+		case <-ticker.C:
+			log.Info("Waiting for CA file...", "path", caCertPath)
+		}
+	}
 }

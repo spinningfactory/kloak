@@ -19,6 +19,20 @@ spec:
         app.kubernetes.io/component: webhook
     spec:
       serviceAccountName: kloak-controller
+      # Wait for controller to create TLS certs before starting webhook
+      initContainers:
+        - name: wait-for-certs
+          image: bitnami/kubectl:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for webhook TLS certificate secret..."
+              until kubectl get secret kloak-webhook-certs -n kloak-system 2>/dev/null; do
+                echo "Secret not found, waiting..."
+                sleep 2
+              done
+              echo "TLS certificate secret found!"
       containers:
         - name: webhook
           image: kloak:latest

@@ -18,6 +18,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/spinningfactory/kloak/pkg/ca"
+	"github.com/spinningfactory/kloak/pkg/certs"
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/storage"
 	"github.com/spinningfactory/kloak/pkg/sync"
@@ -65,6 +66,7 @@ var (
 	enableLeaderElection  bool
 	enableEBPF            bool
 	cgroupPath            string
+	certMode              string
 )
 
 func init() {
@@ -74,6 +76,7 @@ func init() {
 	controllerCmd.Flags().BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 	controllerCmd.Flags().BoolVar(&enableEBPF, "enable-ebpf", false, "Enable eBPF traffic redirection (requires Linux + CAP_BPF).")
 	controllerCmd.Flags().StringVar(&cgroupPath, "cgroup-path", "/sys/fs/cgroup", "Path to cgroup v2 filesystem.")
+	controllerCmd.Flags().StringVar(&certMode, "cert-mode", "auto", "Certificate mode: 'auto' (generate if missing) or 'provided' (expect existing secrets).")
 }
 
 func runController(cmd *cobra.Command, args []string) {
@@ -98,6 +101,24 @@ func runController(cmd *cobra.Command, args []string) {
 	if err != nil {
 		setupLog.Error(err, "failed to create direct client")
 		os.Exit(1)
+	}
+
+	// Handle certificate mode
+	if certMode == "" {
+		certMode = os.Getenv("KLOAK_CERT_MODE")
+	}
+	if certMode == "" {
+		certMode = "auto"
+	}
+	setupLog.Info("Certificate mode", "mode", certMode)
+
+	if certMode == "auto" {
+		// Auto-generate certificates if missing
+		_, err := certs.EnsureCerts(context.Background(), directClient, namespace, setupLog)
+		if err != nil {
+			setupLog.Error(err, "failed to ensure certificates")
+			os.Exit(1)
+		}
 	}
 
 	caStore := ca.NewStore(directClient, namespace)
