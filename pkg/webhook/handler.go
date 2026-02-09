@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -137,6 +138,9 @@ func (h *Handler) isEnabled(ctx context.Context, pod *corev1.Pod, namespace stri
 	// We need to fetch the namespace object to check labels
 	ns := &corev1.Namespace{}
 	if err := h.client.Get(ctx, client.ObjectKey{Name: namespace}, ns); err != nil {
+		h.log.Error(err, "failed to fetch namespace for label check", "namespace", namespace)
+		// Don't return false yet, try other checks? No, failing open or closed?
+		// If namespace check fails, we probably cant proceed safely.
 		return false, err
 	}
 
@@ -144,7 +148,65 @@ func (h *Handler) isEnabled(ctx context.Context, pod *corev1.Pod, namespace stri
 		return true, nil
 	}
 
+	// 3. Check OwnerReferences (Workload inheritance)
+	// Traverse up to find Deployment, DaemonSet, StatefulSet
+	for _, ref := range pod.OwnerReferences {
+		// Handle ReplicaSet (Deployment -> ReplicaSet -> Pod)
+		if ref.Kind == "ReplicaSet" {
+			rs := &appsv1.ReplicaSet{}
+			if err := h.client.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: namespace}, rs); err == nil {
+				// Check RS itself
+				if h.isObjectEnabled(rs.Labels, rs.Annotations) {
+					return true, nil
+				}
+
+				// Check RS owner (Deployment)
+				for _, rsRef := range rs.OwnerReferences {
+					if rsRef.Kind == "Deployment" {
+						deploy := &appsv1.Deployment{}
+						if err := h.client.Get(ctx, client.ObjectKey{Name: rsRef.Name, Namespace: namespace}, deploy); err == nil {
+							if h.isObjectEnabled(deploy.Labels, deploy.Annotations) {
+								return true, nil
+							}
+						}
+					}
+				}
+			}
+		}
+
+		// Handle DaemonSet
+		if ref.Kind == "DaemonSet" {
+			ds := &appsv1.DaemonSet{}
+			if err := h.client.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: namespace}, ds); err == nil {
+				if h.isObjectEnabled(ds.Labels, ds.Annotations) {
+					return true, nil
+				}
+			}
+		}
+
+		// Handle StatefulSet
+		if ref.Kind == "StatefulSet" {
+			sts := &appsv1.StatefulSet{}
+			if err := h.client.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: namespace}, sts); err == nil {
+				if h.isObjectEnabled(sts.Labels, sts.Annotations) {
+					return true, nil
+				}
+			}
+		}
+	}
+
 	return false, nil
+}
+
+// isObjectEnabled checks if the given labels or annotations have the enabled flag.
+func (h *Handler) isObjectEnabled(labels, annotations map[string]string) bool {
+	if labels != nil && labels[AnnotationEnabled] == "true" {
+		return true
+	}
+	if annotations != nil && annotations[AnnotationEnabled] == "true" {
+		return true
+	}
+	return false
 }
 
 // injectEnvoySidecar adds the Envoy sidecar container to the pod.
