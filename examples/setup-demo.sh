@@ -159,14 +159,14 @@ generate_certs() {
     echo "✓ TLS certificates generated"
 }
 
-# Deploy Kloak components
+# Deploy Kloak components using kustomize operator
 deploy_kloak() {
     export KUBECONFIG="$KUBECONFIG_PATH"
     echo ""
-    echo "Deploying Kloak..."
+    echo "Deploying Kloak using operator config..."
     
-    # Apply RBAC first (creates namespace)
-    kubectl apply -f "$ROOT_DIR/config/manifests/rbac.yaml"
+    # Apply base operator config (creates namespace, RBAC, deployments, services)
+    kubectl apply -k "$ROOT_DIR/config/manifests"
     
     # Wait for namespace to be ready
     kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/kloak-system --timeout=30s
@@ -187,7 +187,7 @@ deploy_kloak() {
     echo "Creating demo namespace: $DEMO_NAMESPACE"
     kubectl create namespace "$DEMO_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-    # Label demo namespace to enable webhook
+    # Label demo namespace to enable webhook and CA sync
     kubectl label namespace "$DEMO_NAMESPACE" getkloak.io/enabled=true --overwrite
 
     # Create CA ConfigMap for app pods (to trust our CA)
@@ -200,11 +200,6 @@ deploy_kloak() {
         --from-file="$ROOT_DIR/config/envoy/envoy.yaml" \
         -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
     
-    # Apply controller, agent, and webhook deployments
-    kubectl apply -f "$ROOT_DIR/config/manifests/controller.yaml"
-    kubectl apply -f "$ROOT_DIR/config/manifests/agent.yaml"
-    kubectl apply -f "$ROOT_DIR/config/manifests/webhook.yaml"
-    
     # Get the webhook CA bundle (same as the webhook cert for self-signed)
     CA_BUNDLE=$(base64 < "$CERT_DIR/webhook-tls.crt" | tr -d '\n')
     
@@ -215,7 +210,7 @@ deploy_kloak() {
     # Remove default namespace label if it exists (cleanup)
     kubectl label namespace default getkloak.io/enabled- --overwrite 2>/dev/null || true
     
-    echo "✓ Kloak components deployed (controller, agent, webhook)"
+    echo "✓ Kloak operator deployed (controller DaemonSet, agent DaemonSet, webhook)"
 }
 
 # Wait for Kloak pods
@@ -317,15 +312,21 @@ show_summary() {
     echo " Demo Setup Complete!"
     echo "================================"
     echo ""
+    echo "Architecture:"
+    echo "  Controller:          DaemonSet (runs on each node for eBPF)"
+    echo "  Agent:               DaemonSet (runs on each node for XDS)"
+    echo "  Webhook:             Deployment"
+    echo ""
     echo "Environment:"
     echo "  Kubeconfig:          $KUBECONFIG_PATH"
-    echo "  Metrics:             http://localhost:8080 (forwarded)"
+    echo "  Operator manifests:  $ROOT_DIR/config/manifests"
     echo ""
     echo "Commands:"
     echo "  Use kubectl:         export KUBECONFIG=$KUBECONFIG_PATH"
     echo "  View demo logs:      kubectl logs -f demo-python -n $DEMO_NAMESPACE -c demo-app"
     echo "  View sidecar logs:   kubectl logs -f demo-python -n $DEMO_NAMESPACE -c envoy-sidecar"
     echo "  View webhook logs:   kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook"
+    echo "  View controller logs: kubectl logs -n kloak-system -l app.kubernetes.io/component=controller"
     echo ""
     echo "Verification:"
     echo "  1. Check demo logs:  kubectl logs demo-python -n $DEMO_NAMESPACE -c demo-app | head -30"

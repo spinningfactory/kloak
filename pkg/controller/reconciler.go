@@ -37,13 +37,16 @@ type Reconciler struct {
 	Scheme        *runtime.Scheme
 	CgroupManager CgroupManager
 	CgroupRoot    string
+	// NodeName filters pods to only those on this node (empty = all nodes)
+	NodeName string
 
 	// trackedPods maps pod UID -> cgroup ID
 	trackedPods map[string]uint64
 }
 
 // NewReconciler creates a new pod reconciler.
-func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, cgroupMgr CgroupManager, cgroupRoot string) *Reconciler {
+// nodeName filters pods to only those on this node (empty = all nodes).
+func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, cgroupMgr CgroupManager, cgroupRoot, nodeName string) *Reconciler {
 	if cgroupRoot == "" {
 		cgroupRoot = CgroupBasePath
 	}
@@ -53,6 +56,7 @@ func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, cgr
 		Scheme:        scheme,
 		CgroupManager: cgroupMgr,
 		CgroupRoot:    cgroupRoot,
+		NodeName:      nodeName,
 		trackedPods:   make(map[string]uint64),
 	}
 }
@@ -77,6 +81,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if _, tracked := r.trackedPods[string(pod.UID)]; tracked {
 			return r.handleDelete(string(pod.UID))
 		}
+		return ctrl.Result{}, nil
+	}
+
+	// Filter by node if NodeName is set (per-node controller)
+	if r.NodeName != "" && pod.Spec.NodeName != r.NodeName {
+		log.V(1).Info("skipping pod on different node", "podNode", pod.Spec.NodeName, "ourNode", r.NodeName)
 		return ctrl.Result{}, nil
 	}
 

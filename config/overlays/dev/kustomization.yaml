@@ -1,0 +1,25 @@
+# Kloak Development Overlay
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../manifests
+
+# Development-specific patches
+patches:
+  # Disable eBPF for faster development (if desired)
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/args
+        value:
+          - --enable-ebpf=false
+          - --cgroup-path=/host/sys/fs/cgroup
+    target:
+      kind: DaemonSet
+      name: kloak-controller
+
+# Use local image
+images:
+  - name: kloak
+    newName: kloak
+    newTag: latest

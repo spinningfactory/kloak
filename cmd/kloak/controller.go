@@ -163,12 +163,18 @@ func runController(cmd *cobra.Command, args []string) {
 	}()
 
 	// Create pod reconciler
+	// NODE_NAME is used to filter pods to only those on this node (DaemonSet per-node controller)
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName != "" {
+		setupLog.Info("Node filtering enabled", "nodeName", nodeName)
+	}
 	reconciler := controller.NewReconciler(
 		mgr.GetClient(),
 		ctrl.Log.WithName("controller").WithName("Pod"),
 		mgr.GetScheme(),
 		cgroupMgr,
 		cgroupPath,
+		nodeName,
 	)
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
