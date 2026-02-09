@@ -48,8 +48,17 @@ func (s *Store) GetOrCreate(ctx context.Context) (*CA, error) {
 	if err == nil {
 		secretFound = true
 		// Secret exists, try to load CA
-		certPEM, okCert := secret.Data[CertKey]
-		keyPEM, okKey := secret.Data[KeyKey]
+		// First try tls.crt/tls.key (standard TLS secret format)
+		certPEM, okCert := secret.Data[corev1.TLSCertKey]
+		keyPEM, okKey := secret.Data[corev1.TLSPrivateKeyKey]
+
+		if okCert && okKey {
+			return LoadCA(certPEM, keyPEM)
+		}
+
+		// Fallback to ca.crt/ca.key for backwards compatibility
+		certPEM, okCert = secret.Data[CertKey]
+		keyPEM, okKey = secret.Data[KeyKey]
 
 		if okCert && okKey {
 			return LoadCA(certPEM, keyPEM)
@@ -111,13 +120,21 @@ func (s *Store) Get(ctx context.Context) (*CA, error) {
 		return nil, fmt.Errorf("getting secret: %w", err)
 	}
 
-	certPEM, ok := secret.Data[CertKey]
+	// First try tls.crt/tls.key (standard TLS secret format)
+	certPEM, ok := secret.Data[corev1.TLSCertKey]
 	if !ok {
-		return nil, fmt.Errorf("secret missing %s key", CertKey)
+		// Fallback to ca.crt/ca.key for backwards compatibility
+		certPEM, ok = secret.Data[CertKey]
+		if !ok {
+			return nil, fmt.Errorf("secret missing %s or %s key", corev1.TLSCertKey, CertKey)
+		}
 	}
-	keyPEM, ok := secret.Data[KeyKey]
+	keyPEM, ok := secret.Data[corev1.TLSPrivateKeyKey]
 	if !ok {
-		return nil, fmt.Errorf("secret missing %s key", KeyKey)
+		keyPEM, ok = secret.Data[KeyKey]
+		if !ok {
+			return nil, fmt.Errorf("secret missing %s or %s key", corev1.TLSPrivateKeyKey, KeyKey)
+		}
 	}
 
 	return LoadCA(certPEM, keyPEM)
