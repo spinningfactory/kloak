@@ -171,18 +171,6 @@ func runController(cmd *cobra.Command, args []string) {
 		}
 	}()
 
-	// Create HTTP Server for webhook to store hashes (legacy, will migrate to gRPC)
-	httpServer := controller.NewServer(store, ctrl.Log.WithName("http"))
-
-	// Start HTTP server immediately in goroutine (don't wait for leader election)
-	// This ensures webhook can send hashes during pod admission
-	go func() {
-		setupLog.Info("starting HTTP server immediately (before leader election)")
-		if err := httpServer.Start(ctx, ":8090"); err != nil {
-			setupLog.Error(err, "HTTP server failed")
-		}
-	}()
-
 	// Create pod reconciler
 	// NODE_NAME is used to filter pods to only those on this node (DaemonSet per-node controller)
 	nodeName := os.Getenv("NODE_NAME")

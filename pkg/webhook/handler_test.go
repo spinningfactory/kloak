@@ -9,7 +9,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/go-logr/logr"
-	"github.com/spinningfactory/kloak/pkg/storage"
+
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -250,64 +250,6 @@ func TestMountRootCA(t *testing.T) {
 	}
 	if pod.Spec.Containers[0].Env[0].Value != "/etc/kloak-ca/ca.crt" {
 		t.Errorf("Expected SSL_CERT_FILE='/etc/kloak-ca/ca.crt', got '%s'", pod.Spec.Containers[0].Env[0].Value)
-	}
-}
-
-func TestHashEnvVars(t *testing.T) {
-	store := storage.NewMemory()
-	h := &Handler{
-		storage:    store,
-		envsToHash: []string{"API_KEY", "SECRET"},
-	}
-
-	pod := &corev1.Pod{
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:  "app",
-					Image: "myapp:latest",
-					Env: []corev1.EnvVar{
-						{Name: "API_KEY", Value: "secret-key-123"},
-						{Name: "DEBUG", Value: "true"},
-						{Name: "SECRET", Value: "my-secret"},
-					},
-				},
-			},
-		},
-	}
-
-	h.hashEnvVars(context.Background(), pod, "test/pod")
-
-	// Check API_KEY was hashed (starts with kloak:)
-	env := pod.Spec.Containers[0].Env
-	if env[0].Value == "secret-key-123" {
-		t.Error("API_KEY should have been hashed")
-	}
-	if env[0].Value[:6] != "kloak:" {
-		t.Errorf("Hashed value should start with 'kloak:', got '%s'", env[0].Value)
-	}
-
-	// Check DEBUG was NOT hashed
-	if env[1].Value != "true" {
-		t.Error("DEBUG should not have been hashed")
-	}
-
-	// Check SECRET was hashed
-	if env[2].Value == "my-secret" {
-		t.Error("SECRET should have been hashed")
-	}
-
-	// Verify storage has the mappings
-	all, _ := store.List(context.Background())
-	if len(all) != 2 {
-		t.Errorf("Expected 2 stored mappings, got %d", len(all))
-	}
-
-	// Check content of one entry (optional, but good for verification)
-	for _, entry := range all {
-		if entry.AllowedHosts[0] != "*" {
-			t.Errorf("Expected allowed host '*', got %v", entry.AllowedHosts)
-		}
 	}
 }
 

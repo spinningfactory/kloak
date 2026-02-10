@@ -3,7 +3,6 @@
 package webhook
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -16,16 +15,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/go-logr/logr"
-	"github.com/spinningfactory/kloak/pkg/hash"
-	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
 const (
 	// AnnotationEnabled is the annotation to enable Kloak on a pod.
 	AnnotationEnabled = "getkloak.io/enabled"
-
-	// AnnotationHashedEnvs lists env vars that were hashed.
-	AnnotationHashedEnvs = "getkloak.io/hashed-envs"
 
 	// EnvoyImage is the default Envoy sidecar image.
 	EnvoyImage = "envoyproxy/envoy:v1.37-latest"
@@ -45,25 +39,19 @@ const (
 
 // Handler handles pod mutation requests.
 type Handler struct {
-	client         client.Client
-	decoder        admission.Decoder
-	storage        storage.Storage
-	envsToHash     []string // Environment variable names to hash
-	remoteStoreURL string   // URL to Controller Store API
-	log            logr.Logger
+	client  client.Client
+	decoder admission.Decoder
+	log     logr.Logger
 }
 
 // NewHandler creates a new webhook handler.
-func NewHandler(c client.Client, store storage.Storage, envsToHash []string, remoteStoreURL string, log logr.Logger) *Handler {
+func NewHandler(c client.Client, log logr.Logger) *Handler {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	return &Handler{
-		client:         c,
-		storage:        store,
-		envsToHash:     envsToHash,
-		decoder:        admission.NewDecoder(scheme),
-		remoteStoreURL: remoteStoreURL,
-		log:            log,
+		client:  c,
+		decoder: admission.NewDecoder(scheme),
+		log:     log,
 	}
 }
 
@@ -107,13 +95,6 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 		// Failing is safer if we intend to protect secrets.
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
-
-	// 4. Hash sensitive environment variables
-	podID := fmt.Sprintf("%s/%s", req.Namespace, req.Name)
-	if req.Name == "" {
-		podID = fmt.Sprintf("%s/%s", req.Namespace, mutatedPod.GenerateName)
-	}
-	h.hashEnvVars(ctx, mutatedPod, podID)
 
 	// Create JSON patch
 	marshaledPod, err := json.Marshal(mutatedPod)
@@ -319,90 +300,6 @@ func (h *Handler) mountRootCA(pod *corev1.Pod) {
 				Value: fullPath,
 			},
 		)
-	}
-}
-
-// hashEnvVars hashes specified environment variables and stores mappings.
-func (h *Handler) hashEnvVars(ctx context.Context, pod *corev1.Pod, podID string) {
-	hashedVars := []string{}
-
-	for i := range pod.Spec.Containers {
-		container := &pod.Spec.Containers[i]
-		if container.Name == "envoy-sidecar" {
-			continue
-		}
-
-		for j := range container.Env {
-			env := &container.Env[j]
-			if h.shouldHash(env.Name) && env.Value != "" {
-				originalValue := env.Value
-				hashedValue := hash.GenerateWithPrefix(originalValue)
-
-				// Store the mapping
-				entry := storage.Entry{Value: originalValue, AllowedHosts: []string{"*"}}
-				_ = h.storage.Store(ctx, podID, hashedValue, entry)
-
-				// Send to Remote Store (Controller)
-				if h.remoteStoreURL != "" {
-					go h.sendToRemoteStore(hashedValue, originalValue)
-				}
-
-				// Replace value with hash
-				env.Value = hashedValue
-				hashedVars = append(hashedVars, env.Name)
-			}
-		}
-	}
-
-	// Annotate pod with list of hashed env vars
-	if len(hashedVars) > 0 {
-		if pod.Annotations == nil {
-			pod.Annotations = make(map[string]string)
-		}
-		pod.Annotations[AnnotationHashedEnvs] = fmt.Sprintf("%v", hashedVars)
-	}
-}
-
-// shouldHash checks if an env var should be hashed.
-func (h *Handler) shouldHash(name string) bool {
-	for _, n := range h.envsToHash {
-		if n == name {
-			return true
-		}
-	}
-	return false
-}
-
-func (h *Handler) sendToRemoteStore(hash, original string) {
-	fmt.Printf("DEBUG: Sending hash %s to %s\n", hash, h.remoteStoreURL)
-	if h.remoteStoreURL == "" {
-		fmt.Println("DEBUG: Remote URL is empty")
-		return
-	}
-
-	payload := map[string]interface{}{
-		"hash":          hash,
-		"original":      original,
-		"allowed_hosts": []string{"*"},
-	}
-	data, _ := json.Marshal(payload)
-
-	// We ignore errors here.
-	// Use background context for goroutine
-	resp, err := http.Post(h.remoteStoreURL, "application/json", bytes.NewBuffer(data))
-	if err != nil {
-		fmt.Printf("DEBUG: Error sending hash: %v\n", err)
-		h.log.Error(err, "failed to send hash to remote store", "url", h.remoteStoreURL)
-		return
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("DEBUG: Remote store returned status: %s\n", resp.Status)
-		h.log.Info("remote store returned non-OK status", "status", resp.Status)
-	} else {
-		fmt.Printf("DEBUG: Successfully sent hash\n")
-		h.log.Info("successfully sent hash to remote store", "hash", hash)
 	}
 }
 
