@@ -207,10 +207,8 @@ func runController(cmd *cobra.Command, args []string) {
 	}
 
 	// Create CA reconciler to sync ConfigMap to labeled namespaces
-	caProvider := ca.NewProvider(rootCA, ctrl.Log.WithName("ca-provider"))
 	caReconciler := &ca.Reconciler{
 		Client:         mgr.GetClient(),
-		Provider:       caProvider,
 		Namespace:      namespace,
 		Log:            ctrl.Log.WithName("controller").WithName("CA"),
 		SyncNamespaces: true, // Enable ConfigMap sync to labeled namespaces

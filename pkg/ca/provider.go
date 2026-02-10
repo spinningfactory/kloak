@@ -52,14 +52,3 @@ func (p *Provider) OnChange(fn func(*CA)) {
 	defer p.mu.Unlock()
 	p.callbacks = append(p.callbacks, fn)
 }
-
-// GetCertPEM returns the current CA certificate PEM bytes.
-// Returns nil if no CA is loaded.
-func (p *Provider) GetCertPEM() []byte {
-	p.mu.RLock()
-	defer p.mu.RUnlock()
-	if p.ca == nil {
-		return nil
-	}
-	return p.ca.CertPEM
-}

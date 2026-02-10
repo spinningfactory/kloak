@@ -16,7 +16,7 @@ func TestGetOrCreateCert(t *testing.T) {
 		t.Fatalf("Failed to generate CA: %v", err)
 	}
 
-	server := NewServer(rootCA, logr.Discard())
+	server := NewServer(ca.NewProvider(rootCA, logr.Discard()), logr.Discard())
 
 	// Generate cert for a domain
 	secret, err := server.getOrCreateCert("example.com")
@@ -64,7 +64,7 @@ func TestGetOrCreateCert(t *testing.T) {
 
 func TestClearCache(t *testing.T) {
 	rootCA, _ := ca.GenerateCA("Test CA", 24*time.Hour)
-	server := NewServer(rootCA, logr.Discard())
+	server := NewServer(ca.NewProvider(rootCA, logr.Discard()), logr.Discard())
 
 	// Add some certs
 	server.getOrCreateCert("a.com")

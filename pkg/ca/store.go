@@ -44,34 +44,20 @@ func (s *Store) GetOrCreate(ctx context.Context) (*CA, error) {
 	}, secret)
 
 	secretFound := false
+	var loadedCA *CA
 
 	if err == nil {
 		secretFound = true
-		// Secret exists, try to load CA
-		// First try tls.crt/tls.key (standard TLS secret format)
-		certPEM, okCert := secret.Data[corev1.TLSCertKey]
-		keyPEM, okKey := secret.Data[corev1.TLSPrivateKeyKey]
-
-		if okCert && okKey {
-			return LoadCA(certPEM, keyPEM)
+		loadedCA, err = loadFromSecret(secret)
+		if err == nil {
+			return loadedCA, nil
 		}
-
-		// Fallback to ca.crt/ca.key for backwards compatibility
-		certPEM, okCert = secret.Data[CertKey]
-		keyPEM, okKey = secret.Data[KeyKey]
-
-		if okCert && okKey {
-			return LoadCA(certPEM, keyPEM)
-		}
-
-		// If keys are missing, we fall through to regenerate
-		// But first, we need to delete the invalid secret or just update it?
-		// Update is safer. We will overwrite the data.
+		// If loading failed (invalid data), we regenerate
 	} else if !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("getting secret: %w", err)
 	}
 
-	// Secret doesn't exist, create new CA
+	// Secret doesn't exist or is invalid, create new CA
 	ca, err := GenerateCA("Kloak Root CA", DefaultValidDuration)
 	if err != nil {
 		return nil, fmt.Errorf("generating CA: %w", err)
@@ -120,6 +106,11 @@ func (s *Store) Get(ctx context.Context) (*CA, error) {
 		return nil, fmt.Errorf("getting secret: %w", err)
 	}
 
+	return loadFromSecret(secret)
+}
+
+// loadFromSecret attempts to load CA from a K8s secret, handling standard and legacy keys.
+func loadFromSecret(secret *corev1.Secret) (*CA, error) {
 	// First try tls.crt/tls.key (standard TLS secret format)
 	certPEM, ok := secret.Data[corev1.TLSCertKey]
 	if !ok {

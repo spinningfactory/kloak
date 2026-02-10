@@ -22,20 +22,20 @@ import (
 type Server struct {
 	secret.UnimplementedSecretDiscoveryServiceServer
 
-	ca        *ca.CA
-	log       logr.Logger
-	certCache map[string]*tls.Secret
-	cacheMu   sync.RWMutex
-	certTTL   time.Duration
+	caProvider *ca.Provider
+	log        logr.Logger
+	certCache  map[string]*tls.Secret
+	cacheMu    sync.RWMutex
+	certTTL    time.Duration
 }
 
 // NewServer creates a new SDS server.
-func NewServer(rootCA *ca.CA, log logr.Logger) *Server {
+func NewServer(caProvider *ca.Provider, log logr.Logger) *Server {
 	return &Server{
-		ca:        rootCA,
-		log:       log,
-		certCache: make(map[string]*tls.Secret),
-		certTTL:   24 * time.Hour,
+		caProvider: caProvider,
+		log:        log,
+		certCache:  make(map[string]*tls.Secret),
+		certTTL:    24 * time.Hour,
 	}
 }
 
@@ -188,7 +188,12 @@ func (s *Server) getOrCreateCert(domain string) (*tls.Secret, error) {
 
 	// Generate new certificate
 	s.log.Info("generating certificate", "domain", domain)
-	certPEM, keyPEM, err := s.ca.GenerateServerCert([]string{domain}, 24*time.Hour)
+	currentCA := s.caProvider.Get()
+	if currentCA == nil {
+		return nil, fmt.Errorf("CA not loaded")
+	}
+
+	certPEM, keyPEM, err := currentCA.GenerateServerCert([]string{domain}, 24*time.Hour)
 	if err != nil {
 		s.log.Error(err, "failed to generate certificate", "domain", domain)
 		return nil, err
@@ -197,7 +202,7 @@ func (s *Server) getOrCreateCert(domain string) (*tls.Secret, error) {
 
 	// Build full certificate chain (leaf + CA)
 	// This ensures clients can verify the chain even if they only have the root CA
-	fullChain := append(certPEM, s.ca.CertPEM...)
+	fullChain := append(certPEM, currentCA.CertPEM...)
 
 	secret := &tls.Secret{
 		Name: domain,

@@ -25,11 +25,9 @@ const (
 	CAConfigMapKey = "ca.crt"
 )
 
-// Reconciler watches the kloak-ca Secret and updates the Provider.
-// It also syncs the CA to ConfigMaps in labeled namespaces.
+// Reconciler watches the kloak-ca Secret and syncs it to ConfigMaps.
 type Reconciler struct {
 	client.Client
-	Provider       *Provider
 	Namespace      string // The namespace where kloak-ca Secret lives
 	Log            logr.Logger
 	SyncNamespaces bool // If true, sync ConfigMap to labeled namespaces
@@ -65,23 +63,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			return ctrl.Result{}, nil
 		}
 	}
-	keyPEM, ok := secret.Data[corev1.TLSPrivateKeyKey]
+	_, ok = secret.Data[corev1.TLSPrivateKeyKey]
 	if !ok {
-		keyPEM, ok = secret.Data[KeyKey]
+		_, ok = secret.Data[KeyKey]
 		if !ok {
 			log.Error(nil, "Secret missing CA key")
 			return ctrl.Result{}, nil
 		}
 	}
-
-	ca, err := LoadCA(certPEM, keyPEM)
-	if err != nil {
-		log.Error(err, "Failed to load CA from secret")
-		return ctrl.Result{}, nil
-	}
-
-	// Update the provider
-	r.Provider.Update(ca)
 
 	// Sync ConfigMap to labeled namespaces if enabled
 	if r.SyncNamespaces {
