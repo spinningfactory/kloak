@@ -2,7 +2,7 @@
 
 // Package ebpf provides eBPF program loading and management.
 //
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" redirect ../../pkg/ebpf/redirect.c -- -I../../pkg/ebpf
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror" redirect ../../pkg/ebpf/bpf/redirect.c -- -I../../pkg/ebpf
 package ebpf
 
 import (
