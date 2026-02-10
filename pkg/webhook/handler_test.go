@@ -174,47 +174,7 @@ func TestIsEnabled(t *testing.T) {
 	}
 }
 
-func TestInjectEnvoySidecar(t *testing.T) {
-	h := &Handler{}
-	pod := &corev1.Pod{
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{Name: "app", Image: "myapp:latest"},
-			},
-		},
-	}
-
-	h.injectEnvoySidecar(pod)
-
-	// Check sidecar was added
-	if len(pod.Spec.Containers) != 2 {
-		t.Fatalf("Expected 2 containers, got %d", len(pod.Spec.Containers))
-	}
-
-	sidecar := pod.Spec.Containers[1]
-	if sidecar.Name != "envoy-sidecar" {
-		t.Errorf("Expected sidecar name 'envoy-sidecar', got '%s'", sidecar.Name)
-	}
-
-	// Check volumes were added (should be 1 shared volume now)
-	if len(pod.Spec.Volumes) != 1 {
-		t.Errorf("Expected 1 volumes, got %d", len(pod.Spec.Volumes))
-	}
-	if pod.Spec.Volumes[0].Name != "kloak-envoy-config-vol" {
-		t.Errorf("Expected volume name 'kloak-envoy-config-vol', got '%s'", pod.Spec.Volumes[0].Name)
-	}
-
-	// Check Init Container for config injection
-	if len(pod.Spec.InitContainers) != 1 {
-		t.Fatalf("Expected 1 init container, got %d", len(pod.Spec.InitContainers))
-	}
-	initContainer := pod.Spec.InitContainers[0]
-	if initContainer.Name != "kloak-init-envoy" {
-		t.Errorf("Expected init container name 'kloak-init-envoy', got '%s'", initContainer.Name)
-	}
-}
-
-func TestMountRootCA(t *testing.T) {
+func TestGetCA(t *testing.T) {
 	// Setup fake client with CA secret
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -237,6 +197,60 @@ func TestMountRootCA(t *testing.T) {
 		systemNamespace: "kloak-system",
 	}
 
+	cert, err := h.getCA(context.Background())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cert != "FAKE-CA-CERT" {
+		t.Errorf("Expected cert 'FAKE-CA-CERT', got '%s'", cert)
+	}
+}
+
+func TestInjectInitContainer(t *testing.T) {
+	h := &Handler{}
+	pod := &corev1.Pod{}
+	caCert := "FAKE-CA-CERT"
+
+	h.injectInitContainer(pod, caCert)
+
+	// Check Init Container
+	if len(pod.Spec.InitContainers) != 1 {
+		t.Fatalf("Expected 1 init container, got %d", len(pod.Spec.InitContainers))
+	}
+	initContainer := pod.Spec.InitContainers[0]
+	if initContainer.Name != "kloak-init" {
+		t.Errorf("Expected init container name 'kloak-init', got '%s'", initContainer.Name)
+	}
+	if initContainer.Image != "busybox:1.36" {
+		t.Errorf("Expected image 'busybox:1.36', got '%s'", initContainer.Image)
+	}
+
+	// Check Env Vars
+	foundCA := false
+	foundConfig := false
+	for _, env := range initContainer.Env {
+		if env.Name == "CA_PEM" && env.Value == "FAKE-CA-CERT" {
+			foundCA = true
+		}
+		if env.Name == "ENVOY_CONFIG" && env.Value != "" {
+			foundConfig = true
+		}
+	}
+	if !foundCA {
+		t.Error("Init container missing/incorrect CA_PEM env var")
+	}
+	if !foundConfig {
+		t.Error("Init container missing ENVOY_CONFIG env var")
+	}
+
+	// Check Volumes
+	if len(pod.Spec.Volumes) != 2 {
+		t.Errorf("Expected 2 volumes, got %d", len(pod.Spec.Volumes))
+	}
+}
+
+func TestInjectEnvoySidecar(t *testing.T) {
+	h := &Handler{}
 	pod := &corev1.Pod{
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
@@ -245,41 +259,42 @@ func TestMountRootCA(t *testing.T) {
 		},
 	}
 
-	h.mountRootCA(pod)
+	h.injectEnvoySidecar(pod)
 
-	// Check shared volume was added
-	if len(pod.Spec.Volumes) != 1 {
-		t.Fatalf("Expected 1 volume, got %d", len(pod.Spec.Volumes))
-	}
-
-	if pod.Spec.Volumes[0].Name != "kloak-ca-vol" {
-		t.Errorf("Expected volume name 'kloak-ca-vol', got '%s'", pod.Spec.Volumes[0].Name)
+	// Check sidecar was added
+	if len(pod.Spec.Containers) != 2 {
+		t.Fatalf("Expected 2 containers, got %d", len(pod.Spec.Containers))
 	}
 
-	// Check EmptyDir volume source
-	if pod.Spec.Volumes[0].EmptyDir == nil {
-		t.Fatal("Expected EmptyDir volume source, got nil")
+	sidecar := pod.Spec.Containers[1]
+	if sidecar.Name != "envoy-sidecar" {
+		t.Errorf("Expected sidecar name 'envoy-sidecar', got '%s'", sidecar.Name)
 	}
 
-	// Check Init Container was added
-	if len(pod.Spec.InitContainers) != 1 {
-		t.Fatalf("Expected 1 init container, got %d", len(pod.Spec.InitContainers))
-	}
-	initContainer := pod.Spec.InitContainers[0]
-	if initContainer.Image != "busybox:1.36" {
-		t.Errorf("Expected init container image 'busybox:1.36', got '%s'", initContainer.Image)
-	}
-	// Check Env var in init container
-	foundEnv := false
-	for _, env := range initContainer.Env {
-		if env.Name == "CA_PEM" && env.Value == "FAKE-CA-CERT" {
-			foundEnv = true
+	// Volume mount check
+	foundMount := false
+	for _, m := range sidecar.VolumeMounts {
+		if m.Name == "kloak-envoy-config-vol" && m.MountPath == "/etc/envoy" {
+			foundMount = true
 			break
 		}
 	}
-	if !foundEnv {
-		t.Error("Init container missing CA_PEM env var with correct value")
+	if !foundMount {
+		t.Error("Sidecar missing envoy config volume mount")
 	}
+}
+
+func TestMountCAVolume(t *testing.T) {
+	h := &Handler{}
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{Name: "app", Image: "myapp:latest"},
+			},
+		},
+	}
+
+	h.mountCAVolume(pod)
 
 	// Check mount was added to app container
 	if len(pod.Spec.Containers[0].VolumeMounts) != 1 {
@@ -287,6 +302,9 @@ func TestMountRootCA(t *testing.T) {
 	}
 
 	mount := pod.Spec.Containers[0].VolumeMounts[0]
+	if mount.Name != "kloak-ca-vol" {
+		t.Errorf("Expected volume name 'kloak-ca-vol', got '%s'", mount.Name)
+	}
 	if mount.MountPath != "/etc/kloak-ca" {
 		t.Errorf("Expected mount path '/etc/kloak-ca', got '%s'", mount.MountPath)
 	}

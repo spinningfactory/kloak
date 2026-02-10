@@ -89,17 +89,27 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 	}
 	mutatedPod.Annotations[AnnotationEnabled] = "true"
 
-	// 1. Inject Envoy sidecar
+	// Fetch CA Cert
+	caCert, err := h.getCA(ctx)
+	if err != nil {
+		h.log.Error(err, "failed to fetch CA certificate")
+		// We can't proceed without CA as init container needs it
+		// Fail open or closed? Closed seems safer for mesh.
+		return admission.Errored(http.StatusInternalServerError, err)
+	}
+
+	// 1. Inject Init Container (sets up CA and Envoy config)
+	h.injectInitContainer(mutatedPod, caCert)
+
+	// 2. Inject Envoy sidecar
 	h.injectEnvoySidecar(mutatedPod)
 
-	// 2. Mount Root CA certificate
-	h.mountRootCA(mutatedPod)
+	// 3. Mount Root CA volume to application containers
+	h.mountCAVolume(mutatedPod)
 
-	// 3. Rewrite Secret volumes (swap with shadow secrets)
+	// 4. Rewrite Secret volumes (swap with shadow secrets)
 	if err := h.rewriteSecretVolumes(ctx, mutatedPod, req.Namespace); err != nil {
 		h.log.Error(err, "failed to rewrite secret volumes")
-		// We log error but don't fail admission? Or should we fail?
-		// Failing is safer if we intend to protect secrets.
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
@@ -200,32 +210,61 @@ func (h *Handler) isObjectEnabled(labels, annotations map[string]string) bool {
 //go:embed envoy.yaml
 var envoyConfig []byte
 
-// injectEnvoySidecar adds the Envoy sidecar container to the pod.
-func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
-	// Encode Envoy config to base64 for env var injection
+// getCA fetches the CA certificate from the Kubernetes Secret.
+func (h *Handler) getCA(ctx context.Context) (string, error) {
+	secret := &corev1.Secret{}
+	err := h.client.Get(ctx, client.ObjectKey{
+		Namespace: h.systemNamespace,
+		Name:      CASecretName,
+	}, secret)
+	if err != nil {
+		return "", err
+	}
+
+	if data, ok := secret.Data[corev1.TLSCertKey]; ok {
+		return string(data), nil
+	} else if data, ok := secret.Data["ca.crt"]; ok {
+		return string(data), nil
+	}
+	return "", fmt.Errorf("CA secret missing certificate key")
+}
+
+// injectInitContainer injects the Kloak init container which sets up CA and Envoy config.
+func (h *Handler) injectInitContainer(pod *corev1.Pod, caCert string) {
+	// Encode Envoy config to base64
 	envoyConfigBase64 := base64.StdEncoding.EncodeToString(envoyConfig)
 
-	// 1. Add shared emptyDir volume for Envoy config
-	configVolName := "kloak-envoy-config-vol"
-	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-		Name: configVolName,
-		VolumeSource: corev1.VolumeSource{
-			EmptyDir: &corev1.EmptyDirVolumeSource{},
+	const (
+		EnvoyConfigVolName = "kloak-envoy-config-vol"
+		CAVolName          = "kloak-ca-vol"
+	)
+
+	// 1. Add shared volumes
+	pod.Spec.Volumes = append(pod.Spec.Volumes,
+		corev1.Volume{
+			Name: EnvoyConfigVolName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
 		},
-	})
+		corev1.Volume{
+			Name: CAVolName,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		},
+	)
 
-	// 2. Add Init Container to write Envoy config
-	initContainerName := "kloak-init-envoy"
-
-	// Check if we already have an init container (we might, from CA injection)
-	// But CA injection happens later in Handle().
-	// We can append another init container.
-
+	// 2. Add Init Container
 	initContainer := corev1.Container{
-		Name:    initContainerName,
+		Name:    "kloak-init",
 		Image:   InitContainerImage,
-		Command: []string{"sh", "-c", "echo \"$ENVOY_CONFIG\" | base64 -d > /etc/envoy/envoy.yaml"},
+		Command: []string{"sh", "-c", "echo \"$CA_PEM\" > /etc/kloak-ca/ca.crt && echo \"$ENVOY_CONFIG\" | base64 -d > /etc/envoy/envoy.yaml"},
 		Env: []corev1.EnvVar{
+			{
+				Name:  "CA_PEM",
+				Value: caCert,
+			},
 			{
 				Name:  "ENVOY_CONFIG",
 				Value: envoyConfigBase64,
@@ -233,14 +272,22 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
-				Name:      configVolName,
+				Name:      CAVolName,
+				MountPath: "/etc/kloak-ca",
+			},
+			{
+				Name:      EnvoyConfigVolName,
 				MountPath: "/etc/envoy",
 			},
 		},
 	}
 	pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
+}
 
-	// 3. Add Envoy sidecar container
+// injectEnvoySidecar adds the Envoy sidecar container to the pod.
+func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
+	const EnvoyConfigVolName = "kloak-envoy-config-vol"
+
 	envoyContainer := corev1.Container{
 		Name:  "envoy-sidecar",
 		Image: EnvoyImage,
@@ -253,7 +300,7 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
-				Name:      configVolName,
+				Name:      EnvoyConfigVolName,
 				MountPath: "/etc/envoy",
 				ReadOnly:  true,
 			},
@@ -291,84 +338,23 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 	pod.Spec.Containers = append(pod.Spec.Containers, envoyContainer)
 }
 
-// mountRootCA injects the CA certificate using an init container.
-// It reads the CA from the Secret and writes it to a shared volume.
-func (h *Handler) mountRootCA(pod *corev1.Pod) {
+// mountCAVolume mounts the CA volume to all application containers.
+func (h *Handler) mountCAVolume(pod *corev1.Pod) {
 	const (
+		CAVolName = "kloak-ca-vol"
 		CAVolPath = "/etc/kloak-ca"
 	)
 
-	// Fetch CA Secret
-	// We use context.Background() here because we're inside a synchronous handle loop
-	// and admission request context might be cancelled if we take too long?
-	// Actually we should use the request context but we don't have it passed here easily unless we change signature.
-	// But `Handle` calls this synchronously.
-	// Let's rely on the cached client.
-	secret := &corev1.Secret{}
-	err := h.client.Get(context.Background(), client.ObjectKey{
-		Namespace: h.systemNamespace,
-		Name:      CASecretName,
-	}, secret)
-
-	var caCertPEM string
-	if err != nil {
-		h.log.Error(err, "failed to fetch CA secret for injection", "namespace", h.systemNamespace)
-		// We can't inject. Should we fail?
-		// Without CA, the app will fail to talk to sidecar/services if they use our certs.
-		// For now, log and return. The pod will start without CA and likely fail connection.
-		return
-	}
-
-	// Extract CA cert
-	if data, ok := secret.Data[corev1.TLSCertKey]; ok {
-		caCertPEM = string(data)
-	} else if data, ok := secret.Data["ca.crt"]; ok {
-		caCertPEM = string(data)
-	} else {
-		h.log.Error(nil, "CA secret missing certificate key")
-		return
-	}
-
-	// 1. Add shared emptyDir volume
-	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-		Name: CAVolumeName,
-		VolumeSource: corev1.VolumeSource{
-			EmptyDir: &corev1.EmptyDirVolumeSource{},
-		},
-	})
-
-	// 2. Add Init Container to write CA
-	initContainer := corev1.Container{
-		Name:    "kloak-init-ca",
-		Image:   InitContainerImage,
-		Command: []string{"sh", "-c", "echo \"$CA_PEM\" > /etc/kloak-ca/ca.crt"},
-		Env: []corev1.EnvVar{
-			{
-				Name:  "CA_PEM",
-				Value: caCertPEM,
-			},
-		},
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      CAVolumeName,
-				MountPath: CAVolPath,
-			},
-		},
-		// Security context to ensure we can write?
-		// emptyDir is usually writable by root.
-	}
-	pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
-
-	// 3. Mount volume to all app containers and inject env var
 	for i := range pod.Spec.Containers {
-		// Skip sidecar? Sidecar has its own config. But maybe it needs to trust CA too?
-		// Sidecar usually gets certs via SDS. It doesn't need file CA for that.
-		// But let's mount to all for consistency.
+		// Don't mount to sidecar if it's already there?
+		// Sidecar is added at the end, so this loop might miss it if called before?
+		// Or if called after, it hits it.
+		// We can mount to sidecar too, no harm.
 
 		pod.Spec.Containers[i].VolumeMounts = append(
 			pod.Spec.Containers[i].VolumeMounts,
 			corev1.VolumeMount{
-				Name:      CAVolumeName,
+				Name:      CAVolName,
 				MountPath: CAVolPath,
 				ReadOnly:  true,
 			},
