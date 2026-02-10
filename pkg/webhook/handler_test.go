@@ -203,7 +203,28 @@ func TestInjectEnvoySidecar(t *testing.T) {
 }
 
 func TestMountRootCA(t *testing.T) {
-	h := &Handler{}
+	// Setup fake client with CA secret
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+
+	caSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "kloak-ca",
+			Namespace: "kloak-system",
+		},
+		Data: map[string][]byte{
+			"tls.crt": []byte("FAKE-CA-CERT"),
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(caSecret).Build()
+
+	h := &Handler{
+		client:          fakeClient,
+		log:             logr.Discard(),
+		systemNamespace: "kloak-system",
+	}
+
 	pod := &corev1.Pod{
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{
@@ -214,21 +235,38 @@ func TestMountRootCA(t *testing.T) {
 
 	h.mountRootCA(pod)
 
-	// Check volume was added
+	// Check shared volume was added
 	if len(pod.Spec.Volumes) != 1 {
 		t.Fatalf("Expected 1 volume, got %d", len(pod.Spec.Volumes))
 	}
 
-	if pod.Spec.Volumes[0].Name != "kloak-ca" {
-		t.Errorf("Expected volume name 'kloak-ca', got '%s'", pod.Spec.Volumes[0].Name)
+	if pod.Spec.Volumes[0].Name != "kloak-ca-vol" {
+		t.Errorf("Expected volume name 'kloak-ca-vol', got '%s'", pod.Spec.Volumes[0].Name)
 	}
 
-	// Check ConfigMap volume source
-	if pod.Spec.Volumes[0].ConfigMap == nil {
-		t.Fatal("Expected ConfigMap volume source, got nil")
+	// Check EmptyDir volume source
+	if pod.Spec.Volumes[0].EmptyDir == nil {
+		t.Fatal("Expected EmptyDir volume source, got nil")
 	}
-	if pod.Spec.Volumes[0].ConfigMap.Name != "kloak-ca-cert" {
-		t.Errorf("Expected ConfigMap name 'kloak-ca-cert', got '%s'", pod.Spec.Volumes[0].ConfigMap.Name)
+
+	// Check Init Container was added
+	if len(pod.Spec.InitContainers) != 1 {
+		t.Fatalf("Expected 1 init container, got %d", len(pod.Spec.InitContainers))
+	}
+	initContainer := pod.Spec.InitContainers[0]
+	if initContainer.Image != "busybox:1.36" {
+		t.Errorf("Expected init container image 'busybox:1.36', got '%s'", initContainer.Image)
+	}
+	// Check Env var in init container
+	foundEnv := false
+	for _, env := range initContainer.Env {
+		if env.Name == "CA_PEM" && env.Value == "FAKE-CA-CERT" {
+			foundEnv = true
+			break
+		}
+	}
+	if !foundEnv {
+		t.Error("Init container missing CA_PEM env var with correct value")
 	}
 
 	// Check mount was added to app container

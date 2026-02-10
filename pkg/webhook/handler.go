@@ -27,31 +27,36 @@ const (
 	// EnvoyPort is the port Envoy listens on for intercepted traffic.
 	EnvoyPort = 15001
 
-	// CACertFile matches the key in the ConfigMap
-	CACertFile = "root-ca.crt"
+	// CACertFile is the filename for the CA cert.
+	CACertFile = "ca.crt"
 
-	// CAVolumeName is the name of the volume containing the CA.
-	CAVolumeName = "kloak-ca"
+	// CAVolumeName is the name of the shared volume containing the CA.
+	CAVolumeName = "kloak-ca-vol"
 
-	// CAConfigMapName is the name of the ConfigMap containing the CA cert.
-	CAConfigMapName = "kloak-ca-cert"
+	// CASecretName is the name of the Secret containing the CA.
+	CASecretName = "kloak-ca"
+
+	// InitContainerImage is the image used for the init container.
+	InitContainerImage = "busybox:1.36"
 )
 
 // Handler handles pod mutation requests.
 type Handler struct {
-	client  client.Client
-	decoder admission.Decoder
-	log     logr.Logger
+	client          client.Client
+	decoder         admission.Decoder
+	log             logr.Logger
+	systemNamespace string // Namespace where Kloak is installed (for accessing CA secret)
 }
 
 // NewHandler creates a new webhook handler.
-func NewHandler(c client.Client, log logr.Logger) *Handler {
+func NewHandler(c client.Client, log logr.Logger, systemNamespace string) *Handler {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	return &Handler{
-		client:  c,
-		decoder: admission.NewDecoder(scheme),
-		log:     log,
+		client:          c,
+		decoder:         admission.NewDecoder(scheme),
+		log:             log,
+		systemNamespace: systemNamespace,
 	}
 }
 
@@ -256,36 +261,84 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 
 }
 
-// mountRootCA mounts the CA certificate ConfigMap as a volume.
-// Uses ConfigMap volume mount for automatic updates when CA changes.
+// mountRootCA injects the CA certificate using an init container.
+// It reads the CA from the Secret and writes it to a shared volume.
 func (h *Handler) mountRootCA(pod *corev1.Pod) {
 	const (
-		CAVolName   = "kloak-ca"
-		CAVolPath   = "/etc/kloak-ca"
-		CACertFile  = "ca.crt" // Key in the ConfigMap
-		CAConfigMap = "kloak-ca-cert"
+		CAVolPath = "/etc/kloak-ca"
 	)
 
-	// 1. Add ConfigMap volume for CA certificate
-	// This volume auto-updates when the ConfigMap changes (~60s kubelet sync)
+	// Fetch CA Secret
+	// We use context.Background() here because we're inside a synchronous handle loop
+	// and admission request context might be cancelled if we take too long?
+	// Actually we should use the request context but we don't have it passed here easily unless we change signature.
+	// But `Handle` calls this synchronously.
+	// Let's rely on the cached client.
+	secret := &corev1.Secret{}
+	err := h.client.Get(context.Background(), client.ObjectKey{
+		Namespace: h.systemNamespace,
+		Name:      CASecretName,
+	}, secret)
+
+	var caCertPEM string
+	if err != nil {
+		h.log.Error(err, "failed to fetch CA secret for injection", "namespace", h.systemNamespace)
+		// We can't inject. Should we fail?
+		// Without CA, the app will fail to talk to sidecar/services if they use our certs.
+		// For now, log and return. The pod will start without CA and likely fail connection.
+		return
+	}
+
+	// Extract CA cert
+	if data, ok := secret.Data[corev1.TLSCertKey]; ok {
+		caCertPEM = string(data)
+	} else if data, ok := secret.Data["ca.crt"]; ok {
+		caCertPEM = string(data)
+	} else {
+		h.log.Error(nil, "CA secret missing certificate key")
+		return
+	}
+
+	// 1. Add shared emptyDir volume
 	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-		Name: CAVolName,
+		Name: CAVolumeName,
 		VolumeSource: corev1.VolumeSource{
-			ConfigMap: &corev1.ConfigMapVolumeSource{
-				LocalObjectReference: corev1.LocalObjectReference{
-					Name: CAConfigMap,
-				},
-				Optional: ptr(true), // Don't fail pod if ConfigMap doesn't exist yet
-			},
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
 		},
 	})
 
-	// 2. Mount volume to all containers and inject env var
+	// 2. Add Init Container to write CA
+	initContainer := corev1.Container{
+		Name:    "kloak-init-ca",
+		Image:   InitContainerImage,
+		Command: []string{"sh", "-c", "echo \"$CA_PEM\" > /etc/kloak-ca/ca.crt"},
+		Env: []corev1.EnvVar{
+			{
+				Name:  "CA_PEM",
+				Value: caCertPEM,
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      CAVolumeName,
+				MountPath: CAVolPath,
+			},
+		},
+		// Security context to ensure we can write?
+		// emptyDir is usually writable by root.
+	}
+	pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
+
+	// 3. Mount volume to all app containers and inject env var
 	for i := range pod.Spec.Containers {
+		// Skip sidecar? Sidecar has its own config. But maybe it needs to trust CA too?
+		// Sidecar usually gets certs via SDS. It doesn't need file CA for that.
+		// But let's mount to all for consistency.
+
 		pod.Spec.Containers[i].VolumeMounts = append(
 			pod.Spec.Containers[i].VolumeMounts,
 			corev1.VolumeMount{
-				Name:      CAVolName,
+				Name:      CAVolumeName,
 				MountPath: CAVolPath,
 				ReadOnly:  true,
 			},

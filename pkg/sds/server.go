@@ -30,9 +30,9 @@ type Server struct {
 }
 
 // NewServer creates a new SDS server.
-func NewServer(caProvider *ca.CA, log logr.Logger) *Server {
+func NewServer(ca *ca.CA, log logr.Logger) *Server {
 	return &Server{
-		ca:        caProvider,
+		ca:        ca,
 		log:       log,
 		certCache: make(map[string]*tls.Secret),
 		certTTL:   24 * time.Hour,

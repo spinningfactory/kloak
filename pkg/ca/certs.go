@@ -1,5 +1,5 @@
 // Package certs provides certificate generation utilities for Kloak.
-package certs
+package ca
 
 import (
 	"context"
@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
-	"github.com/spinningfactory/kloak/pkg/ca"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,16 +26,10 @@ const (
 	WebhookConfigName = "kloak-mutating-webhook"
 )
 
-// GenerateCA creates a new CA certificate and key using pkg/ca
-func GenerateCA() (*ca.CA, error) {
-	// 10 years validity for CA
-	return ca.GenerateCA("Kloak Root CA", 10*365*24*time.Hour)
-}
-
-// GenerateWebhookCert creates a webhook TLS certificate signed by the CA
-func GenerateWebhookCert(caCert, caKey []byte, namespace string) ([]byte, []byte, error) {
+// generateWebhookCert creates a webhook TLS certificate signed by the CA
+func generateWebhookCert(caCert, caKey []byte, namespace string) ([]byte, []byte, error) {
 	// Load CA
-	rootCA, err := ca.LoadCA(caCert, caKey)
+	rootCA, err := LoadCA(caCert, caKey)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to load CA: %w", err)
 	}
@@ -68,7 +61,7 @@ func EnsureCerts(ctx context.Context, c client.Client, namespace string, log log
 
 		// Generate new CA
 		log.Info("Generating new CA certificate")
-		rootCA, err := GenerateCA()
+		rootCA, err := GenerateCA("Kloak Root CA", 10*365*24*time.Hour)
 		if err != nil {
 			return nil, err
 		}
@@ -112,7 +105,7 @@ func EnsureCerts(ctx context.Context, c client.Client, namespace string, log log
 		// Generate webhook cert signed by CA
 		log.Info("Generating webhook certificate")
 		log.Info("Generating webhook certificate")
-		certPEM, keyPEM, err := GenerateWebhookCert(caCert, caKey, namespace)
+		certPEM, keyPEM, err := generateWebhookCert(caCert, caKey, namespace)
 		if err != nil {
 			return nil, err
 		}

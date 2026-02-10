@@ -19,7 +19,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/spinningfactory/kloak/pkg/ca"
-	"github.com/spinningfactory/kloak/pkg/certs"
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/storage"
 	"github.com/spinningfactory/kloak/pkg/sync"
@@ -115,7 +114,7 @@ func runController(cmd *cobra.Command, args []string) {
 
 	if certMode == "auto" {
 		// Auto-generate certificates if missing
-		_, err := certs.EnsureCerts(context.Background(), directClient, namespace, setupLog)
+		_, err := ca.EnsureCerts(context.Background(), directClient, namespace, setupLog)
 		if err != nil {
 			setupLog.Error(err, "failed to ensure certificates")
 			os.Exit(1)
@@ -206,21 +205,6 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Create CA reconciler to sync ConfigMap to labeled namespaces
-	caReconciler := &ca.Reconciler{
-		Client:         mgr.GetClient(),
-		Namespace:      namespace,
-		Log:            ctrl.Log.WithName("controller").WithName("CA"),
-		SyncNamespaces: true, // Enable ConfigMap sync to labeled namespaces
-	}
-
-	if err := caReconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "CA")
-		os.Exit(1)
-	}
-	setupLog.Info("CA reconciler configured", "syncNamespaces", true)
-
-	// Add health checks
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)

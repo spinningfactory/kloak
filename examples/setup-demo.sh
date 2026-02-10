@@ -152,11 +152,6 @@ deploy_kloak() {
     # Label demo namespace to enable webhook and CA sync
     kubectl label namespace "$DEMO_NAMESPACE" getkloak.io/enabled=true --overwrite
 
-    # Copy CA cert to demo namespace for app pods (to trust our CA)
-    CA_CERT=$(kubectl get secret kloak-ca -n kloak-system -o jsonpath='{.data.tls\.crt}' | base64 -d)
-    kubectl create configmap kloak-ca-cert \
-        --from-literal=ca.crt="$CA_CERT" \
-        -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
     
     # Create Envoy config
     kubectl create configmap kloak-envoy-config \

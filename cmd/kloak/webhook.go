@@ -58,14 +58,18 @@ func runWebhook(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// No longer need to load CA here - pods mount the CA ConfigMap directly
-	// The controller syncs the kloak-ca-cert ConfigMap to labeled namespaces
-	setupLog.Info("Webhook using ConfigMap-based CA distribution", "configmap", "kloak-ca-cert")
+	// No longer need to load CA here - pods mount the CA via init container injection
+	setupLog.Info("Webhook using Init Container-based CA distribution")
 
 	// Register webhook
+	systemNamespace := os.Getenv("POD_NAMESPACE")
+	if systemNamespace == "" {
+		systemNamespace = "kloak-system"
+	}
+
 	hookServer := mgr.GetWebhookServer()
 	hookServer.Register("/mutate-pods", &webhook.Admission{
-		Handler: webhookpkg.NewHandler(mgr.GetClient(), setupLog),
+		Handler: webhookpkg.NewHandler(mgr.GetClient(), setupLog, systemNamespace),
 	})
 
 	// Add health checks
