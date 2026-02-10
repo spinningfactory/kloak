@@ -5,11 +5,10 @@ package controller
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/go-logr/logr"
+	"github.com/spinningfactory/kloak/pkg/cgroups"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -152,77 +151,46 @@ func (r *Reconciler) isEnabled(pod *corev1.Pod) bool {
 
 // getCgroupID retrieves the cgroup ID for a pod's containers.
 // For cgroups v2, we get the inode number of the cgroup directory.
+// We try to find the POD cgroup (parent of containers) so we can attach before app starts.
 func (r *Reconciler) getCgroupID(pod *corev1.Pod) (uint64, error) {
-	// Try to find a running container
-	for _, status := range pod.Status.ContainerStatuses {
-		if status.ContainerID == "" {
-			continue
-		}
+	// Helper to check statuses
+	checkStatuses := func(statuses []corev1.ContainerStatus) (uint64, error) {
+		for _, status := range statuses {
+			if status.ContainerID == "" {
+				continue
+			}
 
-		// Extract container ID (format: containerd://abc123...)
-		parts := strings.SplitN(status.ContainerID, "://", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		containerID := parts[1]
+			// Extract container ID (format: containerd://abc123...)
+			parts := strings.SplitN(status.ContainerID, "://", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			containerID := parts[1]
 
-		// Find the cgroup path for this container
-		cgroupPath, err := r.findCgroupPath(pod, containerID)
-		if err != nil {
-			continue
-		}
+			// Get Pod cgroup path using shared logic
+			podCgroupPath, err := cgroups.GetPodCgroupPath(r.CgroupRoot, string(pod.UID), containerID)
+			if err != nil {
+				// Fallback: Try container path if pod path fails? (Shouldn't happen if logic is correct)
+				continue
+			}
 
-		// Get the inode number (cgroup ID)
-		return r.getCgroupInode(cgroupPath)
+			r.Log.Info("Found Pod cgroup via container", "container", status.Name, "podCgroup", podCgroupPath)
+			return cgroups.GetCgroupInodeFromPath(podCgroupPath)
+		}
+		return 0, fmt.Errorf("no cgroup found")
+	}
+
+	// Try Init Containers first (they run when Pod is Pending)
+	if id, err := checkStatuses(pod.Status.InitContainerStatuses); err == nil {
+		return id, nil
+	}
+
+	// Try App Containers
+	if id, err := checkStatuses(pod.Status.ContainerStatuses); err == nil {
+		return id, nil
 	}
 
 	return 0, fmt.Errorf("no running container found for pod %s/%s", pod.Namespace, pod.Name)
-}
-
-// findCgroupPath finds the cgroup path for a container.
-func (r *Reconciler) findCgroupPath(pod *corev1.Pod, containerID string) (string, error) {
-	// Common patterns for Kubernetes cgroups v2:
-	// - kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid>.slice/cri-containerd-<containerID>.scope
-	// - kubepods/burstable/pod<uid>/<containerID>
-
-	podUID := string(pod.UID)
-	podUIDUnderscored := strings.ReplaceAll(podUID, "-", "_")
-
-	patterns := []string{
-		// containerd pattern
-		filepath.Join(r.CgroupRoot, "kubepods.slice", "kubepods-burstable.slice",
-			fmt.Sprintf("kubepods-burstable-pod%s.slice", podUIDUnderscored),
-			fmt.Sprintf("cri-containerd-%s.scope", containerID)),
-		// containerd pattern (BestEffort)
-		filepath.Join(r.CgroupRoot, "kubepods.slice", "kubepods-besteffort.slice",
-			fmt.Sprintf("kubepods-besteffort-pod%s.slice", podUIDUnderscored),
-			fmt.Sprintf("cri-containerd-%s.scope", containerID)),
-		// Alternative pattern
-		filepath.Join(r.CgroupRoot, "kubepods", "burstable",
-			fmt.Sprintf("pod%s", podUID), containerID),
-		// Best-effort pattern
-		filepath.Join(r.CgroupRoot, "kubepods", "pod"+podUID),
-	}
-
-	for _, path := range patterns {
-		if _, err := os.Stat(path); err == nil {
-			return path, nil
-		}
-	}
-
-	return "", fmt.Errorf("cgroup path not found for container %s", containerID)
-}
-
-// getCgroupInode gets the inode number of a cgroup directory.
-func (r *Reconciler) getCgroupInode(cgroupPath string) (uint64, error) {
-	stat, err := os.Stat(cgroupPath)
-	if err != nil {
-		return 0, err
-	}
-
-	// Get the inode from the FileInfo
-	// This works on Linux but we need the syscall for the actual inode
-	return getCgroupInodeFromPath(cgroupPath, stat)
 }
 
 // SetupWithManager sets up the controller with the Manager.

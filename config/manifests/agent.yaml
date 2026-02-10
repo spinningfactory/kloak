@@ -47,6 +47,11 @@ spec:
             - name: ca-certs
               mountPath: /etc/kloak/ca
               readOnly: true
+            - name: run-kloak
+              mountPath: /run/kloak
+            - name: sys-fs-cgroup
+              mountPath: /sys/fs/cgroup
+              readOnly: true
           livenessProbe:
             grpc:
               port: 15002
@@ -64,11 +69,31 @@ spec:
             requests:
               cpu: 10m
               memory: 64Mi
+          securityContext:
+            privileged: true  # Required for eBPF
+            runAsGroup: 0 
+            runAsUser: 0 
+            appArmorProfile:
+              type: Unconfined
+            capabilities:
+              add:
+                - BPF
+                - NET_ADMIN
+                - SYS_ADMIN
+                - SYS_RESOURCE
       volumes:
         - name: ca-certs
           secret:
             secretName: kloak-ca
             optional: true
+        - name: run-kloak
+          hostPath:
+            path: /run/kloak
+            type: DirectoryOrCreate
+        - name: sys-fs-cgroup
+          hostPath:
+            path: /sys/fs/cgroup
+            type: Directory
 ---
 apiVersion: v1
 kind: Service

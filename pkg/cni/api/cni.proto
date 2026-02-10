@@ -1,0 +1,35 @@
+syntax = "proto3";
+
+package cni.api;
+
+option go_package = "github.com/spinningfactory/kloak/pkg/cni/api";
+
+service CNI {
+  // HandlePod handles CNI ADD/DEL events
+  rpc HandlePod(PodRequest) returns (PodResponse) {}
+}
+
+enum Command {
+  ADD = 0;
+  DEL = 1;
+  CHECK = 2;
+}
+
+message PodRequest {
+  Command command = 1;
+  string container_id = 2;
+  string netns = 3;
+  string ifname = 4;
+  string args = 5;
+  string path = 6;
+  bytes stdin_data = 7;
+
+  // Metadata extracted from env/args
+  string pod_name = 8;
+  string pod_namespace = 9;
+  string pod_uid = 10;
+}
+
+message PodResponse {
+  // Empty for now (or error)
+}

@@ -12,7 +12,9 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
+	"github.com/spinningfactory/kloak/pkg/agent"
 	"github.com/spinningfactory/kloak/pkg/ca"
+	"github.com/spinningfactory/kloak/pkg/ebpf"
 	"github.com/spinningfactory/kloak/pkg/storage"
 	"github.com/spinningfactory/kloak/pkg/sync"
 	"github.com/spinningfactory/kloak/pkg/xds"
@@ -95,6 +97,26 @@ func runAgent(cmd *cobra.Command, args []string) {
 
 	// Create XDS server (serves LDS, SDS, ExtProc)
 	xdsServer := xds.NewServer(rootCA, store, log.WithName("xds"))
+
+	// Initialize eBPF manager (shared with CNI server)
+	// We need it to add pods to the map when CNI calls us.
+	// For now, we assume standard cgroup path.
+	cgroupPath := "/sys/fs/cgroup"
+	ebpfMgr, err := ebpf.NewEBPFCgroupManager(cgroupPath)
+	if err != nil {
+		log.Error(err, "failed to initialize eBPF manager")
+		os.Exit(1)
+	}
+	defer ebpfMgr.Close()
+
+	// Create and start CNI Server
+	cniServer := agent.NewCNIServer(log.WithName("cni"), ebpfMgr)
+	go func() {
+		if err := cniServer.Start(ctx); err != nil {
+			log.Error(err, "CNI server failed")
+			cancel() // Stop everything if CNI server fails
+		}
+	}()
 
 	// Run XDS server
 	log.Info("Starting XDS server", "addr", agentXDSAddr)

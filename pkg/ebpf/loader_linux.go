@@ -12,6 +12,7 @@ import (
 
 	ciliumebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/rlimit"
 )
 
 // LinuxLoader is the Linux-specific loader with typed fields.
@@ -33,6 +34,11 @@ func NewLinuxLoader(cgroupPath string) *LinuxLoader {
 // Load loads and attaches the eBPF programs.
 func (l *LinuxLoader) Load() error {
 	// Load pre-compiled eBPF programs
+	// Allow the current process to lock memory for eBPF resources.
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return fmt.Errorf("removing memlock limit: %w", err)
+	}
+
 	l.objs = &redirectObjects{}
 	if err := loadRedirectObjects(l.objs, nil); err != nil {
 		return fmt.Errorf("loading eBPF objects: %w", err)

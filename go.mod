@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/cilium/ebpf v0.20.0
+	github.com/containernetworking/cni v1.3.0
 	github.com/envoyproxy/go-control-plane v0.14.1-0.20260206074530-39006a9dec20
 	github.com/envoyproxy/go-control-plane/envoy v1.36.1-0.20260206074530-39006a9dec20
 	github.com/go-logr/logr v1.4.3
@@ -50,6 +51,7 @@ require (
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
+	github.com/vishvananda/netns v0.0.4 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	go.uber.org/zap v1.27.0 // indirect

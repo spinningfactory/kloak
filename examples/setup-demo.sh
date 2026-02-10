@@ -104,6 +104,9 @@ build_images() {
     
     # Build Kloak controller
     docker build -t kloak:latest "$ROOT_DIR"
+
+    # Build Kloak CNI Installer
+    docker build -f "$ROOT_DIR/Dockerfile.cni" -t kloak-cni:latest "$ROOT_DIR"
     
     echo "Importing images into K3s (this may take a moment)..."
     # We pipeline docker save -> lima -> k3s ctr import
@@ -116,6 +119,9 @@ build_images() {
     
     echo "Importing kloak..."
     docker save kloak:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
+
+    echo "Importing kloak-cni..."
+    docker save kloak-cni:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
     
     echo "✓ Images built and imported"
 }
@@ -131,6 +137,9 @@ deploy_kloak() {
     
     # Apply base operator config (creates namespace, RBAC, deployments, services)
     kubectl apply -k "$ROOT_DIR/config/manifests"
+
+    # Apply CNI Installer
+    kubectl apply -f "$ROOT_DIR/config/cni/cni-install.yaml"
     
     # Wait for namespace to be ready
     kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/kloak-system --timeout=30s
@@ -151,14 +160,26 @@ deploy_kloak() {
     echo ""
     echo "✓ Webhook certificate generated"
     
+    # Wait for CNI installation
+    echo "Waiting for CNI installation..."
+    kubectl rollout status daemonset/kloak-cni-install -n kloak-system --timeout=60s
 
-
-    
+    # Restart Agent to pick up new volume mounts (hostPath requires pod restart if changed?)
+    # Agent DaemonSet is applied via kustomize above, but if we updated the manifest locally, kustomize applies it.
+    # `kubectl apply -k` uses `config/manifests/kustomization.yaml`.
+    # `kustomization.yaml` references `agent.yaml`.
+    # So `apply -k` should apply the changes.
+    # BUT: If DaemonSet definition changed, K8s updates it.
+    # So explicit restart is mostly to ensure it picks up CNI socket availability?
+    # Actually, the agent creates the socket.
+    # The CNI plugin connects to it.
+    # So agent just needs to be running with the right mounts.
+    kubectl rollout restart daemonset/kloak-agent -n kloak-system
     
     # Remove default namespace label if it exists (cleanup)
     kubectl label namespace default getkloak.io/enabled- --overwrite 2>/dev/null || true
     
-    echo "✓ Kloak operator deployed (controller DaemonSet, agent DaemonSet, webhook)"
+    echo "✓ Kloak operator deployed (controller DaemonSet, agent DaemonSet, webhook, CNI)"
 }
 
 # Wait for Kloak pods
