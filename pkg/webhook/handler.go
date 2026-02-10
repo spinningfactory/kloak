@@ -4,6 +4,8 @@ package webhook
 
 import (
 	"context"
+	_ "embed"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -195,8 +197,50 @@ func (h *Handler) isObjectEnabled(labels, annotations map[string]string) bool {
 	return false
 }
 
+//go:embed envoy.yaml
+var envoyConfig []byte
+
 // injectEnvoySidecar adds the Envoy sidecar container to the pod.
 func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
+	// Encode Envoy config to base64 for env var injection
+	envoyConfigBase64 := base64.StdEncoding.EncodeToString(envoyConfig)
+
+	// 1. Add shared emptyDir volume for Envoy config
+	configVolName := "kloak-envoy-config-vol"
+	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+		Name: configVolName,
+		VolumeSource: corev1.VolumeSource{
+			EmptyDir: &corev1.EmptyDirVolumeSource{},
+		},
+	})
+
+	// 2. Add Init Container to write Envoy config
+	initContainerName := "kloak-init-envoy"
+
+	// Check if we already have an init container (we might, from CA injection)
+	// But CA injection happens later in Handle().
+	// We can append another init container.
+
+	initContainer := corev1.Container{
+		Name:    initContainerName,
+		Image:   InitContainerImage,
+		Command: []string{"sh", "-c", "echo \"$ENVOY_CONFIG\" | base64 -d > /etc/envoy/envoy.yaml"},
+		Env: []corev1.EnvVar{
+			{
+				Name:  "ENVOY_CONFIG",
+				Value: envoyConfigBase64,
+			},
+		},
+		VolumeMounts: []corev1.VolumeMount{
+			{
+				Name:      configVolName,
+				MountPath: "/etc/envoy",
+			},
+		},
+	}
+	pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
+
+	// 3. Add Envoy sidecar container
 	envoyContainer := corev1.Container{
 		Name:  "envoy-sidecar",
 		Image: EnvoyImage,
@@ -209,7 +253,7 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 		},
 		VolumeMounts: []corev1.VolumeMount{
 			{
-				Name:      "envoy-config",
+				Name:      configVolName,
 				MountPath: "/etc/envoy",
 				ReadOnly:  true,
 			},
@@ -244,21 +288,7 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 		},
 	}
 
-	// Add Envoy container
 	pod.Spec.Containers = append(pod.Spec.Containers, envoyContainer)
-
-	// Add envoy config volume (will be provided by ConfigMap)
-	pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
-		Name: "envoy-config",
-		VolumeSource: corev1.VolumeSource{
-			ConfigMap: &corev1.ConfigMapVolumeSource{
-				LocalObjectReference: corev1.LocalObjectReference{
-					Name: "kloak-envoy-config",
-				},
-			},
-		},
-	})
-
 }
 
 // mountRootCA injects the CA certificate using an init container.

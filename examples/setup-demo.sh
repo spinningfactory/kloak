@@ -145,18 +145,9 @@ deploy_kloak() {
     echo ""
     echo "✓ Webhook certificate generated"
     
-    # Create Demo Namespace
-    echo "Creating demo namespace: $DEMO_NAMESPACE"
-    kubectl create namespace "$DEMO_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
 
-    # Label demo namespace to enable webhook and CA sync
-    kubectl label namespace "$DEMO_NAMESPACE" getkloak.io/enabled=true --overwrite
 
     
-    # Create Envoy config
-    kubectl create configmap kloak-envoy-config \
-        --from-file="$ROOT_DIR/config/envoy/envoy.yaml" \
-        -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
     
     # Remove default namespace label if it exists (cleanup)
     kubectl label namespace default getkloak.io/enabled- --overwrite 2>/dev/null || true
@@ -188,6 +179,13 @@ deploy_demo() {
     export KUBECONFIG="$KUBECONFIG_PATH"
     echo ""
     echo "Deploying demo application to $DEMO_NAMESPACE..."
+
+    # Create Demo Namespace
+    echo "Creating demo namespace: $DEMO_NAMESPACE"
+    kubectl create namespace "$DEMO_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+    # Label demo namespace to enable webhook and CA sync
+    kubectl label namespace "$DEMO_NAMESPACE" getkloak.io/enabled=true --overwrite
     
     # Delete any existing demo deployment/pod first
     kubectl delete deployment demo-python -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true

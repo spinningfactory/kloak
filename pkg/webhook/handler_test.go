@@ -196,9 +196,21 @@ func TestInjectEnvoySidecar(t *testing.T) {
 		t.Errorf("Expected sidecar name 'envoy-sidecar', got '%s'", sidecar.Name)
 	}
 
-	// Check volumes were added
+	// Check volumes were added (should be 1 shared volume now)
 	if len(pod.Spec.Volumes) != 1 {
 		t.Errorf("Expected 1 volumes, got %d", len(pod.Spec.Volumes))
+	}
+	if pod.Spec.Volumes[0].Name != "kloak-envoy-config-vol" {
+		t.Errorf("Expected volume name 'kloak-envoy-config-vol', got '%s'", pod.Spec.Volumes[0].Name)
+	}
+
+	// Check Init Container for config injection
+	if len(pod.Spec.InitContainers) != 1 {
+		t.Fatalf("Expected 1 init container, got %d", len(pod.Spec.InitContainers))
+	}
+	initContainer := pod.Spec.InitContainers[0]
+	if initContainer.Name != "kloak-init-envoy" {
+		t.Errorf("Expected init container name 'kloak-init-envoy', got '%s'", initContainer.Name)
 	}
 }
 
