@@ -138,32 +138,3 @@ func (c *Client) handleEvent(ctx context.Context, event *SecretEvent) error {
 
 	return nil
 }
-
-// FetchAll fetches all secrets from controller (pull model).
-func (c *Client) FetchAll(ctx context.Context) error {
-	if c.client == nil {
-		if err := c.Connect(ctx); err != nil {
-			return err
-		}
-	}
-
-	resp, err := c.client.GetSecrets(ctx, &GetSecretsRequest{
-		Namespaces: c.namespaces,
-	})
-	if err != nil {
-		return err
-	}
-
-	for _, secret := range resp.Secrets {
-		entry := storage.Entry{
-			Value:        secret.Value,
-			AllowedHosts: secret.AllowedHosts,
-		}
-		if err := c.storage.Store(ctx, secret.PodId, secret.Hash, entry); err != nil {
-			c.log.Error(err, "failed to store secret", "hash", secret.Hash)
-		}
-	}
-
-	c.log.Info("fetched all secrets", "count", len(resp.Secrets))
-	return nil
-}

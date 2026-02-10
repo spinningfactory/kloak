@@ -7,14 +7,9 @@ option go_package = "github.com/spinningfactory/kloak/pkg/sync";
 // SyncService provides secret synchronization between controller and agents.
 service SyncService {
   // WatchSecrets streams secret updates from controller to agents.
-  // Agents subscribe with optional namespace filter and receive all matching secrets.
+  // Agents subscribe with optional namespace filter and receive all matching
+  // secrets.
   rpc WatchSecrets(WatchSecretsRequest) returns (stream SecretEvent);
-  
-  // GetSecrets fetches current secrets (pull model, for initial sync).
-  rpc GetSecrets(GetSecretsRequest) returns (GetSecretsResponse);
-  
-  // StoreHash stores a hash→value mapping (called by webhook).
-  rpc StoreHash(StoreHashRequest) returns (StoreHashResponse);
 }
 
 // WatchSecretsRequest configures the watch stream.
@@ -22,7 +17,7 @@ message WatchSecretsRequest {
   // Optional: only receive secrets for these namespaces.
   // Empty means all namespaces.
   repeated string namespaces = 1;
-  
+
   // Optional: node name for filtering (future use).
   string node_name = 2;
 }
@@ -31,19 +26,19 @@ message WatchSecretsRequest {
 message SecretEvent {
   // Type of event.
   EventType type = 1;
-  
+
   // The hash (kloak:xxx format).
   string hash = 2;
-  
+
   // The secret value (only for ADD/UPDATE).
   string value = 3;
-  
+
   // Allowed hosts for this secret.
   repeated string allowed_hosts = 4;
-  
+
   // Namespace the secret belongs to.
   string namespace = 5;
-  
+
   // Pod ID that owns this secret (if applicable).
   string pod_id = 6;
 }
@@ -55,40 +50,4 @@ enum EventType {
   EVENT_TYPE_DELETE = 3;
   // Full sync - agent should replace all secrets.
   EVENT_TYPE_SYNC = 4;
-}
-
-// GetSecretsRequest requests current secrets.
-message GetSecretsRequest {
-  // Optional namespace filter.
-  repeated string namespaces = 1;
-}
-
-// GetSecretsResponse contains all current secrets.
-message GetSecretsResponse {
-  repeated SecretEntry secrets = 1;
-}
-
-// SecretEntry represents a stored secret.
-message SecretEntry {
-  string hash = 1;
-  string value = 2;
-  repeated string allowed_hosts = 3;
-  string namespace = 4;
-  string pod_id = 5;
-}
-
-// StoreHashRequest stores a new hash→value mapping.
-// Called by webhook when it hashes environment variables.
-message StoreHashRequest {
-  string hash = 1;
-  string value = 2;
-  repeated string allowed_hosts = 3;
-  string pod_id = 4;
-  string namespace = 5;
-}
-
-// StoreHashResponse confirms storage.
-message StoreHashResponse {
-  bool success = 1;
-  string error = 2;
 }

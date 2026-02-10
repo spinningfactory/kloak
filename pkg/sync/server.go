@@ -2,7 +2,6 @@
 package sync
 
 import (
-	"context"
 	"sync"
 
 	"github.com/go-logr/logr"
@@ -106,55 +105,6 @@ func (s *Server) sendInitialSync(stream SyncService_WatchSecretsServer, namespac
 
 	s.log.Info("sent initial sync", "count", len(secrets))
 	return nil
-}
-
-// GetSecrets returns all current secrets (pull model).
-func (s *Server) GetSecrets(ctx context.Context, req *GetSecretsRequest) (*GetSecretsResponse, error) {
-	secrets, err := s.storage.List(ctx)
-	if err != nil {
-		return nil, status.Errorf(codes.Internal, "failed to list secrets: %v", err)
-	}
-
-	resp := &GetSecretsResponse{}
-	for hash, entry := range secrets {
-		resp.Secrets = append(resp.Secrets, &SecretEntry{
-			Hash:         hash,
-			Value:        entry.Value,
-			AllowedHosts: entry.AllowedHosts,
-		})
-	}
-
-	return resp, nil
-}
-
-// StoreHash stores a new hash→value mapping.
-// Called by webhook when it hashes environment variables.
-func (s *Server) StoreHash(ctx context.Context, req *StoreHashRequest) (*StoreHashResponse, error) {
-	entry := storage.Entry{
-		Value:        req.Value,
-		AllowedHosts: req.AllowedHosts,
-	}
-
-	if err := s.storage.Store(ctx, req.PodId, req.Hash, entry); err != nil {
-		return &StoreHashResponse{
-			Success: false,
-			Error:   err.Error(),
-		}, nil
-	}
-
-	s.log.Info("stored hash", "hash", req.Hash, "podID", req.PodId, "hosts", req.AllowedHosts)
-
-	// Notify all subscribers
-	s.broadcast(&SecretEvent{
-		Type:         EventType_EVENT_TYPE_ADD,
-		Hash:         req.Hash,
-		Value:        req.Value,
-		AllowedHosts: req.AllowedHosts,
-		Namespace:    req.Namespace,
-		PodId:        req.PodId,
-	})
-
-	return &StoreHashResponse{Success: true}, nil
 }
 
 // broadcast sends an event to all subscribers.
