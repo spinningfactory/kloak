@@ -18,6 +18,19 @@ spec:
         app.kubernetes.io/component: agent
     spec:
       serviceAccountName: kloak-controller
+      initContainers:
+        - name: wait-for-ca
+          image: bitnami/kubectl:latest
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for CA secret..."
+              until kubectl get secret kloak-ca -n kloak-system 2>/dev/null; do
+                echo "Secret not found, waiting..."
+                sleep 2
+              done
+              echo "CA secret found!"
       containers:
         - name: agent
           image: kloak:latest
