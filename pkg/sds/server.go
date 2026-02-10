@@ -22,20 +22,20 @@ import (
 type Server struct {
 	secret.UnimplementedSecretDiscoveryServiceServer
 
-	caProvider *ca.Provider
-	log        logr.Logger
-	certCache  map[string]*tls.Secret
-	cacheMu    sync.RWMutex
-	certTTL    time.Duration
+	ca        *ca.CA
+	log       logr.Logger
+	certCache map[string]*tls.Secret
+	cacheMu   sync.RWMutex
+	certTTL   time.Duration
 }
 
 // NewServer creates a new SDS server.
-func NewServer(caProvider *ca.Provider, log logr.Logger) *Server {
+func NewServer(caProvider *ca.CA, log logr.Logger) *Server {
 	return &Server{
-		caProvider: caProvider,
-		log:        log,
-		certCache:  make(map[string]*tls.Secret),
-		certTTL:    24 * time.Hour,
+		ca:        caProvider,
+		log:       log,
+		certCache: make(map[string]*tls.Secret),
+		certTTL:   24 * time.Hour,
 	}
 }
 
@@ -188,7 +188,7 @@ func (s *Server) getOrCreateCert(domain string) (*tls.Secret, error) {
 
 	// Generate new certificate
 	s.log.Info("generating certificate", "domain", domain)
-	currentCA := s.caProvider.Get()
+	currentCA := s.ca
 	if currentCA == nil {
 		return nil, fmt.Errorf("CA not loaded")
 	}

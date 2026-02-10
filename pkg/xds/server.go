@@ -49,8 +49,7 @@ func NewServer(rootCA *ca.CA, store storage.Storage, log logr.Logger) *Server {
 	// We need a CA provider here. Since XDS server holds the rootCA, we can make a provider.
 	// ideally the caller should pass the provider.
 	// For now, let's wrap the rootCA in a provider.
-	caProvider := ca.NewProvider(rootCA, log.WithName("ca-provider"))
-	sdsSrv := sds.NewServer(caProvider, log.WithName("sds"))
+	sdsSrv := sds.NewServer(rootCA, log.WithName("sds"))
 
 	// Create ExtProc server
 	extProcSrv := extproc.NewServer(store, log.WithName("extproc"))

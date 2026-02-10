@@ -95,20 +95,6 @@ func (s *Store) GetOrCreate(ctx context.Context) (*CA, error) {
 	return ca, nil
 }
 
-// Get retrieves the CA from Kubernetes. Returns error if it doesn't exist.
-func (s *Store) Get(ctx context.Context) (*CA, error) {
-	secret := &corev1.Secret{}
-	err := s.client.Get(ctx, client.ObjectKey{
-		Namespace: s.namespace,
-		Name:      SecretName,
-	}, secret)
-	if err != nil {
-		return nil, fmt.Errorf("getting secret: %w", err)
-	}
-
-	return loadFromSecret(secret)
-}
-
 // loadFromSecret attempts to load CA from a K8s secret, handling standard and legacy keys.
 func loadFromSecret(secret *corev1.Secret) (*CA, error) {
 	// First try tls.crt/tls.key (standard TLS secret format)
