@@ -91,24 +91,5 @@ func (m *Memory) List(ctx context.Context) (map[string]Entry, error) {
 	return result, nil
 }
 
-// ListByPod returns all hash→Entry mappings for a specific pod.
-func (m *Memory) ListByPod(ctx context.Context, podID string) (map[string]Entry, error) {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
-	hashes, exists := m.podToHashes[podID]
-	if !exists {
-		return map[string]Entry{}, nil
-	}
-
-	result := make(map[string]Entry, len(hashes))
-	for hash := range hashes {
-		if entry, ok := m.hashToEntry[hash]; ok {
-			result[hash] = entry
-		}
-	}
-	return result, nil
-}
-
 // Compile-time check that Memory implements Storage
 var _ Storage = (*Memory)(nil)

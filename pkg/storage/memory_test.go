@@ -94,34 +94,3 @@ func TestMemory_List(t *testing.T) {
 		t.Error("Stored values do not match")
 	}
 }
-
-func TestMemory_ListByPod(t *testing.T) {
-	ctx := context.Background()
-	store := NewMemory()
-
-	store.Store(ctx, "pod-1", "hash-1", Entry{Value: "value1"})
-	store.Store(ctx, "pod-1", "hash-2", Entry{Value: "value2"})
-	store.Store(ctx, "pod-2", "hash-3", Entry{Value: "value3"})
-
-	// ListByPod pod-1 should return 2 items
-	items, err := store.ListByPod(ctx, "pod-1")
-	if err != nil {
-		t.Fatalf("ListByPod failed: %v", err)
-	}
-	if len(items) != 2 {
-		t.Errorf("Expected 2 items for pod-1, got %d", len(items))
-	}
-
-	if items["hash-1"].Value != "value1" {
-		t.Errorf("Expected value1, got %s", items["hash-1"].Value)
-	}
-	if items["hash-2"].Value != "value2" {
-		t.Errorf("Expected value2, got %s", items["hash-2"].Value)
-	}
-
-	// Non-existent pod returns empty map
-	empty, _ := store.ListByPod(ctx, "nonexistent")
-	if len(empty) != 0 {
-		t.Fatal("Expected empty map for non-existent pod")
-	}
-}
