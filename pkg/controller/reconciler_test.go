@@ -5,7 +5,6 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
 )
 
 // MockCgroupManager is a mock implementation for testing.
@@ -75,11 +74,11 @@ func TestHandleDelete(t *testing.T) {
 	mgr := &MockCgroupManager{}
 	r := &Reconciler{
 		CgroupManager: mgr,
-		trackedPods:   make(map[string]uint64),
+		trackedPods:   make(map[string]map[uint64]bool),
 	}
 
-	// Add a tracked pod
-	r.trackedPods["test-pod-uid"] = 12345
+	// Add a tracked pod with multiple container cgroups
+	r.trackedPods["test-pod-uid"] = map[uint64]bool{12345: true, 67890: true}
 
 	// Handle delete
 	_, err := r.handleDelete("test-pod-uid")
@@ -87,9 +86,9 @@ func TestHandleDelete(t *testing.T) {
 		t.Fatalf("handleDelete failed: %v", err)
 	}
 
-	// Verify cgroup was removed
-	if len(mgr.removed) != 1 || mgr.removed[0] != 12345 {
-		t.Errorf("Expected cgroup 12345 to be removed, got %v", mgr.removed)
+	// Verify both cgroups were removed
+	if len(mgr.removed) != 2 {
+		t.Errorf("Expected 2 cgroups to be removed, got %v", mgr.removed)
 	}
 
 	// Verify pod is no longer tracked
@@ -100,35 +99,17 @@ func TestHandleDelete(t *testing.T) {
 
 func TestGetTrackedPodCount(t *testing.T) {
 	r := &Reconciler{
-		trackedPods: make(map[string]uint64),
+		trackedPods: make(map[string]map[uint64]bool),
 	}
 
 	if r.GetTrackedPodCount() != 0 {
 		t.Error("Expected 0 tracked pods initially")
 	}
 
-	r.trackedPods["pod1"] = 111
-	r.trackedPods["pod2"] = 222
+	r.trackedPods["pod1"] = map[uint64]bool{111: true}
+	r.trackedPods["pod2"] = map[uint64]bool{222: true, 333: true}
 
 	if r.GetTrackedPodCount() != 2 {
 		t.Errorf("Expected 2 tracked pods, got %d", r.GetTrackedPodCount())
-	}
-}
-
-func TestFindCgroupPath(t *testing.T) {
-	r := &Reconciler{}
-	pod := &corev1.Pod{
-		ObjectMeta: metav1.ObjectMeta{
-			UID: types.UID("abc-123-def"),
-		},
-	}
-
-	// This test just verifies the function doesn't panic
-	// Actual cgroup paths won't exist in test environment
-	_, err := r.findCgroupPath(pod, "container123")
-	if err == nil {
-		t.Log("Cgroup path found (unexpected in test env, but OK)")
-	} else {
-		t.Log("Cgroup path not found (expected in test env)")
 	}
 }

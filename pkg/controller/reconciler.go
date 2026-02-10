@@ -39,8 +39,8 @@ type Reconciler struct {
 	// NodeName filters pods to only those on this node (empty = all nodes)
 	NodeName string
 
-	// trackedPods maps pod UID -> cgroup ID
-	trackedPods map[string]uint64
+	// trackedPods maps pod UID -> set of cgroup IDs (one per container)
+	trackedPods map[string]map[uint64]bool
 }
 
 // NewReconciler creates a new pod reconciler.
@@ -56,7 +56,7 @@ func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, cgr
 		CgroupManager: cgroupMgr,
 		CgroupRoot:    cgroupRoot,
 		NodeName:      nodeName,
-		trackedPods:   make(map[string]uint64),
+		trackedPods:   make(map[string]map[uint64]bool),
 	}
 }
 
@@ -95,48 +95,61 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	// Get the cgroup ID for this pod
-	cgroupID, err := r.getCgroupID(pod)
+	// Get cgroup IDs for all containers in this pod
+	cgroupIDs, err := r.getContainerCgroupIDs(pod)
 	if err != nil {
 		// This is expected during container startup - will retry on next reconcile
-		log.V(1).Info("cgroup ID not available yet", "reason", err.Error())
+		log.V(1).Info("cgroup IDs not available yet", "reason", err.Error())
 		return ctrl.Result{Requeue: true}, nil // Retry after a bit
 	}
 
-	// Track the pod
-	if existingCgroup, tracked := r.trackedPods[string(pod.UID)]; tracked {
-		if existingCgroup == cgroupID {
-			return ctrl.Result{}, nil // Already tracked
+	// Get existing tracked cgroups for this pod
+	existingCgroups := r.trackedPods[string(pod.UID)]
+	if existingCgroups == nil {
+		existingCgroups = make(map[uint64]bool)
+	}
+
+	// Add new cgroups that aren't already tracked
+	for cgroupID := range cgroupIDs {
+		if !existingCgroups[cgroupID] {
+			if err := r.CgroupManager.AddCgroup(cgroupID); err != nil {
+				log.Error(err, "failed to add cgroup to eBPF map", "cgroupID", cgroupID)
+				continue
+			}
+			existingCgroups[cgroupID] = true
+			log.Info("tracking container cgroup", "cgroupID", cgroupID)
 		}
-		// Cgroup changed (shouldn't happen normally)
-		_ = r.CgroupManager.RemoveCgroup(existingCgroup)
 	}
 
-	// Add to eBPF map
-	if err := r.CgroupManager.AddCgroup(cgroupID); err != nil {
-		log.Error(err, "failed to add cgroup to eBPF map", "cgroupID", cgroupID)
-		return ctrl.Result{}, err
+	// Remove old cgroups that are no longer present (container restarted with new cgroup)
+	for cgroupID := range existingCgroups {
+		if !cgroupIDs[cgroupID] {
+			_ = r.CgroupManager.RemoveCgroup(cgroupID)
+			delete(existingCgroups, cgroupID)
+			log.Info("removed stale cgroup", "cgroupID", cgroupID)
+		}
 	}
 
-	r.trackedPods[string(pod.UID)] = cgroupID
-	log.Info("tracking pod", "cgroupID", cgroupID)
+	r.trackedPods[string(pod.UID)] = existingCgroups
 
 	return ctrl.Result{}, nil
 }
 
 // handleDelete removes a pod from tracking.
 func (r *Reconciler) handleDelete(podKey string) (ctrl.Result, error) {
-	cgroupID, tracked := r.trackedPods[podKey]
+	cgroupIDs, tracked := r.trackedPods[podKey]
 	if !tracked {
 		return ctrl.Result{}, nil
 	}
 
-	if err := r.CgroupManager.RemoveCgroup(cgroupID); err != nil {
-		r.Log.Error(err, "failed to remove cgroup from eBPF map", "cgroupID", cgroupID)
+	for cgroupID := range cgroupIDs {
+		if err := r.CgroupManager.RemoveCgroup(cgroupID); err != nil {
+			r.Log.Error(err, "failed to remove cgroup from eBPF map", "cgroupID", cgroupID)
+		}
 	}
 
 	delete(r.trackedPods, podKey)
-	r.Log.Info("stopped tracking pod", "podKey", podKey, "cgroupID", cgroupID)
+	r.Log.Info("stopped tracking pod", "podKey", podKey, "cgroupCount", len(cgroupIDs))
 
 	return ctrl.Result{}, nil
 }
@@ -149,12 +162,15 @@ func (r *Reconciler) isEnabled(pod *corev1.Pod) bool {
 	return pod.Annotations[AnnotationEnabled] == "true"
 }
 
-// getCgroupID retrieves the cgroup ID for a pod's containers.
-// For cgroups v2, we get the inode number of the cgroup directory.
-// We try to find the POD cgroup (parent of containers) so we can attach before app starts.
-func (r *Reconciler) getCgroupID(pod *corev1.Pod) (uint64, error) {
-	// Helper to check statuses
-	checkStatuses := func(statuses []corev1.ContainerStatus) (uint64, error) {
+// getContainerCgroupIDs retrieves the cgroup IDs for all running containers in a pod.
+// For cgroups v2, we get the inode number of each container's cgroup directory.
+// We track container cgroups (not pod cgroups) because bpf_get_current_cgroup_id()
+// returns the container's .scope cgroup, not the pod's .slice cgroup.
+func (r *Reconciler) getContainerCgroupIDs(pod *corev1.Pod) (map[uint64]bool, error) {
+	cgroupIDs := make(map[uint64]bool)
+
+	// Helper to collect cgroup IDs from container statuses
+	collectFromStatuses := func(statuses []corev1.ContainerStatus) {
 		for _, status := range statuses {
 			if status.ContainerID == "" {
 				continue
@@ -167,30 +183,35 @@ func (r *Reconciler) getCgroupID(pod *corev1.Pod) (uint64, error) {
 			}
 			containerID := parts[1]
 
-			// Get Pod cgroup path using shared logic
-			podCgroupPath, err := cgroups.GetPodCgroupPath(r.CgroupRoot, string(pod.UID), containerID)
+			// Get the container's cgroup path (not the pod's parent cgroup)
+			containerCgroupPath, err := cgroups.FindContainerCgroupPath(r.CgroupRoot, string(pod.UID), containerID)
 			if err != nil {
-				// Fallback: Try container path if pod path fails? (Shouldn't happen if logic is correct)
+				r.Log.V(1).Info("could not find container cgroup", "container", status.Name, "err", err)
 				continue
 			}
 
-			r.Log.Info("Found Pod cgroup via container", "container", status.Name, "podCgroup", podCgroupPath)
-			return cgroups.GetCgroupInodeFromPath(podCgroupPath)
+			cgroupID, err := cgroups.GetCgroupInodeFromPath(containerCgroupPath)
+			if err != nil {
+				r.Log.V(1).Info("could not get cgroup inode", "container", status.Name, "path", containerCgroupPath, "err", err)
+				continue
+			}
+
+			r.Log.Info("Found container cgroup", "container", status.Name, "cgroupPath", containerCgroupPath, "cgroupID", cgroupID)
+			cgroupIDs[cgroupID] = true
 		}
-		return 0, fmt.Errorf("no cgroup found")
 	}
 
-	// Try Init Containers first (they run when Pod is Pending)
-	if id, err := checkStatuses(pod.Status.InitContainerStatuses); err == nil {
-		return id, nil
+	// Collect from app containers (these are the ones that matter for traffic interception)
+	collectFromStatuses(pod.Status.ContainerStatuses)
+
+	// Also collect from init containers if they're still running
+	collectFromStatuses(pod.Status.InitContainerStatuses)
+
+	if len(cgroupIDs) == 0 {
+		return nil, fmt.Errorf("no container cgroups found for pod %s/%s", pod.Namespace, pod.Name)
 	}
 
-	// Try App Containers
-	if id, err := checkStatuses(pod.Status.ContainerStatuses); err == nil {
-		return id, nil
-	}
-
-	return 0, fmt.Errorf("no running container found for pod %s/%s", pod.Namespace, pod.Name)
+	return cgroupIDs, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
