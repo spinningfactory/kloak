@@ -83,9 +83,14 @@ func GenerateCA(commonName string, validFor time.Duration) (*CA, error) {
 	}, nil
 }
 
-// GenerateServerCert creates a certificate for a specific domain, signed by the CA.
+// GenerateServerCert creates a certificate for a specific domain (and optional SANs), signed by the CA.
 // This is used by Envoy to dynamically generate certs for intercepted domains.
-func (ca *CA) GenerateServerCert(domain string, validFor time.Duration) (certPEM, keyPEM []byte, err error) {
+func (ca *CA) GenerateServerCert(dnsNames []string, validFor time.Duration) (certPEM, keyPEM []byte, err error) {
+	if len(dnsNames) == 0 {
+		return nil, nil, fmt.Errorf("at least one DNS name is required")
+	}
+	commonName := dnsNames[0]
+
 	// Generate server private key
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -101,14 +106,14 @@ func (ca *CA) GenerateServerCert(domain string, validFor time.Duration) (certPEM
 	template := &x509.Certificate{
 		SerialNumber: serialNumber,
 		Subject: pkix.Name{
-			CommonName:   domain,
+			CommonName:   commonName,
 			Organization: []string{"Kloak Generated"},
 		},
 		NotBefore:   now,
 		NotAfter:    now.Add(validFor),
 		KeyUsage:    x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
 		ExtKeyUsage: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		DNSNames:    []string{domain},
+		DNSNames:    dnsNames,
 	}
 
 	// Sign with CA

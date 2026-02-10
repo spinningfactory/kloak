@@ -35,16 +35,16 @@ func TestGenerateServerCert(t *testing.T) {
 		t.Fatalf("GenerateCA failed: %v", err)
 	}
 
-	certPEM, keyPEM, err := ca.GenerateServerCert("example.com", 1*time.Hour)
+	serverCert, serverKey, err := ca.GenerateServerCert([]string{"example.com"}, 24*time.Hour)
 	if err != nil {
 		t.Fatalf("GenerateServerCert failed: %v", err)
 	}
 
-	if len(certPEM) == 0 {
+	if len(serverCert) == 0 {
 		t.Error("Server certPEM should not be empty")
 	}
 
-	if len(keyPEM) == 0 {
+	if len(serverKey) == 0 {
 		t.Error("Server keyPEM should not be empty")
 	}
 }
@@ -68,7 +68,7 @@ func TestLoadCA(t *testing.T) {
 	}
 
 	// Verify we can sign certs with loaded CA
-	_, _, err = loaded.GenerateServerCert("test.com", 1*time.Hour)
+	_, _, err = loaded.GenerateServerCert([]string{"test.com"}, time.Hour)
 	if err != nil {
 		t.Fatalf("Failed to sign with loaded CA: %v", err)
 	}

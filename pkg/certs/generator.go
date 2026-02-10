@@ -3,17 +3,12 @@ package certs
 
 import (
 	"context"
-	"crypto/rand"
-	"crypto/rsa"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/base64"
-	"encoding/pem"
 	"fmt"
-	"math/big"
 	"time"
 
 	"github.com/go-logr/logr"
+	"github.com/spinningfactory/kloak/pkg/ca"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,89 +25,20 @@ const (
 	WebhookSecretName = "kloak-webhook-certs"
 	// WebhookConfigName is the name of the MutatingWebhookConfiguration
 	WebhookConfigName = "kloak-mutating-webhook"
-
-	// Certificate validity
-	caValidityYears      = 10
-	webhookValidityYears = 1
 )
 
-// CertPair holds a certificate and private key in PEM format
-type CertPair struct {
-	Cert []byte
-	Key  []byte
-}
-
-// GenerateCA creates a new CA certificate and key
-func GenerateCA() (*CertPair, error) {
-	// Generate private key
-	privateKey, err := rsa.GenerateKey(rand.Reader, 4096)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate CA private key: %w", err)
-	}
-
-	// Create certificate template
-	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate serial number: %w", err)
-	}
-
-	template := x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			CommonName: "Kloak Root CA",
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().AddDate(caValidityYears, 0, 0),
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageCRLSign,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-		MaxPathLen:            1,
-	}
-
-	// Self-sign the certificate
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, &template, &privateKey.PublicKey, privateKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create CA certificate: %w", err)
-	}
-
-	// Encode to PEM
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
-
-	return &CertPair{Cert: certPEM, Key: keyPEM}, nil
+// GenerateCA creates a new CA certificate and key using pkg/ca
+func GenerateCA() (*ca.CA, error) {
+	// 10 years validity for CA
+	return ca.GenerateCA("Kloak Root CA", 10*365*24*time.Hour)
 }
 
 // GenerateWebhookCert creates a webhook TLS certificate signed by the CA
-func GenerateWebhookCert(caCert, caKey []byte, namespace string) (*CertPair, error) {
-	// Parse CA certificate and key
-	caBlock, _ := pem.Decode(caCert)
-	if caBlock == nil {
-		return nil, fmt.Errorf("failed to decode CA certificate PEM")
-	}
-	ca, err := x509.ParseCertificate(caBlock.Bytes)
+func GenerateWebhookCert(caCert, caKey []byte, namespace string) ([]byte, []byte, error) {
+	// Load CA
+	rootCA, err := ca.LoadCA(caCert, caKey)
 	if err != nil {
-		return nil, fmt.Errorf("failed to parse CA certificate: %w", err)
-	}
-
-	keyBlock, _ := pem.Decode(caKey)
-	if keyBlock == nil {
-		return nil, fmt.Errorf("failed to decode CA key PEM")
-	}
-	caPrivateKey, err := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse CA private key: %w", err)
-	}
-
-	// Generate webhook private key
-	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate webhook private key: %w", err)
-	}
-
-	// Create certificate template
-	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate serial number: %w", err)
+		return nil, nil, fmt.Errorf("failed to load CA: %w", err)
 	}
 
 	dnsNames := []string{
@@ -123,30 +49,8 @@ func GenerateWebhookCert(caCert, caKey []byte, namespace string) (*CertPair, err
 		"localhost",
 	}
 
-	template := x509.Certificate{
-		SerialNumber: serialNumber,
-		Subject: pkix.Name{
-			CommonName: fmt.Sprintf("kloak-webhook.%s.svc", namespace),
-		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().AddDate(webhookValidityYears, 0, 0),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-		BasicConstraintsValid: true,
-		DNSNames:              dnsNames,
-	}
-
-	// Sign with CA
-	certDER, err := x509.CreateCertificate(rand.Reader, &template, ca, &privateKey.PublicKey, caPrivateKey)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create webhook certificate: %w", err)
-	}
-
-	// Encode to PEM
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: certDER})
-	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "RSA PRIVATE KEY", Bytes: x509.MarshalPKCS1PrivateKey(privateKey)})
-
-	return &CertPair{Cert: certPEM, Key: keyPEM}, nil
+	// 1 year validity for webhook cert
+	return rootCA.GenerateServerCert(dnsNames, 365*24*time.Hour)
 }
 
 // EnsureCerts ensures CA and webhook certificates exist, creating them if needed.
@@ -164,12 +68,12 @@ func EnsureCerts(ctx context.Context, c client.Client, namespace string, log log
 
 		// Generate new CA
 		log.Info("Generating new CA certificate")
-		ca, err := GenerateCA()
+		rootCA, err := GenerateCA()
 		if err != nil {
 			return nil, err
 		}
-		caCert = ca.Cert
-		caKey = ca.Key
+		caCert = rootCA.CertPEM
+		caKey = rootCA.KeyPEM
 
 		// Create CA secret
 		caSecret = &corev1.Secret{
@@ -207,7 +111,8 @@ func EnsureCerts(ctx context.Context, c client.Client, namespace string, log log
 
 		// Generate webhook cert signed by CA
 		log.Info("Generating webhook certificate")
-		webhookCert, err := GenerateWebhookCert(caCert, caKey, namespace)
+		log.Info("Generating webhook certificate")
+		certPEM, keyPEM, err := GenerateWebhookCert(caCert, caKey, namespace)
 		if err != nil {
 			return nil, err
 		}
@@ -224,8 +129,8 @@ func EnsureCerts(ctx context.Context, c client.Client, namespace string, log log
 			},
 			Type: corev1.SecretTypeTLS,
 			Data: map[string][]byte{
-				corev1.TLSCertKey:       webhookCert.Cert,
-				corev1.TLSPrivateKeyKey: webhookCert.Key,
+				corev1.TLSCertKey:       certPEM,
+				corev1.TLSPrivateKeyKey: keyPEM,
 			},
 		}
 		if err := c.Create(ctx, webhookSecret); err != nil {

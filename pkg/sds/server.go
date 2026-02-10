@@ -188,7 +188,7 @@ func (s *Server) getOrCreateCert(domain string) (*tls.Secret, error) {
 
 	// Generate new certificate
 	s.log.Info("generating certificate", "domain", domain)
-	certPEM, keyPEM, err := s.ca.GenerateServerCert(domain, s.certTTL)
+	certPEM, keyPEM, err := s.ca.GenerateServerCert([]string{domain}, 24*time.Hour)
 	if err != nil {
 		s.log.Error(err, "failed to generate certificate", "domain", domain)
 		return nil, err
