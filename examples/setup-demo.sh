@@ -194,7 +194,8 @@ deploy_demo() {
     echo ""
     echo "Deploying demo application to $DEMO_NAMESPACE..."
     
-    # Delete any existing demo pod first
+    # Delete any existing demo deployment/pod first
+    kubectl delete deployment demo-python -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
     kubectl delete pod demo-python -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
     
     # Create SECRET 1: Allowed for httpbin.org
@@ -216,29 +217,29 @@ deploy_demo() {
     # Wait a moment for cleanup
     sleep 2
     
-    # Apply the demo pod (webhook should inject sidecar)
-    kubectl apply -f "$SCRIPT_DIR/demo-python/pod.yaml" -n "$DEMO_NAMESPACE"
+    # Apply the demo deployment (webhook should inject sidecar)
+    kubectl apply -f "$SCRIPT_DIR/demo-python/deployment.yaml" -n "$DEMO_NAMESPACE"
     
     echo "✓ Demo application deployed"
 }
 
-# Wait for demo pod
+# Wait for demo deployment
 wait_for_demo() {
     export KUBECONFIG="$KUBECONFIG_PATH"
     echo ""
-    echo "Waiting for demo pod to be ready..."
+    echo "Waiting for demo deployment to be ready..."
     
-    kubectl wait --for=condition=Ready pod/demo-python -n "$DEMO_NAMESPACE" --timeout=120s || {
-        echo "Warning: Demo pod may not be ready"
+    kubectl rollout status deployment/demo-python -n "$DEMO_NAMESPACE" --timeout=120s || {
+        echo "Warning: Demo deployment may not be ready"
     }
     
     echo ""
-    echo "Demo pod status:"
-    kubectl get pod demo-python -n "$DEMO_NAMESPACE" -o wide
+    echo "Demo pods status:"
+    kubectl get pods -l app=demo-python -n "$DEMO_NAMESPACE" -o wide
     
     echo ""
     echo "Containers in demo pod:"
-    kubectl get pod demo-python -n "$DEMO_NAMESPACE" -o jsonpath='{.spec.containers[*].name}' && echo ""
+    kubectl get pods -l app=demo-python -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' && echo ""
 }
 
 # Verify sidecar injection
@@ -247,7 +248,7 @@ verify_injection() {
     echo ""
     echo "Verifying sidecar injection..."
     
-    CONTAINERS=$(kubectl get pod demo-python -n "$DEMO_NAMESPACE" -o jsonpath='{.spec.containers[*].name}' 2>/dev/null || echo "")
+    CONTAINERS=$(kubectl get pods -l app=demo-python -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null || echo "")
     
     if echo "$CONTAINERS" | grep -q "envoy-sidecar"; then
         echo "✓ Envoy sidecar successfully injected!"
@@ -279,15 +280,15 @@ show_summary() {
     echo ""
     echo "Commands:"
     echo "  Use kubectl:         export KUBECONFIG=$KUBECONFIG_PATH"
-    echo "  View demo logs:      kubectl logs -f demo-python -n $DEMO_NAMESPACE -c demo-app"
-    echo "  View sidecar logs:   kubectl logs -f demo-python -n $DEMO_NAMESPACE -c envoy-sidecar"
+    echo "  View demo logs:      kubectl logs -f -l app=demo-python -n $DEMO_NAMESPACE -c demo-app"
+    echo "  View sidecar logs:   kubectl logs -f -l app=demo-python -n $DEMO_NAMESPACE -c envoy-sidecar"
     echo "  View webhook logs:   kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook"
     echo "  View controller logs: kubectl logs -n kloak-system -l app.kubernetes.io/component=controller"
     echo ""
     echo "Verification:"
-    echo "  1. Check demo logs:  kubectl logs demo-python -n $DEMO_NAMESPACE -c demo-app | head -30"
+    echo "  1. Check demo logs:  kubectl logs -l app=demo-python -n $DEMO_NAMESPACE -c demo-app | head -30"
     echo "     (Should show 'kloak:...' UUIDs for both secrets)"
-    echo "  2. Check response:   kubectl logs demo-python -n $DEMO_NAMESPACE -c demo-app | grep -A20 'Response headers'"
+    echo "  2. Check response:   kubectl logs -l app=demo-python -n $DEMO_NAMESPACE -c demo-app | grep -A20 'Response headers'"
     echo "     X-Secret-Allowed: Should show 'REAL-ALLOWED-KEY-12345' (replaced)"
     echo "     X-Secret-Blocked: Should show 'kloak:...' UUID (NOT replaced - wrong host)"
     echo ""
