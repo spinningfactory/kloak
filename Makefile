@@ -17,7 +17,7 @@ WEBHOOK_BINARY=kloak-webhook
 # Build directories
 BUILD_DIR=bin
 CMD_DIR=cmd
-BPF_DIR=bpf
+BPF_DIR=pkg/ebpf
 EBPF_PKG=pkg/ebpf
 
 # Source files

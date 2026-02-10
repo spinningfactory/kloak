@@ -40,7 +40,6 @@ spec:
           command: ["/kloak", "webhook"]
           args:
             - --cert-dir=/certs
-            - --hash-envs=API_KEY,SECRET_KEY,PASSWORD,TOKEN,OPENAI_API_KEY
           ports:
             - name: webhook
               containerPort: 9443

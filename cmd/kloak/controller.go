@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
+	"github.com/spinningfactory/kloak/pkg/ebpf"
 	"google.golang.org/grpc"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -131,10 +132,10 @@ func runController(cmd *cobra.Command, args []string) {
 
 	// Create cgroup manager
 	var cgroupMgr controller.CgroupManager
-	var ebpfMgr *EBPFCgroupManager
+	var ebpfMgr *ebpf.EBPFCgroupManager
 
 	if enableEBPF {
-		ebpfMgr, err = NewEBPFCgroupManager(cgroupPath)
+		ebpfMgr, err = ebpf.NewEBPFCgroupManager(cgroupPath)
 		if err != nil {
 			setupLog.Error(err, "failed to initialize eBPF, falling back to mock")
 			cgroupMgr = &MockCgroupManager{}
