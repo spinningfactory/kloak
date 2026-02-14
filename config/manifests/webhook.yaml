@@ -23,12 +23,17 @@ spec:
       initContainers:
         - name: wait-for-certs
           image: bitnami/kubectl:latest
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           command:
             - sh
             - -c
             - |
               echo "Waiting for webhook TLS certificate secret..."
-              until kubectl get secret kloak-webhook-certs -n kloak-system 2>/dev/null; do
+              until kubectl get secret kloak-webhook-certs -n "$POD_NAMESPACE" 2>/dev/null; do
                 echo "Secret not found, waiting..."
                 sleep 2
               done

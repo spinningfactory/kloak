@@ -1,0 +1,33 @@
+# Kloak K3s Overlay
+# Overrides CNI host paths for K3s distributions where the default
+# /opt/cni/bin and /etc/cni/net.d are not used.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../manifests
+
+patches:
+  # Override CNI host paths for K3s
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/volumes/0/hostPath/path
+        value: /var/lib/rancher/k3s/data/cni
+      - op: replace
+        path: /spec/template/spec/volumes/1/hostPath/path
+        value: /var/lib/rancher/k3s/agent/etc/cni/net.d
+    target:
+      kind: DaemonSet
+      name: kloak-cni-install
+
+# Local images (override in production with registry-qualified names)
+images:
+  - name: kloak
+    newName: kloak
+    newTag: latest
+  - name: bitnami/kubectl
+    newName: bitnami/kubectl
+    newTag: latest
+  - name: kloak-cni
+    newName: kloak-cni
+    newTag: latest

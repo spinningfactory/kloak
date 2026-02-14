@@ -18,8 +18,14 @@ patches:
       kind: DaemonSet
       name: kloak-controller
 
-# Use local image
+# Use local images
 images:
   - name: kloak
     newName: kloak
+    newTag: latest
+  - name: bitnami/kubectl
+    newName: bitnami/kubectl
+    newTag: latest
+  - name: kloak-cni
+    newName: kloak-cni
     newTag: latest

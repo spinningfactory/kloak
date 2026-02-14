@@ -1,4 +1,9 @@
 # Kloak Operator - Base Kustomization
+#
+# Configurable values for overlays:
+#   - namespace: default is kloak-system (override with kustomize namespace transformer)
+#   - images: kloak, bitnami/kubectl (init containers), kloak-cni (CNI installer)
+#   - CNI host paths: default /opt/cni/bin and /etc/cni/net.d (patch cni-install DaemonSet volumes for K3s etc.)
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
@@ -9,6 +14,7 @@ resources:
   - controller.yaml
   - webhook.yaml
   - agent.yaml
+  - cni-install.yaml
 
 # Common labels for all resources
 labels:
@@ -21,4 +27,10 @@ labels:
 images:
   - name: kloak
     newName: kloak
+    newTag: latest
+  - name: bitnami/kubectl
+    newName: bitnami/kubectl
+    newTag: latest
+  - name: kloak-cni
+    newName: kloak-cni
     newTag: latest

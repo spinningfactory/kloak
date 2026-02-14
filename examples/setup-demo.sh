@@ -135,11 +135,8 @@ deploy_kloak() {
     echo ""
     echo "Deploying Kloak using operator config (auto-cert mode)..."
     
-    # Apply base operator config (creates namespace, RBAC, deployments, services)
-    kubectl apply -k "$ROOT_DIR/config/manifests"
-
-    # Apply CNI Installer
-    kubectl apply -f "$ROOT_DIR/config/cni/cni-install.yaml"
+    # Apply K3s overlay (base manifests + K3s CNI paths)
+    kubectl apply -k "$ROOT_DIR/config/overlays/k3s"
     
     # Wait for namespace to be ready
     kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/kloak-system --timeout=30s

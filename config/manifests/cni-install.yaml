@@ -45,10 +45,10 @@ spec:
       volumes:
       - name: cni-bin
         hostPath:
-          path: /var/lib/rancher/k3s/data/cni
+          path: /opt/cni/bin
       - name: cni-net
         hostPath:
-          path: /var/lib/rancher/k3s/agent/etc/cni/net.d
+          path: /etc/cni/net.d
       - name: kloak-cni-conf
         configMap:
           name: kloak-cni-config

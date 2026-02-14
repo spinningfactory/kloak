@@ -33,8 +33,14 @@ patches:
       kind: DaemonSet
       name: kloak-controller
 
-# Production image from registry
+# Production images from registry
 images:
   - name: kloak
     newName: ghcr.io/your-org/kloak
+    newTag: v1.0.0
+  - name: bitnami/kubectl
+    newName: bitnami/kubectl
+    newTag: latest
+  - name: kloak-cni
+    newName: ghcr.io/your-org/kloak-cni
     newTag: v1.0.0

@@ -21,12 +21,17 @@ spec:
       initContainers:
         - name: wait-for-ca
           image: bitnami/kubectl:latest
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           command:
             - sh
             - -c
             - |
               echo "Waiting for CA secret..."
-              until kubectl get secret kloak-ca -n kloak-system 2>/dev/null; do
+              until kubectl get secret kloak-ca -n "$POD_NAMESPACE" 2>/dev/null; do
                 echo "Secret not found, waiting..."
                 sleep 2
               done
@@ -38,7 +43,12 @@ spec:
           command: ["/kloak", "agent"]
           args:
             - --xds-addr=:15002
-            - --controller-addr=kloak-controller.kloak-system.svc:9090
+            - --controller-addr=kloak-controller.$(POD_NAMESPACE).svc:9090
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: grpc-xds
               containerPort: 15002
