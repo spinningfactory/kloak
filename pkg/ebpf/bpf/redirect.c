@@ -126,11 +126,13 @@ int cgroup_connect6(struct bpf_sock_addr *ctx) {
   };
   bpf_map_update_elem(&original_dst, &cookie, &dst, BPF_ANY);
 
-  // Redirect to IPv6 localhost (::1)
+  // Redirect to IPv4-mapped localhost (::ffff:127.0.0.1) so the kernel
+  // routes to 127.0.0.1 where Envoy listens on 0.0.0.0:15001.
+  // Using ::1 would fail because Envoy only binds IPv4.
   ctx->user_ip6[0] = 0;
   ctx->user_ip6[1] = 0;
-  ctx->user_ip6[2] = 0;
-  ctx->user_ip6[3] = bpf_htonl(1);
+  ctx->user_ip6[2] = bpf_htonl(0x0000FFFF);
+  ctx->user_ip6[3] = bpf_htonl(0x7F000001);
   ctx->user_port = bpf_htons(ENVOY_PORT);
 
   return 1;

@@ -2,6 +2,7 @@ package webhook
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -207,47 +208,79 @@ func TestGetCA(t *testing.T) {
 }
 
 func TestInjectInitContainer(t *testing.T) {
-	h := &Handler{}
-	pod := &corev1.Pod{}
-	caCert := "FAKE-CA-CERT"
+	t.Run("non-java pod uses busybox", func(t *testing.T) {
+		h := &Handler{}
+		pod := &corev1.Pod{}
+		caCert := "FAKE-CA-CERT"
 
-	h.injectInitContainer(pod, caCert)
+		h.injectInitContainer(pod, caCert, false)
 
-	// Check Init Container
-	if len(pod.Spec.InitContainers) != 1 {
-		t.Fatalf("Expected 1 init container, got %d", len(pod.Spec.InitContainers))
-	}
-	initContainer := pod.Spec.InitContainers[0]
-	if initContainer.Name != "kloak-init" {
-		t.Errorf("Expected init container name 'kloak-init', got '%s'", initContainer.Name)
-	}
-	if initContainer.Image != "busybox:1.36" {
-		t.Errorf("Expected image 'busybox:1.36', got '%s'", initContainer.Image)
-	}
-
-	// Check Env Vars
-	foundCA := false
-	foundConfig := false
-	for _, env := range initContainer.Env {
-		if env.Name == "CA_PEM" && env.Value == "FAKE-CA-CERT" {
-			foundCA = true
+		if len(pod.Spec.InitContainers) != 1 {
+			t.Fatalf("Expected 1 init container, got %d", len(pod.Spec.InitContainers))
 		}
-		if env.Name == "ENVOY_CONFIG" && env.Value != "" {
-			foundConfig = true
+		initContainer := pod.Spec.InitContainers[0]
+		if initContainer.Name != "kloak-init" {
+			t.Errorf("Expected init container name 'kloak-init', got '%s'", initContainer.Name)
 		}
-	}
-	if !foundCA {
-		t.Error("Init container missing/incorrect CA_PEM env var")
-	}
-	if !foundConfig {
-		t.Error("Init container missing ENVOY_CONFIG env var")
-	}
+		if initContainer.Image != "busybox:1.36" {
+			t.Errorf("Expected image 'busybox:1.36', got '%s'", initContainer.Image)
+		}
 
-	// Check Volumes
-	if len(pod.Spec.Volumes) != 2 {
-		t.Errorf("Expected 2 volumes, got %d", len(pod.Spec.Volumes))
-	}
+		// Command should NOT contain keytool
+		cmd := initContainer.Command[2]
+		if strings.Contains(cmd, "keytool") {
+			t.Error("Non-Java init container should not contain keytool command")
+		}
+
+		// Check Env Vars
+		foundCA := false
+		foundConfig := false
+		for _, env := range initContainer.Env {
+			if env.Name == "CA_PEM" && env.Value == "FAKE-CA-CERT" {
+				foundCA = true
+			}
+			if env.Name == "ENVOY_CONFIG" && env.Value != "" {
+				foundConfig = true
+			}
+		}
+		if !foundCA {
+			t.Error("Init container missing/incorrect CA_PEM env var")
+		}
+		if !foundConfig {
+			t.Error("Init container missing ENVOY_CONFIG env var")
+		}
+
+		if len(pod.Spec.Volumes) != 2 {
+			t.Errorf("Expected 2 volumes, got %d", len(pod.Spec.Volumes))
+		}
+	})
+
+	t.Run("java pod uses temurin with keytool", func(t *testing.T) {
+		h := &Handler{}
+		pod := &corev1.Pod{}
+		caCert := "FAKE-CA-CERT"
+
+		h.injectInitContainer(pod, caCert, true)
+
+		if len(pod.Spec.InitContainers) != 1 {
+			t.Fatalf("Expected 1 init container, got %d", len(pod.Spec.InitContainers))
+		}
+		initContainer := pod.Spec.InitContainers[0]
+		if initContainer.Image != JavaInitContainerImage {
+			t.Errorf("Expected image '%s', got '%s'", JavaInitContainerImage, initContainer.Image)
+		}
+
+		// Command should contain keytool
+		cmd := initContainer.Command[2]
+		if !strings.Contains(cmd, "keytool") {
+			t.Error("Java init container should contain keytool command")
+		}
+		if !strings.Contains(cmd, "truststore.jks") {
+			t.Error("Java init container should reference truststore.jks")
+		}
+	})
 }
+
 
 func TestInjectEnvoySidecar(t *testing.T) {
 	h := &Handler{}
@@ -285,40 +318,81 @@ func TestInjectEnvoySidecar(t *testing.T) {
 }
 
 func TestMountCAVolume(t *testing.T) {
-	h := &Handler{}
-	pod := &corev1.Pod{
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{Name: "app", Image: "myapp:latest"},
+	t.Run("non-java pod gets SSL_CERT_FILE and NODE_EXTRA_CA_CERTS only", func(t *testing.T) {
+		h := &Handler{}
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "app", Image: "myapp:latest"},
+				},
 			},
-		},
-	}
+		}
 
-	h.mountCAVolume(pod)
+		h.mountCAVolume(pod, false)
 
-	// Check mount was added to app container
-	if len(pod.Spec.Containers[0].VolumeMounts) != 1 {
-		t.Fatalf("Expected 1 volume mount, got %d", len(pod.Spec.Containers[0].VolumeMounts))
-	}
+		// Check mount was added to app container
+		if len(pod.Spec.Containers[0].VolumeMounts) != 1 {
+			t.Fatalf("Expected 1 volume mount, got %d", len(pod.Spec.Containers[0].VolumeMounts))
+		}
 
-	mount := pod.Spec.Containers[0].VolumeMounts[0]
-	if mount.Name != "kloak-ca-vol" {
-		t.Errorf("Expected volume name 'kloak-ca-vol', got '%s'", mount.Name)
-	}
-	if mount.MountPath != "/etc/kloak-ca" {
-		t.Errorf("Expected mount path '/etc/kloak-ca', got '%s'", mount.MountPath)
-	}
+		mount := pod.Spec.Containers[0].VolumeMounts[0]
+		if mount.Name != "kloak-ca-vol" {
+			t.Errorf("Expected volume name 'kloak-ca-vol', got '%s'", mount.Name)
+		}
+		if mount.MountPath != "/etc/kloak-ca" {
+			t.Errorf("Expected mount path '/etc/kloak-ca', got '%s'", mount.MountPath)
+		}
 
-	// Check SSL_CERT_FILE env var was added
-	if len(pod.Spec.Containers[0].Env) != 1 {
-		t.Fatalf("Expected 1 env var, got %d", len(pod.Spec.Containers[0].Env))
-	}
-	if pod.Spec.Containers[0].Env[0].Name != "SSL_CERT_FILE" {
-		t.Errorf("Expected env var 'SSL_CERT_FILE', got '%s'", pod.Spec.Containers[0].Env[0].Name)
-	}
-	if pod.Spec.Containers[0].Env[0].Value != "/etc/kloak-ca/ca.crt" {
-		t.Errorf("Expected SSL_CERT_FILE='/etc/kloak-ca/ca.crt', got '%s'", pod.Spec.Containers[0].Env[0].Value)
-	}
+		// Check CA cert env vars were added (no JAVA_TOOL_OPTIONS)
+		if len(pod.Spec.Containers[0].Env) != 2 {
+			t.Fatalf("Expected 2 env vars, got %d", len(pod.Spec.Containers[0].Env))
+		}
+		if pod.Spec.Containers[0].Env[0].Name != "SSL_CERT_FILE" {
+			t.Errorf("Expected env var 'SSL_CERT_FILE', got '%s'", pod.Spec.Containers[0].Env[0].Name)
+		}
+		if pod.Spec.Containers[0].Env[1].Name != "NODE_EXTRA_CA_CERTS" {
+			t.Errorf("Expected env var 'NODE_EXTRA_CA_CERTS', got '%s'", pod.Spec.Containers[0].Env[1].Name)
+		}
+
+		// Ensure no JAVA_TOOL_OPTIONS
+		for _, env := range pod.Spec.Containers[0].Env {
+			if env.Name == "JAVA_TOOL_OPTIONS" {
+				t.Error("Non-Java pod should not have JAVA_TOOL_OPTIONS")
+			}
+		}
+	})
+
+	t.Run("java pod gets JAVA_TOOL_OPTIONS", func(t *testing.T) {
+		h := &Handler{}
+		pod := &corev1.Pod{
+			Spec: corev1.PodSpec{
+				Containers: []corev1.Container{
+					{Name: "app", Image: "myapp:latest"},
+				},
+			},
+		}
+
+		h.mountCAVolume(pod, true)
+
+		// Check env vars: SSL_CERT_FILE, NODE_EXTRA_CA_CERTS, JAVA_TOOL_OPTIONS
+		if len(pod.Spec.Containers[0].Env) != 3 {
+			t.Fatalf("Expected 3 env vars, got %d", len(pod.Spec.Containers[0].Env))
+		}
+
+		javaEnv := pod.Spec.Containers[0].Env[2]
+		if javaEnv.Name != "JAVA_TOOL_OPTIONS" {
+			t.Errorf("Expected env var 'JAVA_TOOL_OPTIONS', got '%s'", javaEnv.Name)
+		}
+		if !strings.Contains(javaEnv.Value, "trustStore=/etc/kloak-ca/truststore.jks") {
+			t.Errorf("JAVA_TOOL_OPTIONS should reference truststore.jks, got '%s'", javaEnv.Value)
+		}
+		if !strings.Contains(javaEnv.Value, "trustStorePassword=changeit") {
+			t.Errorf("JAVA_TOOL_OPTIONS should contain trustStorePassword, got '%s'", javaEnv.Value)
+		}
+		if !strings.Contains(javaEnv.Value, "preferIPv4Stack=true") {
+			t.Errorf("JAVA_TOOL_OPTIONS should contain preferIPv4Stack, got '%s'", javaEnv.Value)
+		}
+	})
 }
 
 func TestRewriteSecretVolumes(t *testing.T) {
@@ -398,5 +472,155 @@ func TestRewriteSecretVolumes(t *testing.T) {
 	// Verify "other-secret" stayed same
 	if pod.Spec.Volumes[1].Secret.SecretName != "other-secret" {
 		t.Errorf("Expected other-secret, got %s", pod.Spec.Volumes[1].Secret.SecretName)
+	}
+}
+
+func TestNeedsJavaTruststore(t *testing.T) {
+	tests := []struct {
+		name     string
+		pod      *corev1.Pod
+		expected bool
+	}{
+		{
+			name: "annotation override: java",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						AnnotationRuntime: "java",
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "myapp:latest"},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "annotation override: non-java",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						AnnotationRuntime: "python",
+					},
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "eclipse-temurin:21-jre-alpine"},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "image heuristic: temurin",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "eclipse-temurin:21-jre-alpine"},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "image heuristic: openjdk",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "openjdk:17-slim"},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "image heuristic: corretto",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "amazoncorretto:21"},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "image heuristic: spring-boot",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "myorg/spring-boot-app:v1"},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "image heuristic: quarkus",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "quarkus/my-service:latest"},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "no match: python",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "python:3.12-slim"},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "no match: node",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "node:22-alpine"},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "no annotations no match",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "app", Image: "myapp:latest"},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "mixed containers - one java match",
+			pod: &corev1.Pod{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{Name: "sidecar", Image: "nginx:latest"},
+						{Name: "app", Image: "eclipse-temurin:21-jre-alpine"},
+					},
+				},
+			},
+			expected: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			result := needsJavaTruststore(tc.pod)
+			if result != tc.expected {
+				t.Errorf("needsJavaTruststore() = %v, want %v", result, tc.expected)
+			}
+		})
 	}
 }

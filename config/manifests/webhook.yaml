@@ -110,8 +110,7 @@ webhooks:
         namespace: kloak-system
         name: kloak-webhook
         path: /mutate-pods
-      # CA bundle injected by cert-manager or manually
-      caBundle: ""
+      # caBundle is patched automatically by the controller on startup
     rules:
       - operations: ["CREATE"]
         apiGroups: [""]

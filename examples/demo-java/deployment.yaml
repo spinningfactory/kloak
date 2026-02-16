@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-java
+  labels:
+    app: demo-java
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-java
+  template:
+    metadata:
+      labels:
+        app: demo-java
+      annotations:
+        getkloak.io/enabled: "true"
+    spec:
+      containers:
+        - name: demo-app
+          image: kloak-demo-java:latest
+          imagePullPolicy: Never
+          env:
+            - name: SECRET_ALLOWED_FILE
+              value: "/etc/secrets/allowed/api-key"
+            - name: SECRET_BLOCKED_FILE
+              value: "/etc/secrets/blocked/api-key"
+            - name: TARGET_URL
+              value: "https://httpbin.org/headers"
+            - name: REQUEST_INTERVAL
+              value: "5"
+          volumeMounts:
+            - name: secret-allowed-vol
+              mountPath: "/etc/secrets/allowed"
+              readOnly: true
+            - name: secret-blocked-vol
+              mountPath: "/etc/secrets/blocked"
+              readOnly: true
+      volumes:
+        - name: secret-allowed-vol
+          secret:
+            secretName: secret-allowed
+        - name: secret-blocked-vol
+          secret:
+            secretName: secret-blocked

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -40,6 +41,18 @@ const (
 
 	// InitContainerImage is the image used for the init container.
 	InitContainerImage = "busybox:1.36"
+
+	// JavaInitContainerImage is the image used for the init container when Java is detected.
+	JavaInitContainerImage = "eclipse-temurin:21-jre-alpine"
+
+	// JavaTruststoreFile is the filename for the Java truststore.
+	JavaTruststoreFile = "truststore.jks"
+
+	// JavaTruststorePassword is the default password for the Java truststore.
+	JavaTruststorePassword = "changeit"
+
+	// AnnotationRuntime is the annotation to override runtime detection.
+	AnnotationRuntime = "getkloak.io/runtime"
 )
 
 // Handler handles pod mutation requests.
@@ -98,14 +111,17 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
+	// Detect Java runtime for truststore handling
+	isJava := needsJavaTruststore(mutatedPod)
+
 	// 1. Inject Init Container (sets up CA and Envoy config)
-	h.injectInitContainer(mutatedPod, caCert)
+	h.injectInitContainer(mutatedPod, caCert, isJava)
 
 	// 2. Inject Envoy sidecar
 	h.injectEnvoySidecar(mutatedPod)
 
 	// 3. Mount Root CA volume to application containers
-	h.mountCAVolume(mutatedPod)
+	h.mountCAVolume(mutatedPod, isJava)
 
 	// 4. Rewrite Secret volumes (swap with shadow secrets)
 	if err := h.rewriteSecretVolumes(ctx, mutatedPod, req.Namespace); err != nil {
@@ -229,8 +245,37 @@ func (h *Handler) getCA(ctx context.Context) (string, error) {
 	return "", fmt.Errorf("CA secret missing certificate key")
 }
 
+// javaImagePatterns are substrings that indicate a Java-based container image.
+var javaImagePatterns = []string{
+	"java", "jdk", "jre", "temurin", "openjdk", "corretto",
+	"spring-boot", "quarkus", "graalvm",
+}
+
+// needsJavaTruststore returns true if the pod requires Java truststore setup.
+// It checks for an explicit annotation override first, then scans container images
+// for known Java-related patterns.
+func needsJavaTruststore(pod *corev1.Pod) bool {
+	// Check annotation override
+	if pod.Annotations != nil {
+		if val, ok := pod.Annotations[AnnotationRuntime]; ok {
+			return val == "java"
+		}
+	}
+
+	// Scan container images for Java patterns
+	for _, c := range pod.Spec.Containers {
+		image := strings.ToLower(c.Image)
+		for _, pattern := range javaImagePatterns {
+			if strings.Contains(image, pattern) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // injectInitContainer injects the Kloak init container which sets up CA and Envoy config.
-func (h *Handler) injectInitContainer(pod *corev1.Pod, caCert string) {
+func (h *Handler) injectInitContainer(pod *corev1.Pod, caCert string, isJava bool) {
 	// Encode Envoy config to base64
 	envoyConfigBase64 := base64.StdEncoding.EncodeToString(envoyConfig)
 
@@ -256,10 +301,17 @@ func (h *Handler) injectInitContainer(pod *corev1.Pod, caCert string) {
 	)
 
 	// 2. Add Init Container
+	image := InitContainerImage
+	cmd := `echo "$CA_PEM" > /etc/kloak-ca/ca.crt && echo "$ENVOY_CONFIG" | base64 -d > /etc/envoy/envoy.yaml`
+	if isJava {
+		image = JavaInitContainerImage
+		cmd += ` && cp $JAVA_HOME/lib/security/cacerts /etc/kloak-ca/truststore.jks && keytool -importcert -alias kloak-ca -file /etc/kloak-ca/ca.crt -keystore /etc/kloak-ca/truststore.jks -storepass changeit -noprompt`
+	}
+
 	initContainer := corev1.Container{
 		Name:    "kloak-init",
-		Image:   InitContainerImage,
-		Command: []string{"sh", "-c", "echo \"$CA_PEM\" > /etc/kloak-ca/ca.crt && echo \"$ENVOY_CONFIG\" | base64 -d > /etc/envoy/envoy.yaml"},
+		Image:   image,
+		Command: []string{"sh", "-c", cmd},
 		Env: []corev1.EnvVar{
 			{
 				Name:  "CA_PEM",
@@ -339,18 +391,13 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 }
 
 // mountCAVolume mounts the CA volume to all application containers.
-func (h *Handler) mountCAVolume(pod *corev1.Pod) {
+func (h *Handler) mountCAVolume(pod *corev1.Pod, isJava bool) {
 	const (
 		CAVolName = "kloak-ca-vol"
 		CAVolPath = "/etc/kloak-ca"
 	)
 
 	for i := range pod.Spec.Containers {
-		// Don't mount to sidecar if it's already there?
-		// Sidecar is added at the end, so this loop might miss it if called before?
-		// Or if called after, it hits it.
-		// We can mount to sidecar too, no harm.
-
 		pod.Spec.Containers[i].VolumeMounts = append(
 			pod.Spec.Containers[i].VolumeMounts,
 			corev1.VolumeMount{
@@ -360,7 +407,7 @@ func (h *Handler) mountCAVolume(pod *corev1.Pod) {
 			},
 		)
 
-		// Inject SSL_CERT_FILE env var pointing to the CA cert
+		// Inject CA cert env vars for different runtimes
 		fullPath := fmt.Sprintf("%s/%s", CAVolPath, CACertFile)
 		pod.Spec.Containers[i].Env = append(
 			pod.Spec.Containers[i].Env,
@@ -368,7 +415,21 @@ func (h *Handler) mountCAVolume(pod *corev1.Pod) {
 				Name:  "SSL_CERT_FILE",
 				Value: fullPath,
 			},
+			corev1.EnvVar{
+				Name:  "NODE_EXTRA_CA_CERTS",
+				Value: fullPath,
+			},
 		)
+
+		if isJava {
+			pod.Spec.Containers[i].Env = append(
+				pod.Spec.Containers[i].Env,
+				corev1.EnvVar{
+					Name:  "JAVA_TOOL_OPTIONS",
+					Value: fmt.Sprintf("-Djavax.net.ssl.trustStore=%s/%s -Djavax.net.ssl.trustStorePassword=%s -Djava.net.preferIPv4Stack=true", CAVolPath, JavaTruststoreFile, JavaTruststorePassword),
+				},
+			)
+		}
 	}
 }
 
