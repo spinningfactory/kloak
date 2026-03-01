@@ -35,7 +35,6 @@ type Reconciler struct {
 	client.Client
 	Log           logr.Logger
 	Scheme        *runtime.Scheme
-	CgroupManager CgroupManager
 	UprobeManager *ebpf.TLSUprobeManager
 	CgroupRoot    string
 	// NodeName filters pods to only those on this node (empty = all nodes)
@@ -46,8 +45,7 @@ type Reconciler struct {
 }
 
 // NewReconciler creates a new pod reconciler.
-// nodeName filters pods to only those on this node (empty = all nodes).
-func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, cgroupMgr CgroupManager, uprobeMgr *ebpf.TLSUprobeManager, cgroupRoot, nodeName string) *Reconciler {
+func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, uprobeMgr *ebpf.TLSUprobeManager, cgroupRoot, nodeName string) *Reconciler {
 	if cgroupRoot == "" {
 		cgroupRoot = CgroupBasePath
 	}
@@ -55,7 +53,6 @@ func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, cgr
 		Client:        c,
 		Log:           log,
 		Scheme:        scheme,
-		CgroupManager: cgroupMgr,
 		UprobeManager: uprobeMgr,
 		CgroupRoot:    cgroupRoot,
 		NodeName:      nodeName,
@@ -115,14 +112,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// Add new cgroups that aren't already tracked
 	for cgroupID := range cgroupIDs {
 		if !existingCgroups[cgroupID] {
-			// Only redirect traffic to Envoy for pods that have the Envoy sidecar (Java pods).
-			// Non-Java pods use eBPF uprobe rewrite and don't need traffic redirection.
-			if hasEnvoySidecar(pod) {
-				if err := r.CgroupManager.AddCgroup(cgroupID); err != nil {
-					log.Error(err, "failed to add cgroup to eBPF map", "cgroupID", cgroupID)
-					continue
-				}
-			}
 			existingCgroups[cgroupID] = true
 			log.Info("tracking container cgroup", "cgroupID", cgroupID)
 
@@ -136,7 +125,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// Remove old cgroups that are no longer present (container restarted with new cgroup)
 	for cgroupID := range existingCgroups {
 		if !cgroupIDs[cgroupID] {
-			_ = r.CgroupManager.RemoveCgroup(cgroupID)
 			delete(existingCgroups, cgroupID)
 			log.Info("removed stale cgroup", "cgroupID", cgroupID)
 		}
@@ -209,12 +197,9 @@ func (r *Reconciler) handleDelete(podKey string) (ctrl.Result, error) {
 		return ctrl.Result{}, nil
 	}
 
-	for cgroupID := range cgroupIDs {
-		if err := r.CgroupManager.RemoveCgroup(cgroupID); err != nil {
-			r.Log.Error(err, "failed to remove cgroup from eBPF map", "cgroupID", cgroupID)
-		}
-	}
-
+	// Uprobes will be automatically cleaned up by the uprobe component when
+	// the process dies, so we no longer have to detach them manually or remove cgroups from maps.
+	// Just remove the pod from our tracking.
 	delete(r.trackedPods, podKey)
 	r.Log.Info("stopped tracking pod", "podKey", podKey, "cgroupCount", len(cgroupIDs))
 
@@ -291,16 +276,4 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 // GetTrackedPodCount returns the number of currently tracked pods.
 func (r *Reconciler) GetTrackedPodCount() int {
 	return len(r.trackedPods)
-}
-
-// hasEnvoySidecar returns true if the pod has an Envoy sidecar container.
-// Only Java pods get Envoy injected by the webhook; non-Java pods use eBPF
-// uprobe rewrite and should NOT have their traffic redirected to Envoy.
-func hasEnvoySidecar(pod *corev1.Pod) bool {
-	for _, c := range pod.Spec.Containers {
-		if c.Name == "envoy-sidecar" {
-			return true
-		}
-	}
-	return false
 }

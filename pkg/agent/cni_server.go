@@ -7,9 +7,7 @@ import (
 	"os"
 
 	"github.com/go-logr/logr"
-	"github.com/spinningfactory/kloak/pkg/cgroups"
 	"github.com/spinningfactory/kloak/pkg/cni/api"
-	"github.com/spinningfactory/kloak/pkg/ebpf"
 	"google.golang.org/grpc"
 )
 
@@ -21,15 +19,13 @@ const (
 // CNIServer implements the CNI gRPC service
 type CNIServer struct {
 	api.UnimplementedCNIServer
-	Log         logr.Logger
-	EBPFManager *ebpf.EBPFCgroupManager
+	Log logr.Logger
 }
 
 // NewCNIServer creates a new CNI server
-func NewCNIServer(log logr.Logger, ebpfMgr *ebpf.EBPFCgroupManager) *CNIServer {
+func NewCNIServer(log logr.Logger) *CNIServer {
 	return &CNIServer{
-		Log:         log,
-		EBPFManager: ebpfMgr,
+		Log: log,
 	}
 }
 
@@ -87,64 +83,11 @@ func (s *CNIServer) HandlePod(ctx context.Context, req *api.PodRequest) (*api.Po
 }
 
 func (s *CNIServer) handleAdd(ctx context.Context, req *api.PodRequest) (*api.PodResponse, error) {
-	// CNI ADD is called very early during pod creation, often before the container cgroup exists.
-	// The container cgroup is what bpf_get_current_cgroup_id() returns, and it's specific to each
-	// container (.scope), not the pod (.slice).
-	//
-	// Since the container cgroup may not exist at CNI ADD time (the sandbox/pause container is
-	// just being created), we try to find it but don't fail if it doesn't exist yet.
-	// The controller will handle eBPF tracking once containers are running.
-	cgroupRoot := "/sys/fs/cgroup"
-
-	containerCgroupPath, err := cgroups.FindContainerCgroupPath(cgroupRoot, req.PodUid, req.ContainerId)
-	if err != nil {
-		// This is expected during early pod creation - cgroup may not exist yet
-		s.Log.Info("CNI ADD: Container cgroup not found yet (expected during pod creation), controller will handle eBPF tracking",
-			"pod", req.PodName, "uid", req.PodUid, "containerID", req.ContainerId)
-		return &api.PodResponse{}, nil
-	}
-
-	inode, err := cgroups.GetCgroupInodeFromPath(containerCgroupPath)
-	if err != nil {
-		s.Log.Info("CNI ADD: Could not get cgroup inode, controller will handle eBPF tracking",
-			"pod", req.PodName, "path", containerCgroupPath, "err", err)
-		return &api.PodResponse{}, nil
-	}
-
-	s.Log.Info("CNI ADD: Programs eBPF for container", "pod", req.PodName, "cgroupPath", containerCgroupPath, "inode", inode)
-
-	if err := s.EBPFManager.AddCgroup(inode); err != nil {
-		s.Log.Error(err, "failed to add cgroup to eBPF map")
-		// Don't fail CNI - controller will handle it
-	}
-
+	s.Log.Info("CNI ADD: Received request, controller handles uprobe tracking", "pod", req.PodName, "containerID", req.ContainerId)
 	return &api.PodResponse{}, nil
 }
 
 func (s *CNIServer) handleDel(ctx context.Context, req *api.PodRequest) (*api.PodResponse, error) {
-	// Default cgroup root
-	cgroupRoot := "/sys/fs/cgroup"
-
-	// Try to find the container's cgroup to get the inode
-	// Note: During deletion, the cgroup might already be gone.
-	containerCgroupPath, err := cgroups.FindContainerCgroupPath(cgroupRoot, req.PodUid, req.ContainerId)
-	if err != nil {
-		// If we can't find it, maybe it's already gone.
-		s.Log.Info("CNI DEL: Cgroup not found, assuming already cleaned up", "err", err)
-		return &api.PodResponse{}, nil
-	}
-
-	inode, err := cgroups.GetCgroupInodeFromPath(containerCgroupPath)
-	if err != nil {
-		s.Log.Info("CNI DEL: Could not get inode, assuming already cleaned up", "err", err)
-		return &api.PodResponse{}, nil
-	}
-
-	s.Log.Info("CNI DEL: Removing eBPF for container", "pod", req.PodName, "inode", inode)
-	if err := s.EBPFManager.RemoveCgroup(inode); err != nil {
-		s.Log.Error(err, "failed to remove cgroup from eBPF map", "inode", inode)
-		// Don't fail the CNI DEL, just log
-	}
-
+	s.Log.Info("CNI DEL: Received request, uprobes auto-detach on process exit", "pod", req.PodName, "containerID", req.ContainerId)
 	return &api.PodResponse{}, nil
 }

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/go-logr/logr"
@@ -33,8 +34,10 @@ type secretKey struct {
 
 // secretValue matches C struct secret_value
 type secretValue struct {
-	Len        uint32
-	RealSecret [128]byte
+	Len         uint32
+	RealSecret  [128]byte
+	HostLen     uint32
+	AllowedHost [64]byte
 }
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -D__TARGET_ARCH_arm64" tlsuprobe bpf/tls_uprobe.c -- -I../ebpf
@@ -55,7 +58,12 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 	log := ctrl.Log.WithName("ebpf-uprobe")
 
 	objs := &tlsuprobeObjects{}
-	if err := loadTlsuprobeObjects(objs, nil); err != nil {
+	opts := &ebpf.CollectionOptions{
+		Programs: ebpf.ProgramOptions{
+			LogLevel: ebpf.LogLevelInstruction | ebpf.LogLevelBranch,
+		},
+	}
+	if err := loadTlsuprobeObjects(objs, opts); err != nil {
 		return nil, fmt.Errorf("loading eBPF objects: %w", err)
 	}
 
@@ -265,11 +273,22 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 		}
 		copy(val.RealSecret[:], []byte(entry.Value)[:val.Len])
 
+		// Set allowed host for host-based filtering
+		if len(entry.AllowedHosts) > 0 && entry.AllowedHosts[0] != "*" {
+			host := entry.AllowedHosts[0]
+			if len(host) > 64 {
+				host = host[:64]
+			}
+			val.HostLen = uint32(len(host))
+			copy(val.AllowedHost[:], []byte(host))
+		}
+		// HostLen == 0 means wildcard (allow all hosts)
+
 		// Save into eBPF Map
 		if err := m.objs.SecretMap.Update(&key, &val, 0); err != nil {
 			m.log.Error(err, "failed to update BPF secret_map", "hash", hash)
 		} else {
-			m.log.Info("Synced secret into eBPF map", "hash", hash)
+			m.log.Info("Synced secret into eBPF map", "hash", hash, "hostLen", val.HostLen)
 		}
 	}
 }

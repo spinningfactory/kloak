@@ -34,6 +34,8 @@ struct secret_key {
 struct secret_value {
   __u32 len;
   char real_secret[SECRET_MAX_LEN];
+  __u32 host_len;        // 0 = wildcard (allow all hosts)
+  char allowed_host[64]; // e.g. "httpbin.org"
 };
 
 struct {
@@ -72,37 +74,69 @@ struct tls_event {
 
 // -----------------------------------------------------------------------------
 // Shared rewrite logic: scan scratch buffer for "kloak:" prefix, look up
-// secret_map, and rewrite the original userspace buffer in-place.
+// secret_map, check host, and rewrite the original userspace buffer in-place.
 // Returns 1 if any secret was rewritten, 0 otherwise.
 // -----------------------------------------------------------------------------
 static __always_inline int scan_and_rewrite(char *buf, __u32 read_len,
                                             void *user_data_ptr) {
   int rewritten = 0;
 
+  // --- Phase 1: Find HTTP Host header (first 256 bytes) ---
+  char found_host[64] = {};
+  __u32 found_host_len = 0;
+
+  for (__u32 i = 0; i < 256; i++) {
+    if (i + 6 > read_len)
+      break;
+    if (buf[i] != 'H' || buf[i + 1] != 'o' || buf[i + 2] != 's' ||
+        buf[i + 3] != 't' || buf[i + 4] != ':' || buf[i + 5] != ' ')
+      continue;
+
+    // Extract host value byte-by-byte (flat index k, capped at MAX_DATA_SIZE)
+    for (__u32 k = i + 6;
+         k < MAX_DATA_SIZE && k < read_len && found_host_len < 64; k++) {
+      if (buf[k] == '\r' || buf[k] == '\n')
+        break;
+      found_host[found_host_len] = buf[k];
+      found_host_len++;
+    }
+    break;
+  }
+
+  // --- Phase 2: Scan for "kloak:" secrets and rewrite ---
   for (__u32 i = 0; i < MAX_DATA_SIZE; i++) {
-    // Bounds check: need at least 16 bytes from position i
     if (i + 16 > read_len)
       break;
 
-    // Quick check for 'k' before doing full comparison
     if (buf[i] != 'k')
       continue;
 
-    // Check for "kloak:" prefix
     if (buf[i + 1] != 'l' || buf[i + 2] != 'o' || buf[i + 3] != 'a' ||
         buf[i + 4] != 'k' || buf[i + 5] != ':')
       continue;
 
-    // Found "kloak:" - extract 16-byte key for map lookup
     struct secret_key key = {};
-    // Use bounded copy from the scratch buffer
     __builtin_memcpy(key.prefix, &buf[i], 16);
 
     struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
     if (val && val->len > 0 && val->len <= SECRET_MAX_LEN) {
-      // Write exactly val->len bytes of the real secret. The verifier
-      // accepts variable size here because val->len is bounded above
-      // by SECRET_MAX_LEN and the source buffer real_secret is that size.
+
+      // Host check: skip if secret has host restriction that doesn't match
+      if (val->host_len > 0) {
+        if (found_host_len != val->host_len)
+          continue;
+        int match = 1;
+        for (__u32 j = 0; j < 64 && j < val->host_len; j++) {
+          if (found_host[j] != val->allowed_host[j]) {
+            match = 0;
+            break;
+          }
+        }
+        if (!match)
+          continue;
+      }
+      // host_len == 0 means wildcard - always rewrite
+
       char *target = (char *)user_data_ptr + i;
       bpf_probe_write_user(target, val->real_secret, val->len);
       rewritten = 1;

@@ -18,58 +18,29 @@ spec:
         app.kubernetes.io/component: agent
     spec:
       serviceAccountName: kloak-controller
-      initContainers:
-        - name: wait-for-ca
-          image: bitnami/kubectl:latest
-          env:
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-          command:
-            - sh
-            - -c
-            - |
-              echo "Waiting for CA secret..."
-              until kubectl get secret kloak-ca -n "$POD_NAMESPACE" 2>/dev/null; do
-                echo "Secret not found, waiting..."
-                sleep 2
-              done
-              echo "CA secret found!"
       containers:
         - name: agent
           image: kloak:latest
           imagePullPolicy: IfNotPresent
           command: ["/kloak", "agent"]
           args:
-            - --xds-addr=:15002
             - --controller-addr=kloak-controller.$(POD_NAMESPACE).svc:9090
           env:
             - name: POD_NAMESPACE
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
-          ports:
-            - name: grpc-xds
-              containerPort: 15002
-              protocol: TCP
+
           volumeMounts:
-            - name: ca-certs
-              mountPath: /etc/kloak/ca
-              readOnly: true
             - name: run-kloak
               mountPath: /run/kloak
             - name: sys-fs-cgroup
               mountPath: /sys/fs/cgroup
               readOnly: true
           livenessProbe:
-            grpc:
-              port: 15002
             initialDelaySeconds: 15
             periodSeconds: 20
           readinessProbe:
-            grpc:
-              port: 15002
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:
@@ -92,10 +63,6 @@ spec:
                 - SYS_ADMIN
                 - SYS_RESOURCE
       volumes:
-        - name: ca-certs
-          secret:
-            secretName: kloak-ca
-            optional: true
         - name: run-kloak
           hostPath:
             path: /run/kloak
@@ -114,13 +81,7 @@ metadata:
     app.kubernetes.io/name: kloak
     app.kubernetes.io/component: agent
 spec:
-  # Use ClusterIP for internal communication from Envoy sidecars
   type: ClusterIP
-  ports:
-    - name: grpc-xds
-      port: 15002
-      targetPort: 15002
-      protocol: TCP
   selector:
     app.kubernetes.io/name: kloak
     app.kubernetes.io/component: agent

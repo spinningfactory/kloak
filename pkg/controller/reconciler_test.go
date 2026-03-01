@@ -7,22 +7,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// MockCgroupManager is a mock implementation for testing.
-type MockCgroupManager struct {
-	added   []uint64
-	removed []uint64
-}
-
-func (m *MockCgroupManager) AddCgroup(cgroupID uint64) error {
-	m.added = append(m.added, cgroupID)
-	return nil
-}
-
-func (m *MockCgroupManager) RemoveCgroup(cgroupID uint64) error {
-	m.removed = append(m.removed, cgroupID)
-	return nil
-}
-
 func TestIsEnabled(t *testing.T) {
 	r := &Reconciler{}
 
@@ -71,10 +55,8 @@ func TestIsEnabled(t *testing.T) {
 }
 
 func TestHandleDelete(t *testing.T) {
-	mgr := &MockCgroupManager{}
 	r := &Reconciler{
-		CgroupManager: mgr,
-		trackedPods:   make(map[string]map[uint64]bool),
+		trackedPods: make(map[string]map[uint64]bool),
 	}
 
 	// Add a tracked pod with multiple container cgroups
@@ -84,11 +66,6 @@ func TestHandleDelete(t *testing.T) {
 	_, err := r.handleDelete("test-pod-uid")
 	if err != nil {
 		t.Fatalf("handleDelete failed: %v", err)
-	}
-
-	// Verify both cgroups were removed
-	if len(mgr.removed) != 2 {
-		t.Errorf("Expected 2 cgroups to be removed, got %v", mgr.removed)
 	}
 
 	// Verify pod is no longer tracked

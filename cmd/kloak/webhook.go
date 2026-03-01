@@ -61,15 +61,9 @@ func runWebhook(cmd *cobra.Command, args []string) {
 	// No longer need to load CA here - pods mount the CA via init container injection
 	setupLog.Info("Webhook using Init Container-based CA distribution")
 
-	// Register webhook
-	systemNamespace := os.Getenv("POD_NAMESPACE")
-	if systemNamespace == "" {
-		systemNamespace = "kloak-system"
-	}
-
 	hookServer := mgr.GetWebhookServer()
 	hookServer.Register("/mutate-pods", &webhook.Admission{
-		Handler: webhookpkg.NewHandler(mgr.GetClient(), setupLog, systemNamespace),
+		Handler: webhookpkg.NewHandler(mgr.GetClient(), setupLog),
 	})
 
 	// Add health checks

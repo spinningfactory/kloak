@@ -14,11 +14,9 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	"github.com/spinningfactory/kloak/pkg/ca"
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/storage"
 	"github.com/spinningfactory/kloak/pkg/sync"
@@ -30,19 +28,6 @@ var (
 
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
-}
-
-// MockCgroupManager is used when eBPF is disabled or not available.
-type MockCgroupManager struct{}
-
-func (m *MockCgroupManager) AddCgroup(cgroupID uint64) error {
-	ctrl.Log.Info("mock: would add cgroup", "cgroupID", cgroupID)
-	return nil
-}
-
-func (m *MockCgroupManager) RemoveCgroup(cgroupID uint64) error {
-	ctrl.Log.Info("mock: would remove cgroup", "cgroupID", cgroupID)
-	return nil
 }
 
 var controllerCmd = &cobra.Command{
@@ -95,14 +80,6 @@ func runController(cmd *cobra.Command, args []string) {
 		namespace = "kloak-system"
 	}
 
-	// We need a direct client to access Secrets before the manager cache is started
-	k8sConfig := ctrl.GetConfigOrDie()
-	directClient, err := client.New(k8sConfig, client.Options{Scheme: scheme})
-	if err != nil {
-		setupLog.Error(err, "failed to create direct client")
-		os.Exit(1)
-	}
-
 	// Handle certificate mode
 	if certMode == "" {
 		certMode = os.Getenv("KLOAK_CERT_MODE")
@@ -112,38 +89,14 @@ func runController(cmd *cobra.Command, args []string) {
 	}
 	setupLog.Info("Certificate mode", "mode", certMode)
 
-	if certMode == "auto" {
-		// Auto-generate certificates if missing
-		_, err := ca.EnsureCerts(context.Background(), directClient, namespace, setupLog)
-		if err != nil {
-			setupLog.Error(err, "failed to ensure certificates")
-			os.Exit(1)
-		}
-	}
+	// We rely purely on the underlying runtime providing certificates to workloads (or eBPF uprobes intercepting)
+	// No CA generation happens here anymore
 
-	caStore := ca.NewStore(directClient, namespace)
-	rootCA, err := caStore.GetOrCreate(context.Background())
-	if err != nil {
-		setupLog.Error(err, "failed to get or create CA")
-		os.Exit(1)
-	}
-	setupLog.Info("CA loaded successfully", "commonName", rootCA.Cert.Subject.CommonName)
-
-	// Create cgroup manager and uprobe manager
-	var cgroupMgr controller.CgroupManager
-	var ebpfMgr *ebpf.EBPFCgroupManager
+	// Create uprobe manager instances
 	var uprobeMgr *ebpf.TLSUprobeManager
 
+	var err error
 	if enableEBPF {
-		ebpfMgr, err = ebpf.NewEBPFCgroupManager(cgroupPath)
-		if err != nil {
-			setupLog.Error(err, "failed to initialize eBPF cgroup map, falling back to mock")
-			cgroupMgr = &MockCgroupManager{}
-		} else {
-			cgroupMgr = ebpfMgr
-			setupLog.Info("eBPF traffic redirection enabled")
-		}
-
 		uprobeMgr, err = ebpf.NewTLSUprobeManager(store)
 		if err != nil {
 			setupLog.Error(err, "failed to initialize eBPF uprobe manager")
@@ -152,8 +105,7 @@ func runController(cmd *cobra.Command, args []string) {
 			setupLog.Info("eBPF TLS uprobes enabled")
 		}
 	} else {
-		setupLog.Info("eBPF disabled, using mock cgroup manager")
-		cgroupMgr = &MockCgroupManager{}
+		setupLog.Info("eBPF disabled")
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -190,7 +142,6 @@ func runController(cmd *cobra.Command, args []string) {
 		mgr.GetClient(),
 		ctrl.Log.WithName("controller").WithName("Pod"),
 		mgr.GetScheme(),
-		cgroupMgr,
 		uprobeMgr,
 		cgroupPath,
 		nodeName,
@@ -236,17 +187,11 @@ func runController(cmd *cobra.Command, args []string) {
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
-		if ebpfMgr != nil {
-			ebpfMgr.Close()
-		}
 		os.Exit(1)
 	}
 
 	// Cleanup
 	cancel()
-	if ebpfMgr != nil {
-		ebpfMgr.Close()
-	}
 	if uprobeMgr != nil {
 		uprobeMgr.Close()
 	}

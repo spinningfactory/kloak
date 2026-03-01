@@ -1,14 +1,11 @@
-// Package webhook provides the Kubernetes mutating admission webhook
-// for injecting Envoy sidecars and Root CA into pods.
+// Package webhook provides the mutating admission webhook handler
+// for rewriting secret volumes to point to shadow secrets.
 package webhook
 
 import (
 	"context"
-	_ "embed"
 	"encoding/json"
-	"fmt"
 	"net/http"
-	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -22,55 +19,21 @@ import (
 const (
 	// AnnotationEnabled is the annotation to enable Kloak on a pod.
 	AnnotationEnabled = "getkloak.io/enabled"
-
-	// EnvoyImage is the default Envoy sidecar image.
-	EnvoyImage = "envoyproxy/envoy:v1.37-latest"
-
-	// EnvoyPort is the port Envoy listens on for intercepted traffic.
-	EnvoyPort = 15001
-
-	// CACertFile is the filename for the CA cert.
-	CACertFile = "ca.crt"
-
-	// CAVolumeName is the name of the shared volume containing the CA.
-	CAVolumeName = "kloak-ca-vol"
-
-	// CASecretName is the name of the Secret containing the CA.
-	CASecretName = "kloak-ca"
-
-	// InitContainerImage is the image used for the init container.
-	InitContainerImage = "busybox:1.36"
-
-	// JavaInitContainerImage is the image used for the init container when Java is detected.
-	JavaInitContainerImage = "eclipse-temurin:21-jre-alpine"
-
-	// JavaTruststoreFile is the filename for the Java truststore.
-	JavaTruststoreFile = "truststore.jks"
-
-	// JavaTruststorePassword is the default password for the Java truststore.
-	JavaTruststorePassword = "changeit"
-
-	// AnnotationRuntime is the annotation to override runtime detection.
-	AnnotationRuntime = "getkloak.io/runtime"
 )
 
-// Handler handles pod mutation requests.
 type Handler struct {
-	client          client.Client
-	decoder         admission.Decoder
-	log             logr.Logger
-	systemNamespace string // Namespace where Kloak is installed (for accessing CA secret)
+	client  client.Client
+	decoder admission.Decoder
+	log     logr.Logger
 }
 
-// NewHandler creates a new webhook handler.
-func NewHandler(c client.Client, log logr.Logger, systemNamespace string) *Handler {
+func NewHandler(c client.Client, log logr.Logger) *Handler {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	return &Handler{
-		client:          c,
-		decoder:         admission.NewDecoder(scheme),
-		log:             log,
-		systemNamespace: systemNamespace,
+		client:  c,
+		decoder: admission.NewDecoder(scheme),
+		log:     log,
 	}
 }
 
@@ -101,28 +64,7 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 	}
 	mutatedPod.Annotations[AnnotationEnabled] = "true"
 
-	// Fetch CA Cert
-	caCert, err := h.getCA(ctx)
-	if err != nil {
-		h.log.Error(err, "failed to fetch CA certificate")
-		// We can't proceed without CA as init container needs it
-		// Fail open or closed? Closed seems safer for mesh.
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
-
-	// Detect Java runtime for truststore handling and Envoy injection
-	isJava := needsJavaTruststore(mutatedPod)
-
-	if isJava {
-		// 1. Inject Init Container (sets up CA and Envoy config)
-		h.injectInitContainer(mutatedPod, caCert)
-
-		// 2. Inject Envoy sidecar
-		h.injectEnvoySidecar(mutatedPod)
-
-		// 3. Mount Root CA volume to application containers
-		h.mountCAVolume(mutatedPod)
-	}
+	mutatedPod.Annotations[AnnotationEnabled] = "true"
 
 	// 4. Rewrite Secret volumes (swap with shadow secrets)
 	if err := h.rewriteSecretVolumes(ctx, mutatedPod, req.Namespace); err != nil {
@@ -222,199 +164,6 @@ func (h *Handler) isObjectEnabled(labels, annotations map[string]string) bool {
 		return true
 	}
 	return false
-}
-
-//go:embed envoy.yaml
-var envoyConfig []byte
-
-// getCA fetches the CA certificate from the Kubernetes Secret.
-func (h *Handler) getCA(ctx context.Context) (string, error) {
-	secret := &corev1.Secret{}
-	err := h.client.Get(ctx, client.ObjectKey{
-		Namespace: h.systemNamespace,
-		Name:      CASecretName,
-	}, secret)
-	if err != nil {
-		return "", err
-	}
-
-	if data, ok := secret.Data[corev1.TLSCertKey]; ok {
-		return string(data), nil
-	} else if data, ok := secret.Data["ca.crt"]; ok {
-		return string(data), nil
-	}
-	return "", fmt.Errorf("CA secret missing certificate key")
-}
-
-// javaImagePatterns are substrings that indicate a Java-based container image.
-var javaImagePatterns = []string{
-	"java", "jdk", "jre", "temurin", "openjdk", "corretto",
-	"spring-boot", "quarkus", "graalvm",
-}
-
-// needsJavaTruststore returns true if the pod requires Java truststore setup.
-// It checks for an explicit annotation override first, then scans container images
-// for known Java-related patterns.
-func needsJavaTruststore(pod *corev1.Pod) bool {
-	// Check annotation override
-	if pod.Annotations != nil {
-		if val, ok := pod.Annotations[AnnotationRuntime]; ok {
-			return val == "java"
-		}
-	}
-
-	// Scan container images for Java patterns
-	for _, c := range pod.Spec.Containers {
-		image := strings.ToLower(c.Image)
-		for _, pattern := range javaImagePatterns {
-			if strings.Contains(image, pattern) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// injectInitContainer injects the Kloak init container which sets up CA and Envoy config.
-func (h *Handler) injectInitContainer(pod *corev1.Pod, caCert string) {
-	const (
-		EnvoyConfigVolName = "kloak-envoy-config-vol"
-		CAVolName          = "kloak-ca-vol"
-	)
-
-	// Always add the CA volume
-	pod.Spec.Volumes = append(pod.Spec.Volumes,
-		corev1.Volume{
-			Name: CAVolName,
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		},
-	)
-
-	// 2. Add Init Container
-	image := InitContainerImage
-	cmd := `echo "$CA_PEM" > /etc/kloak-ca/ca.crt`
-
-	var envVars []corev1.EnvVar
-	envVars = append(envVars, corev1.EnvVar{
-		Name:  "CA_PEM",
-		Value: caCert,
-	})
-
-	var volumeMounts []corev1.VolumeMount
-	volumeMounts = append(volumeMounts, corev1.VolumeMount{
-		Name:      CAVolName,
-		MountPath: "/etc/kloak-ca",
-	})
-
-	initContainer := corev1.Container{
-		Name:         "kloak-init",
-		Image:        image,
-		Command:      []string{"sh", "-c", cmd},
-		Env:          envVars,
-		VolumeMounts: volumeMounts,
-	}
-	pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
-}
-
-// injectEnvoySidecar adds the Envoy sidecar container to the pod.
-func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
-	const EnvoyConfigVolName = "kloak-envoy-config-vol"
-
-	envoyContainer := corev1.Container{
-		Name:  "envoy-sidecar",
-		Image: EnvoyImage,
-		Ports: []corev1.ContainerPort{
-			{
-				Name:          "proxy",
-				ContainerPort: EnvoyPort,
-				Protocol:      corev1.ProtocolTCP,
-			},
-		},
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      EnvoyConfigVolName,
-				MountPath: "/etc/envoy",
-				ReadOnly:  true,
-			},
-		},
-		Args: []string{
-			"-c", "/etc/envoy/envoy.yaml",
-			"--service-cluster", "kloak-sidecar",
-			"--service-node", "kloak-sidecar-$(POD_NAME)",
-			"--log-level", "debug",
-		},
-		Env: []corev1.EnvVar{
-			{
-				Name: "POD_NAME",
-				ValueFrom: &corev1.EnvVarSource{
-					FieldRef: &corev1.ObjectFieldSelector{
-						FieldPath: "metadata.name",
-					},
-				},
-			},
-			{
-				Name: "POD_NAMESPACE",
-				ValueFrom: &corev1.EnvVarSource{
-					FieldRef: &corev1.ObjectFieldSelector{
-						FieldPath: "metadata.namespace",
-					},
-				},
-			},
-		},
-		SecurityContext: &corev1.SecurityContext{
-			RunAsUser:  ptr(int64(1337)),
-			RunAsGroup: ptr(int64(1337)),
-		},
-	}
-
-	pod.Spec.Containers = append(pod.Spec.Containers, envoyContainer)
-}
-
-// mountCAVolume mounts the CA volume to all application containers.
-func (h *Handler) mountCAVolume(pod *corev1.Pod) {
-	const (
-		CAVolName = "kloak-ca-vol"
-		CAVolPath = "/etc/kloak-ca"
-	)
-
-	for i := range pod.Spec.Containers {
-		pod.Spec.Containers[i].VolumeMounts = append(
-			pod.Spec.Containers[i].VolumeMounts,
-			corev1.VolumeMount{
-				Name:      CAVolName,
-				MountPath: CAVolPath,
-				ReadOnly:  true,
-			},
-		)
-
-		// Inject CA cert env vars for different runtimes
-		fullPath := fmt.Sprintf("%s/%s", CAVolPath, CACertFile)
-		pod.Spec.Containers[i].Env = append(
-			pod.Spec.Containers[i].Env,
-			corev1.EnvVar{
-				Name:  "SSL_CERT_FILE",
-				Value: fullPath,
-			},
-			corev1.EnvVar{
-				Name:  "NODE_EXTRA_CA_CERTS",
-				Value: fullPath,
-			},
-		)
-
-		pod.Spec.Containers[i].Env = append(
-			pod.Spec.Containers[i].Env,
-			corev1.EnvVar{
-				Name:  "JAVA_TOOL_OPTIONS",
-				Value: fmt.Sprintf("-Djavax.net.ssl.trustStore=%s/%s -Djavax.net.ssl.trustStorePassword=%s -Djava.net.preferIPv4Stack=true", CAVolPath, JavaTruststoreFile, JavaTruststorePassword),
-			},
-		)
-	}
-}
-
-func ptr[T any](v T) *T {
-	return &v
 }
 
 // rewriteSecretVolumes checks volume mounts and swaps enabled secrets with shadow secrets.
