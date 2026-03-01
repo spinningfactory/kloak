@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -79,4 +80,27 @@ func GetPodCgroupPath(cgroupRoot, podUID, containerID string) (string, error) {
 	}
 
 	return "", fmt.Errorf("pod cgroup path not found for pod %s", podUID)
+}
+
+// ReadCgroupProcs reads the PIDs from a cgroup's cgroup.procs file.
+func ReadCgroupProcs(cgroupPath string) ([]int, error) {
+	procsPath := filepath.Join(cgroupPath, "cgroup.procs")
+	data, err := os.ReadFile(procsPath)
+	if err != nil {
+		return nil, fmt.Errorf("reading %s: %w", procsPath, err)
+	}
+
+	var pids []int
+	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		pid, err := strconv.Atoi(line)
+		if err != nil {
+			continue
+		}
+		pids = append(pids, pid)
+	}
+	return pids, nil
 }

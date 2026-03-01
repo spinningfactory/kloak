@@ -192,13 +192,15 @@ wait_for_kloak() {
     echo ""
     echo "Waiting for Kloak pods to be ready..."
     
-    kubectl wait --for=condition=Ready pod \
-        -l app.kubernetes.io/name=kloak \
-        -n kloak-system \
-        --timeout=120s || {
-        echo "Warning: Some Kloak pods may not be ready"
-        kubectl get pods -n kloak-system
-    }
+    # Use rollout status instead of kubectl wait.
+    # After deploy_kloak does "rollout restart", the old pods go into Terminating
+    # state with Ready=False. "kubectl wait --for=condition=Ready" matches those
+    # dying pods and blocks until timeout. "rollout status" properly tracks the
+    # rolling update and returns as soon as new pods are ready.
+    kubectl rollout status daemonset/kloak-controller -n kloak-system --timeout=120s
+    kubectl rollout status deployment/kloak-webhook -n kloak-system --timeout=120s
+    kubectl rollout status daemonset/kloak-agent -n kloak-system --timeout=120s
+    kubectl rollout status daemonset/kloak-cni-install -n kloak-system --timeout=120s
     
     echo ""
     echo "Kloak pods status:"

@@ -109,6 +109,20 @@ func runAgent(cmd *cobra.Command, args []string) {
 	}
 	defer ebpfMgr.Close()
 
+	// Initialize eBPF TLS uprobe manager
+	uprobeMgr, err := ebpf.NewTLSUprobeManager(store)
+	if err != nil {
+		log.Error(err, "failed to initialize eBPF TLS uprobe manager")
+		// Non-fatal for development if bpf fails
+	} else {
+		defer uprobeMgr.Close()
+		go func() {
+			if err := uprobeMgr.PollEvents(ctx); err != nil && ctx.Err() == nil {
+				log.Error(err, "TLS uprobe event poller failed")
+			}
+		}()
+	}
+
 	// Create and start CNI Server
 	cniServer := agent.NewCNIServer(log.WithName("cni"), ebpfMgr)
 	go func() {

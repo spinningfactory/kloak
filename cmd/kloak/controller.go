@@ -129,18 +129,27 @@ func runController(cmd *cobra.Command, args []string) {
 	}
 	setupLog.Info("CA loaded successfully", "commonName", rootCA.Cert.Subject.CommonName)
 
-	// Create cgroup manager
+	// Create cgroup manager and uprobe manager
 	var cgroupMgr controller.CgroupManager
 	var ebpfMgr *ebpf.EBPFCgroupManager
+	var uprobeMgr *ebpf.TLSUprobeManager
 
 	if enableEBPF {
 		ebpfMgr, err = ebpf.NewEBPFCgroupManager(cgroupPath)
 		if err != nil {
-			setupLog.Error(err, "failed to initialize eBPF, falling back to mock")
+			setupLog.Error(err, "failed to initialize eBPF cgroup map, falling back to mock")
 			cgroupMgr = &MockCgroupManager{}
 		} else {
 			cgroupMgr = ebpfMgr
 			setupLog.Info("eBPF traffic redirection enabled")
+		}
+
+		uprobeMgr, err = ebpf.NewTLSUprobeManager(store)
+		if err != nil {
+			setupLog.Error(err, "failed to initialize eBPF uprobe manager")
+			// non-fatal for this demo
+		} else {
+			setupLog.Info("eBPF TLS uprobes enabled")
 		}
 	} else {
 		setupLog.Info("eBPF disabled, using mock cgroup manager")
@@ -182,6 +191,7 @@ func runController(cmd *cobra.Command, args []string) {
 		ctrl.Log.WithName("controller").WithName("Pod"),
 		mgr.GetScheme(),
 		cgroupMgr,
+		uprobeMgr,
 		cgroupPath,
 		nodeName,
 	)
@@ -214,6 +224,15 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	// Start eBPF TLS event poller (syncs secrets to BPF map and reads events)
+	if uprobeMgr != nil {
+		go func() {
+			if err := uprobeMgr.PollEvents(ctx); err != nil && ctx.Err() == nil {
+				setupLog.Error(err, "eBPF TLS event poller failed")
+			}
+		}()
+	}
+
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
@@ -227,6 +246,9 @@ func runController(cmd *cobra.Command, args []string) {
 	cancel()
 	if ebpfMgr != nil {
 		ebpfMgr.Close()
+	}
+	if uprobeMgr != nil {
+		uprobeMgr.Close()
 	}
 }
 

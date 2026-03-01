@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/spinningfactory/kloak/pkg/cgroups"
+	"github.com/spinningfactory/kloak/pkg/ebpf"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -35,6 +36,7 @@ type Reconciler struct {
 	Log           logr.Logger
 	Scheme        *runtime.Scheme
 	CgroupManager CgroupManager
+	UprobeManager *ebpf.TLSUprobeManager
 	CgroupRoot    string
 	// NodeName filters pods to only those on this node (empty = all nodes)
 	NodeName string
@@ -45,7 +47,7 @@ type Reconciler struct {
 
 // NewReconciler creates a new pod reconciler.
 // nodeName filters pods to only those on this node (empty = all nodes).
-func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, cgroupMgr CgroupManager, cgroupRoot, nodeName string) *Reconciler {
+func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, cgroupMgr CgroupManager, uprobeMgr *ebpf.TLSUprobeManager, cgroupRoot, nodeName string) *Reconciler {
 	if cgroupRoot == "" {
 		cgroupRoot = CgroupBasePath
 	}
@@ -54,6 +56,7 @@ func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, cgr
 		Log:           log,
 		Scheme:        scheme,
 		CgroupManager: cgroupMgr,
+		UprobeManager: uprobeMgr,
 		CgroupRoot:    cgroupRoot,
 		NodeName:      nodeName,
 		trackedPods:   make(map[string]map[uint64]bool),
@@ -112,12 +115,21 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// Add new cgroups that aren't already tracked
 	for cgroupID := range cgroupIDs {
 		if !existingCgroups[cgroupID] {
-			if err := r.CgroupManager.AddCgroup(cgroupID); err != nil {
-				log.Error(err, "failed to add cgroup to eBPF map", "cgroupID", cgroupID)
-				continue
+			// Only redirect traffic to Envoy for pods that have the Envoy sidecar (Java pods).
+			// Non-Java pods use eBPF uprobe rewrite and don't need traffic redirection.
+			if hasEnvoySidecar(pod) {
+				if err := r.CgroupManager.AddCgroup(cgroupID); err != nil {
+					log.Error(err, "failed to add cgroup to eBPF map", "cgroupID", cgroupID)
+					continue
+				}
 			}
 			existingCgroups[cgroupID] = true
 			log.Info("tracking container cgroup", "cgroupID", cgroupID)
+
+			// Get the container PID from cgroup filesystem and attach uprobes
+			// We iterate through procs file to find a PID in that cgroup
+			// Finding the PID from cgroup or container ID is required to attach TLS uprobes
+			r.attachUprobesToCgroup(cgroupID, pod)
 		}
 	}
 
@@ -133,6 +145,61 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	r.trackedPods[string(pod.UID)] = existingCgroups
 
 	return ctrl.Result{}, nil
+}
+
+// attachUprobesToCgroup reads the cgroup's procs file to find a PID and calls the uprobe manager
+func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) {
+	if r.UprobeManager == nil {
+		return
+	}
+
+	r.Log.Info("Trying to attach uprobes to new container", "cgroup", cgroupID)
+
+	// Find the container cgroup path again to read cgroup.procs
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.ContainerID == "" {
+			continue
+		}
+		parts := strings.SplitN(status.ContainerID, "://", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		containerID := parts[1]
+
+		containerCgroupPath, err := cgroups.FindContainerCgroupPath(r.CgroupRoot, string(pod.UID), containerID)
+		if err != nil {
+			continue
+		}
+
+		// Verify this is the right cgroup by checking inode
+		inode, err := cgroups.GetCgroupInodeFromPath(containerCgroupPath)
+		if err != nil || inode != cgroupID {
+			continue
+		}
+
+		// Read PIDs from cgroup.procs
+		pids, err := cgroups.ReadCgroupProcs(containerCgroupPath)
+		if err != nil {
+			r.Log.Error(err, "failed to read cgroup.procs", "path", containerCgroupPath)
+			return
+		}
+
+		if len(pids) == 0 {
+			r.Log.V(1).Info("no PIDs found in cgroup.procs", "path", containerCgroupPath)
+			return
+		}
+
+		// Attach uprobes to the first PID (main process)
+		pid := pids[0]
+		if err := r.UprobeManager.AttachTLS(pid); err != nil {
+			r.Log.Error(err, "failed to attach TLS uprobes", "pid", pid, "container", status.Name)
+		} else {
+			r.Log.Info("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
+		}
+		return
+	}
+
+	r.Log.V(1).Info("could not find matching container for cgroup", "cgroupID", cgroupID)
 }
 
 // handleDelete removes a pod from tracking.
@@ -224,4 +291,16 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 // GetTrackedPodCount returns the number of currently tracked pods.
 func (r *Reconciler) GetTrackedPodCount() int {
 	return len(r.trackedPods)
+}
+
+// hasEnvoySidecar returns true if the pod has an Envoy sidecar container.
+// Only Java pods get Envoy injected by the webhook; non-Java pods use eBPF
+// uprobe rewrite and should NOT have their traffic redirected to Envoy.
+func hasEnvoySidecar(pod *corev1.Pod) bool {
+	for _, c := range pod.Spec.Containers {
+		if c.Name == "envoy-sidecar" {
+			return true
+		}
+	}
+	return false
 }

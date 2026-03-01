@@ -5,7 +5,6 @@ package webhook
 import (
 	"context"
 	_ "embed"
-	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -111,17 +110,19 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 
-	// Detect Java runtime for truststore handling
+	// Detect Java runtime for truststore handling and Envoy injection
 	isJava := needsJavaTruststore(mutatedPod)
 
-	// 1. Inject Init Container (sets up CA and Envoy config)
-	h.injectInitContainer(mutatedPod, caCert, isJava)
+	if isJava {
+		// 1. Inject Init Container (sets up CA and Envoy config)
+		h.injectInitContainer(mutatedPod, caCert)
 
-	// 2. Inject Envoy sidecar
-	h.injectEnvoySidecar(mutatedPod)
+		// 2. Inject Envoy sidecar
+		h.injectEnvoySidecar(mutatedPod)
 
-	// 3. Mount Root CA volume to application containers
-	h.mountCAVolume(mutatedPod, isJava)
+		// 3. Mount Root CA volume to application containers
+		h.mountCAVolume(mutatedPod)
+	}
 
 	// 4. Rewrite Secret volumes (swap with shadow secrets)
 	if err := h.rewriteSecretVolumes(ctx, mutatedPod, req.Namespace); err != nil {
@@ -275,23 +276,14 @@ func needsJavaTruststore(pod *corev1.Pod) bool {
 }
 
 // injectInitContainer injects the Kloak init container which sets up CA and Envoy config.
-func (h *Handler) injectInitContainer(pod *corev1.Pod, caCert string, isJava bool) {
-	// Encode Envoy config to base64
-	envoyConfigBase64 := base64.StdEncoding.EncodeToString(envoyConfig)
-
+func (h *Handler) injectInitContainer(pod *corev1.Pod, caCert string) {
 	const (
 		EnvoyConfigVolName = "kloak-envoy-config-vol"
 		CAVolName          = "kloak-ca-vol"
 	)
 
-	// 1. Add shared volumes
+	// Always add the CA volume
 	pod.Spec.Volumes = append(pod.Spec.Volumes,
-		corev1.Volume{
-			Name: EnvoyConfigVolName,
-			VolumeSource: corev1.VolumeSource{
-				EmptyDir: &corev1.EmptyDirVolumeSource{},
-			},
-		},
 		corev1.Volume{
 			Name: CAVolName,
 			VolumeSource: corev1.VolumeSource{
@@ -302,36 +294,26 @@ func (h *Handler) injectInitContainer(pod *corev1.Pod, caCert string, isJava boo
 
 	// 2. Add Init Container
 	image := InitContainerImage
-	cmd := `echo "$CA_PEM" > /etc/kloak-ca/ca.crt && echo "$ENVOY_CONFIG" | base64 -d > /etc/envoy/envoy.yaml`
-	if isJava {
-		image = JavaInitContainerImage
-		cmd += ` && cp $JAVA_HOME/lib/security/cacerts /etc/kloak-ca/truststore.jks && keytool -importcert -alias kloak-ca -file /etc/kloak-ca/ca.crt -keystore /etc/kloak-ca/truststore.jks -storepass changeit -noprompt`
-	}
+	cmd := `echo "$CA_PEM" > /etc/kloak-ca/ca.crt`
+
+	var envVars []corev1.EnvVar
+	envVars = append(envVars, corev1.EnvVar{
+		Name:  "CA_PEM",
+		Value: caCert,
+	})
+
+	var volumeMounts []corev1.VolumeMount
+	volumeMounts = append(volumeMounts, corev1.VolumeMount{
+		Name:      CAVolName,
+		MountPath: "/etc/kloak-ca",
+	})
 
 	initContainer := corev1.Container{
-		Name:    "kloak-init",
-		Image:   image,
-		Command: []string{"sh", "-c", cmd},
-		Env: []corev1.EnvVar{
-			{
-				Name:  "CA_PEM",
-				Value: caCert,
-			},
-			{
-				Name:  "ENVOY_CONFIG",
-				Value: envoyConfigBase64,
-			},
-		},
-		VolumeMounts: []corev1.VolumeMount{
-			{
-				Name:      CAVolName,
-				MountPath: "/etc/kloak-ca",
-			},
-			{
-				Name:      EnvoyConfigVolName,
-				MountPath: "/etc/envoy",
-			},
-		},
+		Name:         "kloak-init",
+		Image:        image,
+		Command:      []string{"sh", "-c", cmd},
+		Env:          envVars,
+		VolumeMounts: volumeMounts,
 	}
 	pod.Spec.InitContainers = append(pod.Spec.InitContainers, initContainer)
 }
@@ -391,7 +373,7 @@ func (h *Handler) injectEnvoySidecar(pod *corev1.Pod) {
 }
 
 // mountCAVolume mounts the CA volume to all application containers.
-func (h *Handler) mountCAVolume(pod *corev1.Pod, isJava bool) {
+func (h *Handler) mountCAVolume(pod *corev1.Pod) {
 	const (
 		CAVolName = "kloak-ca-vol"
 		CAVolPath = "/etc/kloak-ca"
@@ -421,15 +403,13 @@ func (h *Handler) mountCAVolume(pod *corev1.Pod, isJava bool) {
 			},
 		)
 
-		if isJava {
-			pod.Spec.Containers[i].Env = append(
-				pod.Spec.Containers[i].Env,
-				corev1.EnvVar{
-					Name:  "JAVA_TOOL_OPTIONS",
-					Value: fmt.Sprintf("-Djavax.net.ssl.trustStore=%s/%s -Djavax.net.ssl.trustStorePassword=%s -Djava.net.preferIPv4Stack=true", CAVolPath, JavaTruststoreFile, JavaTruststorePassword),
-				},
-			)
-		}
+		pod.Spec.Containers[i].Env = append(
+			pod.Spec.Containers[i].Env,
+			corev1.EnvVar{
+				Name:  "JAVA_TOOL_OPTIONS",
+				Value: fmt.Sprintf("-Djavax.net.ssl.trustStore=%s/%s -Djavax.net.ssl.trustStorePassword=%s -Djava.net.preferIPv4Stack=true", CAVolPath, JavaTruststoreFile, JavaTruststorePassword),
+			},
+		)
 	}
 }
 
