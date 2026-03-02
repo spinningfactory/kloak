@@ -37,7 +37,7 @@ type secretValue struct {
 	Len         uint32
 	RealSecret  [128]byte
 	HostLen     uint32
-	AllowedHost [64]byte
+	AllowedHost [32]byte
 }
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -D__TARGET_ARCH_arm64" tlsuprobe bpf/tls_uprobe.c -- -I../ebpf
@@ -58,9 +58,28 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 	log := ctrl.Log.WithName("ebpf-uprobe")
 
 	objs := &tlsuprobeObjects{}
-	opts := &ebpf.CollectionOptions{}
-	if err := loadTlsuprobeObjects(objs, opts); err != nil {
-		return nil, fmt.Errorf("loading eBPF objects: %w", err)
+	// First attempt: no verifier log (avoids large memory allocation).
+	if err := loadTlsuprobeObjects(objs, nil); err != nil {
+		// Retry with verifier log on failure to capture diagnostics.
+		opts := &ebpf.CollectionOptions{
+			Programs: ebpf.ProgramOptions{
+				LogLevel: ebpf.LogLevelBranch,
+			},
+		}
+		if retryErr := loadTlsuprobeObjects(objs, opts); retryErr != nil {
+			var ve *ebpf.VerifierError
+			if errors.As(retryErr, &ve) {
+				log.Error(retryErr, "eBPF Verifier Error", "verifier_log", fmt.Sprintf("%+v", ve))
+			}
+			return nil, fmt.Errorf("loading eBPF objects: %w", retryErr)
+		}
+	}
+
+	// Wire up tail call map: index 0 -> bpf_phase2_rewrite
+	fd := uint32(objs.BpfPhase2Rewrite.FD())
+	if err := objs.ProgArray.Put(uint32(0), fd); err != nil {
+		objs.Close()
+		return nil, fmt.Errorf("configuring tail call map: %w", err)
 	}
 
 	reader, err := ringbuf.NewReader(objs.TlsEvents)
@@ -272,8 +291,8 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 		// Set allowed host for host-based filtering
 		if len(entry.AllowedHosts) > 0 && entry.AllowedHosts[0] != "*" {
 			host := entry.AllowedHosts[0]
-			if len(host) > 64 {
-				host = host[:64]
+			if len(host) > 32 {
+				host = host[:32]
 			}
 			val.HostLen = uint32(len(host))
 			copy(val.AllowedHost[:], []byte(host))

@@ -20,11 +20,13 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
 
-// Reduced buffer size to keep verifier happy (512 iterations max)
-#define MAX_DATA_SIZE 512
-// Fixed secret rewrite size - must be a compile-time constant for
-// bpf_probe_write_user
+// Buffer size for reading TLS data. Must be a power of 2 for bitmask bounds.
+// 256 keeps the phase 2 scan loop under the verifier's 8192-jump limit.
+#define MAX_DATA_SIZE 256
+// Fixed secret rewrite size
 #define SECRET_MAX_LEN 128
+// Max host length for matching (compared as 4 x uint64, no loop needed)
+#define MAX_HOST_LEN 32
 
 // BPF Map: shadow secret prefix -> real secret value
 struct secret_key {
@@ -34,8 +36,8 @@ struct secret_key {
 struct secret_value {
   __u32 len;
   char real_secret[SECRET_MAX_LEN];
-  __u32 host_len;        // 0 = wildcard (allow all hosts)
-  char allowed_host[64]; // e.g. "httpbin.org"
+  __u32 host_len;                  // 0 = wildcard (allow all hosts)
+  char allowed_host[MAX_HOST_LEN]; // e.g. "httpbin.org"
 };
 
 struct {
@@ -46,8 +48,12 @@ struct {
 } secret_map SEC(".maps");
 
 // Per-CPU array used as scratch space for reading and scanning data.
-// This avoids scanning ringbuf memory, which causes verifier issues.
 struct scratch_buf {
+  __u64 user_data_ptr;
+  __u32 read_len;
+  __u32 host_offset;
+  __u32 host_value_len; // length of extracted host value
+  char host_value[MAX_HOST_LEN]; // extracted host bytes from HTTP header
   char data[MAX_DATA_SIZE];
 };
 
@@ -57,6 +63,13 @@ struct {
   __type(key, __u32);
   __type(value, struct scratch_buf);
 } scratch SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u32);
+} prog_array SEC(".maps");
 
 // Ringbuffer for lightweight events to userspace (metrics/logging only)
 struct {
@@ -73,76 +86,134 @@ struct tls_event {
 };
 
 // -----------------------------------------------------------------------------
-// Shared rewrite logic: scan scratch buffer for "kloak:" prefix, look up
-// secret_map, check host, and rewrite the original userspace buffer in-place.
-// Returns 1 if any secret was rewritten, 0 otherwise.
+// Phase 1: Parse Host header and extract its value into scratch buffer.
+// This runs inline in the uprobe entry points (before tail-calling phase 2).
+// By extracting host bytes here, phase 2 can compare using fixed-size
+// uint64 comparisons with zero loops, staying under verifier limits.
 // -----------------------------------------------------------------------------
-static __always_inline int scan_and_rewrite(char *buf, __u32 read_len,
-                                            void *user_data_ptr) {
-  int rewritten = 0;
+static __always_inline void parse_host(struct scratch_buf *scratch) {
+  scratch->host_offset = 0;
+  scratch->host_value_len = 0;
+  __builtin_memset(scratch->host_value, 0, MAX_HOST_LEN);
 
-  // --- Phase 1: Find HTTP Host header (first 256 bytes) ---
-  char found_host[64] = {};
-  __u32 found_host_len = 0;
+  __u32 read_len = scratch->read_len;
+  if (read_len > MAX_DATA_SIZE)
+    read_len = MAX_DATA_SIZE;
 
+  // Scan the first 256 bytes to find "Host: "
+  __u32 host_start = 0;
   for (__u32 i = 0; i < 256; i++) {
     if (i + 6 > read_len)
       break;
-    if (buf[i] != 'H' || buf[i + 1] != 'o' || buf[i + 2] != 's' ||
-        buf[i + 3] != 't' || buf[i + 4] != ':' || buf[i + 5] != ' ')
-      continue;
 
-    // Extract host value byte-by-byte (flat index k, capped at MAX_DATA_SIZE)
-    for (__u32 k = i + 6;
-         k < MAX_DATA_SIZE && k < read_len && found_host_len < 64; k++) {
-      if (buf[k] == '\r' || buf[k] == '\n')
-        break;
-      found_host[found_host_len] = buf[k];
-      found_host_len++;
+    if (scratch->data[i] == 'H' && scratch->data[i + 1] == 'o' &&
+        scratch->data[i + 2] == 's' && scratch->data[i + 3] == 't' &&
+        scratch->data[i + 4] == ':' && scratch->data[i + 5] == ' ') {
+      host_start = i + 6;
+      scratch->host_offset = host_start;
+      break;
     }
-    break;
   }
 
-  // --- Phase 2: Scan for "kloak:" secrets and rewrite ---
+  if (host_start == 0)
+    return;
+
+  // Extract host value bytes into scratch->host_value (up to MAX_HOST_LEN)
+  // Stop at \r, \n, or : (end of host value)
+  __u32 host_len = 0;
+  for (__u32 j = 0; j < MAX_HOST_LEN; j++) {
+    __u32 idx = host_start + j;
+    if (idx >= read_len)
+      break;
+    char c = scratch->data[idx];
+    if (c == '\r' || c == '\n' || c == ':')
+      break;
+    scratch->host_value[j] = c;
+    host_len++;
+  }
+  scratch->host_value_len = host_len;
+}
+
+// -----------------------------------------------------------------------------
+// Phase 2: Scan for "kloak:" secrets and rewrite.
+// Host comparison uses fixed-size uint64 comparisons (no loops).
+// -----------------------------------------------------------------------------
+SEC("uprobe/phase2_rewrite")
+int bpf_phase2_rewrite(struct pt_regs *ctx) {
+  __u32 zero = 0;
+  struct scratch_buf *scratch_data = bpf_map_lookup_elem(&scratch, &zero);
+  if (!scratch_data)
+    return 0;
+
+  __u32 read_len = scratch_data->read_len;
+  if (read_len > MAX_DATA_SIZE)
+    read_len = MAX_DATA_SIZE;
+
+  int rewritten = 0;
+
   for (__u32 i = 0; i < MAX_DATA_SIZE; i++) {
     if (i + 16 > read_len)
       break;
 
-    if (buf[i] != 'k')
+    if (scratch_data->data[i] != 'k')
       continue;
 
-    if (buf[i + 1] != 'l' || buf[i + 2] != 'o' || buf[i + 3] != 'a' ||
-        buf[i + 4] != 'k' || buf[i + 5] != ':')
-      continue;
+    // Check for "kloak:"
+    if (scratch_data->data[i + 1] == 'l' && scratch_data->data[i + 2] == 'o' &&
+        scratch_data->data[i + 3] == 'a' && scratch_data->data[i + 4] == 'k' &&
+        scratch_data->data[i + 5] == ':') {
 
-    struct secret_key key = {};
-    __builtin_memcpy(key.prefix, &buf[i], 16);
+      struct secret_key key = {};
+      __builtin_memcpy(key.prefix, &scratch_data->data[i], 16);
 
-    struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
-    if (val && val->len > 0 && val->len <= SECRET_MAX_LEN) {
+      struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
+      if (val && val->len > 0 && val->len <= SECRET_MAX_LEN) {
 
-      // Host check: skip if secret has host restriction that doesn't match
-      if (val->host_len > 0) {
-        if (found_host_len != val->host_len)
-          continue;
-        int match = 1;
-        for (__u32 j = 0; j < 64 && j < val->host_len; j++) {
-          if (found_host[j] != val->allowed_host[j]) {
-            match = 0;
-            break;
-          }
+        // Host-based filtering: compare pre-extracted host against allowed_host
+        // using fixed-size uint64 comparisons (no loop, no verifier complexity)
+        if (val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
+          if (scratch_data->host_value_len == 0)
+            continue;
+
+          // Compare as 4 x uint64 (covers all 32 bytes)
+          __u64 *host_a = (__u64 *)scratch_data->host_value;
+          __u64 *host_b = (__u64 *)val->allowed_host;
+          if (host_a[0] != host_b[0] || host_a[1] != host_b[1] ||
+              host_a[2] != host_b[2] || host_a[3] != host_b[3])
+            continue;
         }
-        if (!match)
-          continue;
-      }
-      // host_len == 0 means wildcard - always rewrite
 
-      char *target = (char *)user_data_ptr + i;
-      bpf_probe_write_user(target, val->real_secret, val->len);
-      rewritten = 1;
+        // Rewrite: bounds-check i for the verifier
+        __u32 safe_i = i & (MAX_DATA_SIZE - 1);
+        char *target = (char *)scratch_data->user_data_ptr + safe_i;
+
+        __u32 write_len = val->len;
+        write_len &= (SECRET_MAX_LEN - 1);
+
+        if (write_len == 0)
+          continue;
+
+        bpf_probe_write_user(target, val->real_secret, write_len);
+        rewritten = 1;
+      }
     }
   }
-  return rewritten;
+
+  bpf_printk("kloak phase2: rewritten=%d", rewritten);
+
+  if (rewritten) {
+    struct tls_event *event =
+        bpf_ringbuf_reserve(&tls_events, sizeof(struct tls_event), 0);
+    if (event) {
+      event->pid = bpf_get_current_pid_tgid();
+      event->tgid = bpf_get_current_pid_tgid() >> 32;
+      event->len = read_len;
+      event->is_rewritten = 1;
+      bpf_ringbuf_submit(event, 0);
+    }
+  }
+
+  return 0;
 }
 
 // -----------------------------------------------------------------------------
@@ -156,7 +227,6 @@ static __always_inline int scan_and_rewrite(char *buf, __u32 read_len,
 SEC("uprobe/go_tls_write")
 int bpf_uprobe_go_tls_write(struct pt_regs *ctx) {
   __u32 pid = bpf_get_current_pid_tgid();
-  __u32 tgid = bpf_get_current_pid_tgid() >> 32;
 
   void *data_ptr;
   __u64 data_len;
@@ -194,21 +264,13 @@ int bpf_uprobe_go_tls_write(struct pt_regs *ctx) {
   bpf_printk("kloak go_tls: read_user ret=%ld read_len=%u first4=%.4s", ret,
              read_len, scratch_data->data);
 
-  // Scan and rewrite in-kernel
-  int rewritten = scan_and_rewrite(scratch_data->data, read_len, data_ptr);
+  scratch_data->user_data_ptr = (__u64)data_ptr;
+  scratch_data->read_len = read_len;
 
-  bpf_printk("kloak go_tls: rewritten=%d", rewritten);
+  parse_host(scratch_data);
 
-  // Send lightweight event to userspace
-  struct tls_event *event =
-      bpf_ringbuf_reserve(&tls_events, sizeof(struct tls_event), 0);
-  if (event) {
-    event->pid = pid;
-    event->tgid = tgid;
-    event->len = read_len;
-    event->is_rewritten = rewritten ? 1 : 0;
-    bpf_ringbuf_submit(event, 0);
-  }
+  // Jump to Phase 2
+  bpf_tail_call(ctx, &prog_array, 0);
 
   return 0;
 }
@@ -224,7 +286,6 @@ int bpf_uprobe_go_tls_write(struct pt_regs *ctx) {
 SEC("uprobe/ssl_write")
 int bpf_uprobe_ssl_write(struct pt_regs *ctx) {
   __u32 pid = bpf_get_current_pid_tgid();
-  __u32 tgid = bpf_get_current_pid_tgid() >> 32;
 
   void *data_ptr;
   int num;
@@ -259,17 +320,13 @@ int bpf_uprobe_ssl_write(struct pt_regs *ctx) {
   bpf_printk("kloak ssl: read_user ret=%ld len=%u first4=%.4s", ret, read_len,
              scratch_data->data);
 
-  int rewritten = scan_and_rewrite(scratch_data->data, read_len, data_ptr);
+  scratch_data->user_data_ptr = (__u64)data_ptr;
+  scratch_data->read_len = read_len;
 
-  struct tls_event *event =
-      bpf_ringbuf_reserve(&tls_events, sizeof(struct tls_event), 0);
-  if (event) {
-    event->pid = pid;
-    event->tgid = tgid;
-    event->len = read_len;
-    event->is_rewritten = rewritten ? 1 : 0;
-    bpf_ringbuf_submit(event, 0);
-  }
+  parse_host(scratch_data);
+
+  // Jump to Phase 2
+  bpf_tail_call(ctx, &prog_array, 0);
 
   return 0;
 }
