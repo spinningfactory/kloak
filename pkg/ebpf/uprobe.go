@@ -58,11 +58,7 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 	log := ctrl.Log.WithName("ebpf-uprobe")
 
 	objs := &tlsuprobeObjects{}
-	opts := &ebpf.CollectionOptions{
-		Programs: ebpf.ProgramOptions{
-			LogLevel: ebpf.LogLevelInstruction | ebpf.LogLevelBranch,
-		},
-	}
+	opts := &ebpf.CollectionOptions{}
 	if err := loadTlsuprobeObjects(objs, opts); err != nil {
 		return nil, fmt.Errorf("loading eBPF objects: %w", err)
 	}

@@ -16,7 +16,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/spinningfactory/kloak/pkg/storage"
-	"github.com/spinningfactory/kloak/pkg/sync"
 )
 
 const (
@@ -34,10 +33,9 @@ const (
 // SecretReconciler reconciles a Secret object
 type SecretReconciler struct {
 	client.Client
-	Log        logr.Logger
-	Scheme     *runtime.Scheme
-	Storage    storage.Storage
-	SyncServer *sync.Server // Optional: notify agents of changes
+	Log     logr.Logger
+	Scheme  *runtime.Scheme
+	Storage storage.Storage
 }
 
 // Reconcile handles Secret events.
@@ -181,11 +179,6 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if err := r.Storage.Store(ctx, secretID, shadowVal, entry); err != nil {
 			log.Error(err, "failed to store mapping", "shadow", shadowVal)
 			return ctrl.Result{}, err
-		}
-
-		// Notify agents of the update
-		if r.SyncServer != nil {
-			r.SyncServer.NotifyUpdate(shadowVal, entry, secret.Namespace)
 		}
 	}
 

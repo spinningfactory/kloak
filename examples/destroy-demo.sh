@@ -49,7 +49,6 @@ cleanup_images() {
         docker rmi kloak-demo-python:latest 2>/dev/null || true
         docker rmi kloak-demo-go:latest 2>/dev/null || true
         docker rmi kloak-demo-js:latest 2>/dev/null || true
-        docker rmi kloak-demo-java:latest 2>/dev/null || true
         echo "✓ Docker images removed"
     else
         echo "✓ Docker images kept"

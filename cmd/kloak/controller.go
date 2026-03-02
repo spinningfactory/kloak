@@ -2,24 +2,21 @@ package main
 
 import (
 	"context"
-	"fmt"
-	"net"
 	"os"
 
-	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
 	"github.com/spinningfactory/kloak/pkg/ebpf"
-	"google.golang.org/grpc"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/storage"
-	"github.com/spinningfactory/kloak/pkg/sync"
+	"github.com/spinningfactory/kloak/pkg/webhook"
 )
 
 var (
@@ -39,15 +36,13 @@ manages eBPF programs, and serves the gRPC sync API for agents.
 The controller is responsible for:
 - Watching K8s Secrets with kloak.io/managed label
 - Managing the Root CA for TLS interception
-- Managing eBPF cgroup tracking for labeled pods
-- Serving the sync gRPC API so agents can receive secret updates`,
+- Managing eBPF cgroup tracking for labeled pods`,
 	Run: runController,
 }
 
 var (
 	controllerMetricsAddr string
 	controllerProbeAddr   string
-	controllerSyncAddr    string
 	enableLeaderElection  bool
 	enableEBPF            bool
 	cgroupPath            string
@@ -57,7 +52,6 @@ var (
 func init() {
 	controllerCmd.Flags().StringVar(&controllerMetricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	controllerCmd.Flags().StringVar(&controllerProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	controllerCmd.Flags().StringVar(&controllerSyncAddr, "sync-address", ":9090", "The address the gRPC sync server binds to.")
 	controllerCmd.Flags().BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 	controllerCmd.Flags().BoolVar(&enableEBPF, "enable-ebpf", false, "Enable eBPF traffic redirection (requires Linux + CAP_BPF).")
 	controllerCmd.Flags().StringVar(&cgroupPath, "cgroup-path", "/sys/fs/cgroup", "Path to cgroup v2 filesystem.")
@@ -80,22 +74,28 @@ func runController(cmd *cobra.Command, args []string) {
 		namespace = "kloak-system"
 	}
 
-	// Handle certificate mode
-	if certMode == "" {
-		certMode = os.Getenv("KLOAK_CERT_MODE")
-	}
-	if certMode == "" {
-		certMode = "auto"
-	}
-	setupLog.Info("Certificate mode", "mode", certMode)
-
 	// We rely purely on the underlying runtime providing certificates to workloads (or eBPF uprobes intercepting)
-	// No CA generation happens here anymore
+	// No application CA generation happens here anymore
+
+	// However, we still need to provide a TLS cert for the MutatingWebhook, since K8s apiservers demand HTTPS
+	k8sConfig := ctrl.GetConfigOrDie()
+	directClient, err := client.New(k8sConfig, client.Options{Scheme: scheme})
+	if err != nil {
+		setupLog.Error(err, "failed to create direct client")
+		os.Exit(1)
+	}
+
+	_, err = webhook.EnsureWebhookCerts(context.Background(), directClient, namespace)
+	if err != nil {
+		setupLog.Error(err, "failed to ensure webhook TLS certificates")
+		// The webhook might fail to start since the secret won't exist.
+	} else {
+		setupLog.Info("Webhook TLS certificates exist")
+	}
 
 	// Create uprobe manager instances
 	var uprobeMgr *ebpf.TLSUprobeManager
 
-	var err error
 	if enableEBPF {
 		uprobeMgr, err = ebpf.NewTLSUprobeManager(store)
 		if err != nil {
@@ -119,18 +119,8 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Create gRPC Sync Server (replaces XDS in controller)
-	syncServer := sync.NewServer(store, ctrl.Log.WithName("sync"))
-
-	// Start gRPC server
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-
-	go func() {
-		if err := startSyncServer(ctx, controllerSyncAddr, syncServer, setupLog); err != nil {
-			setupLog.Error(err, "sync server failed")
-		}
-	}()
 
 	// Create pod reconciler
 	// NODE_NAME is used to filter pods to only those on this node (DaemonSet per-node controller)
@@ -152,13 +142,12 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Create secret reconciler with sync server for notifications
+	// Create secret reconciler
 	secretReconciler := &controller.SecretReconciler{
-		Client:     mgr.GetClient(),
-		Log:        ctrl.Log.WithName("controller").WithName("Secret"),
-		Scheme:     mgr.GetScheme(),
-		Storage:    store,
-		SyncServer: syncServer,
+		Client:  mgr.GetClient(),
+		Log:     ctrl.Log.WithName("controller").WithName("Secret"),
+		Scheme:  mgr.GetScheme(),
+		Storage: store,
 	}
 
 	if err := secretReconciler.SetupWithManager(mgr); err != nil {
@@ -195,26 +184,6 @@ func runController(cmd *cobra.Command, args []string) {
 	if uprobeMgr != nil {
 		uprobeMgr.Close()
 	}
-}
-
-// startSyncServer starts the gRPC sync server.
-func startSyncServer(ctx context.Context, addr string, syncServer *sync.Server, log logr.Logger) error {
-	lis, err := net.Listen("tcp", addr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", addr, err)
-	}
-
-	grpcServer := grpc.NewServer()
-	syncServer.Register(grpcServer)
-
-	log.Info("starting gRPC sync server", "addr", addr)
-
-	go func() {
-		<-ctx.Done()
-		grpcServer.GracefulStop()
-	}()
-
-	return grpcServer.Serve(lis)
 }
 
 // runnableFunc helper for manager.Runnable

@@ -105,15 +105,9 @@ build_images() {
     # Build demo JS app
     docker build -t kloak-demo-js:latest "$SCRIPT_DIR/demo-js"
 
-    # Build demo Java app
-    docker build -t kloak-demo-java:latest "$SCRIPT_DIR/demo-java"
-
     # Build Kloak controller
     docker build -t kloak:latest "$ROOT_DIR"
 
-    # Build Kloak CNI Installer
-    docker build -f "$ROOT_DIR/Dockerfile.cni" -t kloak-cni:latest "$ROOT_DIR"
-    
     echo "Importing images into K3s (this may take a moment)..."
     # We pipeline docker save -> lima -> k3s ctr import
     
@@ -126,15 +120,9 @@ build_images() {
     echo "Importing kloak-demo-js..."
     docker save kloak-demo-js:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
 
-    echo "Importing kloak-demo-java..."
-    docker save kloak-demo-java:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
-
     echo "Importing kloak..."
     docker save kloak:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
 
-    echo "Importing kloak-cni..."
-    docker save kloak-cni:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
-    
     echo "✓ Images built and imported"
 }
 
@@ -153,15 +141,6 @@ deploy_kloak() {
     # Wait for namespace to be ready
     kubectl wait --for=jsonpath='{.status.phase}'=Active namespace/kloak-system --timeout=30s
     
-    # Wait for controller to generate certificates (auto-cert mode)
-    echo "Waiting for controller to generate certificates..."
-    until kubectl get secret kloak-ca -n kloak-system 2>/dev/null; do
-        echo -n "."
-        sleep 2
-    done
-    echo ""
-    echo "✓ CA certificate generated"
-    
     until kubectl get secret kloak-webhook-certs -n kloak-system 2>/dev/null; do
         echo -n "."
         sleep 2
@@ -169,21 +148,16 @@ deploy_kloak() {
     echo ""
     echo "✓ Webhook certificate generated"
     
-    # Wait for CNI installation
-    echo "Waiting for CNI installation..."
-    kubectl rollout status daemonset/kloak-cni-install -n kloak-system --timeout=60s
-
     # Restart all Kloak components to pick up new images.
     # kubectl apply won't trigger a rollout when the image tag hasn't changed
     # (e.g. kloak:latest), so an explicit restart is needed.
     kubectl rollout restart daemonset/kloak-controller -n kloak-system
     kubectl rollout restart deployment/kloak-webhook -n kloak-system
-    kubectl rollout restart daemonset/kloak-agent -n kloak-system
     
     # Remove default namespace label if it exists (cleanup)
     kubectl label namespace default getkloak.io/enabled- --overwrite 2>/dev/null || true
     
-    echo "✓ Kloak operator deployed (controller DaemonSet, agent DaemonSet, webhook, CNI)"
+    echo "✓ Kloak operator deployed (controller DaemonSet, webhook)"
 }
 
 # Wait for Kloak pods
@@ -199,8 +173,6 @@ wait_for_kloak() {
     # rolling update and returns as soon as new pods are ready.
     kubectl rollout status daemonset/kloak-controller -n kloak-system --timeout=120s
     kubectl rollout status deployment/kloak-webhook -n kloak-system --timeout=120s
-    kubectl rollout status daemonset/kloak-agent -n kloak-system --timeout=120s
-    kubectl rollout status daemonset/kloak-cni-install -n kloak-system --timeout=120s
     
     echo ""
     echo "Kloak pods status:"
@@ -227,8 +199,6 @@ deploy_demo() {
     kubectl delete pod demo-go -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
     kubectl delete deployment demo-js -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
     kubectl delete pod demo-js -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
-    kubectl delete deployment demo-java -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
-    kubectl delete pod demo-java -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
     
     # Create SECRET 1: Allowed for httpbin.org
     echo "Creating secret-allowed (hosts=httpbin.org)..."
@@ -253,9 +223,8 @@ deploy_demo() {
     kubectl apply -f "$SCRIPT_DIR/demo-python/deployment.yaml" -n "$DEMO_NAMESPACE"
     kubectl apply -f "$SCRIPT_DIR/demo-go/deployment.yaml" -n "$DEMO_NAMESPACE"
     kubectl apply -f "$SCRIPT_DIR/demo-js/deployment.yaml" -n "$DEMO_NAMESPACE"
-    kubectl apply -f "$SCRIPT_DIR/demo-java/deployment.yaml" -n "$DEMO_NAMESPACE"
 
-    echo "✓ Demo applications deployed (Python + Go + JS + Java)"
+    echo "✓ Demo applications deployed (Python + Go + JS)"
 }
 
 # Wait for demo deployment
@@ -276,10 +245,6 @@ wait_for_demo() {
         echo "Warning: JS demo deployment may not be ready"
     }
 
-    kubectl rollout status deployment/demo-java -n "$DEMO_NAMESPACE" --timeout=120s || {
-        echo "Warning: Java demo deployment may not be ready"
-    }
-
     echo ""
     echo "Demo pods status:"
     kubectl get pods -n "$DEMO_NAMESPACE" -o wide
@@ -293,9 +258,6 @@ wait_for_demo() {
 
     echo "Containers in JS demo pod:"
     kubectl get pods -l app=demo-js -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' && echo ""
-
-    echo "Containers in Java demo pod:"
-    kubectl get pods -l app=demo-java -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' && echo ""
 }
 
 # Verify sidecar injection
@@ -304,7 +266,7 @@ verify_injection() {
     echo ""
     echo "Verifying sidecar injection..."
     
-    for app in demo-python demo-go demo-js demo-java; do
+    for app in demo-python demo-go demo-js; do
         echo "Checking $app..."
         CONTAINERS=$(kubectl get pods -l app=$app -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null || echo "")
         
@@ -320,8 +282,7 @@ verify_injection() {
     # Show webhook logs if any injection failed
     if ! kubectl get pods -l app=demo-python -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null | grep -q envoy-sidecar || \
        ! kubectl get pods -l app=demo-go -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null | grep -q envoy-sidecar || \
-       ! kubectl get pods -l app=demo-js -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null | grep -q envoy-sidecar || \
-       ! kubectl get pods -l app=demo-java -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null | grep -q envoy-sidecar; then
+       ! kubectl get pods -l app=demo-js -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null | grep -q envoy-sidecar; then
         echo ""
         echo "Checking webhook logs..."
         kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook --tail=10 2>/dev/null || true
@@ -349,12 +310,11 @@ show_summary() {
     echo "  View Python logs:    kubectl logs -f -l app=demo-python -n $DEMO_NAMESPACE -c demo-app"
     echo "  View Go logs:        kubectl logs -f -l app=demo-go -n $DEMO_NAMESPACE -c demo-app"
     echo "  View JS logs:        kubectl logs -f -l app=demo-js -n $DEMO_NAMESPACE -c demo-app"
-    echo "  View Java logs:      kubectl logs -f -l app=demo-java -n $DEMO_NAMESPACE -c demo-app"
     echo "  View sidecar logs:   kubectl logs -f -l app=demo-python -n $DEMO_NAMESPACE -c envoy-sidecar"
     echo "  View webhook logs:   kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook"
     echo "  View controller logs: kubectl logs -n kloak-system -l app.kubernetes.io/component=controller"
     echo ""
-    echo "Verification (for demo-python, demo-go, demo-js, or demo-java):"
+    echo "Verification (for demo-python, demo-go, or demo-js):"
     echo "  1. Check demo logs:  kubectl logs -l app=demo-python -n $DEMO_NAMESPACE -c demo-app | head -30"
     echo "     (Should show 'kloak:...' UUIDs for both secrets)"
     echo "  2. Check response:   kubectl logs -l app=demo-python -n $DEMO_NAMESPACE -c demo-app | grep -A20 'Response headers'"

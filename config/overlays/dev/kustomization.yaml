@@ -26,6 +26,3 @@ images:
   - name: bitnami/kubectl
     newName: bitnami/kubectl
     newTag: latest
-  - name: kloak-cni
-    newName: kloak-cni
-    newTag: latest
