@@ -1,9 +1,11 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -59,8 +61,21 @@ func main() {
 	fmt.Println("Waiting 15s for Kloak controller to sync...")
 	time.Sleep(15 * time.Second)
 
+	// Force HTTP/1.1 — Go defaults to h2 via ALPN, but HTTP/2 uses binary
+	// HPACK-encoded frames that the eBPF uprobe scanner cannot parse.
+	// HTTP/1.1 sends plaintext headers through tls.Conn.Write in a single call.
 	client := &http.Client{
 		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				NextProtos: []string{"http/1.1"},
+			},
+			DialTLSContext: nil,
+			ForceAttemptHTTP2: false,
+			DialContext: (&net.Dialer{
+				Timeout: 10 * time.Second,
+			}).DialContext,
+		},
 	}
 
 	requestCount := 0

@@ -121,32 +121,40 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	}
 
 	// 2. Try OpenSSL (Node.js, Python, Rust)
-	// OpenSSL functions might be in libssl.so, which we would have to search for in /proc/pid/maps,
-	// or statically linked into the main binary.
-	// For simplicity in this demo, let's try attaching to SSL_write on the main executable.
-	// In a complete implementation, we'd parse /proc/pid/maps to find the absolute path of libssl.so.
-	sslWriteSym := "SSL_write"
-	upSSL, err := ex.Uprobe(sslWriteSym, m.objs.BpfUprobeSslWrite, nil)
-	if err == nil {
-		m.log.Info("Attached OpenSSL uprobe to process", "pid", pid, "symbol", sslWriteSym)
-		m.links = append(m.links, upSSL)
-		return nil
-	} else if !errors.Is(err, link.ErrNoSymbol) && !strings.Contains(err.Error(), "no symbol") {
-		m.log.V(1).Info("failed to attach OpenSSL uprobe to main exe", "error", err)
+	// Modern OpenSSL 3.x has both SSL_write (legacy) and SSL_write_ex (preferred).
+	// Python 3.11+ uses SSL_write_ex exclusively, so we must probe both.
+	// The calling convention is identical for the first 3 params (ssl, buf, len).
+	sslSymbols := []string{"SSL_write", "SSL_write_ex"}
+	attached := false
+
+	// Try main executable first
+	for _, sym := range sslSymbols {
+		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
+		if err == nil {
+			m.log.Info("Attached OpenSSL uprobe to main exe", "pid", pid, "symbol", sym)
+			m.links = append(m.links, up)
+			attached = true
+		}
 	}
 
-	// TODO: Parse /proc/<pid>/maps for "libssl.so" and link.OpenExecutable() on that library.
+	// Try libssl.so shared library
 	libsslPath, err := findLibSSL(pid)
 	if err == nil && libsslPath != "" {
 		libEx, err := link.OpenExecutable(libsslPath)
 		if err == nil {
-			upLibSSL, err := libEx.Uprobe(sslWriteSym, m.objs.BpfUprobeSslWrite, nil)
-			if err == nil {
-				m.log.Info("Attached OpenSSL uprobe to shared library", "pid", pid, "lib", libsslPath)
-				m.links = append(m.links, upLibSSL)
-				return nil
+			for _, sym := range sslSymbols {
+				up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
+				if err == nil {
+					m.log.Info("Attached OpenSSL uprobe to shared library", "pid", pid, "symbol", sym, "lib", libsslPath)
+					m.links = append(m.links, up)
+					attached = true
+				}
 			}
 		}
+	}
+
+	if attached {
+		return nil
 	}
 
 	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
