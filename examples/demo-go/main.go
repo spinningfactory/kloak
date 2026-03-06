@@ -57,7 +57,7 @@ func main() {
 	// Add startup delay to wait for Controller to program eBPF maps
 	// Go starts very fast, often before the ConfigMap/eBPF is ready.
 	// This prevents the "Persistent Connection Race" where the first connection
-	// bypasses Envoy and then is reused for all subsequent requests.
+	// bypasses eBPF interception and then is reused for all subsequent requests.
 	fmt.Println("Waiting 15s for Kloak controller to sync...")
 	time.Sleep(15 * time.Second)
 
@@ -70,7 +70,7 @@ func main() {
 			TLSClientConfig: &tls.Config{
 				NextProtos: []string{"http/1.1"},
 			},
-			DialTLSContext: nil,
+			DialTLSContext:    nil,
 			ForceAttemptHTTP2: false,
 			DialContext: (&net.Dialer{
 				Timeout: 10 * time.Second,

@@ -24,7 +24,7 @@ func init() {
 var webhookCmd = &cobra.Command{
 	Use:   "webhook",
 	Short: "Run the Kloak mutating admission webhook",
-	Long:  `Starts the admission webhook that injects Envoy sidecars and hashes environment variables.`,
+	Long:  `Starts the mutating admission webhook that rewrites Secret volumes to use Kloak shadow secrets.`,
 	Run:   runWebhook,
 }
 

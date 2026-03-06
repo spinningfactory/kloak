@@ -27,6 +27,6 @@ type Storage interface {
 	Delete(ctx context.Context, podID string) error
 
 	// List returns all hash→Entry mappings.
-	// Used for syncing to XDS/ext_proc.
+	// Used for syncing to eBPF maps.
 	List(ctx context.Context) (map[string]Entry, error)
 }

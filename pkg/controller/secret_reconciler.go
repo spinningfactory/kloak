@@ -26,7 +26,7 @@ const (
 	ShadowSecretSuffix = "-kloak"
 
 	// ValuePrefix is the prefix for generated UUID values.
-	// Must match what ExtProc expects (see pkg/extproc/server.go).
+	// Must match what the eBPF program expects.
 	ValuePrefix = "kloak:"
 )
 
