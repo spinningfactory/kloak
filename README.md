@@ -38,6 +38,7 @@ Kloak separates concerns into a robust control plane and an ultra-fast data plan
 graph TD
     subgraph Control Plane
         C[Kloak Controller]
+        W[Mutating Webhook]
     end
     
     subgraph Data Plane
@@ -45,7 +46,9 @@ graph TD
         E[eBPF Traffic Control & Secret Replacement]
     end
     
-    C -.->|Watches secrets & manages eBPF programs| E
+    C -.->|Creates shadow secrets| W
+    W -.->|Mutates Pod to mount shadow secrets| P
+    C -.->|Manages eBPF programs| E
     P -->|Encrypted HTTPS Traffic w/ Placeholders| E
     E -->|Real Secrets Injected| Internet
 ```
@@ -55,6 +58,7 @@ graph TD
 | Component | Description |
 |-----------|-------------|
 | **Controller** | Watches Kubernetes secrets labeled with `getkloak.io/enabled=true` and manages eBPF programs in the kernel. |
+| **Webhook** | Mutating admission webhook that intercepts Pod creation. Instead of injecting sidecars, it rewrites Secret volume mounts to point to Kloak's generated shadow secrets containing hashes. |
 | **Data Plane (eBPF)** | Pure kernel-space interception and replacement of hashed placeholders with real secret values during active HTTPS connections. |
 
 ## 🚀 How It Works
@@ -140,7 +144,7 @@ kloak/
 │   ├── controller/      # Kubernetes controller logic
 │   ├── ebpf/            # eBPF programs and bindings
 │   ├── storage/         # Secret storage backend
-│   └── webhook/         # Admission webhook (legacy/support)
+│   └── webhook/         # Admission webhook (mutates secret volumes)
 ├── bpf/                 # eBPF C source code
 ├── config/              # Envoy and K8s manifests
 └── examples/            # Demo applications
