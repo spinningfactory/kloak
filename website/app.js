@@ -113,26 +113,71 @@ document.querySelectorAll('a[href^="#"]').forEach(anchor => {
 });
 
 /**
- * Handle form submission via mailto
+ * Handle form submission via Formspree AJAX
  */
 const demoForm = document.getElementById('demo-form');
+const formStatus = document.getElementById('form-status');
+
 if (demoForm) {
-    demoForm.addEventListener('submit', function (e) {
+    demoForm.addEventListener('submit', async function (e) {
         e.preventDefault();
 
-        const name = document.getElementById('name').value;
-        const email = document.getElementById('email').value;
-        const company = document.getElementById('company').value;
-        const message = document.getElementById('message').value;
+        const submitBtn = demoForm.querySelector('button[type="submit"]');
+        const originalBtnText = submitBtn.innerHTML;
 
-        const subject = encodeURIComponent(`Demo Request from ${name} at ${company}`);
-        const body = encodeURIComponent(
-            `Name: ${name}\n` +
-            `Email: ${email}\n` +
-            `Company: ${company}\n\n` +
-            `Message:\n${message}`
-        );
+        // Disable button while submitting
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = '<span>Sending...</span>';
 
-        window.location.href = `mailto:mailto@spinningfactory.io?subject=${subject}&body=${body}`;
+        const data = new FormData(demoForm);
+
+        try {
+            const response = await fetch(demoForm.action, {
+                method: demoForm.method,
+                body: data,
+                headers: {
+                    'Accept': 'application/json'
+                }
+            });
+
+            if (response.ok) {
+                // Success UI
+                formStatus.style.display = 'block';
+                formStatus.style.backgroundColor = 'rgba(0, 191, 165, 0.1)';
+                formStatus.style.color = '#00BFA5';
+                formStatus.style.border = '1px solid #00BFA5';
+                formStatus.textContent = 'Demo request sent successfully! We will be in touch soon.';
+                demoForm.reset();
+            } else {
+                // Server Error UI
+                let errorMessage = 'Oops! There was a problem submitting your form.';
+                const result = await response.json();
+                if (Object.hasOwn(result, 'errors')) {
+                    errorMessage = result.errors.map(error => error.message).join(', ');
+                }
+
+                formStatus.style.display = 'block';
+                formStatus.style.backgroundColor = 'rgba(239, 68, 68, 0.1)';
+                formStatus.style.color = '#ef4444';
+                formStatus.style.border = '1px solid #ef4444';
+                formStatus.textContent = errorMessage;
+            }
+        } catch (error) {
+            // Network Error UI
+            formStatus.style.display = 'block';
+            formStatus.style.backgroundColor = 'rgba(239, 68, 68, 0.1)';
+            formStatus.style.color = '#ef4444';
+            formStatus.style.border = '1px solid #ef4444';
+            formStatus.textContent = 'Oops! There was a network error fulfilling your request.';
+        } finally {
+            // Re-enable button
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = originalBtnText;
+
+            // Hide status message after 8 seconds
+            setTimeout(() => {
+                formStatus.style.display = 'none';
+            }, 8000);
+        }
     });
 }
