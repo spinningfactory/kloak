@@ -24,14 +24,10 @@ rules:
   - apiGroups: [""]
     resources: ["pods"]
     verbs: ["get", "list", "watch"]
-  # Secret management for CA and SecretReconciler
+  # Secret management for SecretReconciler
   - apiGroups: [""]
     resources: ["secrets"]
-    verbs: ["get", "list", "watch", "create", "update"]
-  # ConfigMap for Envoy config
-  - apiGroups: [""]
-    resources: ["configmaps"]
-    verbs: ["get", "list", "create", "update"]
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   # Events for debugging
   - apiGroups: [""]
     resources: ["events"]
@@ -40,6 +36,10 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # MutatingWebhookConfiguration for auto cert mode
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations"]
+    verbs: ["get", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

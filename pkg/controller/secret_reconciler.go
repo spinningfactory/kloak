@@ -111,19 +111,39 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	for key, originalBytes := range secret.Data {
 		originalValue := string(originalBytes)
+		originalLen := len(originalBytes)
 		var shadowValue string
 
 		// Try to reuse existing UUID
 		if shadowExists && len(existingShadow.Data[key]) > 0 {
 			existingVal := string(existingShadow.Data[key])
 			if strings.HasPrefix(existingVal, ValuePrefix) {
-				shadowValue = existingVal
+				// Strip padding if necessary to compare/reuse the true UUID part
+				// For now, let's just use the exact existing padded string if lengths match
+				if len(existingVal) == originalLen {
+					shadowValue = existingVal
+				}
 			}
 		}
 
-		// Generate new if needed
+		// Generate new if needed or if length mismatch
 		if shadowValue == "" {
-			shadowValue = ValuePrefix + uuid.New().String()
+			newUUID := uuid.New().String()
+			baseVal := ValuePrefix + newUUID
+
+			// Handle padding or truncation to exactly match originalLen
+			if len(baseVal) > originalLen {
+				// We cannot truncate UUIDs safely and guarantee uniqueness easily.
+				// However, if the secret is shorter than our prefix + UUID (kloak: + 36 chars = 42 chars)
+				// we are in trouble anyway because ebpf probe rewrite needs space.
+				// We will log a warning, but we must truncate to avoid memory corruption on rewrite.
+				log.Info("WARNING: original secret is shorter than shadow secret UUID. Truncating UUID, collision risk.", "key", key, "originalLen", originalLen)
+				shadowValue = baseVal[:originalLen]
+			} else {
+				// Pad with spaces (or another safe character) to match the original length
+				paddingStr := strings.Repeat(" ", originalLen-len(baseVal))
+				shadowValue = baseVal + paddingStr
+			}
 		}
 
 		newData[key] = []byte(shadowValue)

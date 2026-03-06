@@ -1,0 +1,54 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kloak-cni-config
+  namespace: kloak-system
+data:
+  kloak-cni.conf: |
+    {
+      "type": "kloak-cni",
+      "log_level": "info"
+    }
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kloak-cni-install
+  namespace: kloak-system
+  labels:
+    app: kloak-cni-install
+spec:
+  selector:
+    matchLabels:
+      app: kloak-cni-install
+  template:
+    metadata:
+      labels:
+        app: kloak-cni-install
+    spec:
+      hostNetwork: true
+      tolerations:
+      - operator: Exists
+        effect: NoSchedule
+      containers:
+      - name: install-cni
+        image: kloak-cni:latest
+        imagePullPolicy: IfNotPresent
+        command: ["/install-cni.sh"]
+        volumeMounts:
+        - name: cni-bin
+          mountPath: /host/opt/cni/bin
+        - name: cni-net
+          mountPath: /host/etc/cni/net.d
+        - name: kloak-cni-conf
+          mountPath: /etc/kloak-cni/net.d
+      volumes:
+      - name: cni-bin
+        hostPath:
+          path: /opt/cni/bin
+      - name: cni-net
+        hostPath:
+          path: /etc/cni/net.d
+      - name: kloak-cni-conf
+        configMap:
+          name: kloak-cni-config

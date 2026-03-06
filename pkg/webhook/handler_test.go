@@ -4,30 +4,91 @@ import (
 	"context"
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/go-logr/logr"
-	"github.com/spinningfactory/kloak/pkg/storage"
+
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestIsEnabled(t *testing.T) {
-	h := &Handler{}
+	// Setup fake client with namespaces and workloads
+	scheme := runtime.NewScheme()
+	_ = corev1.AddToScheme(scheme)
+	_ = appsv1.AddToScheme(scheme)
+
+	nsDefault := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "default",
+		},
+	}
+	nsEnabled := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "enabled-ns",
+			Labels: map[string]string{
+				AnnotationEnabled: "true",
+			},
+		},
+	}
+
+	// Workload objects for inheritance testing
+	deployment := &appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "enabled-deploy",
+			Namespace: "default",
+			Labels: map[string]string{
+				AnnotationEnabled: "true",
+			},
+		},
+	}
+
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "enabled-deploy-rs",
+			Namespace: "default",
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					Kind: "Deployment",
+					Name: "enabled-deploy",
+				},
+			},
+		},
+	}
+
+	ds := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "enabled-ds",
+			Namespace: "default",
+			Annotations: map[string]string{
+				AnnotationEnabled: "true",
+			},
+		},
+	}
+
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(nsDefault, nsEnabled, deployment, rs, ds).Build()
+
+	h := &Handler{
+		client: fakeClient,
+		log:    logr.Discard(),
+	}
 
 	tests := []struct {
-		name     string
-		pod      *corev1.Pod
-		expected bool
+		name      string
+		pod       *corev1.Pod
+		namespace string
+		expected  bool
 	}{
 		{
-			name:     "no annotations",
-			pod:      &corev1.Pod{},
-			expected: false,
+			name:      "no annotations, default ns",
+			pod:       &corev1.Pod{},
+			namespace: "default",
+			expected:  false,
 		},
 		{
-			name: "enabled=true",
+			name: "explicit enabled=true",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
@@ -35,10 +96,11 @@ func TestIsEnabled(t *testing.T) {
 					},
 				},
 			},
-			expected: true,
+			namespace: "default",
+			expected:  true,
 		},
 		{
-			name: "enabled=false",
+			name: "explicit enabled=false",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
 					Annotations: map[string]string{
@@ -46,135 +108,69 @@ func TestIsEnabled(t *testing.T) {
 					},
 				},
 			},
-			expected: false,
+			namespace: "default",
+			expected:  false,
+		},
+		{
+			name:      "inheritance from enabled namespace",
+			pod:       &corev1.Pod{},
+			namespace: "enabled-ns",
+			expected:  true,
+		},
+		{
+			name: "disabled pod in enabled namespace",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{
+						AnnotationEnabled: "false",
+					},
+				},
+			},
+			namespace: "enabled-ns",
+			expected:  false,
+		},
+		{
+			name: "inheritance from deployment (via RS)",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind: "ReplicaSet",
+							Name: "enabled-deploy-rs",
+						},
+					},
+				},
+			},
+			namespace: "default",
+			expected:  true,
+		},
+		{
+			name: "inheritance from daemonset",
+			pod: &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					OwnerReferences: []metav1.OwnerReference{
+						{
+							Kind: "DaemonSet",
+							Name: "enabled-ds",
+						},
+					},
+				},
+			},
+			namespace: "default",
+			expected:  true,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			result := h.isEnabled(tc.pod)
+			result, err := h.isEnabled(context.Background(), tc.pod, tc.namespace)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
 			if result != tc.expected {
 				t.Errorf("isEnabled() = %v, want %v", result, tc.expected)
 			}
 		})
-	}
-}
-
-func TestInjectEnvoySidecar(t *testing.T) {
-	h := &Handler{}
-	pod := &corev1.Pod{
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{Name: "app", Image: "myapp:latest"},
-			},
-		},
-	}
-
-	h.injectEnvoySidecar(pod)
-
-	// Check sidecar was added
-	if len(pod.Spec.Containers) != 2 {
-		t.Fatalf("Expected 2 containers, got %d", len(pod.Spec.Containers))
-	}
-
-	sidecar := pod.Spec.Containers[1]
-	if sidecar.Name != "envoy-sidecar" {
-		t.Errorf("Expected sidecar name 'envoy-sidecar', got '%s'", sidecar.Name)
-	}
-
-	// Check volumes were added
-	if len(pod.Spec.Volumes) != 1 {
-		t.Errorf("Expected 1 volumes, got %d", len(pod.Spec.Volumes))
-	}
-}
-
-func TestMountRootCA(t *testing.T) {
-	h := &Handler{}
-	pod := &corev1.Pod{
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{Name: "app", Image: "myapp:latest"},
-			},
-		},
-	}
-
-	h.mountRootCA(pod)
-
-	// Check volume was added
-	if len(pod.Spec.Volumes) != 1 {
-		t.Fatalf("Expected 1 volume, got %d", len(pod.Spec.Volumes))
-	}
-
-	if pod.Spec.Volumes[0].Name != "kloak-data" {
-		t.Errorf("Expected volume name 'kloak-data', got '%s'", pod.Spec.Volumes[0].Name)
-	}
-
-	// Check mount was added to app container
-	if len(pod.Spec.Containers[0].VolumeMounts) != 1 {
-		t.Fatalf("Expected 1 volume mount, got %d", len(pod.Spec.Containers[0].VolumeMounts))
-	}
-
-	mount := pod.Spec.Containers[0].VolumeMounts[0]
-	if mount.MountPath != "/etc/kloak-data" {
-		t.Errorf("Expected mount path '/etc/kloak-data', got '%s'", mount.MountPath)
-	}
-}
-
-func TestHashEnvVars(t *testing.T) {
-	store := storage.NewMemory()
-	h := &Handler{
-		storage:    store,
-		envsToHash: []string{"API_KEY", "SECRET"},
-	}
-
-	pod := &corev1.Pod{
-		Spec: corev1.PodSpec{
-			Containers: []corev1.Container{
-				{
-					Name:  "app",
-					Image: "myapp:latest",
-					Env: []corev1.EnvVar{
-						{Name: "API_KEY", Value: "secret-key-123"},
-						{Name: "DEBUG", Value: "true"},
-						{Name: "SECRET", Value: "my-secret"},
-					},
-				},
-			},
-		},
-	}
-
-	h.hashEnvVars(context.Background(), pod, "test/pod")
-
-	// Check API_KEY was hashed (starts with kloak:)
-	env := pod.Spec.Containers[0].Env
-	if env[0].Value == "secret-key-123" {
-		t.Error("API_KEY should have been hashed")
-	}
-	if env[0].Value[:6] != "kloak:" {
-		t.Errorf("Hashed value should start with 'kloak:', got '%s'", env[0].Value)
-	}
-
-	// Check DEBUG was NOT hashed
-	if env[1].Value != "true" {
-		t.Error("DEBUG should not have been hashed")
-	}
-
-	// Check SECRET was hashed
-	if env[2].Value == "my-secret" {
-		t.Error("SECRET should have been hashed")
-	}
-
-	// Verify storage has the mappings
-	all, _ := store.List(context.Background())
-	if len(all) != 2 {
-		t.Errorf("Expected 2 stored mappings, got %d", len(all))
-	}
-
-	// Check content of one entry (optional, but good for verification)
-	for _, entry := range all {
-		if entry.AllowedHosts[0] != "*" {
-			t.Errorf("Expected allowed host '*', got %v", entry.AllowedHosts)
-		}
 	}
 }
 
@@ -256,4 +252,5 @@ func TestRewriteSecretVolumes(t *testing.T) {
 	if pod.Spec.Volumes[1].Secret.SecretName != "other-secret" {
 		t.Errorf("Expected other-secret, got %s", pod.Spec.Volumes[1].Secret.SecretName)
 	}
+
 }

@@ -1,0 +1,30 @@
+# Kloak Operator - Base Kustomization
+#
+# Configurable values for overlays:
+#   - namespace: default is kloak-system (override with kustomize namespace transformer)
+#   - images: kloak, bitnami/kubectl (init containers)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: kloak-system
+
+resources:
+  - rbac.yaml
+  - controller.yaml
+  - webhook.yaml
+
+# Common labels for all resources
+labels:
+  - includeSelectors: true
+    pairs:
+      app.kubernetes.io/name: kloak
+      app.kubernetes.io/managed-by: kustomize
+
+# Image configuration (can be overridden in overlays)
+images:
+  - name: kloak
+    newName: kloak
+    newTag: latest
+  - name: bitnami/kubectl
+    newName: bitnami/kubectl
+    newTag: latest

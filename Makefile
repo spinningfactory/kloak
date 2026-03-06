@@ -14,16 +14,22 @@ GOGENERATE=$(GOCMD) generate
 BINARY_NAME=kloak
 WEBHOOK_BINARY=kloak-webhook
 
+# Proto generation
+.PHONY: proto
+proto:
+	buf generate
+
+
 # Build directories
 BUILD_DIR=bin
 CMD_DIR=cmd
-BPF_DIR=bpf
+BPF_DIR=pkg/ebpf
 EBPF_PKG=pkg/ebpf
 
 # Source files
 GO_SOURCES=$(shell find . -name '*.go' -not -path './vendor/*')
 BPF_SOURCES=$(wildcard $(BPF_DIR)/*.c $(BPF_DIR)/*.h)
-EBPF_GENERATED=$(EBPF_PKG)/redirect_bpfel.go $(EBPF_PKG)/redirect_bpfeb.go
+EBPF_GENERATED=$(EBPF_PKG)/tlsuprobe_bpfel.go $(EBPF_PKG)/tlsuprobe_bpfeb.go
 
 # Docker
 DOCKER_IMAGE=kloak
@@ -65,8 +71,8 @@ test-linux: lima-ensure
 clean:
 	$(GOCLEAN)
 	rm -rf $(BUILD_DIR)
-	rm -f $(EBPF_PKG)/redirect_bpfel.go $(EBPF_PKG)/redirect_bpfeb.go
-	rm -f $(EBPF_PKG)/redirect_bpfel.o $(EBPF_PKG)/redirect_bpfeb.o
+	rm -f $(EBPF_PKG)/tlsuprobe_bpfel.go $(EBPF_PKG)/tlsuprobe_bpfeb.go
+	rm -f $(EBPF_PKG)/tlsuprobe_bpfel.o $(EBPF_PKG)/tlsuprobe_bpfeb.o
 
 deps:
 	$(GOMOD) download
