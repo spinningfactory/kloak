@@ -111,3 +111,28 @@ document.querySelectorAll('a[href^="#"]').forEach(anchor => {
         }
     });
 });
+
+/**
+ * Handle form submission via mailto
+ */
+const demoForm = document.getElementById('demo-form');
+if (demoForm) {
+    demoForm.addEventListener('submit', function (e) {
+        e.preventDefault();
+
+        const name = document.getElementById('name').value;
+        const email = document.getElementById('email').value;
+        const company = document.getElementById('company').value;
+        const message = document.getElementById('message').value;
+
+        const subject = encodeURIComponent(`Demo Request from ${name} at ${company}`);
+        const body = encodeURIComponent(
+            `Name: ${name}\n` +
+            `Email: ${email}\n` +
+            `Company: ${company}\n\n` +
+            `Message:\n${message}`
+        );
+
+        window.location.href = `mailto:mailto@spinningfactory.io?subject=${subject}&body=${body}`;
+    });
+}
