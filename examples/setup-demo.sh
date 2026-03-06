@@ -135,7 +135,7 @@ deploy_kloak() {
     echo ""
     echo "Deploying Kloak using operator config (auto-cert mode)..."
     
-    # Apply K3s overlay (base manifests + K3s CNI paths)
+    # Apply K3s overlay
     kubectl apply -k "$ROOT_DIR/config/overlays/k3s"
     
     # Wait for namespace to be ready
@@ -219,7 +219,7 @@ deploy_demo() {
     # Wait a moment for cleanup
     sleep 2
     
-    # Apply the demo deployments (webhook should inject sidecar)
+    # Apply the demo deployments (webhook should mutate pods)
     kubectl apply -f "$SCRIPT_DIR/demo-python/deployment.yaml" -n "$DEMO_NAMESPACE"
     kubectl apply -f "$SCRIPT_DIR/demo-go/deployment.yaml" -n "$DEMO_NAMESPACE"
     kubectl apply -f "$SCRIPT_DIR/demo-js/deployment.yaml" -n "$DEMO_NAMESPACE"
@@ -260,29 +260,27 @@ wait_for_demo() {
     kubectl get pods -l app=demo-js -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' && echo ""
 }
 
-# Verify sidecar injection
-verify_injection() {
+# Verify webhook mutation
+verify_mutation() {
     export KUBECONFIG="$KUBECONFIG_PATH"
     echo ""
-    echo "Verifying sidecar injection..."
+    echo "Verifying webhook mutation..."
     
     for app in demo-python demo-go demo-js; do
         echo "Checking $app..."
-        CONTAINERS=$(kubectl get pods -l app=$app -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null || echo "")
+        ANNOTATION=$(kubectl get pods -l app=$app -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].metadata.annotations.getkloak\.io/enabled}' 2>/dev/null || echo "")
         
-        if echo "$CONTAINERS" | grep -q "envoy-sidecar"; then
-            echo "✓ [$app] Envoy sidecar successfully injected!"
-            echo "  Containers: $CONTAINERS"
+        if [ "$ANNOTATION" = "true" ]; then
+            echo "✓ [$app] Pod successfully mutated by webhook!"
         else
-            echo "✗ [$app] Envoy sidecar NOT found"
-            echo "  Containers: $CONTAINERS"
+            echo "✗ [$app] Pod NOT mutated"
         fi
     done
     
-    # Show webhook logs if any injection failed
-    if ! kubectl get pods -l app=demo-python -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null | grep -q envoy-sidecar || \
-       ! kubectl get pods -l app=demo-go -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null | grep -q envoy-sidecar || \
-       ! kubectl get pods -l app=demo-js -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].spec.containers[*].name}' 2>/dev/null | grep -q envoy-sidecar; then
+    # Show webhook logs if any mutation failed
+    if [ "$(kubectl get pods -l app=demo-python -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].metadata.annotations.getkloak\.io/enabled}' 2>/dev/null)" != "true" ] || \
+       [ "$(kubectl get pods -l app=demo-go -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].metadata.annotations.getkloak\.io/enabled}' 2>/dev/null)" != "true" ] || \
+       [ "$(kubectl get pods -l app=demo-js -n "$DEMO_NAMESPACE" -o jsonpath='{.items[0].metadata.annotations.getkloak\.io/enabled}' 2>/dev/null)" != "true" ]; then
         echo ""
         echo "Checking webhook logs..."
         kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook --tail=10 2>/dev/null || true
@@ -298,7 +296,6 @@ show_summary() {
     echo ""
     echo "Architecture:"
     echo "  Controller:          DaemonSet (runs on each node for eBPF)"
-    echo "  Agent:               DaemonSet (runs on each node for XDS)"
     echo "  Webhook:             Deployment"
     echo ""
     echo "Environment:"
@@ -310,7 +307,6 @@ show_summary() {
     echo "  View Python logs:    kubectl logs -f -l app=demo-python -n $DEMO_NAMESPACE -c demo-app"
     echo "  View Go logs:        kubectl logs -f -l app=demo-go -n $DEMO_NAMESPACE -c demo-app"
     echo "  View JS logs:        kubectl logs -f -l app=demo-js -n $DEMO_NAMESPACE -c demo-app"
-    echo "  View sidecar logs:   kubectl logs -f -l app=demo-python -n $DEMO_NAMESPACE -c envoy-sidecar"
     echo "  View webhook logs:   kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook"
     echo "  View controller logs: kubectl logs -n kloak-system -l app.kubernetes.io/component=controller"
     echo ""
@@ -333,7 +329,7 @@ main() {
     wait_for_kloak
     deploy_demo
     wait_for_demo
-    verify_injection
+    verify_mutation
     show_summary
 }
 

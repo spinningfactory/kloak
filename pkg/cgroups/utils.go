@@ -59,7 +59,7 @@ func GetPodCgroupPath(cgroupRoot, podUID, containerID string) (string, error) {
 		return filepath.Dir(containerPath), nil
 	}
 
-	// 2. Fallback: Search for Pod-level cgroup slice directly (common in CNI ADD when scope isn't ready)
+	// 2. Fallback: Search for Pod-level cgroup slice directly (common when container scope isn't ready)
 	podPatterns := []string{
 		// containerd/systemd patterns
 		filepath.Join(cgroupRoot, "kubepods.slice", "kubepods-burstable.slice",

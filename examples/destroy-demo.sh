@@ -45,7 +45,7 @@ cleanup_images() {
     
     if [[ $REPLY =~ ^[Yy]$ ]]; then
         docker rmi kloak:latest 2>/dev/null || true
-        docker rmi kloak-cni:latest 2>/dev/null || true
+
         docker rmi kloak-demo-python:latest 2>/dev/null || true
         docker rmi kloak-demo-go:latest 2>/dev/null || true
         docker rmi kloak-demo-js:latest 2>/dev/null || true
