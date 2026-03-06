@@ -5,6 +5,7 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+	"github.com/spinningfactory/kloak/pkg/ebpf"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -13,10 +14,9 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
-	"github.com/spinningfactory/kloak/pkg/ca"
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/storage"
-	"github.com/spinningfactory/kloak/pkg/xds"
+	"github.com/spinningfactory/kloak/pkg/webhook"
 )
 
 var (
@@ -27,24 +27,17 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 }
 
-// MockCgroupManager is used when eBPF is disabled or not available.
-type MockCgroupManager struct{}
-
-func (m *MockCgroupManager) AddCgroup(cgroupID uint64) error {
-	ctrl.Log.Info("mock: would add cgroup", "cgroupID", cgroupID)
-	return nil
-}
-
-func (m *MockCgroupManager) RemoveCgroup(cgroupID uint64) error {
-	ctrl.Log.Info("mock: would remove cgroup", "cgroupID", cgroupID)
-	return nil
-}
-
 var controllerCmd = &cobra.Command{
 	Use:   "controller",
 	Short: "Run the Kloak controller",
-	Long:  `Starts the Kubernetes controller that watches pods and manages eBPF programs.`,
-	Run:   runController,
+	Long: `Starts the Kubernetes controller that watches pods and secrets,
+manages eBPF programs, and serves the gRPC sync API for agents.
+
+The controller is responsible for:
+- Watching K8s Secrets with kloak.io/managed label
+- Managing the Root CA for TLS interception
+- Managing eBPF cgroup tracking for labeled pods`,
+	Run: runController,
 }
 
 var (
@@ -53,6 +46,7 @@ var (
 	enableLeaderElection  bool
 	enableEBPF            bool
 	cgroupPath            string
+	certMode              string
 )
 
 func init() {
@@ -61,6 +55,7 @@ func init() {
 	controllerCmd.Flags().BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 	controllerCmd.Flags().BoolVar(&enableEBPF, "enable-ebpf", false, "Enable eBPF traffic redirection (requires Linux + CAP_BPF).")
 	controllerCmd.Flags().StringVar(&cgroupPath, "cgroup-path", "/sys/fs/cgroup", "Path to cgroup v2 filesystem.")
+	controllerCmd.Flags().StringVar(&certMode, "cert-mode", "auto", "Certificate mode: 'auto' (generate if missing) or 'provided' (expect existing secrets).")
 }
 
 func runController(cmd *cobra.Command, args []string) {
@@ -79,7 +74,10 @@ func runController(cmd *cobra.Command, args []string) {
 		namespace = "kloak-system"
 	}
 
-	// We need a direct client to access Secrets before the manager cache is started
+	// We rely purely on the underlying runtime providing certificates to workloads (or eBPF uprobes intercepting)
+	// No application CA generation happens here anymore
+
+	// However, we still need to provide a TLS cert for the MutatingWebhook, since K8s apiservers demand HTTPS
 	k8sConfig := ctrl.GetConfigOrDie()
 	directClient, err := client.New(k8sConfig, client.Options{Scheme: scheme})
 	if err != nil {
@@ -87,30 +85,27 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	caStore := ca.NewStore(directClient, namespace)
-	rootCA, err := caStore.GetOrCreate(context.Background())
+	_, err = webhook.EnsureWebhookCerts(context.Background(), directClient, namespace)
 	if err != nil {
-		setupLog.Error(err, "failed to get or create CA")
-		os.Exit(1)
+		setupLog.Error(err, "failed to ensure webhook TLS certificates")
+		// The webhook might fail to start since the secret won't exist.
+	} else {
+		setupLog.Info("Webhook TLS certificates exist")
 	}
-	setupLog.Info("CA loaded successfully", "commonName", rootCA.Cert.Subject.CommonName)
 
-	// Create cgroup manager
-	var cgroupMgr controller.CgroupManager
-	var ebpfMgr *EBPFCgroupManager
+	// Create uprobe manager instances
+	var uprobeMgr *ebpf.TLSUprobeManager
 
 	if enableEBPF {
-		ebpfMgr, err = NewEBPFCgroupManager(cgroupPath)
+		uprobeMgr, err = ebpf.NewTLSUprobeManager(store)
 		if err != nil {
-			setupLog.Error(err, "failed to initialize eBPF, falling back to mock")
-			cgroupMgr = &MockCgroupManager{}
+			setupLog.Error(err, "failed to initialize eBPF uprobe manager")
+			// non-fatal for this demo
 		} else {
-			cgroupMgr = ebpfMgr
-			setupLog.Info("eBPF traffic redirection enabled")
+			setupLog.Info("eBPF TLS uprobes enabled")
 		}
 	} else {
-		setupLog.Info("eBPF disabled, using mock cgroup manager")
-		cgroupMgr = &MockCgroupManager{}
+		setupLog.Info("eBPF disabled")
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -124,36 +119,22 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Create XDS Server
-	xdsServer := xds.NewServer(rootCA, store, ctrl.Log.WithName("xds"))
-	if err := mgr.Add(runnableFunc(func(ctx context.Context) error {
-		return xdsServer.Run(ctx, ":15002")
-	})); err != nil {
-		setupLog.Error(err, "unable to add XDS server")
-		os.Exit(1)
-	}
-
-	// Create HTTP Server
-	httpServer := controller.NewServer(store, ctrl.Log.WithName("http"))
-
-	// Start HTTP server immediately in goroutine (don't wait for leader election)
-	// This ensures webhook can send hashes during pod admission
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go func() {
-		setupLog.Info("starting HTTP server immediately (before leader election)")
-		if err := httpServer.Start(ctx, ":8090"); err != nil {
-			setupLog.Error(err, "HTTP server failed")
-		}
-	}()
 
 	// Create pod reconciler
+	// NODE_NAME is used to filter pods to only those on this node (DaemonSet per-node controller)
+	nodeName := os.Getenv("NODE_NAME")
+	if nodeName != "" {
+		setupLog.Info("Node filtering enabled", "nodeName", nodeName)
+	}
 	reconciler := controller.NewReconciler(
 		mgr.GetClient(),
 		ctrl.Log.WithName("controller").WithName("Pod"),
 		mgr.GetScheme(),
-		cgroupMgr,
+		uprobeMgr,
 		cgroupPath,
+		nodeName,
 	)
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
@@ -174,7 +155,6 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Add health checks
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
@@ -184,18 +164,25 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	// Start eBPF TLS event poller (syncs secrets to BPF map and reads events)
+	if uprobeMgr != nil {
+		go func() {
+			if err := uprobeMgr.PollEvents(ctx); err != nil && ctx.Err() == nil {
+				setupLog.Error(err, "eBPF TLS event poller failed")
+			}
+		}()
+	}
+
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
-		if ebpfMgr != nil {
-			ebpfMgr.Close()
-		}
 		os.Exit(1)
 	}
 
 	// Cleanup
-	if ebpfMgr != nil {
-		ebpfMgr.Close()
+	cancel()
+	if uprobeMgr != nil {
+		uprobeMgr.Close()
 	}
 }
 

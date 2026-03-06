@@ -29,7 +29,4 @@ type Storage interface {
 	// List returns all hash→Entry mappings.
 	// Used for syncing to XDS/ext_proc.
 	List(ctx context.Context) (map[string]Entry, error)
-
-	// ListByPod returns all hash→Entry mappings for a specific pod.
-	ListByPod(ctx context.Context, podID string) (map[string]Entry, error)
 }

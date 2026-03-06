@@ -5,11 +5,11 @@ package controller
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/go-logr/logr"
+	"github.com/spinningfactory/kloak/pkg/cgroups"
+	"github.com/spinningfactory/kloak/pkg/ebpf"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -35,15 +35,17 @@ type Reconciler struct {
 	client.Client
 	Log           logr.Logger
 	Scheme        *runtime.Scheme
-	CgroupManager CgroupManager
+	UprobeManager *ebpf.TLSUprobeManager
 	CgroupRoot    string
+	// NodeName filters pods to only those on this node (empty = all nodes)
+	NodeName string
 
-	// trackedPods maps pod UID -> cgroup ID
-	trackedPods map[string]uint64
+	// trackedPods maps pod UID -> set of cgroup IDs (one per container)
+	trackedPods map[string]map[uint64]bool
 }
 
 // NewReconciler creates a new pod reconciler.
-func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, cgroupMgr CgroupManager, cgroupRoot string) *Reconciler {
+func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, uprobeMgr *ebpf.TLSUprobeManager, cgroupRoot, nodeName string) *Reconciler {
 	if cgroupRoot == "" {
 		cgroupRoot = CgroupBasePath
 	}
@@ -51,9 +53,10 @@ func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, cgr
 		Client:        c,
 		Log:           log,
 		Scheme:        scheme,
-		CgroupManager: cgroupMgr,
+		UprobeManager: uprobeMgr,
 		CgroupRoot:    cgroupRoot,
-		trackedPods:   make(map[string]uint64),
+		NodeName:      nodeName,
+		trackedPods:   make(map[string]map[uint64]bool),
 	}
 }
 
@@ -80,54 +83,125 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
+	// Filter by node if NodeName is set (per-node controller)
+	if r.NodeName != "" && pod.Spec.NodeName != r.NodeName {
+		log.V(1).Info("skipping pod on different node", "podNode", pod.Spec.NodeName, "ourNode", r.NodeName)
+		return ctrl.Result{}, nil
+	}
+
 	// Pod is running and enabled
 	if pod.Status.Phase != corev1.PodRunning {
 		log.V(1).Info("pod not running yet", "phase", pod.Status.Phase)
 		return ctrl.Result{}, nil
 	}
 
-	// Get the cgroup ID for this pod
-	cgroupID, err := r.getCgroupID(pod)
+	// Get cgroup IDs for all containers in this pod
+	cgroupIDs, err := r.getContainerCgroupIDs(pod)
 	if err != nil {
 		// This is expected during container startup - will retry on next reconcile
-		log.V(1).Info("cgroup ID not available yet", "reason", err.Error())
+		log.V(1).Info("cgroup IDs not available yet", "reason", err.Error())
 		return ctrl.Result{Requeue: true}, nil // Retry after a bit
 	}
 
-	// Track the pod
-	if existingCgroup, tracked := r.trackedPods[string(pod.UID)]; tracked {
-		if existingCgroup == cgroupID {
-			return ctrl.Result{}, nil // Already tracked
+	// Get existing tracked cgroups for this pod
+	existingCgroups := r.trackedPods[string(pod.UID)]
+	if existingCgroups == nil {
+		existingCgroups = make(map[uint64]bool)
+	}
+
+	// Add new cgroups that aren't already tracked
+	for cgroupID := range cgroupIDs {
+		if !existingCgroups[cgroupID] {
+			existingCgroups[cgroupID] = true
+			log.Info("tracking container cgroup", "cgroupID", cgroupID)
+
+			// Get the container PID from cgroup filesystem and attach uprobes
+			// We iterate through procs file to find a PID in that cgroup
+			// Finding the PID from cgroup or container ID is required to attach TLS uprobes
+			r.attachUprobesToCgroup(cgroupID, pod)
 		}
-		// Cgroup changed (shouldn't happen normally)
-		_ = r.CgroupManager.RemoveCgroup(existingCgroup)
 	}
 
-	// Add to eBPF map
-	if err := r.CgroupManager.AddCgroup(cgroupID); err != nil {
-		log.Error(err, "failed to add cgroup to eBPF map", "cgroupID", cgroupID)
-		return ctrl.Result{}, err
+	// Remove old cgroups that are no longer present (container restarted with new cgroup)
+	for cgroupID := range existingCgroups {
+		if !cgroupIDs[cgroupID] {
+			delete(existingCgroups, cgroupID)
+			log.Info("removed stale cgroup", "cgroupID", cgroupID)
+		}
 	}
 
-	r.trackedPods[string(pod.UID)] = cgroupID
-	log.Info("tracking pod", "cgroupID", cgroupID)
+	r.trackedPods[string(pod.UID)] = existingCgroups
 
 	return ctrl.Result{}, nil
 }
 
+// attachUprobesToCgroup reads the cgroup's procs file to find a PID and calls the uprobe manager
+func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) {
+	if r.UprobeManager == nil {
+		return
+	}
+
+	r.Log.Info("Trying to attach uprobes to new container", "cgroup", cgroupID)
+
+	// Find the container cgroup path again to read cgroup.procs
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.ContainerID == "" {
+			continue
+		}
+		parts := strings.SplitN(status.ContainerID, "://", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		containerID := parts[1]
+
+		containerCgroupPath, err := cgroups.FindContainerCgroupPath(r.CgroupRoot, string(pod.UID), containerID)
+		if err != nil {
+			continue
+		}
+
+		// Verify this is the right cgroup by checking inode
+		inode, err := cgroups.GetCgroupInodeFromPath(containerCgroupPath)
+		if err != nil || inode != cgroupID {
+			continue
+		}
+
+		// Read PIDs from cgroup.procs
+		pids, err := cgroups.ReadCgroupProcs(containerCgroupPath)
+		if err != nil {
+			r.Log.Error(err, "failed to read cgroup.procs", "path", containerCgroupPath)
+			return
+		}
+
+		if len(pids) == 0 {
+			r.Log.V(1).Info("no PIDs found in cgroup.procs", "path", containerCgroupPath)
+			return
+		}
+
+		// Attach uprobes to the first PID (main process)
+		pid := pids[0]
+		if err := r.UprobeManager.AttachTLS(pid); err != nil {
+			r.Log.Error(err, "failed to attach TLS uprobes", "pid", pid, "container", status.Name)
+		} else {
+			r.Log.Info("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
+		}
+		return
+	}
+
+	r.Log.V(1).Info("could not find matching container for cgroup", "cgroupID", cgroupID)
+}
+
 // handleDelete removes a pod from tracking.
 func (r *Reconciler) handleDelete(podKey string) (ctrl.Result, error) {
-	cgroupID, tracked := r.trackedPods[podKey]
+	cgroupIDs, tracked := r.trackedPods[podKey]
 	if !tracked {
 		return ctrl.Result{}, nil
 	}
 
-	if err := r.CgroupManager.RemoveCgroup(cgroupID); err != nil {
-		r.Log.Error(err, "failed to remove cgroup from eBPF map", "cgroupID", cgroupID)
-	}
-
+	// Uprobes will be automatically cleaned up by the uprobe component when
+	// the process dies, so we no longer have to detach them manually or remove cgroups from maps.
+	// Just remove the pod from our tracking.
 	delete(r.trackedPods, podKey)
-	r.Log.Info("stopped tracking pod", "podKey", podKey, "cgroupID", cgroupID)
+	r.Log.Info("stopped tracking pod", "podKey", podKey, "cgroupCount", len(cgroupIDs))
 
 	return ctrl.Result{}, nil
 }
@@ -140,79 +214,56 @@ func (r *Reconciler) isEnabled(pod *corev1.Pod) bool {
 	return pod.Annotations[AnnotationEnabled] == "true"
 }
 
-// getCgroupID retrieves the cgroup ID for a pod's containers.
-// For cgroups v2, we get the inode number of the cgroup directory.
-func (r *Reconciler) getCgroupID(pod *corev1.Pod) (uint64, error) {
-	// Try to find a running container
-	for _, status := range pod.Status.ContainerStatuses {
-		if status.ContainerID == "" {
-			continue
-		}
+// getContainerCgroupIDs retrieves the cgroup IDs for all running containers in a pod.
+// For cgroups v2, we get the inode number of each container's cgroup directory.
+// We track container cgroups (not pod cgroups) because bpf_get_current_cgroup_id()
+// returns the container's .scope cgroup, not the pod's .slice cgroup.
+func (r *Reconciler) getContainerCgroupIDs(pod *corev1.Pod) (map[uint64]bool, error) {
+	cgroupIDs := make(map[uint64]bool)
 
-		// Extract container ID (format: containerd://abc123...)
-		parts := strings.SplitN(status.ContainerID, "://", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		containerID := parts[1]
+	// Helper to collect cgroup IDs from container statuses
+	collectFromStatuses := func(statuses []corev1.ContainerStatus) {
+		for _, status := range statuses {
+			if status.ContainerID == "" {
+				continue
+			}
 
-		// Find the cgroup path for this container
-		cgroupPath, err := r.findCgroupPath(pod, containerID)
-		if err != nil {
-			continue
-		}
+			// Extract container ID (format: containerd://abc123...)
+			parts := strings.SplitN(status.ContainerID, "://", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			containerID := parts[1]
 
-		// Get the inode number (cgroup ID)
-		return r.getCgroupInode(cgroupPath)
-	}
+			// Get the container's cgroup path (not the pod's parent cgroup)
+			containerCgroupPath, err := cgroups.FindContainerCgroupPath(r.CgroupRoot, string(pod.UID), containerID)
+			if err != nil {
+				r.Log.V(1).Info("could not find container cgroup", "container", status.Name, "err", err)
+				continue
+			}
 
-	return 0, fmt.Errorf("no running container found for pod %s/%s", pod.Namespace, pod.Name)
-}
+			cgroupID, err := cgroups.GetCgroupInodeFromPath(containerCgroupPath)
+			if err != nil {
+				r.Log.V(1).Info("could not get cgroup inode", "container", status.Name, "path", containerCgroupPath, "err", err)
+				continue
+			}
 
-// findCgroupPath finds the cgroup path for a container.
-func (r *Reconciler) findCgroupPath(pod *corev1.Pod, containerID string) (string, error) {
-	// Common patterns for Kubernetes cgroups v2:
-	// - kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod<uid>.slice/cri-containerd-<containerID>.scope
-	// - kubepods/burstable/pod<uid>/<containerID>
-
-	podUID := string(pod.UID)
-	podUIDUnderscored := strings.ReplaceAll(podUID, "-", "_")
-
-	patterns := []string{
-		// containerd pattern
-		filepath.Join(r.CgroupRoot, "kubepods.slice", "kubepods-burstable.slice",
-			fmt.Sprintf("kubepods-burstable-pod%s.slice", podUIDUnderscored),
-			fmt.Sprintf("cri-containerd-%s.scope", containerID)),
-		// containerd pattern (BestEffort)
-		filepath.Join(r.CgroupRoot, "kubepods.slice", "kubepods-besteffort.slice",
-			fmt.Sprintf("kubepods-besteffort-pod%s.slice", podUIDUnderscored),
-			fmt.Sprintf("cri-containerd-%s.scope", containerID)),
-		// Alternative pattern
-		filepath.Join(r.CgroupRoot, "kubepods", "burstable",
-			fmt.Sprintf("pod%s", podUID), containerID),
-		// Best-effort pattern
-		filepath.Join(r.CgroupRoot, "kubepods", "pod"+podUID),
-	}
-
-	for _, path := range patterns {
-		if _, err := os.Stat(path); err == nil {
-			return path, nil
+			r.Log.Info("Found container cgroup", "container", status.Name, "cgroupPath", containerCgroupPath, "cgroupID", cgroupID)
+			cgroupIDs[cgroupID] = true
 		}
 	}
 
-	return "", fmt.Errorf("cgroup path not found for container %s", containerID)
-}
+	// Collect from app containers (these are the ones that matter for traffic interception)
+	collectFromStatuses(pod.Status.ContainerStatuses)
 
-// getCgroupInode gets the inode number of a cgroup directory.
-func (r *Reconciler) getCgroupInode(cgroupPath string) (uint64, error) {
-	stat, err := os.Stat(cgroupPath)
-	if err != nil {
-		return 0, err
+	// Also collect from init containers if they're still running
+	collectFromStatuses(pod.Status.InitContainerStatuses)
+
+	if len(cgroupIDs) == 0 {
+		return nil, fmt.Errorf("no container cgroups found for pod %s/%s", pod.Namespace, pod.Name)
 	}
 
-	// Get the inode from the FileInfo
-	// This works on Linux but we need the syscall for the actual inode
-	return getCgroupInodeFromPath(cgroupPath, stat)
+	return cgroupIDs, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.

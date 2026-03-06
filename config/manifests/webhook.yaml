@@ -19,6 +19,25 @@ spec:
         app.kubernetes.io/component: webhook
     spec:
       serviceAccountName: kloak-controller
+      # Wait for controller to create TLS certs before starting webhook
+      initContainers:
+        - name: wait-for-certs
+          image: bitnami/kubectl:latest
+          env:
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+          command:
+            - sh
+            - -c
+            - |
+              echo "Waiting for webhook TLS certificate secret..."
+              until kubectl get secret kloak-webhook-certs -n "$POD_NAMESPACE" 2>/dev/null; do
+                echo "Secret not found, waiting..."
+                sleep 2
+              done
+              echo "TLS certificate secret found!"
       containers:
         - name: webhook
           image: kloak:latest
@@ -26,7 +45,6 @@ spec:
           command: ["/kloak", "webhook"]
           args:
             - --cert-dir=/certs
-            - --hash-envs=API_KEY,SECRET_KEY,PASSWORD,TOKEN,OPENAI_API_KEY
           ports:
             - name: webhook
               containerPort: 9443
@@ -92,8 +110,7 @@ webhooks:
         namespace: kloak-system
         name: kloak-webhook
         path: /mutate-pods
-      # CA bundle injected by cert-manager or manually
-      caBundle: ""
+      # caBundle is patched automatically by the controller on startup
     rules:
       - operations: ["CREATE"]
         apiGroups: [""]
@@ -104,4 +121,4 @@ webhooks:
         - key: getkloak.io/enabled
           operator: In
           values: ["true"]
-    failurePolicy: Ignore
+    failurePolicy: Fail
