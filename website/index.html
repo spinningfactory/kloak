@@ -1,41 +1,41 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <meta name="description" content="Kloak - Kubernetes eBPF HTTPS Interceptor with Envoy Sidecar Injection. Secure API key management without exposing secrets.">
-    <meta name="keywords" content="Kubernetes, eBPF, HTTPS, Envoy, Sidecar, Security, Secrets Management">
+    <meta name="description"
+        content="Kloak - Kubernetes eBPF Secret Interceptor for HTTPS. Secure secret management without application changes or sidecars.">
+    <meta name="keywords" content="Kubernetes, eBPF, HTTPS, Security, Secrets Management, Agentless">
     <title>Kloak - Kubernetes eBPF HTTPS Interceptor</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
-    <link rel="stylesheet" href="styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="styles.css?v=2">
 </head>
+
 <body>
     <!-- Navigation -->
     <nav class="navbar" id="navbar">
         <div class="nav-container">
             <a href="#" class="nav-logo">
-                <span class="logo-icon">🔐</span>
-                <span class="logo-text">Kloak</span>
+                <img src="transparent-logo.svg" alt="K" class="logo-icon">
+                <span class="logo-text">LOAK</span>
             </a>
             <ul class="nav-menu" id="nav-menu">
                 <li><a href="#features" class="nav-link">Features</a></li>
                 <li><a href="#how-it-works" class="nav-link">How It Works</a></li>
                 <li><a href="#architecture" class="nav-link">Architecture</a></li>
-                <li><a href="#getting-started" class="nav-link">Get Started</a></li>
             </ul>
-            <a href="https://github.com/spinningfactory/kloak" class="nav-cta" target="_blank" rel="noopener">
-                <svg class="github-icon" viewBox="0 0 24 24" width="20" height="20">
-                    <path fill="currentColor" d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
-                </svg>
-                GitHub
-            </a>
-            <button class="nav-toggle" id="nav-toggle" aria-label="Toggle menu">
-                <span></span>
-                <span></span>
-                <span></span>
-            </button>
+            <div class="nav-actions">
+                <a href="#getting-started" class="btn btn-primary btn-sm nav-cta">Book a Demo</a>
+                <button class="nav-toggle" id="nav-toggle" aria-label="Toggle menu">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </button>
+            </div>
         </div>
     </nav>
 
@@ -45,71 +45,81 @@
             <div class="hero-gradient"></div>
             <div class="hero-grid"></div>
         </div>
-        <div class="hero-container">
-            <div class="hero-badge">
-                <span class="badge-dot"></span>
-                Open Source Kubernetes Security
-            </div>
-            <h1 class="hero-title">
-                Secure Your Secrets,
-                <span class="gradient-text">Invisibly</span>
-            </h1>
-            <p class="hero-description">
-                Kloak transparently intercepts HTTPS traffic in Kubernetes, replacing hashed placeholders with real secrets at the network edge. Your applications never see the actual credentials.
-            </p>
-            <div class="hero-actions">
-                <a href="#getting-started" class="btn btn-primary">
-                    <span>Get Started</span>
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M5 12h14M12 5l7 7-7 7"/>
-                    </svg>
-                </a>
-                <a href="#how-it-works" class="btn btn-secondary">
-                    Learn More
-                </a>
-            </div>
-            <div class="hero-stats">
-                <div class="stat">
-                    <span class="stat-value">eBPF</span>
-                    <span class="stat-label">Powered</span>
+        <div class="container">
+            <div class="hero-header">
+                <div class="hero-badge">
+                    <span class="badge-dot"></span>
+                    Agentless Kubernetes Security
                 </div>
-                <div class="stat-divider"></div>
-                <div class="stat">
-                    <span class="stat-value">Zero</span>
-                    <span class="stat-label">Code Changes</span>
-                </div>
-                <div class="stat-divider"></div>
-                <div class="stat">
-                    <span class="stat-value">K8s</span>
-                    <span class="stat-label">Native</span>
-                </div>
+                <h1 class="hero-title">
+                    Secure Your Secrets, <span class="gradient-text">Agentless</span>
+                </h1>
             </div>
-        </div>
-        <div class="hero-visual">
-            <div class="terminal">
-                <div class="terminal-header">
-                    <div class="terminal-buttons">
-                        <span class="terminal-btn red"></span>
-                        <span class="terminal-btn yellow"></span>
-                        <span class="terminal-btn green"></span>
+            <div class="hero-layout">
+                <div class="hero-container">
+                    <p class="hero-description">
+                        Kloak transparently intercepts HTTPS traffic in Kubernetes using pure eBPF, replacing hashed
+                        placeholders with real secrets at the network edge. Your applications never see the actual
+                        credentials,
+                        and no sidecars are required.
+                    </p>
+                    <div class="hero-actions">
+                        <a href="#getting-started" class="btn btn-primary">
+                            <span>Get Started</span>
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <path d="M5 12h14M12 5l7 7-7 7" />
+                            </svg>
+                        </a>
+                        <a href="#how-it-works" class="btn btn-secondary">
+                            Learn More
+                        </a>
                     </div>
-                    <span class="terminal-title">demo-pod</span>
+                    <div class="hero-stats">
+                        <div class="stat">
+                            <span class="stat-value">eBPF</span>
+                            <span class="stat-label">Powered</span>
+                        </div>
+                        <div class="stat-divider"></div>
+                        <div class="stat">
+                            <span class="stat-value">Zero</span>
+                            <span class="stat-label">Code Changes</span>
+                        </div>
+                        <div class="stat-divider"></div>
+                        <div class="stat">
+                            <span class="stat-value">K8s</span>
+                            <span class="stat-label">Native</span>
+                        </div>
+                    </div>
                 </div>
-                <div class="terminal-body">
-                    <pre><code><span class="term-comment"># Your app sends this header:</span>
+                <div class="hero-visual">
+                    <img src="transparent-logo.svg" alt="" class="hero-logo-bg" aria-hidden="true">
+                    <div class="terminal">
+                        <div class="terminal-header">
+                            <div class="terminal-buttons">
+                                <span class="terminal-btn red"></span>
+                                <span class="terminal-btn yellow"></span>
+                                <span class="terminal-btn green"></span>
+                            </div>
+                            <span class="terminal-title">demo-pod</span>
+                        </div>
+                        <div class="terminal-body">
+                            <pre><code><span class="term-comment"># Your app sends this header:</span>
 <span class="term-key">Authorization:</span> <span class="term-hash">kloak:a1b2c3d4-e5f6-7890</span>
 
 <span class="term-comment"># Kloak transforms it to:</span>
 <span class="term-key">Authorization:</span> <span class="term-value">Bearer sk-live-xyz123...</span>
 
 <span class="term-success">✓ Secret never exposed to application</span></code></pre>
+                        </div>
+                    </div>
                 </div>
             </div>
-        </div>
     </section>
 
     <!-- Features Section -->
     <section class="features" id="features">
+        <img src="transparent-logo.svg" alt="" class="section-logo-bg logo-shift-left" aria-hidden="true">
         <div class="container">
             <div class="section-header">
                 <span class="section-tag">Features</span>
@@ -121,74 +131,88 @@
             <div class="features-grid">
                 <div class="feature-card">
                     <div class="feature-icon">
-                        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
-                            <path d="M9 12l2 2 4-4"/>
+                        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor"
+                            stroke-width="1.5">
+                            <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
+                            <path d="M9 12l2 2 4-4" />
                         </svg>
                     </div>
                     <h3 class="feature-title">Secure by Design</h3>
                     <p class="feature-description">
-                        Secrets are replaced at the network edge. Your application code never sees real credentials, eliminating accidental exposure.
+                        Secrets are replaced at the network edge. Your application code never sees real credentials,
+                        eliminating accidental exposure.
                     </p>
                 </div>
                 <div class="feature-card">
                     <div class="feature-icon">
-                        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <circle cx="12" cy="12" r="10"/>
-                            <path d="M12 6v6l4 2"/>
+                        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor"
+                            stroke-width="1.5">
+                            <circle cx="12" cy="12" r="10" />
+                            <path d="M12 6v6l4 2" />
                         </svg>
                     </div>
                     <h3 class="feature-title">Zero Latency Impact</h3>
                     <p class="feature-description">
-                        eBPF-powered traffic redirection happens in kernel space, adding negligible overhead to your requests.
+                        eBPF-powered traffic redirection happens in kernel space, adding negligible overhead to your
+                        requests.
                     </p>
                 </div>
                 <div class="feature-card">
                     <div class="feature-icon">
-                        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
-                            <path d="M3.27 6.96L12 12.01l8.73-5.05M12 22.08V12"/>
+                        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor"
+                            stroke-width="1.5">
+                            <path
+                                d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" />
+                            <path d="M3.27 6.96L12 12.01l8.73-5.05M12 22.08V12" />
                         </svg>
                     </div>
                     <h3 class="feature-title">Kubernetes Native</h3>
                     <p class="feature-description">
-                        Works with standard Kubernetes Secrets. Just add a label and Kloak handles the rest automatically.
+                        Works with standard Kubernetes Secrets. Just add a label and Kloak handles the rest
+                        automatically.
                     </p>
                 </div>
                 <div class="feature-card">
                     <div class="feature-icon">
-                        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M12 2L2 7l10 5 10-5-10-5z"/>
-                            <path d="M2 17l10 5 10-5"/>
-                            <path d="M2 12l10 5 10-5"/>
+                        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor"
+                            stroke-width="1.5">
+                            <path d="M12 2L2 7l10 5 10-5-10-5z" />
+                            <path d="M2 17l10 5 10-5" />
+                            <path d="M2 12l10 5 10-5" />
                         </svg>
                     </div>
                     <h3 class="feature-title">Host Restrictions</h3>
                     <p class="feature-description">
-                        Control which secrets can be used with which hosts. Prevent credential misuse with fine-grained access control.
+                        Control which secrets can be used with which hosts. Prevent credential misuse with fine-grained
+                        access control.
                     </p>
                 </div>
                 <div class="feature-card">
                     <div class="feature-icon">
-                        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/>
+                        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor"
+                            stroke-width="1.5">
+                            <path
+                                d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
                         </svg>
                     </div>
                     <h3 class="feature-title">Zero Code Changes</h3>
                     <p class="feature-description">
-                        No SDK required. Works with any language or framework. Just use the hash placeholder in your config.
+                        No SDK required. Works with any language or framework. Just use the hash placeholder in your
+                        config.
                     </p>
                 </div>
                 <div class="feature-card">
                     <div class="feature-icon">
-                        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
-                            <path d="M22 6l-10 7L2 6"/>
+                        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor"
+                            stroke-width="1.5">
+                            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z" />
+                            <path d="M22 6l-10 7L2 6" />
                         </svg>
                     </div>
-                    <h3 class="feature-title">Automatic Injection</h3>
+                    <h3 class="feature-title">Pure eBPF Integration</h3>
                     <p class="feature-description">
-                        Envoy sidecars are automatically injected via mutating webhook. Just label your namespace.
+                        No bulky sidecars or complex CNI plugins. Operates purely at the kernel level for maximum
+                        efficiency.
                     </p>
                 </div>
             </div>
@@ -197,6 +221,7 @@
 
     <!-- How It Works Section -->
     <section class="how-it-works" id="how-it-works">
+        <img src="transparent-logo.svg" alt="" class="section-logo-bg logo-shift-right" aria-hidden="true">
         <div class="container">
             <div class="section-header">
                 <span class="section-tag">How It Works</span>
@@ -211,7 +236,8 @@
                     <div class="step-content">
                         <h3 class="step-title">Register Your Secrets</h3>
                         <p class="step-description">
-                            Label your Kubernetes secrets with <code>getkloak.io/enabled=true</code>. Kloak generates a unique hash (UUID) for each secret value.
+                            Label your Kubernetes secrets with <code>getkloak.io/enabled=true</code>. Kloak generates a
+                            unique hash (UUID) for each secret value.
                         </p>
                         <div class="step-code">
                             <pre><code><span class="code-key">labels:</span>
@@ -225,7 +251,8 @@
                     <div class="step-content">
                         <h3 class="step-title">Use Hash Placeholders</h3>
                         <p class="step-description">
-                            Reference the generated hash in your application config instead of the actual secret. Your app never sees the real value.
+                            Reference the generated hash in your application config instead of the actual secret. Your
+                            app never sees the real value.
                         </p>
                         <div class="step-code">
                             <pre><code><span class="code-key">headers:</span>
@@ -238,7 +265,8 @@
                     <div class="step-content">
                         <h3 class="step-title">Automatic Transform</h3>
                         <p class="step-description">
-                            When your app makes an HTTPS request, Kloak intercepts it and replaces the hash with the real secret before forwarding.
+                            When your app makes an HTTPS request, Kloak intercepts it and replaces the hash with the
+                            real secret before forwarding.
                         </p>
                         <div class="step-code">
                             <pre><code><span class="code-comment"># Request leaves your pod with real credentials</span>
@@ -261,31 +289,23 @@
                 </p>
             </div>
             <div class="arch-diagram">
+                <img src="transparent-logo.svg" alt="" class="section-logo-bg logo-shift-right" aria-hidden="true">
                 <div class="arch-layer arch-control">
                     <div class="arch-layer-label">Control Plane</div>
                     <div class="arch-components">
                         <div class="arch-component">
-                            <div class="arch-icon">📡</div>
+                            <div class="arch-icon">
+                                <img src="transparent-logo.svg" alt="" style="width: 24px; height: 24px;">
+                            </div>
                             <div class="arch-name">Controller</div>
-                            <div class="arch-desc">Watches secrets & generates hashes</div>
-                        </div>
-                        <div class="arch-arrow">→</div>
-                        <div class="arch-component">
-                            <div class="arch-icon">🔧</div>
-                            <div class="arch-name">xDS Server</div>
-                            <div class="arch-desc">SDS, LDS & ExtProc</div>
-                        </div>
-                        <div class="arch-component">
-                            <div class="arch-icon">🎯</div>
-                            <div class="arch-name">Webhook</div>
-                            <div class="arch-desc">Sidecar injection</div>
+                            <div class="arch-desc">Watches secrets & manages eBPF programs</div>
                         </div>
                     </div>
                 </div>
                 <div class="arch-connector">
                     <svg width="24" height="40" viewBox="0 0 24 40">
-                        <path d="M12 0 L12 40" stroke="currentColor" stroke-width="2" stroke-dasharray="4 4"/>
-                        <path d="M6 34 L12 40 L18 34" stroke="currentColor" stroke-width="2" fill="none"/>
+                        <path d="M12 0 L12 40" stroke="currentColor" stroke-width="2" stroke-dasharray="4 4" />
+                        <path d="M6 34 L12 40 L18 34" stroke="currentColor" stroke-width="2" fill="none" />
                     </svg>
                 </div>
                 <div class="arch-layer arch-data">
@@ -294,181 +314,86 @@
                         <div class="arch-pod-label">Application Pod</div>
                         <div class="arch-pod-containers">
                             <div class="arch-container app">
-                                <div class="arch-container-icon">📦</div>
+                                <div class="arch-container-icon">
+                                    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+                                        stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                        <path
+                                            d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z">
+                                        </path>
+                                        <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+                                        <line x1="12" y1="22.08" x2="12" y2="12"></line>
+                                    </svg>
+                                </div>
                                 <div class="arch-container-name">App</div>
                             </div>
-                            <div class="arch-container-arrow">
-                                <svg width="40" height="24" viewBox="0 0 40 24">
-                                    <path d="M0 12 L40 12" stroke="currentColor" stroke-width="2"/>
-                                    <path d="M34 6 L40 12 L34 18" stroke="currentColor" stroke-width="2" fill="none"/>
-                                </svg>
-                            </div>
-                            <div class="arch-container envoy">
-                                <div class="arch-container-icon">🔀</div>
-                                <div class="arch-container-name">Envoy</div>
-                            </div>
+                        </div>
+                        <div class="arch-flow">
+                            <div class="flow-dot"></div>
+                            <div class="flow-dot"></div>
+                            <div class="flow-dot"></div>
                         </div>
                         <div class="arch-ebpf">
-                            <span class="arch-ebpf-label">eBPF Traffic Redirect</span>
+                            <span class="arch-ebpf-label">
+                                <img src="transparent-logo.svg" alt=""
+                                    style="width: 16px; height: 16px; margin-right: 8px; vertical-align: middle;">
+                                eBPF Traffic Control & Secret Replacement
+                            </span>
                         </div>
                     </div>
-                </div>
-            </div>
-            <div class="tech-stack">
-                <div class="tech-item">
-                    <span class="tech-name">Go 1.25+</span>
-                </div>
-                <div class="tech-item">
-                    <span class="tech-name">eBPF</span>
-                </div>
-                <div class="tech-item">
-                    <span class="tech-name">Envoy</span>
-                </div>
-                <div class="tech-item">
-                    <span class="tech-name">gRPC</span>
-                </div>
-                <div class="tech-item">
-                    <span class="tech-name">xDS</span>
                 </div>
             </div>
         </div>
     </section>
 
-    <!-- Getting Started Section -->
+    <!-- Book a Demo Section -->
     <section class="getting-started" id="getting-started">
+        <img src="transparent-logo.svg" alt="" class="section-logo-bg logo-shift-left" aria-hidden="true">
         <div class="container">
             <div class="section-header">
-                <span class="section-tag">Get Started</span>
-                <h2 class="section-title">Up and Running in Minutes</h2>
+                <span class="section-tag">Book a Demo</span>
+                <h2 class="section-title">
+                    See
+                    <span
+                        style="display: inline-flex; align-items: center; gap: 0; font-weight: 800; letter-spacing: 0.05em; vertical-align: bottom;">
+                        <img src="transparent-logo.svg" alt="K" class="logo-icon">
+                        <span class="logo-text">LOAK</span>
+                    </span>
+                    in Action
+                </h2>
                 <p class="section-description">
-                    Try the demo or deploy to your cluster
+                    Schedule a personalized walkthrough of our agentless eBPF secret management platform.
                 </p>
             </div>
-            <div class="getting-started-content">
-                <div class="install-tabs">
-                    <button class="install-tab active" data-tab="demo">Demo</button>
-                    <button class="install-tab" data-tab="manual">Manual Install</button>
-                </div>
-                <div class="install-panels">
-                    <div class="install-panel active" id="demo-panel">
-                        <div class="install-step">
-                            <div class="install-step-header">
-                                <span class="install-step-number">1</span>
-                                <span class="install-step-title">Clone the repository</span>
-                            </div>
-                            <div class="code-block">
-                                <button class="copy-btn" data-clipboard="git clone https://github.com/spinningfactory/kloak.git && cd kloak">
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                                    </svg>
-                                </button>
-                                <pre><code>git clone https://github.com/spinningfactory/kloak.git && cd kloak</code></pre>
-                            </div>
-                        </div>
-                        <div class="install-step">
-                            <div class="install-step-header">
-                                <span class="install-step-number">2</span>
-                                <span class="install-step-title">Run the demo script</span>
-                            </div>
-                            <div class="code-block">
-                                <button class="copy-btn" data-clipboard="./examples/setup-demo.sh">
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                                    </svg>
-                                </button>
-                                <pre><code>./examples/setup-demo.sh</code></pre>
-                            </div>
-                        </div>
-                        <div class="install-step">
-                            <div class="install-step-header">
-                                <span class="install-step-number">3</span>
-                                <span class="install-step-title">Verify the transformation</span>
-                            </div>
-                            <div class="code-block">
-                                <button class="copy-btn" data-clipboard="export KUBECONFIG=/tmp/kloak-k3s.yaml && kubectl logs demo-python -n kloak-demo -c demo-app">
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                                    </svg>
-                                </button>
-                                <pre><code>export KUBECONFIG=/tmp/kloak-k3s.yaml
-kubectl logs demo-python -n kloak-demo -c demo-app</code></pre>
-                            </div>
-                        </div>
+            <div class="demo-form-container">
+                <form id="demo-form" class="demo-form" action="mailto:glad.bread4864@fastmail.com" method="post"
+                    enctype="text/plain">
+                    <div class="form-group">
+                        <label for="name">Full Name</label>
+                        <input type="text" id="name" name="name" required placeholder="Jane Doe">
                     </div>
-                    <div class="install-panel" id="manual-panel">
-                        <div class="install-step">
-                            <div class="install-step-header">
-                                <span class="install-step-number">1</span>
-                                <span class="install-step-title">Build the binary</span>
-                            </div>
-                            <div class="code-block">
-                                <button class="copy-btn" data-clipboard="make build">
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                                    </svg>
-                                </button>
-                                <pre><code>make build</code></pre>
-                            </div>
-                        </div>
-                        <div class="install-step">
-                            <div class="install-step-header">
-                                <span class="install-step-number">2</span>
-                                <span class="install-step-title">Build the Docker image</span>
-                            </div>
-                            <div class="code-block">
-                                <button class="copy-btn" data-clipboard="make docker-build">
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                                    </svg>
-                                </button>
-                                <pre><code>make docker-build</code></pre>
-                            </div>
-                        </div>
-                        <div class="install-step">
-                            <div class="install-step-header">
-                                <span class="install-step-number">3</span>
-                                <span class="install-step-title">Deploy to your cluster</span>
-                            </div>
-                            <div class="code-block">
-                                <button class="copy-btn" data-clipboard="kubectl apply -f config/manifests/">
-                                    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                        <rect x="9" y="9" width="13" height="13" rx="2" ry="2"/>
-                                        <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
-                                    </svg>
-                                </button>
-                                <pre><code>kubectl apply -f config/manifests/</code></pre>
-                            </div>
-                        </div>
+                    <div class="form-group">
+                        <label for="email">Work Email</label>
+                        <input type="email" id="email" name="email" required placeholder="jane@company.com">
                     </div>
-                </div>
-            </div>
-        </div>
-    </section>
-
-    <!-- CTA Section -->
-    <section class="cta">
-        <div class="container">
-            <div class="cta-content">
-                <h2 class="cta-title">Ready to Secure Your Secrets?</h2>
-                <p class="cta-description">
-                    Join the growing community of developers using Kloak to manage secrets securely.
-                </p>
-                <div class="cta-actions">
-                    <a href="https://github.com/spinningfactory/kloak" class="btn btn-primary btn-large" target="_blank" rel="noopener">
-                        <svg class="github-icon" viewBox="0 0 24 24" width="20" height="20">
-                            <path fill="currentColor" d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/>
-                        </svg>
-                        View on GitHub
-                    </a>
-                    <a href="https://github.com/spinningfactory/kloak/issues" class="btn btn-secondary btn-large" target="_blank" rel="noopener">
-                        Report an Issue
-                    </a>
-                </div>
+                    <div class="form-group">
+                        <label for="company">Company</label>
+                        <input type="text" id="company" name="company" required placeholder="Acme Corp">
+                    </div>
+                    <div class="form-group form-group-full">
+                        <label for="message">How can we help you?</label>
+                        <textarea id="message" name="message" rows="4"
+                            placeholder="Tell us about your current secret management challenges..."></textarea>
+                    </div>
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-primary btn-large btn-block">
+                            <span>Request Demo</span>
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                                stroke-width="2">
+                                <path d="M5 12h14M12 5l7 7-7 7" />
+                            </svg>
+                        </button>
+                    </div>
+                </form>
             </div>
         </div>
     </section>
@@ -478,19 +403,13 @@ kubectl logs demo-python -n kloak-demo -c demo-app</code></pre>
         <div class="container">
             <div class="footer-content">
                 <div class="footer-brand">
-                    <span class="logo-icon">🔐</span>
-                    <span class="logo-text">Kloak</span>
+                    <img src="transparent-logo.svg" alt="K" class="logo-icon">
+                    <span class="logo-text">LOAK</span>
                 </div>
                 <p class="footer-tagline">
-                    Kubernetes eBPF HTTPS Interceptor
                 </p>
-                <div class="footer-links">
-                    <a href="https://github.com/spinningfactory/kloak" target="_blank" rel="noopener">GitHub</a>
-                    <a href="https://github.com/spinningfactory/kloak/blob/main/LICENSE" target="_blank" rel="noopener">License</a>
-                    <a href="https://github.com/spinningfactory/kloak/issues" target="_blank" rel="noopener">Issues</a>
-                </div>
                 <p class="footer-copyright">
-                    © 2026 Kloak. Licensed under Apache 2.0.
+                    © 2026 Kloak. All rights reserved.
                 </p>
             </div>
         </div>
@@ -498,4 +417,5 @@ kubectl logs demo-python -n kloak-demo -c demo-app</code></pre>
 
     <script src="app.js"></script>
 </body>
+
 </html>
