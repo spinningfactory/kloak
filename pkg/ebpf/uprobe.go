@@ -259,13 +259,17 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 }
 
 // syncSecretsToBPF updates the eBPF map with the latest shadow secret values.
-// Called on init and periodically or when triggered.
+// Called on init and periodically. Stale entries (secrets deleted from storage)
+// are removed from the map so the eBPF program stops rewriting them.
 func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 	secrets, err := m.store.List(ctx)
 	if err != nil {
 		m.log.Error(err, "failed to list secrets to sync to BPF map")
 		return
 	}
+
+	// newKeys tracks which keys we upsert so we can prune stale entries afterwards.
+	newKeys := make(map[secretKey]struct{}, len(secrets))
 
 	for hash, entry := range secrets {
 		// hash is already the full shadow value like "kloak:0a6dbc80-b38a-47"
@@ -280,13 +284,13 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 
 		// The BPF program looks up the first 16 bytes of the shadow secret
 		if len(shadowPrefix) < 16 {
-			// Skip too short secrets for now (needs to be padded or managed differently)
 			m.log.V(1).Info("Skipping secret too short for 16-byte BPF key", "hash", hash)
 			continue
 		}
 
 		var key secretKey
 		copy(key.Prefix[:], []byte(shadowPrefix)[:16])
+		newKeys[key] = struct{}{}
 
 		var val secretValue
 		val.Len = uint32(len(entry.Value))
@@ -307,11 +311,31 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 		}
 		// HostLen == 0 means wildcard (allow all hosts)
 
-		// Save into eBPF Map
 		if err := m.objs.SecretMap.Update(&key, &val, 0); err != nil {
 			m.log.Error(err, "failed to update BPF secret_map", "hash", hash)
 		} else {
 			m.log.Info("Synced secret into eBPF map", "hash", hash, "hostLen", val.HostLen)
+		}
+	}
+
+	// Prune stale entries: iterate existing map keys and delete any not in newKeys.
+	var staleKeys []secretKey
+	var iterKey secretKey
+	var iterVal secretValue
+	iter := m.objs.SecretMap.Iterate()
+	for iter.Next(&iterKey, &iterVal) {
+		if _, exists := newKeys[iterKey]; !exists {
+			staleKeys = append(staleKeys, iterKey)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		m.log.Error(err, "error iterating BPF secret_map for pruning")
+	}
+	for i := range staleKeys {
+		if err := m.objs.SecretMap.Delete(&staleKeys[i]); err != nil {
+			m.log.Error(err, "failed to delete stale BPF secret_map entry")
+		} else {
+			m.log.Info("Pruned stale entry from eBPF map")
 		}
 	}
 }
