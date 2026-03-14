@@ -8,6 +8,7 @@ import (
 	"os"
 
 	"github.com/cilium/ebpf"
+
 	ebpfpkg "github.com/spinningfactory/kloak/pkg/ebpf"
 )
 
@@ -23,6 +24,6 @@ func main() {
 		}
 		os.Exit(1)
 	}
-	defer mgr.Close()
+	defer func() { _ = mgr.Close() }()
 	fmt.Println("eBPF objects loaded successfully!")
 }

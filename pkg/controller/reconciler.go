@@ -164,7 +164,8 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) {
 	r.Log.Info("Trying to attach uprobes to new container", "cgroup", cgroupID)
 
 	// Find the container cgroup path again to read cgroup.procs
-	for _, status := range pod.Status.ContainerStatuses {
+	for i := range pod.Status.ContainerStatuses {
+		status := &pod.Status.ContainerStatuses[i]
 		if status.ContainerID == "" {
 			continue
 		}
@@ -252,7 +253,8 @@ func (r *Reconciler) getContainerCgroupIDs(pod *corev1.Pod) (map[uint64]bool, er
 
 	// Helper to collect cgroup IDs from container statuses
 	collectFromStatuses := func(statuses []corev1.ContainerStatus) {
-		for _, status := range statuses {
+		for i := range statuses {
+			status := &statuses[i]
 			if status.ContainerID == "" {
 				continue
 			}

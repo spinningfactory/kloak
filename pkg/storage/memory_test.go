@@ -46,9 +46,9 @@ func TestMemory_Delete(t *testing.T) {
 	store := NewMemory()
 
 	// Store values for two pods
-	store.Store(ctx, "pod-1", "hash1", Entry{Value: "value1"})
-	store.Store(ctx, "pod-1", "hash2", Entry{Value: "value2"})
-	store.Store(ctx, "pod-2", "hash3", Entry{Value: "value3"})
+	_ = store.Store(ctx, "pod-1", "hash1", Entry{Value: "value1"})
+	_ = store.Store(ctx, "pod-1", "hash2", Entry{Value: "value2"})
+	_ = store.Store(ctx, "pod-2", "hash3", Entry{Value: "value3"})
 
 	// Delete pod-1
 	err := store.Delete(ctx, "pod-1")
@@ -80,8 +80,8 @@ func TestMemory_List(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemory()
 
-	store.Store(ctx, "pod-1", "hash1", Entry{Value: "value1"})
-	store.Store(ctx, "pod-2", "hash2", Entry{Value: "value2"})
+	_ = store.Store(ctx, "pod-1", "hash1", Entry{Value: "value1"})
+	_ = store.Store(ctx, "pod-2", "hash2", Entry{Value: "value2"})
 
 	all, err := store.List(ctx)
 	if err != nil {
