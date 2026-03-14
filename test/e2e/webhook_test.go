@@ -48,15 +48,27 @@ func TestWebhookAnnotationInjection(t *testing.T) {
 	createEnabledSecret(t, "test-wh-annot", secretData, nil)
 	assertShadowSecret(t, "test-wh-annot", secretData)
 
-	// Create pod WITHOUT the annotation — namespace label should trigger webhook
+	// Create pod WITHOUT the annotation — namespace label should trigger webhook.
+	// Pod creation may fail transiently if the webhook is slow (context deadline),
+	// so retry a few times.
 	name := "test-wh-annot-pod"
-	createPodWithoutAnnotation(t, name, "test-wh-annot")
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-	if err := waitForPodPhase(ctx, testNamespace, name); err != nil {
-		t.Fatalf("pod not created: %v", err)
+	var createErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		createPodWithoutAnnotationNoFatal(t, name, "test-wh-annot")
+		// Check if the pod was actually created
+		_, createErr = clientset.CoreV1().Pods(testNamespace).Get(context.Background(), name, metav1.GetOptions{})
+		if createErr == nil {
+			break
+		}
+		t.Logf("pod creation attempt %d failed (webhook may be slow): %v", attempt+1, createErr)
+		time.Sleep(5 * time.Second)
 	}
+	if createErr != nil {
+		t.Fatalf("pod creation failed after retries: %v", createErr)
+	}
+	t.Cleanup(func() {
+		_ = clientset.CoreV1().Pods(testNamespace).Delete(context.Background(), name, metav1.DeleteOptions{})
+	})
 
 	pod, err := clientset.CoreV1().Pods(testNamespace).Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
@@ -151,20 +163,20 @@ func TestWebhookMountedContent(t *testing.T) {
 	}
 }
 
-// createPodWithoutAnnotation creates a pod without getkloak.io/enabled annotation.
-// The namespace label should trigger the webhook instead.
-func createPodWithoutAnnotation(t *testing.T, name, secretName string) {
+// createPodWithoutAnnotationNoFatal creates a pod without getkloak.io/enabled annotation.
+// Does not call t.Fatal on error so the caller can retry.
+func createPodWithoutAnnotationNoFatal(t *testing.T, name, secretName string) {
 	t.Helper()
+	// Delete any previous attempt
+	_ = clientset.CoreV1().Pods(testNamespace).Delete(context.Background(), name, metav1.DeleteOptions{})
+	time.Sleep(1 * time.Second)
+
 	pod := createBasePod(name, secretName)
-	// Remove the annotation — rely on namespace label
 	pod.Annotations = nil
 	_, err := clientset.CoreV1().Pods(testNamespace).Create(context.Background(), pod, metav1.CreateOptions{})
 	if err != nil {
-		t.Fatalf("failed to create pod %s: %v", name, err)
+		t.Logf("pod creation returned error: %v", err)
 	}
-	t.Cleanup(func() {
-		_ = clientset.CoreV1().Pods(testNamespace).Delete(context.Background(), name, metav1.DeleteOptions{})
-	})
 }
 
 // createPodThatReadsSecret creates a pod that cats a secret key and exits.

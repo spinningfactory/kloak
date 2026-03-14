@@ -283,9 +283,13 @@ func assertShadowSecret(t *testing.T, originalName string, originalData map[stri
 			t.Errorf("key %q: shadow length %d != original length %d", key, len(shadowVal), len(originalVal))
 		}
 
-		// Must start with "kloak:" prefix
-		if !strings.HasPrefix(string(shadowVal), "kloak:") {
-			t.Errorf("key %q: shadow value %q does not start with 'kloak:' prefix", key, string(shadowVal))
+		// Must start with "kloak:" prefix (or "kloak" if value is shorter than the prefix)
+		kloakPrefix := "kloak:"
+		if len(originalVal) < len(kloakPrefix) {
+			kloakPrefix = kloakPrefix[:len(originalVal)]
+		}
+		if !strings.HasPrefix(string(shadowVal), kloakPrefix) {
+			t.Errorf("key %q: shadow value %q does not start with expected prefix %q", key, string(shadowVal), kloakPrefix)
 		}
 	}
 
