@@ -9,12 +9,13 @@ import (
 	"sync"
 
 	"github.com/go-logr/logr"
-	"github.com/spinningfactory/kloak/pkg/cgroups"
-	"github.com/spinningfactory/kloak/pkg/ebpf"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/spinningfactory/kloak/pkg/cgroups"
+	"github.com/spinningfactory/kloak/pkg/ebpf"
 )
 
 const (
@@ -75,12 +76,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// Pod was deleted — look up the UID we stored on the last successful
 		// reconcile so we can find the entry in trackedPods (keyed by UID).
 		r.mu.RLock()
-		uid, known := r.podKeyToUID[req.NamespacedName.String()]
+		uid, known := r.podKeyToUID[req.String()]
 		r.mu.RUnlock()
 		if !known {
 			return ctrl.Result{}, nil
 		}
-		return r.handleDelete(uid, req.NamespacedName.String())
+		return r.handleDelete(uid, req.String())
 	}
 
 	// Check if Kloak is enabled
@@ -90,7 +91,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		_, tracked := r.trackedPods[string(pod.UID)]
 		r.mu.RUnlock()
 		if tracked {
-			return r.handleDelete(string(pod.UID), req.NamespacedName.String())
+			return r.handleDelete(string(pod.UID), req.String())
 		}
 		return ctrl.Result{}, nil
 	}
@@ -144,7 +145,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	r.trackedPods[string(pod.UID)] = existingCgroups
-	r.podKeyToUID[req.NamespacedName.String()] = string(pod.UID)
+	r.podKeyToUID[req.String()] = string(pod.UID)
 	r.mu.Unlock()
 
 	// Attach uprobes outside the lock — this involves filesystem I/O.
@@ -164,7 +165,8 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) {
 	r.Log.Info("Trying to attach uprobes to new container", "cgroup", cgroupID)
 
 	// Find the container cgroup path again to read cgroup.procs
-	for _, status := range pod.Status.ContainerStatuses {
+	for i := range pod.Status.ContainerStatuses {
+		status := &pod.Status.ContainerStatuses[i]
 		if status.ContainerID == "" {
 			continue
 		}
@@ -252,7 +254,8 @@ func (r *Reconciler) getContainerCgroupIDs(pod *corev1.Pod) (map[uint64]bool, er
 
 	// Helper to collect cgroup IDs from container statuses
 	collectFromStatuses := func(statuses []corev1.ContainerStatus) {
-		for _, status := range statuses {
+		for i := range statuses {
+			status := &statuses[i]
 			if status.ContainerID == "" {
 				continue
 			}

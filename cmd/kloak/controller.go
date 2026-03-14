@@ -5,7 +5,6 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/spinningfactory/kloak/pkg/ebpf"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
@@ -15,6 +14,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/spinningfactory/kloak/pkg/controller"
+	"github.com/spinningfactory/kloak/pkg/ebpf"
 	"github.com/spinningfactory/kloak/pkg/storage"
 	"github.com/spinningfactory/kloak/pkg/webhook"
 )
@@ -120,9 +120,6 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
 	// Create pod reconciler
 	// NODE_NAME is used to filter pods to only those on this node (DaemonSet per-node controller)
 	nodeName := os.Getenv("NODE_NAME")
@@ -165,6 +162,8 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	ctx, cancel := context.WithCancel(context.Background())
+
 	// Start eBPF TLS event poller (syncs secrets to BPF map and reads events)
 	if uprobeMgr != nil {
 		go func() {
@@ -177,13 +176,13 @@ func runController(cmd *cobra.Command, args []string) {
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
-		os.Exit(1)
 	}
 
 	// Cleanup
 	cancel()
 	if uprobeMgr != nil {
-		uprobeMgr.Close()
+		if err := uprobeMgr.Close(); err != nil {
+			setupLog.Error(err, "failed to close uprobe manager")
+		}
 	}
 }
-
