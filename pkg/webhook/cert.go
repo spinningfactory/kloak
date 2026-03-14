@@ -111,7 +111,7 @@ func patchWebhookConfiguration(ctx context.Context, c client.Client, certPEM []b
 	return nil
 }
 
-func generateSelfSignedCert(namespace string) (certPEM []byte, keyPEM []byte, err error) {
+func generateSelfSignedCert(namespace string) (certPEM, keyPEM []byte, err error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, nil, err
