@@ -188,10 +188,14 @@ int bpf_phase2_rewrite(struct pt_regs *ctx) {
         char *target = (char *)scratch_data->user_data_ptr + safe_i;
 
         __u32 write_len = val->len;
-        write_len &= (SECRET_MAX_LEN - 1);
-
         if (write_len == 0)
           continue;
+        if (write_len > SECRET_MAX_LEN)
+          write_len = SECRET_MAX_LEN;
+        /* Use 2*SECRET_MAX_LEN-1 as the verifier mask: covers [1,128] safely
+         * since write_len <= 128 <= 255. The previous mask (SECRET_MAX_LEN-1 = 127)
+         * incorrectly zeroed write_len when val->len == 128. */
+        write_len &= (2 * SECRET_MAX_LEN - 1);
 
         bpf_probe_write_user(target, val->real_secret, write_len);
         rewritten = 1;
