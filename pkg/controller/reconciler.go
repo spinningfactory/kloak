@@ -105,7 +105,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		// This is expected during container startup - will retry on next reconcile
 		log.V(1).Info("cgroup IDs not available yet", "reason", err.Error())
-		return ctrl.Result{Requeue: true}, nil // Retry after a bit
+		return ctrl.Result{Requeue: true}, nil
 	}
 
 	// Get existing tracked cgroups for this pod

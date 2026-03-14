@@ -97,15 +97,9 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	newData := make(map[string][]byte)
 	secretID := fmt.Sprintf("%s/%s", secret.Namespace, secret.Name)
 
-	// Clear old mappings to prevent leaks?
-	// Actually, clearing first is safer to remove deleted keys.
-	// Storage.Delete clears everything for this SecretID.
-	// But we want to PRESERVE UUIDs if key exists.
-	// So we should:
-	// 1. Calculate new mappings.
-	// 2. Clear old mappings.
-	// 3. Store new mappings.
-	// This minimizes race window where keys are missing.
+	// Recalculate all mappings, then clear old ones and store the new ones.
+	// Delete-before-store removes stale keys (e.g. a key removed from the original secret)
+	// while UUIDs are reused where possible to keep shadow values stable.
 
 	newMappings := make(map[string]string) // uuid -> original
 
@@ -154,7 +148,6 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// We delete first to remove stale keys (keys removed from original secret)
 	if err := r.Storage.Delete(ctx, secretID); err != nil {
 		log.Error(err, "failed to clear old storage mappings")
-		// Continue anyway, overwrite is fine, just risks leaks
 	}
 
 	for shadowVal, originalVal := range newMappings {
