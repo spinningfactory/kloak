@@ -205,8 +205,9 @@ int bpf_phase2_rewrite(struct pt_regs *ctx) {
     struct tls_event *event =
         bpf_ringbuf_reserve(&tls_events, sizeof(struct tls_event), 0);
     if (event) {
-      event->pid = bpf_get_current_pid_tgid();
-      event->tgid = bpf_get_current_pid_tgid() >> 32;
+      __u64 pid_tgid = bpf_get_current_pid_tgid();
+      event->pid  = (__u32)(pid_tgid & 0xFFFFFFFF);
+      event->tgid = (__u32)(pid_tgid >> 32);
       event->len = read_len;
       event->is_rewritten = 1;
       bpf_ringbuf_submit(event, 0);
