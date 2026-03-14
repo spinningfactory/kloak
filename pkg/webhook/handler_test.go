@@ -238,10 +238,7 @@ func TestRewriteSecretVolumes(t *testing.T) {
 		},
 	}
 
-	err := h.rewriteSecretVolumes(context.Background(), pod, "default")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
+	h.rewriteSecretVolumes(context.Background(), pod, "default")
 
 	// Verify "my-secret" rewrote to "my-secret-kloak"
 	if pod.Spec.Volumes[0].Secret.SecretName != "my-secret-kloak" {

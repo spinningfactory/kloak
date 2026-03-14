@@ -59,7 +59,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	// 3. Handle deletion or disabled state
-	if !secret.ObjectMeta.DeletionTimestamp.IsZero() || !enabled {
+	if !secret.DeletionTimestamp.IsZero() || !enabled {
 		// If disabled or deleted, we should clean up the shadow secret.
 		// We rely on K8s Garbage Collection (OwnerReference) for shadow secret deletion if owner is deleted.
 		// But if just disabled, we should delete it manually.
@@ -166,7 +166,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 		// Store mapping (uuid -> original + hosts)
 		entry := storage.Entry{
-			Value:        string(originalVal),
+			Value:        originalVal,
 			AllowedHosts: allowedHosts,
 		}
 		if err := r.Storage.Store(ctx, secretID, shadowVal, entry); err != nil {

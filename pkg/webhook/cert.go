@@ -96,8 +96,8 @@ func patchWebhookConfiguration(ctx context.Context, c client.Client, certPEM []b
 	}
 
 	patched := false
-	for i, wh := range webhookConfig.Webhooks {
-		if wh.Name == "pod.mutate.getkloak.io" {
+	for i := range webhookConfig.Webhooks {
+		if webhookConfig.Webhooks[i].Name == "pod.mutate.getkloak.io" {
 			webhookConfig.Webhooks[i].ClientConfig.CABundle = certPEM
 			patched = true
 		}
@@ -111,7 +111,7 @@ func patchWebhookConfiguration(ctx context.Context, c client.Client, certPEM []b
 	return nil
 }
 
-func generateSelfSignedCert(namespace string) ([]byte, []byte, error) {
+func generateSelfSignedCert(namespace string) (certPEM, keyPEM []byte, err error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		return nil, nil, err
