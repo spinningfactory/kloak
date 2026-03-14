@@ -177,12 +177,16 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) {
 			return
 		}
 
-		// Attach uprobes to the first PID (main process)
-		pid := pids[0]
-		if err := r.UprobeManager.AttachTLS(pid); err != nil {
-			r.Log.Error(err, "failed to attach TLS uprobes", "pid", pid, "container", status.Name)
-		} else {
-			r.Log.Info("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
+		// Attempt to attach uprobes to every PID in the cgroup.
+		// Containers may run multiple processes; we probe all of them so that
+		// whichever process makes TLS calls is instrumented. AttachTLS skips
+		// PIDs that have no compatible TLS symbols.
+		for _, pid := range pids {
+			if err := r.UprobeManager.AttachTLS(pid); err != nil {
+				r.Log.V(1).Info("could not attach TLS uprobes to pid (no compatible symbols or already attached)", "pid", pid, "container", status.Name, "err", err)
+			} else {
+				r.Log.Info("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
+			}
 		}
 		return
 	}
