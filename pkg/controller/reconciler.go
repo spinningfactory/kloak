@@ -36,6 +36,11 @@ type Reconciler struct {
 
 	// trackedPods maps pod UID -> set of cgroup IDs (one per container)
 	trackedPods map[string]map[uint64]bool
+
+	// podKeyToUID maps "namespace/name" -> pod UID, so that on a NotFound
+	// delete event (where we only have the namespaced name) we can look up
+	// the UID and clean up trackedPods correctly.
+	podKeyToUID map[string]string
 }
 
 // NewReconciler creates a new pod reconciler.
@@ -51,6 +56,7 @@ func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, upr
 		CgroupRoot:    cgroupRoot,
 		NodeName:      nodeName,
 		trackedPods:   make(map[string]map[uint64]bool),
+		podKeyToUID:   make(map[string]string),
 	}
 }
 
@@ -64,15 +70,20 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if client.IgnoreNotFound(err) != nil {
 			return ctrl.Result{}, err
 		}
-		// Pod was deleted - clean up
-		return r.handleDelete(req.NamespacedName.String())
+		// Pod was deleted — look up the UID we stored on the last successful
+		// reconcile so we can find the entry in trackedPods (keyed by UID).
+		uid, known := r.podKeyToUID[req.NamespacedName.String()]
+		if !known {
+			return ctrl.Result{}, nil
+		}
+		return r.handleDelete(uid, req.NamespacedName.String())
 	}
 
 	// Check if Kloak is enabled
 	if !r.isEnabled(pod) {
 		// If was tracked before, clean up
 		if _, tracked := r.trackedPods[string(pod.UID)]; tracked {
-			return r.handleDelete(string(pod.UID))
+			return r.handleDelete(string(pod.UID), req.NamespacedName.String())
 		}
 		return ctrl.Result{}, nil
 	}
@@ -125,6 +136,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	r.trackedPods[string(pod.UID)] = existingCgroups
+	r.podKeyToUID[req.NamespacedName.String()] = string(pod.UID)
 
 	return ctrl.Result{}, nil
 }
@@ -188,9 +200,10 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) {
 	r.Log.V(1).Info("could not find matching container for cgroup", "cgroupID", cgroupID)
 }
 
-// handleDelete removes a pod from tracking.
-func (r *Reconciler) handleDelete(podKey string) (ctrl.Result, error) {
-	cgroupIDs, tracked := r.trackedPods[podKey]
+// handleDelete removes a pod from tracking. uid is the pod UID (trackedPods key),
+// namespacedName is the "namespace/name" string (podKeyToUID key).
+func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, error) {
+	cgroupIDs, tracked := r.trackedPods[uid]
 	if !tracked {
 		return ctrl.Result{}, nil
 	}
@@ -198,8 +211,9 @@ func (r *Reconciler) handleDelete(podKey string) (ctrl.Result, error) {
 	// Uprobes will be automatically cleaned up by the uprobe component when
 	// the process dies, so we no longer have to detach them manually or remove cgroups from maps.
 	// Just remove the pod from our tracking.
-	delete(r.trackedPods, podKey)
-	r.Log.Info("stopped tracking pod", "podKey", podKey, "cgroupCount", len(cgroupIDs))
+	delete(r.trackedPods, uid)
+	delete(r.podKeyToUID, namespacedName)
+	r.Log.Info("stopped tracking pod", "pod", namespacedName, "uid", uid, "cgroupCount", len(cgroupIDs))
 
 	return ctrl.Result{}, nil
 }
