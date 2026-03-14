@@ -20,6 +20,11 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
 
+/* Define KLOAK_DEBUG at compile time to enable verbose bpf_printk tracing.
+ * Example: add -DKLOAK_DEBUG to the bpf2go cflags in uprobe.go.
+ * Do NOT enable in production: bpf_printk writes to trace_pipe on every
+ * TLS write call and adds significant overhead. */
+
 // Buffer size for reading TLS data. Must be a power of 2 for bitmask bounds.
 // 256 keeps the phase 2 scan loop under the verifier's 8192-jump limit.
 #define MAX_DATA_SIZE 256
@@ -199,7 +204,9 @@ int bpf_phase2_rewrite(struct pt_regs *ctx) {
     }
   }
 
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak phase2: rewritten=%d", rewritten);
+#endif
 
   if (rewritten) {
     struct tls_event *event =
@@ -243,8 +250,10 @@ int bpf_uprobe_go_tls_write(struct pt_regs *ctx) {
   return 0;
 #endif
 
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak go_tls: ptr=%llx len=%llu pid=%d", (__u64)data_ptr,
              data_len, pid);
+#endif
 
   if (!data_ptr || data_len == 0)
     return 0;
@@ -261,8 +270,10 @@ int bpf_uprobe_go_tls_write(struct pt_regs *ctx) {
 
   // Read plaintext into scratch buffer (per-CPU array, not ringbuf)
   long ret = bpf_probe_read_user(scratch_data->data, read_len, data_ptr);
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak go_tls: read_user ret=%ld read_len=%u first4=%.4s", ret,
              read_len, scratch_data->data);
+#endif
 
   scratch_data->user_data_ptr = (__u64)data_ptr;
   scratch_data->read_len = read_len;
@@ -302,7 +313,9 @@ int bpf_uprobe_ssl_write(struct pt_regs *ctx) {
   return 0;
 #endif
 
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak ssl: ptr=%llx num=%d pid=%d", (__u64)data_ptr, num, pid);
+#endif
 
   if (!data_ptr || num <= 0)
     return 0;
@@ -317,8 +330,10 @@ int bpf_uprobe_ssl_write(struct pt_regs *ctx) {
     read_len = MAX_DATA_SIZE;
 
   long ret = bpf_probe_read_user(scratch_data->data, read_len, data_ptr);
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak ssl: read_user ret=%ld len=%u first4=%.4s", ret, read_len,
              scratch_data->data);
+#endif
 
   scratch_data->user_data_ptr = (__u64)data_ptr;
   scratch_data->read_len = read_len;
