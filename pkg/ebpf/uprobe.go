@@ -14,8 +14,9 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/go-logr/logr"
-	"github.com/spinningfactory/kloak/pkg/storage"
 	ctrl "sigs.k8s.io/controller-runtime"
+
+	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
 // tlsEvent must match the C struct tls_event (lightweight, no data payload)
@@ -78,13 +79,13 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 	// Wire up tail call map: index 0 -> bpf_phase2_rewrite
 	fd := uint32(objs.BpfPhase2Rewrite.FD())
 	if err := objs.ProgArray.Put(uint32(0), fd); err != nil {
-		objs.Close()
+		_ = objs.Close()
 		return nil, fmt.Errorf("configuring tail call map: %w", err)
 	}
 
 	reader, err := ringbuf.NewReader(objs.TlsEvents)
 	if err != nil {
-		objs.Close()
+		_ = objs.Close()
 		return nil, fmt.Errorf("creating ringbuf reader: %w", err)
 	}
 
@@ -194,7 +195,9 @@ func (m *TLSUprobeManager) Close() error {
 	m.links = nil
 
 	if m.reader != nil {
-		m.reader.Close()
+		if err := m.reader.Close(); err != nil {
+			errs = append(errs, err)
+		}
 	}
 	if m.objs != nil {
 		if err := m.objs.Close(); err != nil {
@@ -279,7 +282,7 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 		if len(shadowPrefix) > len(entry.Value) {
 			shadowPrefix = shadowPrefix[:len(entry.Value)]
 		} else if len(shadowPrefix) < len(entry.Value) {
-			shadowPrefix = shadowPrefix + strings.Repeat(" ", len(entry.Value)-len(shadowPrefix))
+			shadowPrefix += strings.Repeat(" ", len(entry.Value)-len(shadowPrefix))
 		}
 
 		// The BPF program looks up the first 16 bytes of the shadow secret
@@ -307,7 +310,7 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 				host = host[:32]
 			}
 			val.HostLen = uint32(len(host))
-			copy(val.AllowedHost[:], []byte(host))
+			copy(val.AllowedHost[:], host)
 		}
 		// HostLen == 0 means wildcard (allow all hosts)
 

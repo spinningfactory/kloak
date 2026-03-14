@@ -38,7 +38,8 @@ func NewHandler(c client.Client, log logr.Logger) *Handler {
 }
 
 // Handle processes admission requests for pods.
-func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.Response {
+// The admission.Handler interface requires req by value — cannot use a pointer.
+func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.Response { //nolint:gocritic // hugeParam: interface requirement
 	pod := &corev1.Pod{}
 	if err := h.decoder.Decode(req, pod); err != nil {
 		return admission.Errored(http.StatusBadRequest, err)
@@ -65,10 +66,7 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 	mutatedPod.Annotations[AnnotationEnabled] = "true"
 
 	// Rewrite Secret volumes (swap with shadow secrets)
-	if err := h.rewriteSecretVolumes(ctx, mutatedPod, req.Namespace); err != nil {
-		h.log.Error(err, "failed to rewrite secret volumes")
-		return admission.Errored(http.StatusInternalServerError, err)
-	}
+	h.rewriteSecretVolumes(ctx, mutatedPod, req.Namespace)
 
 	// Create JSON patch
 	marshaledPod, err := json.Marshal(mutatedPod)
@@ -163,7 +161,7 @@ func (h *Handler) isObjectEnabled(labels, annotations map[string]string) bool {
 }
 
 // rewriteSecretVolumes checks volume mounts and swaps enabled secrets with shadow secrets.
-func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, namespace string) error {
+func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, namespace string) {
 	for i := range pod.Spec.Volumes {
 		vol := &pod.Spec.Volumes[i]
 		if vol.Secret != nil {
@@ -195,5 +193,4 @@ func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, nam
 			}
 		}
 	}
-	return nil
 }
