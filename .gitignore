@@ -19,10 +19,11 @@ bin/
 *.test
 *.out
 
-# eBPF generated
-*.o
-*_bpfel.go
-*_bpfeb.go
+# eBPF object files are committed (required for CI builds without eBPF toolchain).
+# Only ignore object files outside pkg/ebpf/.
+!pkg/ebpf/*_bpfel.go
+!pkg/ebpf/*_bpfeb.go
+!pkg/ebpf/*.o
 
 # Kubernetes
 kubeconfig
