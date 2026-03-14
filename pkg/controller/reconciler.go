@@ -35,7 +35,7 @@ type Reconciler struct {
 	// NodeName filters pods to only those on this node (empty = all nodes)
 	NodeName string
 
-	mu sync.Mutex
+	mu sync.RWMutex
 	// trackedPods maps pod UID -> set of cgroup IDs (one per container)
 	trackedPods map[string]map[uint64]bool
 
@@ -84,9 +84,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// Check if Kloak is enabled
 	if !r.isEnabled(pod) {
 		// If was tracked before, clean up
-		r.mu.Lock()
+		r.mu.RLock()
 		_, tracked := r.trackedPods[string(pod.UID)]
-		r.mu.Unlock()
+		r.mu.RUnlock()
 		if tracked {
 			return r.handleDelete(string(pod.UID), req.NamespacedName.String())
 		}
@@ -302,7 +302,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // GetTrackedPodCount returns the number of currently tracked pods.
 func (r *Reconciler) GetTrackedPodCount() int {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return len(r.trackedPods)
 }
