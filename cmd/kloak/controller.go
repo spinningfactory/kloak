@@ -30,13 +30,13 @@ func init() {
 var controllerCmd = &cobra.Command{
 	Use:   "controller",
 	Short: "Run the Kloak controller",
-	Long: `Starts the Kubernetes controller that watches pods and secrets,
-manages eBPF programs, and serves the gRPC sync API for agents.
+	Long: `Starts the Kubernetes controller that watches pods and secrets
+and manages eBPF uprobe programs for in-kernel TLS secret rewriting.
 
 The controller is responsible for:
-- Watching K8s Secrets with kloak.io/managed label
-- Managing the Root CA for TLS interception
-- Managing eBPF cgroup tracking for labeled pods`,
+- Watching K8s Secrets labeled getkloak.io/enabled=true and creating shadow secrets
+- Generating and patching TLS certs for the mutating webhook
+- Attaching eBPF TLS uprobes to tracked pod processes`,
 	Run: runController,
 }
 
@@ -74,10 +74,8 @@ func runController(cmd *cobra.Command, args []string) {
 		namespace = "kloak-system"
 	}
 
-	// We rely purely on the underlying runtime providing certificates to workloads (or eBPF uprobes intercepting)
-	// No application CA generation happens here anymore
-
-	// However, we still need to provide a TLS cert for the MutatingWebhook, since K8s apiservers demand HTTPS
+	// Generate TLS certs for the mutating webhook if they don't already exist.
+	// The K8s apiserver requires HTTPS for webhook endpoints.
 	k8sConfig := ctrl.GetConfigOrDie()
 	directClient, err := client.New(k8sConfig, client.Options{Scheme: scheme})
 	if err != nil {
@@ -100,7 +98,6 @@ func runController(cmd *cobra.Command, args []string) {
 		uprobeMgr, err = ebpf.NewTLSUprobeManager(store)
 		if err != nil {
 			setupLog.Error(err, "failed to initialize eBPF uprobe manager")
-			// non-fatal for this demo
 		} else {
 			setupLog.Info("eBPF TLS uprobes enabled")
 		}
@@ -186,9 +183,3 @@ func runController(cmd *cobra.Command, args []string) {
 	}
 }
 
-// runnableFunc helper for manager.Runnable
-type runnableFunc func(context.Context) error
-
-func (r runnableFunc) Start(ctx context.Context) error {
-	return r(ctx)
-}

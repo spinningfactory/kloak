@@ -42,9 +42,9 @@ The binary (`cmd/kloak/main.go`) has two subcommands via cobra:
 - **`kloak controller`** — runs as a DaemonSet per node. Starts two reconcilers and optionally the eBPF uprobe manager:
   - `SecretReconciler` (`pkg/controller/secret_reconciler.go`) — watches Secrets labeled `getkloak.io/enabled=true`, creates shadow secrets (`<name>-kloak`) with UUID placeholders length-matched to originals, and stores hash→real-value mappings in `storage.Storage`.
   - `Reconciler` (`pkg/controller/reconciler.go`) — watches Pods annotated `getkloak.io/enabled=true`, discovers container cgroup IDs, and attaches eBPF TLS uprobes to container processes.
-  - `TLSUprobeManager` (`pkg/ebpf/uprobe.go`) — loads eBPF programs, attaches uprobes to `crypto/tls.(*Conn).Write` (Go) or `SSL_write` (OpenSSL/libssl), syncs secrets into the BPF map, and polls the ring buffer for rewrite events.
+  - `TLSUprobeManager` (`pkg/ebpf/uprobe.go`) — loads eBPF programs, attaches uprobes to `crypto/tls.(*Conn).Write` (Go) or `SSL_write`/`SSL_write_ex` (OpenSSL/libssl — scans `/proc/<pid>/maps` to locate `libssl.so`), syncs secrets into the BPF map, and polls the ring buffer for rewrite events. Uses a two-phase tail-call design: phase 1 intercepts the TLS write, phase 2 performs the in-kernel rewrite via a `ProgArray` tail call. Also on startup, generates TLS certs for the webhook and patches the `CABundle` in the `MutatingWebhookConfiguration`.
 
-- **`kloak webhook`** — mutating admission webhook. `Handler` (`pkg/webhook/handler.go`) intercepts pod creation, checks enablement (pod annotation → namespace label → owner workload labels), and rewrites Secret volume references to point to shadow secrets. Cert management is in `pkg/webhook/cert.go`.
+- **`kloak webhook`** — mutating admission webhook. `Handler` (`pkg/webhook/handler.go`) intercepts pod creation, checks enablement (pod annotation → namespace label → owner workload labels, following ReplicaSet → Deployment chains), and rewrites Secret volume references to point to shadow secrets. `pkg/webhook/cert.go` generates self-signed RSA-2048 certs stored in the `kloak-webhook-certs` secret.
 
 ### Data Flow
 
@@ -55,7 +55,7 @@ The binary (`cmd/kloak/main.go`) has two subcommands via cobra:
 
 ### Key Interfaces
 
-- `storage.Storage` (`pkg/storage/storage.go`) — hash-to-value store interface. Currently only in-memory (`pkg/storage/memory.go`).
+- `storage.Storage` (`pkg/storage/storage.go`) — hash-to-value store interface with `Store`, `Lookup`, `Delete`, `List` methods. `Entry` holds `Value` string + `AllowedHosts []string`. Currently only in-memory (`pkg/storage/memory.go`).
 - `pkg/cgroups/` — platform-specific cgroup utilities (Linux-only implementation + stub for other OS).
 
 ### Labels & Annotations
@@ -66,12 +66,14 @@ The binary (`cmd/kloak/main.go`) has two subcommands via cobra:
 
 ## Project Layout
 
-- `cmd/kloak/` — CLI entry point and subcommand wiring
+- `cmd/kloak/` — CLI entry point and subcommand wiring (`controller.go`, `webhook.go`)
+- `cmd/ebpftest/` — standalone eBPF test utility
 - `pkg/controller/` — Kubernetes reconcilers (pod + secret)
 - `pkg/ebpf/` — eBPF program loading, uprobe attachment, BPF map sync
 - `pkg/ebpf/bpf/` — eBPF C source and vmlinux.h
 - `pkg/webhook/` — admission webhook handler and cert generation
 - `pkg/storage/` — secret storage interface and implementations
-- `pkg/cgroups/` — cgroup path resolution and inode lookup
-- `config/manifests/` — Kubernetes deployment manifests (controller, webhook, RBAC)
+- `pkg/cgroups/` — cgroup path resolution and inode lookup (Linux-only impl + stub)
+- `config/manifests/` — Kubernetes deployment manifests (controller DaemonSet, webhook Deployment, RBAC)
 - `config/overlays/` — Kustomize overlays (dev, prod, k3s)
+- `examples/` — demo applications (Go, Node.js, Python)

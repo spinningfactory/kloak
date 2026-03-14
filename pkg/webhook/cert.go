@@ -81,9 +81,8 @@ func patchWebhookConfiguration(ctx context.Context, c client.Client, certPEM []b
 	webhookConfig := &admissionregistrationv1.MutatingWebhookConfiguration{}
 	err := c.Get(ctx, types.NamespacedName{Name: "kloak-mutating-webhook"}, webhookConfig)
 	if err != nil {
-		// If it doesn't exist yet, we can't patch it. The quick setup might apply it after the controller starts.
-		// For now, return nil and let it be. But typically we should patch it.
 		if apierrors.IsNotFound(err) {
+			// Webhook configuration not yet applied; CABundle will be patched on next cert rotation.
 			return nil
 		}
 		return err
