@@ -24,12 +24,6 @@ const (
 	CgroupBasePath = "/sys/fs/cgroup"
 )
 
-// CgroupManager is the interface for managing cgroups in eBPF maps.
-type CgroupManager interface {
-	AddCgroup(cgroupID uint64) error
-	RemoveCgroup(cgroupID uint64) error
-}
-
 // Reconciler watches pods and manages eBPF cgroup tracking.
 type Reconciler struct {
 	client.Client
