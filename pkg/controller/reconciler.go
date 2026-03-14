@@ -74,7 +74,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		// Pod was deleted — look up the UID we stored on the last successful
 		// reconcile so we can find the entry in trackedPods (keyed by UID).
+		r.mu.RLock()
 		uid, known := r.podKeyToUID[req.NamespacedName.String()]
+		r.mu.RUnlock()
 		if !known {
 			return ctrl.Result{}, nil
 		}
@@ -142,13 +144,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	r.trackedPods[string(pod.UID)] = existingCgroups
+	r.podKeyToUID[req.NamespacedName.String()] = string(pod.UID)
 	r.mu.Unlock()
 
 	// Attach uprobes outside the lock — this involves filesystem I/O.
 	for _, cgroupID := range newCgroups {
 		r.attachUprobesToCgroup(cgroupID, pod)
 	}
-	r.podKeyToUID[req.NamespacedName.String()] = string(pod.UID)
 
 	return ctrl.Result{}, nil
 }
@@ -215,7 +217,7 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) {
 // handleDelete removes a pod from tracking. uid is the pod UID (trackedPods key),
 // namespacedName is the "namespace/name" string (podKeyToUID key).
 func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, error) {
-  r.mu.Lock()
+	r.mu.Lock()
 	cgroupIDs, tracked := r.trackedPods[uid]
 	if !tracked {
 		r.mu.Unlock()
@@ -225,10 +227,10 @@ func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, erro
 	// Uprobes will be automatically cleaned up by the uprobe component when
 	// the process dies, so we no longer have to detach them manually or remove cgroups from maps.
 	// Just remove the pod from our tracking.
-	delete(r.trackedPods, podKey)
+	delete(r.trackedPods, uid)
+	delete(r.podKeyToUID, namespacedName)
 	r.mu.Unlock()
-  delete(r.podKeyToUID, namespacedName)
-	r.Log.Info("stopped tracking pod", "podKey", podKey, "cgroupCount", len(cgroupIDs))
+	r.Log.Info("stopped tracking pod", "pod", namespacedName, "uid", uid, "cgroupCount", len(cgroupIDs))
 
 	return ctrl.Result{}, nil
 }
