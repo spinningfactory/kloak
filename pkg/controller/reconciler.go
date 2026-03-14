@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	"github.com/go-logr/logr"
 	"github.com/spinningfactory/kloak/pkg/cgroups"
@@ -40,6 +41,7 @@ type Reconciler struct {
 	// NodeName filters pods to only those on this node (empty = all nodes)
 	NodeName string
 
+	mu sync.Mutex
 	// trackedPods maps pod UID -> set of cgroup IDs (one per container)
 	trackedPods map[string]map[uint64]bool
 }
@@ -77,7 +79,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// Check if Kloak is enabled
 	if !r.isEnabled(pod) {
 		// If was tracked before, clean up
-		if _, tracked := r.trackedPods[string(pod.UID)]; tracked {
+		r.mu.Lock()
+		_, tracked := r.trackedPods[string(pod.UID)]
+		r.mu.Unlock()
+		if tracked {
 			return r.handleDelete(string(pod.UID))
 		}
 		return ctrl.Result{}, nil
@@ -103,22 +108,23 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{Requeue: true}, nil // Retry after a bit
 	}
 
-	// Get existing tracked cgroups for this pod
+	// Compute cgroup diff under the lock, then attach uprobes outside it.
+	// attachUprobesToCgroup does blocking filesystem I/O and must not run
+	// while the lock is held to avoid blocking other reconcile goroutines.
+	var newCgroups []uint64
+
+	r.mu.Lock()
 	existingCgroups := r.trackedPods[string(pod.UID)]
 	if existingCgroups == nil {
 		existingCgroups = make(map[uint64]bool)
 	}
 
-	// Add new cgroups that aren't already tracked
+	// Collect new cgroups that aren't already tracked
 	for cgroupID := range cgroupIDs {
 		if !existingCgroups[cgroupID] {
 			existingCgroups[cgroupID] = true
 			log.Info("tracking container cgroup", "cgroupID", cgroupID)
-
-			// Get the container PID from cgroup filesystem and attach uprobes
-			// We iterate through procs file to find a PID in that cgroup
-			// Finding the PID from cgroup or container ID is required to attach TLS uprobes
-			r.attachUprobesToCgroup(cgroupID, pod)
+			newCgroups = append(newCgroups, cgroupID)
 		}
 	}
 
@@ -131,6 +137,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 
 	r.trackedPods[string(pod.UID)] = existingCgroups
+	r.mu.Unlock()
+
+	// Attach uprobes outside the lock — this involves filesystem I/O.
+	for _, cgroupID := range newCgroups {
+		r.attachUprobesToCgroup(cgroupID, pod)
+	}
 
 	return ctrl.Result{}, nil
 }
@@ -192,8 +204,10 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) {
 
 // handleDelete removes a pod from tracking.
 func (r *Reconciler) handleDelete(podKey string) (ctrl.Result, error) {
+	r.mu.Lock()
 	cgroupIDs, tracked := r.trackedPods[podKey]
 	if !tracked {
+		r.mu.Unlock()
 		return ctrl.Result{}, nil
 	}
 
@@ -201,6 +215,7 @@ func (r *Reconciler) handleDelete(podKey string) (ctrl.Result, error) {
 	// the process dies, so we no longer have to detach them manually or remove cgroups from maps.
 	// Just remove the pod from our tracking.
 	delete(r.trackedPods, podKey)
+	r.mu.Unlock()
 	r.Log.Info("stopped tracking pod", "podKey", podKey, "cgroupCount", len(cgroupIDs))
 
 	return ctrl.Result{}, nil
@@ -275,5 +290,7 @@ func (r *Reconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 // GetTrackedPodCount returns the number of currently tracked pods.
 func (r *Reconciler) GetTrackedPodCount() int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	return len(r.trackedPods)
 }
