@@ -20,6 +20,11 @@
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_tracing.h>
 
+/* Define KLOAK_DEBUG at compile time to enable verbose bpf_printk tracing.
+ * Example: add -DKLOAK_DEBUG to the bpf2go cflags in uprobe.go.
+ * Do NOT enable in production: bpf_printk writes to trace_pipe on every
+ * TLS write call and adds significant overhead. */
+
 // Buffer size for reading TLS data. Must be a power of 2 for bitmask bounds.
 // 256 keeps the phase 2 scan loop under the verifier's 8192-jump limit.
 #define MAX_DATA_SIZE 256
@@ -188,10 +193,14 @@ int bpf_phase2_rewrite(struct pt_regs *ctx) {
         char *target = (char *)scratch_data->user_data_ptr + safe_i;
 
         __u32 write_len = val->len;
-        write_len &= (SECRET_MAX_LEN - 1);
-
         if (write_len == 0)
           continue;
+        if (write_len > SECRET_MAX_LEN)
+          write_len = SECRET_MAX_LEN;
+        /* Use 2*SECRET_MAX_LEN-1 as the verifier mask: covers [1,128] safely
+         * since write_len <= 128 <= 255. The previous mask (SECRET_MAX_LEN-1 = 127)
+         * incorrectly zeroed write_len when val->len == 128. */
+        write_len &= (2 * SECRET_MAX_LEN - 1);
 
         bpf_probe_write_user(target, val->real_secret, write_len);
         rewritten = 1;
@@ -199,14 +208,17 @@ int bpf_phase2_rewrite(struct pt_regs *ctx) {
     }
   }
 
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak phase2: rewritten=%d", rewritten);
+#endif
 
   if (rewritten) {
     struct tls_event *event =
         bpf_ringbuf_reserve(&tls_events, sizeof(struct tls_event), 0);
     if (event) {
-      event->pid = bpf_get_current_pid_tgid();
-      event->tgid = bpf_get_current_pid_tgid() >> 32;
+      __u64 pid_tgid = bpf_get_current_pid_tgid();
+      event->pid  = (__u32)(pid_tgid & 0xFFFFFFFF);
+      event->tgid = (__u32)(pid_tgid >> 32);
       event->len = read_len;
       event->is_rewritten = 1;
       bpf_ringbuf_submit(event, 0);
@@ -243,8 +255,10 @@ int bpf_uprobe_go_tls_write(struct pt_regs *ctx) {
   return 0;
 #endif
 
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak go_tls: ptr=%llx len=%llu pid=%d", (__u64)data_ptr,
              data_len, pid);
+#endif
 
   if (!data_ptr || data_len == 0)
     return 0;
@@ -261,8 +275,10 @@ int bpf_uprobe_go_tls_write(struct pt_regs *ctx) {
 
   // Read plaintext into scratch buffer (per-CPU array, not ringbuf)
   long ret = bpf_probe_read_user(scratch_data->data, read_len, data_ptr);
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak go_tls: read_user ret=%ld read_len=%u first4=%.4s", ret,
              read_len, scratch_data->data);
+#endif
 
   scratch_data->user_data_ptr = (__u64)data_ptr;
   scratch_data->read_len = read_len;
@@ -302,7 +318,9 @@ int bpf_uprobe_ssl_write(struct pt_regs *ctx) {
   return 0;
 #endif
 
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak ssl: ptr=%llx num=%d pid=%d", (__u64)data_ptr, num, pid);
+#endif
 
   if (!data_ptr || num <= 0)
     return 0;
@@ -317,8 +335,10 @@ int bpf_uprobe_ssl_write(struct pt_regs *ctx) {
     read_len = MAX_DATA_SIZE;
 
   long ret = bpf_probe_read_user(scratch_data->data, read_len, data_ptr);
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak ssl: read_user ret=%ld len=%u first4=%.4s", ret, read_len,
              scratch_data->data);
+#endif
 
   scratch_data->user_data_ptr = (__u64)data_ptr;
   scratch_data->read_len = read_len;

@@ -57,13 +57,15 @@ func TestIsEnabled(t *testing.T) {
 func TestHandleDelete(t *testing.T) {
 	r := &Reconciler{
 		trackedPods: make(map[string]map[uint64]bool),
+		podKeyToUID: make(map[string]string),
 	}
 
 	// Add a tracked pod with multiple container cgroups
 	r.trackedPods["test-pod-uid"] = map[uint64]bool{12345: true, 67890: true}
+	r.podKeyToUID["default/test-pod"] = "test-pod-uid"
 
 	// Handle delete
-	_, err := r.handleDelete("test-pod-uid")
+	_, err := r.handleDelete("test-pod-uid", "default/test-pod")
 	if err != nil {
 		t.Fatalf("handleDelete failed: %v", err)
 	}
@@ -71,6 +73,11 @@ func TestHandleDelete(t *testing.T) {
 	// Verify pod is no longer tracked
 	if _, exists := r.trackedPods["test-pod-uid"]; exists {
 		t.Error("Pod should no longer be tracked")
+	}
+
+	// Verify reverse map is also cleaned up
+	if _, exists := r.podKeyToUID["default/test-pod"]; exists {
+		t.Error("podKeyToUID entry should be removed on delete")
 	}
 }
 

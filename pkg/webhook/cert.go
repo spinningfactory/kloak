@@ -64,8 +64,15 @@ func EnsureWebhookCerts(ctx context.Context, c client.Client, namespace string) 
 
 	if err := c.Create(ctx, newSecret); err != nil {
 		if apierrors.IsAlreadyExists(err) {
-			// Another controller created it in the meantime
-			return EnsureWebhookCerts(ctx, c, namespace) // Retry getting it
+			// Another instance created it concurrently; fetch and return the existing cert.
+			existing := &corev1.Secret{}
+			if getErr := c.Get(ctx, client.ObjectKey{Name: SecretName, Namespace: namespace}, existing); getErr != nil {
+				return nil, fmt.Errorf("secret created concurrently but could not be fetched: %w", getErr)
+			}
+			if cert, ok := existing.Data[CertKey]; ok {
+				return cert, nil
+			}
+			return nil, fmt.Errorf("secret %s exists but is missing the %s key", SecretName, CertKey)
 		}
 		return nil, fmt.Errorf("failed to create secret %s: %w", SecretName, err)
 	}

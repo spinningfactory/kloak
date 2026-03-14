@@ -25,12 +25,6 @@ const (
 	CgroupBasePath = "/sys/fs/cgroup"
 )
 
-// CgroupManager is the interface for managing cgroups in eBPF maps.
-type CgroupManager interface {
-	AddCgroup(cgroupID uint64) error
-	RemoveCgroup(cgroupID uint64) error
-}
-
 // Reconciler watches pods and manages eBPF cgroup tracking.
 type Reconciler struct {
 	client.Client
@@ -44,6 +38,11 @@ type Reconciler struct {
 	mu sync.Mutex
 	// trackedPods maps pod UID -> set of cgroup IDs (one per container)
 	trackedPods map[string]map[uint64]bool
+
+	// podKeyToUID maps "namespace/name" -> pod UID, so that on a NotFound
+	// delete event (where we only have the namespaced name) we can look up
+	// the UID and clean up trackedPods correctly.
+	podKeyToUID map[string]string
 }
 
 // NewReconciler creates a new pod reconciler.
@@ -59,6 +58,7 @@ func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, upr
 		CgroupRoot:    cgroupRoot,
 		NodeName:      nodeName,
 		trackedPods:   make(map[string]map[uint64]bool),
+		podKeyToUID:   make(map[string]string),
 	}
 }
 
@@ -72,8 +72,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		if client.IgnoreNotFound(err) != nil {
 			return ctrl.Result{}, err
 		}
-		// Pod was deleted - clean up
-		return r.handleDelete(req.NamespacedName.String())
+		// Pod was deleted — look up the UID we stored on the last successful
+		// reconcile so we can find the entry in trackedPods (keyed by UID).
+		uid, known := r.podKeyToUID[req.NamespacedName.String()]
+		if !known {
+			return ctrl.Result{}, nil
+		}
+		return r.handleDelete(uid, req.NamespacedName.String())
 	}
 
 	// Check if Kloak is enabled
@@ -83,7 +88,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		_, tracked := r.trackedPods[string(pod.UID)]
 		r.mu.Unlock()
 		if tracked {
-			return r.handleDelete(string(pod.UID))
+			return r.handleDelete(string(pod.UID), req.NamespacedName.String())
 		}
 		return ctrl.Result{}, nil
 	}
@@ -143,6 +148,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	for _, cgroupID := range newCgroups {
 		r.attachUprobesToCgroup(cgroupID, pod)
 	}
+	r.podKeyToUID[req.NamespacedName.String()] = string(pod.UID)
 
 	return ctrl.Result{}, nil
 }
@@ -189,12 +195,16 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) {
 			return
 		}
 
-		// Attach uprobes to the first PID (main process)
-		pid := pids[0]
-		if err := r.UprobeManager.AttachTLS(pid); err != nil {
-			r.Log.Error(err, "failed to attach TLS uprobes", "pid", pid, "container", status.Name)
-		} else {
-			r.Log.Info("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
+		// Attempt to attach uprobes to every PID in the cgroup.
+		// Containers may run multiple processes; we probe all of them so that
+		// whichever process makes TLS calls is instrumented. AttachTLS skips
+		// PIDs that have no compatible TLS symbols.
+		for _, pid := range pids {
+			if err := r.UprobeManager.AttachTLS(pid); err != nil {
+				r.Log.V(1).Info("could not attach TLS uprobes to pid (no compatible symbols or already attached)", "pid", pid, "container", status.Name, "err", err)
+			} else {
+				r.Log.Info("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
+			}
 		}
 		return
 	}
@@ -202,10 +212,11 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) {
 	r.Log.V(1).Info("could not find matching container for cgroup", "cgroupID", cgroupID)
 }
 
-// handleDelete removes a pod from tracking.
-func (r *Reconciler) handleDelete(podKey string) (ctrl.Result, error) {
-	r.mu.Lock()
-	cgroupIDs, tracked := r.trackedPods[podKey]
+// handleDelete removes a pod from tracking. uid is the pod UID (trackedPods key),
+// namespacedName is the "namespace/name" string (podKeyToUID key).
+func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, error) {
+  r.mu.Lock()
+	cgroupIDs, tracked := r.trackedPods[uid]
 	if !tracked {
 		r.mu.Unlock()
 		return ctrl.Result{}, nil
@@ -216,6 +227,7 @@ func (r *Reconciler) handleDelete(podKey string) (ctrl.Result, error) {
 	// Just remove the pod from our tracking.
 	delete(r.trackedPods, podKey)
 	r.mu.Unlock()
+  delete(r.podKeyToUID, namespacedName)
 	r.Log.Info("stopped tracking pod", "podKey", podKey, "cgroupCount", len(cgroupIDs))
 
 	return ctrl.Result{}, nil
