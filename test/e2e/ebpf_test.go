@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -28,12 +29,13 @@ func TestEBPFSecretRewrite(t *testing.T) {
 	assertShadowSecret(t, "secret-blocked", blockedData)
 
 	// Deploy the demo-go app
-	_, err := kubectl("apply", "-f", "examples/demo-go/deployment.yaml", "-n", testNamespace)
+	demoManifest := filepath.Join(repoRoot, "examples", "demo-go", "deployment.yaml")
+	_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
 	if err != nil {
 		t.Fatalf("failed to deploy demo-go: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = kubectl("delete", "-f", "examples/demo-go/deployment.yaml", "-n", testNamespace, "--ignore-not-found")
+		_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
 	})
 
 	// Wait for demo app to start and make requests

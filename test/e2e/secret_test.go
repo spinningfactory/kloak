@@ -29,9 +29,9 @@ func TestShadowSecretMultipleKeys(t *testing.T) {
 
 func TestShadowSecretLengthMatching(t *testing.T) {
 	data := map[string][]byte{
-		"short":  []byte("abcde"),                                                                                                                                                                                       // 5 bytes
-		"medium": []byte("this-is-a-medium-length-secret-value-here!x"),                                                                                                                                                 // 42 bytes
-		"long":   []byte(strings.Repeat("x", 200)),                                                                                                                                                                      // 200 bytes
+		"short":  []byte("abcde"),
+		"medium": []byte("this-is-a-medium-length-secret-value-here!x"),
+		"long":   []byte(strings.Repeat("x", 200)),
 	}
 	createEnabledSecret(t, "test-shadow-lengths", data, nil)
 	assertShadowSecret(t, "test-shadow-lengths", data)

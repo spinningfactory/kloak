@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,9 +23,29 @@ const (
 	pollInterval   = 2 * time.Second
 )
 
-var clientset *kubernetes.Clientset
+var (
+	clientset *kubernetes.Clientset
+	repoRoot  string
+)
+
+// findRepoRoot returns the absolute path to the repository root
+// by looking for go.mod starting from the test directory.
+func findRepoRoot() (string, error) {
+	out, err := exec.Command("go", "list", "-m", "-f", "{{.Dir}}").CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("failed to find module root: %w\n%s", err, out)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
 
 func TestMain(m *testing.M) {
+	var err error
+	repoRoot, err = findRepoRoot()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to find repo root: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Build kubeconfig
 	kubeconfig := os.Getenv("KUBECONFIG")
 	if kubeconfig == "" {
@@ -43,8 +65,9 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	// Deploy Kloak
-	if _, err := kubectl("apply", "-k", "config/overlays/e2e"); err != nil {
+	// Deploy Kloak using absolute path to overlay
+	overlayPath := filepath.Join(repoRoot, "config", "overlays", "e2e")
+	if _, err := kubectl("apply", "-k", overlayPath); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to deploy kloak: %v\n", err)
 		os.Exit(1)
 	}
@@ -95,7 +118,8 @@ func teardown() {
 	// Delete test namespace (cascade deletes all resources in it)
 	_ = clientset.CoreV1().Namespaces().Delete(context.Background(), testNamespace, metav1.DeleteOptions{})
 	// Remove kloak deployment
-	_, _ = kubectl("delete", "-k", "config/overlays/e2e", "--ignore-not-found")
+	overlayPath := filepath.Join(repoRoot, "config", "overlays", "e2e")
+	_, _ = kubectl("delete", "-k", overlayPath, "--ignore-not-found")
 }
 
 func dumpLogs() {
