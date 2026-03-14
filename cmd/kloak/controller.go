@@ -85,12 +85,16 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	_, err = webhook.EnsureWebhookCerts(context.Background(), directClient, namespace)
-	if err != nil {
-		setupLog.Error(err, "failed to ensure webhook TLS certificates")
-		// The webhook might fail to start since the secret won't exist.
+	if certMode == "auto" {
+		_, err = webhook.EnsureWebhookCerts(context.Background(), directClient, namespace)
+		if err != nil {
+			setupLog.Error(err, "failed to ensure webhook TLS certificates")
+			// The webhook might fail to start since the secret won't exist.
+		} else {
+			setupLog.Info("Webhook TLS certificates ensured")
+		}
 	} else {
-		setupLog.Info("Webhook TLS certificates exist")
+		setupLog.Info("Cert mode is 'provided'; skipping certificate generation — expecting kloak-webhook-certs secret to exist")
 	}
 
 	// Create uprobe manager instances
