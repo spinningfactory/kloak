@@ -38,7 +38,8 @@ func NewHandler(c client.Client, log logr.Logger) *Handler {
 }
 
 // Handle processes admission requests for pods.
-func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.Response {
+// The admission.Handler interface requires req by value — cannot use a pointer.
+func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.Response { //nolint:gocritic // hugeParam: interface requirement
 	pod := &corev1.Pod{}
 	if err := h.decoder.Decode(req, pod); err != nil {
 		return admission.Errored(http.StatusBadRequest, err)

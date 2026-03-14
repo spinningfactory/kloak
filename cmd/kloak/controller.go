@@ -177,13 +177,18 @@ func runController(cmd *cobra.Command, args []string) {
 	setupLog.Info("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Error(err, "problem running manager")
+		cancel()
+		if uprobeMgr != nil {
+			_ = uprobeMgr.Close()
+		}
 		os.Exit(1)
 	}
 
-	// Cleanup
+	// Cleanup when Start returns normally (signal received)
 	cancel()
 	if uprobeMgr != nil {
-		uprobeMgr.Close()
+		if err := uprobeMgr.Close(); err != nil {
+			setupLog.Error(err, "failed to close uprobe manager")
+		}
 	}
 }
-
