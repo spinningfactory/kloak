@@ -64,9 +64,7 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 	}
 	mutatedPod.Annotations[AnnotationEnabled] = "true"
 
-	mutatedPod.Annotations[AnnotationEnabled] = "true"
-
-	// 4. Rewrite Secret volumes (swap with shadow secrets)
+	// Rewrite Secret volumes (swap with shadow secrets)
 	if err := h.rewriteSecretVolumes(ctx, mutatedPod, req.Namespace); err != nil {
 		h.log.Error(err, "failed to rewrite secret volumes")
 		return admission.Errored(http.StatusInternalServerError, err)
@@ -96,8 +94,6 @@ func (h *Handler) isEnabled(ctx context.Context, pod *corev1.Pod, namespace stri
 	ns := &corev1.Namespace{}
 	if err := h.client.Get(ctx, client.ObjectKey{Name: namespace}, ns); err != nil {
 		h.log.Error(err, "failed to fetch namespace for label check", "namespace", namespace)
-		// Don't return false yet, try other checks? No, failing open or closed?
-		// If namespace check fails, we probably cant proceed safely.
 		return false, err
 	}
 
@@ -199,6 +195,5 @@ func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, nam
 			}
 		}
 	}
-	// TODO: Handle EnvFrom? User specifically mentioned "mount".
 	return nil
 }
