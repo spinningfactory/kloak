@@ -1,4 +1,4 @@
-.PHONY: all build build-linux test test-linux clean deps docker-build \
+.PHONY: all build build-linux test test-linux e2e e2e-cleanup clean deps docker-build \
         generate-ebpf generate-vmlinux run help \
         lima-start lima-stop lima-delete lima-shell lima-exec lima-check
 
@@ -67,6 +67,33 @@ test: deps
 # Run tests in Linux VM (for eBPF tests) - depends on Lima running
 test-linux: lima-ensure
 	$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go test -v ./..."
+
+# E2E cluster and image configuration
+E2E_CLUSTER=kloak-e2e
+E2E_IMAGE_TAG=e2e
+
+# Run e2e tests against a local k3d cluster (works on macOS ARM and Linux).
+# Creates a disposable cluster, builds and imports images, runs tests, then tears down.
+e2e:
+	@which k3d > /dev/null || (echo "Error: k3d not found. Install with: brew install k3d" && exit 1)
+	@echo "==> Creating k3d cluster '$(E2E_CLUSTER)'..."
+	@k3d cluster create $(E2E_CLUSTER) --wait --timeout 120s 2>/dev/null || true
+	@echo "==> Building kloak image..."
+	@docker build -t $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) .
+	@echo "==> Importing images into k3d..."
+	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) -c $(E2E_CLUSTER)
+	@docker pull bitnami/kubectl:latest
+	@k3d image import bitnami/kubectl:latest -c $(E2E_CLUSTER)
+	@echo "==> Running e2e tests..."
+	@KUBECONFIG=$$(k3d kubeconfig write $(E2E_CLUSTER)) $(GOTEST) -v -timeout 300s -count=1 ./test/e2e/; \
+		EXIT_CODE=$$?; \
+		echo "==> Cleaning up k3d cluster..."; \
+		k3d cluster delete $(E2E_CLUSTER) 2>/dev/null; \
+		exit $$EXIT_CODE
+
+# Tear down e2e cluster if it was left running (e.g. after a ctrl-c)
+e2e-cleanup:
+	@k3d cluster delete $(E2E_CLUSTER) 2>/dev/null || true
 
 clean:
 	$(GOCLEAN)
@@ -168,8 +195,10 @@ help:
 	@echo "Build targets:"
 	@echo "  build           - Build the kloak binary (native)"
 	@echo "  build-linux     - Build for Linux (uses Lima on macOS)"
-	@echo "  test            - Run tests"
+	@echo "  test            - Run unit tests"
 	@echo "  test-linux      - Run tests in Linux VM"
+	@echo "  e2e             - Run e2e tests (creates k3d cluster, requires Docker)"
+	@echo "  e2e-cleanup     - Delete leftover e2e k3d cluster"
 	@echo "  clean           - Clean build artifacts"
 	@echo "  deps            - Download and tidy dependencies"
 	@echo "  docker-build    - Build Docker image"
