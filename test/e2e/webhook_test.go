@@ -44,44 +44,31 @@ func TestWebhookVolumeRewrite(t *testing.T) {
 }
 
 func TestWebhookAnnotationInjection(t *testing.T) {
-	// This test verifies that pods WITHOUT the getkloak.io/enabled annotation
-	// still get mutated when the namespace has the label. The namespace-inheritance
-	// logic is also covered by the unit test TestIsEnabled/inheritance_from_enabled_namespace.
-	//
-	// In CI, the webhook may time out on pods without annotations due to the
-	// additional API calls isEnabled makes (namespace fetch, owner traversal).
-	// We retry and skip if the webhook is consistently unresponsive.
 	secretData := map[string][]byte{"key": []byte("annotation-inject-val!")}
 	createEnabledSecret(t, "test-wh-annot", secretData, nil)
 	assertShadowSecret(t, "test-wh-annot", secretData)
 
+	// Create pod WITHOUT the annotation — namespace label should trigger webhook
 	name := "test-wh-annot-pod"
-	var createErr error
-	for attempt := 0; attempt < 5; attempt++ {
-		createPodWithoutAnnotationNoFatal(t, name, "test-wh-annot")
-		_, createErr = clientset.CoreV1().Pods(testNamespace).Get(context.Background(), name, metav1.GetOptions{})
-		if createErr == nil {
-			break
-		}
-		t.Logf("pod creation attempt %d failed (webhook may be slow): %v", attempt+1, createErr)
-		time.Sleep(5 * time.Second)
+	createPodWithoutAnnotation(t, name, "test-wh-annot")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := waitForPodPhase(ctx, testNamespace, name); err != nil {
+		t.Fatalf("pod not created: %v", err)
 	}
-	if createErr != nil {
-		t.Skipf("skipping: webhook consistently timed out for unannotated pod (namespace-inheritance path validated by unit tests): %v", createErr)
-	}
-	t.Cleanup(func() {
-		_ = clientset.CoreV1().Pods(testNamespace).Delete(context.Background(), name, metav1.DeleteOptions{})
-	})
 
 	pod, err := clientset.CoreV1().Pods(testNamespace).Get(context.Background(), name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("failed to get pod: %v", err)
 	}
 
+	// Webhook should have injected the annotation
 	if pod.Annotations["getkloak.io/enabled"] != "true" {
 		t.Errorf("expected annotation getkloak.io/enabled=true, got annotations: %v", pod.Annotations)
 	}
 
+	// Volume should be rewritten
 	for _, vol := range pod.Spec.Volumes {
 		if vol.Secret != nil && vol.Secret.SecretName == "test-wh-annot-kloak" {
 			return
@@ -164,20 +151,19 @@ func TestWebhookMountedContent(t *testing.T) {
 	}
 }
 
-// createPodWithoutAnnotationNoFatal creates a pod without getkloak.io/enabled annotation.
-// Does not call t.Fatal on error so the caller can retry.
-func createPodWithoutAnnotationNoFatal(t *testing.T, name, secretName string) {
+// createPodWithoutAnnotation creates a pod without getkloak.io/enabled annotation.
+// The namespace label should trigger the webhook instead.
+func createPodWithoutAnnotation(t *testing.T, name, secretName string) {
 	t.Helper()
-	// Delete any previous attempt
-	_ = clientset.CoreV1().Pods(testNamespace).Delete(context.Background(), name, metav1.DeleteOptions{})
-	time.Sleep(1 * time.Second)
-
 	pod := createBasePod(name, secretName)
 	pod.Annotations = nil
 	_, err := clientset.CoreV1().Pods(testNamespace).Create(context.Background(), pod, metav1.CreateOptions{})
 	if err != nil {
-		t.Logf("pod creation returned error: %v", err)
+		t.Fatalf("failed to create pod %s: %v", name, err)
 	}
+	t.Cleanup(func() {
+		_ = clientset.CoreV1().Pods(testNamespace).Delete(context.Background(), name, metav1.DeleteOptions{})
+	})
 }
 
 // createPodThatReadsSecret creates a pod that cats a secret key and exits.
