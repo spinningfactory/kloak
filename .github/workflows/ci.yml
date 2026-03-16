@@ -99,29 +99,41 @@ jobs:
           retention-days: 7
 
   docker:
-    name: Docker Build
+    name: Docker Build (Multi-Arch)
     runs-on: ubuntu-latest
     needs: [lint, build, test]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Set up QEMU (for arm64 cross-build)
+        uses: docker/setup-qemu-action@v3
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image
+      - name: Build multi-arch Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
+          platforms: linux/amd64,linux/arm64
           push: false
-          tags: kloak:${{ github.sha }}
+          tags: kloak:${{ github.sha }},kloak:e2e
+          outputs: type=docker,dest=/tmp/kloak.tar
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Upload Docker image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kloak-image
+          path: /tmp/kloak.tar
+          retention-days: 1
 
   e2e:
     name: E2E Tests
     runs-on: ubuntu-latest
-    needs: [build, test]
+    needs: [docker]
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -137,32 +149,36 @@ jobs:
 
       - name: Create k3d cluster (with BPF mounts)
         run: |
-          k3d cluster create kloak-ebpf-e2e --wait --timeout 120s \
+          k3d cluster create kloak-e2e --wait --timeout 120s \
             --volume /sys/kernel/btf:/sys/kernel/btf:ro@server:0 \
             --volume /sys/fs/bpf:/sys/fs/bpf:rw@server:0
-          k3d kubeconfig get kloak-ebpf-e2e > /tmp/kubeconfig-ebpf.yaml
+          k3d kubeconfig get kloak-e2e > /tmp/kubeconfig-e2e.yaml
 
-      - name: Build Docker images
+      - name: Download kloak image artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: kloak-image
+          path: /tmp
+
+      - name: Load and import images into k3d
         run: |
-          docker build --build-arg TARGETARCH=amd64 -t kloak:e2e .
+          docker load -i /tmp/kloak.tar
+          k3d image import kloak:e2e -c kloak-e2e
           docker build -t kloak-demo-go:e2e -t kloak-demo-go:latest ./examples/demo-go/
-
-      - name: Import images into k3d
-        run: |
-          k3d image import kloak:e2e kloak-demo-go:e2e kloak-demo-go:latest -c kloak-ebpf-e2e
+          k3d image import kloak-demo-go:e2e kloak-demo-go:latest -c kloak-e2e
           docker pull bitnami/kubectl:latest
-          k3d image import bitnami/kubectl:latest -c kloak-ebpf-e2e
+          k3d image import bitnami/kubectl:latest -c kloak-e2e
 
       - name: Run E2E tests (with eBPF)
         run: go test -v -timeout 600s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
-          KUBECONFIG: /tmp/kubeconfig-ebpf.yaml
+          KUBECONFIG: /tmp/kubeconfig-e2e.yaml
           KLOAK_E2E_OVERLAY: e2e-ebpf
 
       - name: Collect logs on failure
         if: failure()
         env:
-          KUBECONFIG: /tmp/kubeconfig-ebpf.yaml
+          KUBECONFIG: /tmp/kubeconfig-e2e.yaml
         run: |
           echo "=== Kloak Controller Logs ==="
           kubectl logs -n kloak-system -l app.kubernetes.io/component=controller --tail=200 2>/dev/null || true
@@ -179,4 +195,4 @@ jobs:
 
       - name: Delete k3d cluster
         if: always()
-        run: k3d cluster delete kloak-ebpf-e2e
+        run: k3d cluster delete kloak-e2e
