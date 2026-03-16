@@ -50,8 +50,14 @@ func TestEBPFSecretRewrite(t *testing.T) {
 	ctrlLogs, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=100")
 	t.Logf("=== Controller logs ===\n%s", ctrlLogs)
 
-	// Wait for at least one request cycle (15s startup + 5s interval)
-	time.Sleep(25 * time.Second)
+	// Wait for demo-go startup delay (15s) + a few request cycles (5s each).
+	// Also give the controller time to sync secrets to the BPF map and
+	// attach uprobes after the pod is detected.
+	time.Sleep(45 * time.Second)
+
+	// Dump controller logs AFTER requests have been made to see rewrite events
+	ctrlLogsAfter, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=200")
+	t.Logf("=== Controller logs (after requests) ===\n%s", ctrlLogsAfter)
 
 	// Read demo app logs
 	out, err := kubectl("logs", "-n", testNamespace, "-l", "app=demo-go", "--tail=50")
