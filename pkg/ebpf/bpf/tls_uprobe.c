@@ -144,7 +144,7 @@ static __always_inline void parse_host(struct scratch_buf *scratch) {
 // Host comparison uses fixed-size uint64 comparisons (no loops).
 // -----------------------------------------------------------------------------
 SEC("uprobe/phase2_rewrite")
-int bpf_phase2_rewrite(struct pt_regs *ctx) {
+int bpf_phase2_rewrite(void *ctx) {
   __u32 zero = 0;
   struct scratch_buf *scratch_data = bpf_map_lookup_elem(&scratch, &zero);
   if (!scratch_data)
@@ -237,18 +237,22 @@ int bpf_phase2_rewrite(struct pt_regs *ctx) {
 // -----------------------------------------------------------------------------
 
 SEC("uprobe/go_tls_write")
-int bpf_uprobe_go_tls_write(struct pt_regs *ctx) {
+int bpf_uprobe_go_tls_write(void *ctx) {
   void *data_ptr;
   __u64 data_len;
 
 #if defined(bpf_target_x86)
   // x86_64 Go register ABI: RAX=receiver, RBX=data, RCX=len
+  // pt_regs offsets: rbx=40, rcx=88
   bpf_probe_read_kernel(&data_ptr, sizeof(void *), (char *)ctx + 40);
   bpf_probe_read_kernel(&data_len, sizeof(__u64), (char *)ctx + 88);
 #elif defined(bpf_target_arm64)
   // ARM64 Go register ABI: R0=receiver, R1=data, R2=len
-  data_ptr = (void *)PT_REGS_PARM2(ctx);
-  data_len = PT_REGS_PARM3(ctx);
+  // user_pt_regs offsets: regs[1]=8, regs[2]=16
+  // Use raw offsets instead of PT_REGS_PARMx to avoid CO-RE relocation
+  // failures (kernel BTF may expose user_pt_regs, not pt_regs).
+  bpf_probe_read_kernel(&data_ptr, sizeof(void *), (char *)ctx + 8);
+  bpf_probe_read_kernel(&data_len, sizeof(__u64), (char *)ctx + 16);
 #else
   return 0;
 #endif
@@ -300,18 +304,22 @@ int bpf_uprobe_go_tls_write(struct pt_regs *ctx) {
 // -----------------------------------------------------------------------------
 
 SEC("uprobe/ssl_write")
-int bpf_uprobe_ssl_write(struct pt_regs *ctx) {
+int bpf_uprobe_ssl_write(void *ctx) {
   void *data_ptr;
   int num;
 
 #if defined(bpf_target_x86)
   // x86_64 C ABI: RDI=ssl, RSI=buf, RDX=num
+  // pt_regs offsets: rsi=104, rdx=96
   bpf_probe_read_kernel(&data_ptr, sizeof(void *), (char *)ctx + 104);
   bpf_probe_read_kernel(&num, sizeof(int), (char *)ctx + 96);
 #elif defined(bpf_target_arm64)
   // ARM64 C ABI: X0=ssl, X1=buf, X2=num
-  data_ptr = (void *)PT_REGS_PARM2(ctx);
-  num = (int)PT_REGS_PARM3(ctx);
+  // user_pt_regs offsets: regs[1]=8, regs[2]=16
+  // Use raw offsets instead of PT_REGS_PARMx to avoid CO-RE relocation
+  // failures (kernel BTF may expose user_pt_regs, not pt_regs).
+  bpf_probe_read_kernel(&data_ptr, sizeof(void *), (char *)ctx + 8);
+  bpf_probe_read_kernel(&num, sizeof(int), (char *)ctx + 16);
 #else
   return 0;
 #endif

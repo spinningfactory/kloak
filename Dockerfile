@@ -1,19 +1,17 @@
-# Build stage
-FROM golang:1.25-alpine AS builder
+# eBPF generation stage (Debian-based for proper libbpf + clang support)
+FROM golang:1.25 AS ebpf-gen
 
 WORKDIR /app
 
-# Install build dependencies (clang/llvm for eBPF compilation)
-RUN apk add --no-cache make git clang llvm libbpf-dev
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    clang llvm libbpf-dev && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy go mod files
 COPY go.mod go.sum* ./
 RUN go mod download
 
-# Copy source
 COPY . .
 
-# Generate eBPF bindings for the build platform.
 # Map Docker TARGETARCH (amd64, arm64) to kernel arch names (x86, arm64).
 ARG TARGETARCH
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
@@ -21,21 +19,50 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
     else \
       export KLOAK_TARGET_ARCH=${TARGETARCH}; \
     fi && \
-    cd pkg/ebpf && go generate
+    cd pkg/ebpf && go generate && \
+    echo "--- bpf2go generated .o (may be broken) ---" && \
+    llvm-objdump -d tlsuprobe_bpfel.o 2>/dev/null | head -5
 
-# Build single binary
+# Overwrite with directly compiled .o files (bpf2go's llvm-strip corrupts them).
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      ARCH_DEFINE=__TARGET_ARCH_x86; \
+    else \
+      ARCH_DEFINE=__TARGET_ARCH_${TARGETARCH}; \
+    fi && \
+    clang -O2 -g -Wall -Werror -D${ARCH_DEFINE} \
+      -target bpfel -c pkg/ebpf/bpf/tls_uprobe.c \
+      -o pkg/ebpf/tlsuprobe_bpfel.o && \
+    clang -O2 -g -Wall -Werror -D${ARCH_DEFINE} \
+      -target bpfeb -c pkg/ebpf/bpf/tls_uprobe.c \
+      -o pkg/ebpf/tlsuprobe_bpfeb.o && \
+    echo "--- direct clang .o (correct) ---" && \
+    llvm-objdump -d pkg/ebpf/tlsuprobe_bpfel.o 2>/dev/null | head -5
+
+# Build stage (Alpine for small image)
+FROM golang:1.25-alpine AS builder
+
+WORKDIR /app
+
+COPY go.mod go.sum* ./
+RUN go mod download
+
+COPY . .
+
+# Copy correctly generated eBPF files from the ebpf-gen stage
+COPY --from=ebpf-gen /app/pkg/ebpf/tlsuprobe_bpfel.go pkg/ebpf/
+COPY --from=ebpf-gen /app/pkg/ebpf/tlsuprobe_bpfel.o  pkg/ebpf/
+COPY --from=ebpf-gen /app/pkg/ebpf/tlsuprobe_bpfeb.go pkg/ebpf/
+COPY --from=ebpf-gen /app/pkg/ebpf/tlsuprobe_bpfeb.o  pkg/ebpf/
+
 RUN CGO_ENABLED=0 go build -o /kloak ./cmd/kloak
 
 # Runtime stage
 FROM alpine:3.19
 
-# Install runtime dependencies
 RUN apk add --no-cache ca-certificates
 
-# Copy binary
 COPY --from=builder /kloak /kloak
 
-# Run as non-root (UID 65532 = nonroot, matches K8s manifest)
 RUN adduser -D -u 65532 kloak
 USER 65532
 
