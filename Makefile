@@ -151,14 +151,15 @@ run: build
 # eBPF generation targets
 # ============================================================================
 
-# Generate eBPF code - depends on BPF sources and vmlinux.h
+# Generate eBPF code - depends on BPF sources and vmlinux.h.
+# KLOAK_TARGET_ARCH defaults to arm64 (Lima VM). Set to x86 for amd64 builds.
 generate-ebpf: $(BPF_SOURCES) $(BPF_DIR)/vmlinux.h lima-ensure
-	@echo "Generating eBPF code..."
+	@echo "Generating eBPF code (arch=$${KLOAK_TARGET_ARCH:-arm64})..."
 	@if [ "$$(uname)" = "Linux" ]; then \
 		cd $(EBPF_PKG) && $(GOGENERATE); \
 	else \
 		echo "Using Lima VM for eBPF generation..."; \
-		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR)/$(EBPF_PKG) && go generate"; \
+		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR)/$(EBPF_PKG) && KLOAK_TARGET_ARCH=$${KLOAK_TARGET_ARCH:-arm64} go generate"; \
 	fi
 	@echo "eBPF generation complete."
 
