@@ -4,7 +4,6 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
 
 env:
   GO_VERSION: '1.25'
@@ -22,6 +21,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      - name: Install clang for eBPF generation
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev
+
+      - name: Generate eBPF bindings
+        run: KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/
 
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v7
@@ -41,6 +46,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      - name: Install clang for eBPF generation
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev
+
+      - name: Generate eBPF bindings
+        run: KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/
 
       - name: Download dependencies
         run: go mod download
@@ -67,6 +78,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      - name: Install clang for eBPF generation
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev
+
+      - name: Generate eBPF bindings
+        run: KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/
 
       - name: Download dependencies
         run: go mod download
@@ -118,39 +135,48 @@ jobs:
       - name: Install k3d
         run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
 
-      - name: Create k3d cluster
+      - name: Create k3d cluster (with BPF mounts)
         run: |
-          k3d cluster create kloak-e2e --wait --timeout 120s
-          k3d kubeconfig get kloak-e2e > /tmp/kubeconfig-e2e.yaml
+          k3d cluster create kloak-ebpf-e2e --wait --timeout 120s \
+            --volume /sys/kernel/btf:/sys/kernel/btf:ro@server:0 \
+            --volume /sys/fs/bpf:/sys/fs/bpf:rw@server:0
+          k3d kubeconfig get kloak-ebpf-e2e > /tmp/kubeconfig-ebpf.yaml
 
-      - name: Build Docker image
-        run: docker build -t kloak:e2e .
+      - name: Build Docker images
+        run: |
+          docker build --build-arg TARGETARCH=amd64 -t kloak:e2e .
+          docker build -t kloak-demo-go:e2e -t kloak-demo-go:latest ./examples/demo-go/
 
       - name: Import images into k3d
         run: |
-          k3d image import kloak:e2e -c kloak-e2e
+          k3d image import kloak:e2e kloak-demo-go:e2e kloak-demo-go:latest -c kloak-ebpf-e2e
           docker pull bitnami/kubectl:latest
-          k3d image import bitnami/kubectl:latest -c kloak-e2e
+          k3d image import bitnami/kubectl:latest -c kloak-ebpf-e2e
 
-      - name: Run E2E tests
-        run: go test -v -timeout 300s -count=1 ./test/e2e/
+      - name: Run E2E tests (with eBPF)
+        run: go test -v -timeout 600s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
-          KUBECONFIG: /tmp/kubeconfig-e2e.yaml
+          KUBECONFIG: /tmp/kubeconfig-ebpf.yaml
+          KLOAK_E2E_OVERLAY: e2e-ebpf
 
       - name: Collect logs on failure
         if: failure()
         env:
-          KUBECONFIG: /tmp/kubeconfig-e2e.yaml
+          KUBECONFIG: /tmp/kubeconfig-ebpf.yaml
         run: |
           echo "=== Kloak Controller Logs ==="
-          kubectl logs -n kloak-system -l app.kubernetes.io/component=controller --tail=100 2>/dev/null || true
+          kubectl logs -n kloak-system -l app.kubernetes.io/component=controller --tail=200 2>/dev/null || true
           echo "=== Kloak Webhook Logs ==="
           kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook --tail=100 2>/dev/null || true
+          echo "=== Demo App Logs ==="
+          kubectl logs -n kloak-e2e -l app=demo-go --tail=100 2>/dev/null || true
           echo "=== All Pods ==="
           kubectl get pods -A 2>/dev/null || true
           echo "=== Events ==="
           kubectl get events -n kloak-e2e --sort-by='.lastTimestamp' 2>/dev/null || true
+          echo "=== Describe Controller ==="
+          kubectl describe daemonset -n kloak-system kloak-controller 2>/dev/null || true
 
       - name: Delete k3d cluster
         if: always()
-        run: k3d cluster delete kloak-e2e
+        run: k3d cluster delete kloak-ebpf-e2e

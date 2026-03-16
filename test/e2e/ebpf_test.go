@@ -14,9 +14,10 @@ func TestEBPFSecretRewrite(t *testing.T) {
 	// This test requires --enable-ebpf=true and a demo app that makes HTTPS requests.
 	// It verifies that the eBPF uprobe replaces kloak:UUID with the real secret value.
 
-	// Create secrets with host restrictions
-	allowedData := map[string][]byte{"key": []byte("REAL-ALLOWED-KEY-12345")}
-	blockedData := map[string][]byte{"key": []byte("REAL-BLOCKED-KEY-67890")}
+	// Create secrets with host restrictions.
+	// Key must be "api-key" to match the demo-go deployment's volume mount paths.
+	allowedData := map[string][]byte{"api-key": []byte("REAL-ALLOWED-KEY-12345")}
+	blockedData := map[string][]byte{"api-key": []byte("REAL-BLOCKED-KEY-67890")}
 
 	createEnabledSecret(t, "secret-allowed", allowedData, map[string]string{
 		"getkloak.io/hosts": "httpbin.org",
@@ -45,22 +46,33 @@ func TestEBPFSecretRewrite(t *testing.T) {
 		t.Fatalf("demo-go not ready: %v", err)
 	}
 
-	// Wait for at least one request cycle (15s startup + 5s interval)
-	time.Sleep(25 * time.Second)
+	// Dump controller logs to see eBPF status (uprobe attachment, errors, etc.)
+	ctrlLogs, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=100")
+	t.Logf("=== Controller logs ===\n%s", ctrlLogs)
+
+	// Wait for demo-go startup delay (15s) + a few request cycles (5s each).
+	// Also give the controller time to sync secrets to the BPF map and
+	// attach uprobes after the pod is detected.
+	time.Sleep(45 * time.Second)
+
+	// Dump controller logs AFTER requests have been made to see rewrite events
+	ctrlLogsAfter, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=200")
+	t.Logf("=== Controller logs (after requests) ===\n%s", ctrlLogsAfter)
 
 	// Read demo app logs
 	out, err := kubectl("logs", "-n", testNamespace, "-l", "app=demo-go", "--tail=50")
 	if err != nil {
 		t.Fatalf("failed to read demo-go logs: %v", err)
 	}
+	t.Logf("=== Demo app logs ===\n%s", out)
 
 	// The allowed secret should be rewritten to the real value
 	if !strings.Contains(out, "REAL-ALLOWED-KEY-12345") {
-		t.Error("demo-go logs should contain the real allowed secret (eBPF should have replaced it)")
+		t.Errorf("demo-go logs should contain the real allowed secret (eBPF should have replaced it)")
 	}
 
 	// The blocked secret should NOT be rewritten (wrong host restriction)
 	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {
-		t.Error("demo-go logs should NOT contain the real blocked secret (host restriction should prevent replacement)")
+		t.Errorf("demo-go logs should NOT contain the real blocked secret (host restriction should prevent replacement)")
 	}
 }

@@ -19,11 +19,10 @@ bin/
 *.test
 *.out
 
-# eBPF object files are committed (required for CI builds without eBPF toolchain).
-# Only ignore object files outside pkg/ebpf/.
-!pkg/ebpf/*_bpfel.go
-!pkg/ebpf/*_bpfeb.go
-!pkg/ebpf/*.o
+# eBPF generated files (generated at Docker build time via go generate)
+*_bpfel.go
+*_bpfeb.go
+*.o
 
 # Kubernetes
 kubeconfig

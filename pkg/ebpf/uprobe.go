@@ -41,7 +41,10 @@ type secretValue struct {
 	AllowedHost [32]byte
 }
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags "-O2 -g -Wall -Werror -D__TARGET_ARCH_arm64" tlsuprobe bpf/tls_uprobe.c -- -I../ebpf
+// Generate eBPF bindings. The KLOAK_TARGET_ARCH env var (set by Dockerfile or
+// Makefile) controls which __TARGET_ARCH_xxx define is passed to clang.
+// Defaults to arm64 for local development on macOS/Lima.
+//go:generate sh -c "ARCH=${KLOAK_TARGET_ARCH:-arm64}; go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags \"-O2 -g -Wall -Werror -D__TARGET_ARCH_${ARCH}\" tlsuprobe bpf/tls_uprobe.c -- -I../ebpf"
 
 // TLSUprobeManager manages the loading and attaching of eBPF uprobes for TLS interception.
 type TLSUprobeManager struct {
