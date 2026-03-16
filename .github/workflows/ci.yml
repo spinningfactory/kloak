@@ -154,3 +154,65 @@ jobs:
       - name: Delete k3d cluster
         if: always()
         run: k3d cluster delete kloak-e2e
+
+  e2e-ebpf:
+    name: E2E Tests (eBPF)
+    runs-on: ubuntu-latest
+    needs: [build, test]
+    continue-on-error: true
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install k3d
+        run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+      - name: Create k3d cluster
+        run: |
+          k3d cluster create kloak-ebpf-e2e --wait --timeout 120s
+          k3d kubeconfig get kloak-ebpf-e2e > /tmp/kubeconfig-ebpf.yaml
+
+      - name: Build Docker images
+        run: |
+          docker build -t kloak:e2e .
+          docker build -t kloak-demo-go:e2e ./examples/demo-go/
+
+      - name: Import images into k3d
+        run: |
+          k3d image import kloak:e2e kloak-demo-go:e2e -c kloak-ebpf-e2e
+          docker pull bitnami/kubectl:latest
+          k3d image import bitnami/kubectl:latest -c kloak-ebpf-e2e
+
+      - name: Run E2E tests (with eBPF)
+        run: go test -v -timeout 600s -tags=e2e_ebpf -count=1 ./test/e2e/
+        env:
+          KUBECONFIG: /tmp/kubeconfig-ebpf.yaml
+          KLOAK_E2E_OVERLAY: e2e-ebpf
+
+      - name: Collect logs on failure
+        if: failure()
+        env:
+          KUBECONFIG: /tmp/kubeconfig-ebpf.yaml
+        run: |
+          echo "=== Kloak Controller Logs ==="
+          kubectl logs -n kloak-system -l app.kubernetes.io/component=controller --tail=200 2>/dev/null || true
+          echo "=== Kloak Webhook Logs ==="
+          kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook --tail=100 2>/dev/null || true
+          echo "=== Demo App Logs ==="
+          kubectl logs -n kloak-e2e -l app=demo-go --tail=100 2>/dev/null || true
+          echo "=== All Pods ==="
+          kubectl get pods -A 2>/dev/null || true
+          echo "=== Events ==="
+          kubectl get events -n kloak-e2e --sort-by='.lastTimestamp' 2>/dev/null || true
+          echo "=== Describe Controller ==="
+          kubectl describe daemonset -n kloak-system kloak-controller 2>/dev/null || true
+
+      - name: Delete k3d cluster
+        if: always()
+        run: k3d cluster delete kloak-ebpf-e2e

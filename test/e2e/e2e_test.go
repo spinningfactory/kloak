@@ -24,8 +24,9 @@ const (
 )
 
 var (
-	clientset *kubernetes.Clientset
-	repoRoot  string
+	clientset  *kubernetes.Clientset
+	repoRoot   string
+	overlayDir string // set from KLOAK_E2E_OVERLAY env var, defaults to "e2e"
 )
 
 // findRepoRoot returns the absolute path to the repository root
@@ -66,7 +67,11 @@ func TestMain(m *testing.M) {
 	}
 
 	// Deploy Kloak using absolute path to overlay
-	overlayPath := filepath.Join(repoRoot, "config", "overlays", "e2e")
+	overlayDir = os.Getenv("KLOAK_E2E_OVERLAY")
+	if overlayDir == "" {
+		overlayDir = "e2e"
+	}
+	overlayPath := filepath.Join(repoRoot, "config", "overlays", overlayDir)
 	if _, err := kubectl("apply", "-k", overlayPath); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to deploy kloak: %v\n", err)
 		os.Exit(1)
@@ -118,7 +123,7 @@ func teardown() {
 	// Delete test namespace (cascade deletes all resources in it)
 	_ = clientset.CoreV1().Namespaces().Delete(context.Background(), testNamespace, metav1.DeleteOptions{})
 	// Remove kloak deployment
-	overlayPath := filepath.Join(repoRoot, "config", "overlays", "e2e")
+	overlayPath := filepath.Join(repoRoot, "config", "overlays", overlayDir)
 	_, _ = kubectl("delete", "-k", overlayPath, "--ignore-not-found")
 }
 

@@ -4,8 +4,8 @@ on:
   workflow_dispatch:
     inputs:
       runner:
-        description: 'Runner label (must support eBPF/CAP_BPF)'
-        default: 'self-hosted'
+        description: 'Runner label'
+        default: 'ubuntu-latest'
         type: string
 
 env:
@@ -48,6 +48,7 @@ jobs:
         run: go test -v -timeout 600s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
           KUBECONFIG: /tmp/kubeconfig-ebpf.yaml
+          KLOAK_E2E_OVERLAY: e2e-ebpf
 
       - name: Collect logs on failure
         if: failure()
