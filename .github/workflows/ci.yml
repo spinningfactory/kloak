@@ -181,11 +181,11 @@ jobs:
       - name: Build Docker images
         run: |
           docker build -t kloak:e2e .
-          docker build -t kloak-demo-go:e2e ./examples/demo-go/
+          docker build -t kloak-demo-go:e2e -t kloak-demo-go:latest ./examples/demo-go/
 
       - name: Import images into k3d
         run: |
-          k3d image import kloak:e2e kloak-demo-go:e2e -c kloak-ebpf-e2e
+          k3d image import kloak:e2e kloak-demo-go:e2e kloak-demo-go:latest -c kloak-ebpf-e2e
           docker pull bitnami/kubectl:latest
           k3d image import bitnami/kubectl:latest -c kloak-ebpf-e2e
 

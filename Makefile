@@ -111,9 +111,9 @@ e2e-ebpf-setup:
 	@echo "==> Building kloak image..."
 	@docker build -t $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) .
 	@echo "==> Building demo-go image..."
-	@docker build -t kloak-demo-go:$(E2E_IMAGE_TAG) ./examples/demo-go/
+	@docker build -t kloak-demo-go:$(E2E_IMAGE_TAG) -t kloak-demo-go:latest ./examples/demo-go/
 	@echo "==> Importing images into k3d..."
-	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:$(E2E_IMAGE_TAG) -c $(E2E_EBPF_CLUSTER)
+	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:$(E2E_IMAGE_TAG) kloak-demo-go:latest -c $(E2E_EBPF_CLUSTER)
 	@docker pull bitnami/kubectl:latest
 	@k3d image import bitnami/kubectl:latest -c $(E2E_EBPF_CLUSTER)
 	@echo "==> eBPF E2E environment ready."

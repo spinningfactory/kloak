@@ -14,9 +14,10 @@ func TestEBPFSecretRewrite(t *testing.T) {
 	// This test requires --enable-ebpf=true and a demo app that makes HTTPS requests.
 	// It verifies that the eBPF uprobe replaces kloak:UUID with the real secret value.
 
-	// Create secrets with host restrictions
-	allowedData := map[string][]byte{"key": []byte("REAL-ALLOWED-KEY-12345")}
-	blockedData := map[string][]byte{"key": []byte("REAL-BLOCKED-KEY-67890")}
+	// Create secrets with host restrictions.
+	// Key must be "api-key" to match the demo-go deployment's volume mount paths.
+	allowedData := map[string][]byte{"api-key": []byte("REAL-ALLOWED-KEY-12345")}
+	blockedData := map[string][]byte{"api-key": []byte("REAL-BLOCKED-KEY-67890")}
 
 	createEnabledSecret(t, "secret-allowed", allowedData, map[string]string{
 		"getkloak.io/hosts": "httpbin.org",
