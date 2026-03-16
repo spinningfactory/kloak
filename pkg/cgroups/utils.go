@@ -11,7 +11,8 @@ import (
 // DefaultCgroupRoot is the standard cgroup v2 root
 const DefaultCgroupRoot = "/sys/fs/cgroup"
 
-// FindContainerCgroupPath attempts to find the cgroup path for a container ID
+// FindContainerCgroupPath attempts to find the cgroup path for a container ID.
+// Tries well-known patterns first, then falls back to walking the cgroup tree.
 func FindContainerCgroupPath(cgroupRoot, podUID, containerID string) (string, error) {
 	if cgroupRoot == "" {
 		cgroupRoot = DefaultCgroupRoot
@@ -20,18 +21,24 @@ func FindContainerCgroupPath(cgroupRoot, podUID, containerID string) (string, er
 	podUIDUnderscored := strings.ReplaceAll(podUID, "-", "_")
 
 	patterns := []string{
-		// containerd pattern
+		// containerd systemd cgroup driver (standard Kubernetes)
 		filepath.Join(cgroupRoot, "kubepods.slice", "kubepods-burstable.slice",
 			fmt.Sprintf("kubepods-burstable-pod%s.slice", podUIDUnderscored),
 			fmt.Sprintf("cri-containerd-%s.scope", containerID)),
-		// containerd pattern (BestEffort)
 		filepath.Join(cgroupRoot, "kubepods.slice", "kubepods-besteffort.slice",
 			fmt.Sprintf("kubepods-besteffort-pod%s.slice", podUIDUnderscored),
 			fmt.Sprintf("cri-containerd-%s.scope", containerID)),
-		// Alternative pattern
+		filepath.Join(cgroupRoot, "kubepods.slice", "kubepods-guaranteed.slice",
+			fmt.Sprintf("kubepods-guaranteed-pod%s.slice", podUIDUnderscored),
+			fmt.Sprintf("cri-containerd-%s.scope", containerID)),
+		// containerd cgroupfs driver (k3s default)
 		filepath.Join(cgroupRoot, "kubepods", "burstable",
 			fmt.Sprintf("pod%s", podUID), containerID),
-		// Best-effort pattern
+		filepath.Join(cgroupRoot, "kubepods", "besteffort",
+			fmt.Sprintf("pod%s", podUID), containerID),
+		filepath.Join(cgroupRoot, "kubepods", "guaranteed",
+			fmt.Sprintf("pod%s", podUID), containerID),
+		// pod-level fallback
 		filepath.Join(cgroupRoot, "kubepods", "pod"+podUID),
 	}
 
@@ -39,6 +46,23 @@ func FindContainerCgroupPath(cgroupRoot, podUID, containerID string) (string, er
 		if _, err := os.Stat(path); err == nil {
 			return path, nil
 		}
+	}
+
+	// Fallback: walk the cgroup tree looking for a directory containing the
+	// container ID. Handles non-standard layouts (k3d, minikube, etc.).
+	var found string
+	_ = filepath.WalkDir(cgroupRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if strings.Contains(d.Name(), containerID) {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	if found != "" {
+		return found, nil
 	}
 
 	return "", fmt.Errorf("cgroup path not found for container %s", containerID)
