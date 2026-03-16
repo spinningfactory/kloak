@@ -23,6 +23,12 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
+      - name: Install clang for eBPF generation
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev
+
+      - name: Generate eBPF bindings
+        run: KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/
+
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v7
         with:
@@ -41,6 +47,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      - name: Install clang for eBPF generation
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev
+
+      - name: Generate eBPF bindings
+        run: KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/
 
       - name: Download dependencies
         run: go mod download
@@ -67,6 +79,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      - name: Install clang for eBPF generation
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev
+
+      - name: Generate eBPF bindings
+        run: KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/
 
       - name: Download dependencies
         run: go mod download
@@ -124,7 +142,7 @@ jobs:
           k3d kubeconfig get kloak-e2e > /tmp/kubeconfig-e2e.yaml
 
       - name: Build Docker image
-        run: docker build -t kloak:e2e .
+        run: docker build --build-arg TARGETARCH=amd64 -t kloak:e2e .
 
       - name: Import images into k3d
         run: |
@@ -182,7 +200,7 @@ jobs:
 
       - name: Build Docker images
         run: |
-          docker build -t kloak:e2e .
+          docker build --build-arg TARGETARCH=amd64 -t kloak:e2e .
           docker build -t kloak-demo-go:e2e -t kloak-demo-go:latest ./examples/demo-go/
 
       - name: Import images into k3d
