@@ -46,6 +46,10 @@ func TestEBPFSecretRewrite(t *testing.T) {
 		t.Fatalf("demo-go not ready: %v", err)
 	}
 
+	// Dump controller logs to see eBPF status (uprobe attachment, errors, etc.)
+	ctrlLogs, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=100")
+	t.Logf("=== Controller logs ===\n%s", ctrlLogs)
+
 	// Wait for at least one request cycle (15s startup + 5s interval)
 	time.Sleep(25 * time.Second)
 
@@ -54,14 +58,15 @@ func TestEBPFSecretRewrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read demo-go logs: %v", err)
 	}
+	t.Logf("=== Demo app logs ===\n%s", out)
 
 	// The allowed secret should be rewritten to the real value
 	if !strings.Contains(out, "REAL-ALLOWED-KEY-12345") {
-		t.Error("demo-go logs should contain the real allowed secret (eBPF should have replaced it)")
+		t.Errorf("demo-go logs should contain the real allowed secret (eBPF should have replaced it)")
 	}
 
 	// The blocked secret should NOT be rewritten (wrong host restriction)
 	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {
-		t.Error("demo-go logs should NOT contain the real blocked secret (host restriction should prevent replacement)")
+		t.Errorf("demo-go logs should NOT contain the real blocked secret (host restriction should prevent replacement)")
 	}
 }

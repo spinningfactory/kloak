@@ -106,8 +106,11 @@ e2e-ebpf: e2e-ebpf-setup e2e-ebpf-run e2e-ebpf-cleanup
 # Create k3d cluster, build and import kloak + demo-go images.
 e2e-ebpf-setup:
 	@which k3d > /dev/null || (echo "Error: k3d not found. Install with: brew install k3d" && exit 1)
-	@echo "==> Creating k3d cluster '$(E2E_EBPF_CLUSTER)'..."
-	@k3d cluster create $(E2E_EBPF_CLUSTER) --wait --timeout 120s 2>/dev/null || true
+	@echo "==> Creating k3d cluster '$(E2E_EBPF_CLUSTER)' with BPF mounts..."
+	@k3d cluster create $(E2E_EBPF_CLUSTER) --wait --timeout 120s \
+		--volume /sys/kernel/btf:/sys/kernel/btf:ro@server:0 \
+		--volume /sys/fs/bpf:/sys/fs/bpf:rw@server:0 \
+		2>/dev/null || true
 	@echo "==> Building kloak image..."
 	@docker build -t $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) .
 	@echo "==> Building demo-go image..."

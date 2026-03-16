@@ -28,9 +28,11 @@ jobs:
       - name: Install k3d
         run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
 
-      - name: Create k3d cluster (privileged)
+      - name: Create k3d cluster (with BPF mounts)
         run: |
-          k3d cluster create kloak-ebpf --wait --timeout 120s
+          k3d cluster create kloak-ebpf --wait --timeout 120s \
+            --volume /sys/kernel/btf:/sys/kernel/btf:ro@server:0 \
+            --volume /sys/fs/bpf:/sys/fs/bpf:rw@server:0
           k3d kubeconfig get kloak-ebpf > /tmp/kubeconfig-ebpf.yaml
 
       - name: Build Docker images
