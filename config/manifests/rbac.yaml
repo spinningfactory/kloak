@@ -28,6 +28,14 @@ rules:
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  # Namespace reading for webhook enablement inheritance
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "watch"]
+  # Workload reading for webhook enablement inheritance (pod → owner chain)
+  - apiGroups: ["apps"]
+    resources: ["replicasets", "deployments", "daemonsets", "statefulsets"]
+    verbs: ["get", "list", "watch"]
   # Events for debugging
   - apiGroups: [""]
     resources: ["events"]

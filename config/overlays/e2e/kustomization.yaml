@@ -1,0 +1,54 @@
+# Kloak E2E Test Overlay
+# Disables eBPF so tests run on standard CI runners (no CAP_BPF needed).
+# Strips privileged security context and BPF/BTF volumes.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../manifests
+
+patches:
+  # Disable eBPF for control-plane-only testing
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/args
+        value:
+          - --enable-ebpf=false
+          - --cgroup-path=/host/sys/fs/cgroup
+    target:
+      kind: DaemonSet
+      name: kloak-controller
+
+  # Drop privileged mode and BPF capabilities (not needed without eBPF)
+  - patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/securityContext
+        value:
+          runAsUser: 0
+          runAsGroup: 0
+    target:
+      kind: DaemonSet
+      name: kloak-controller
+
+  # Remove bpf and btf hostPath volumes (indices 1 and 2) and their mounts.
+  # Must remove higher indices first to avoid shifting.
+  - patch: |-
+      - op: remove
+        path: /spec/template/spec/containers/0/volumeMounts/2
+      - op: remove
+        path: /spec/template/spec/containers/0/volumeMounts/1
+      - op: remove
+        path: /spec/template/spec/volumes/2
+      - op: remove
+        path: /spec/template/spec/volumes/1
+    target:
+      kind: DaemonSet
+      name: kloak-controller
+
+images:
+  - name: kloak
+    newName: kloak
+    newTag: e2e
+  - name: bitnami/kubectl
+    newName: bitnami/kubectl
+    newTag: latest

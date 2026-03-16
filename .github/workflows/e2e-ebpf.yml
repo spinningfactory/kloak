@@ -1,0 +1,66 @@
+name: E2E Tests (eBPF)
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Runner label (must support eBPF/CAP_BPF)'
+        default: 'self-hosted'
+        type: string
+
+env:
+  GO_VERSION: '1.25'
+
+jobs:
+  e2e-ebpf:
+    name: E2E Tests (Full eBPF)
+    runs-on: ${{ github.event.inputs.runner }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install k3d
+        run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
+
+      - name: Create k3d cluster (privileged)
+        run: |
+          k3d cluster create kloak-ebpf --wait --timeout 120s
+          k3d kubeconfig get kloak-ebpf > /tmp/kubeconfig-ebpf.yaml
+
+      - name: Build Docker images
+        run: |
+          docker build -t kloak:e2e .
+          docker build -t kloak-demo-go:e2e ./examples/demo-go/
+
+      - name: Import images into k3d
+        run: |
+          k3d image import kloak:e2e kloak-demo-go:e2e -c kloak-ebpf
+          docker pull bitnami/kubectl:latest
+          k3d image import bitnami/kubectl:latest -c kloak-ebpf
+
+      - name: Run E2E tests (with eBPF)
+        run: go test -v -timeout 600s -tags=e2e_ebpf -count=1 ./test/e2e/
+        env:
+          KUBECONFIG: /tmp/kubeconfig-ebpf.yaml
+
+      - name: Collect logs on failure
+        if: failure()
+        env:
+          KUBECONFIG: /tmp/kubeconfig-ebpf.yaml
+        run: |
+          echo "=== Kloak Controller Logs ==="
+          kubectl logs -n kloak-system -l app.kubernetes.io/component=controller --tail=100 2>/dev/null || true
+          echo "=== Kloak Webhook Logs ==="
+          kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook --tail=100 2>/dev/null || true
+          echo "=== All Pods ==="
+          kubectl get pods -A 2>/dev/null || true
+
+      - name: Delete k3d cluster
+        if: always()
+        run: k3d cluster delete kloak-ebpf
