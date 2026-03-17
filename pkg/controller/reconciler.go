@@ -161,8 +161,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	for _, cgroupID := range needsAttach {
 		if r.attachUprobesToCgroup(cgroupID, pod) {
 			r.mu.Lock()
-			if cgroups := r.trackedPods[string(pod.UID)]; cgroups != nil {
-				cgroups[cgroupID] = true // mark as successfully attached
+			if tracked := r.trackedPods[string(pod.UID)]; tracked != nil {
+				tracked[cgroupID] = true // mark as successfully attached
 			}
 			r.mu.Unlock()
 		}
@@ -172,8 +172,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// This handles runtimes like Python where libssl loads lazily.
 	r.mu.RLock()
 	needsRetry := false
-	if cgroups := r.trackedPods[string(pod.UID)]; cgroups != nil {
-		for _, attached := range cgroups {
+	if tracked := r.trackedPods[string(pod.UID)]; tracked != nil {
+		for _, attached := range tracked {
 			if !attached {
 				needsRetry = true
 				break
