@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
@@ -37,7 +38,9 @@ type Reconciler struct {
 	NodeName string
 
 	mu sync.RWMutex
-	// trackedPods maps pod UID -> set of cgroup IDs (one per container)
+	// trackedPods maps pod UID -> set of cgroup IDs (one per container).
+	// Value is true if uprobes were successfully attached, false if attachment
+	// failed (e.g. libssl not loaded yet) and should be retried.
 	trackedPods map[string]map[uint64]bool
 
 	// podKeyToUID maps "namespace/name" -> pod UID, so that on a NotFound
@@ -119,7 +122,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// Compute cgroup diff under the lock, then attach uprobes outside it.
 	// attachUprobesToCgroup does blocking filesystem I/O and must not run
 	// while the lock is held to avoid blocking other reconcile goroutines.
-	var newCgroups []uint64
+	var needsAttach []uint64
 
 	r.mu.Lock()
 	existingCgroups := r.trackedPods[string(pod.UID)]
@@ -127,12 +130,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		existingCgroups = make(map[uint64]bool)
 	}
 
-	// Collect new cgroups that aren't already tracked
+	// Collect cgroups that need uprobe attachment:
+	// - New cgroups not yet tracked
+	// - Previously tracked cgroups where attachment failed (value=false)
 	for cgroupID := range cgroupIDs {
-		if !existingCgroups[cgroupID] {
-			existingCgroups[cgroupID] = true
+		attached, tracked := existingCgroups[cgroupID]
+		if !tracked {
+			existingCgroups[cgroupID] = false // tracked but not yet attached
 			log.Info("tracking container cgroup", "cgroupID", cgroupID)
-			newCgroups = append(newCgroups, cgroupID)
+			needsAttach = append(needsAttach, cgroupID)
+		} else if !attached {
+			// Retry attachment (e.g. libssl not loaded on first attempt)
+			needsAttach = append(needsAttach, cgroupID)
 		}
 	}
 
@@ -149,17 +158,41 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	r.mu.Unlock()
 
 	// Attach uprobes outside the lock — this involves filesystem I/O.
-	for _, cgroupID := range newCgroups {
-		r.attachUprobesToCgroup(cgroupID, pod)
+	for _, cgroupID := range needsAttach {
+		if r.attachUprobesToCgroup(cgroupID, pod) {
+			r.mu.Lock()
+			if cgroups := r.trackedPods[string(pod.UID)]; cgroups != nil {
+				cgroups[cgroupID] = true // mark as successfully attached
+			}
+			r.mu.Unlock()
+		}
 	}
 
+	// If any cgroups still need attachment, requeue to retry later.
+	// This handles runtimes like Python where libssl loads lazily.
+	r.mu.RLock()
+	needsRetry := false
+	if cgroups := r.trackedPods[string(pod.UID)]; cgroups != nil {
+		for _, attached := range cgroups {
+			if !attached {
+				needsRetry = true
+				break
+			}
+		}
+	}
+	r.mu.RUnlock()
+
+	if needsRetry {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
 	return ctrl.Result{}, nil
 }
 
-// attachUprobesToCgroup reads the cgroup's procs file to find a PID and calls the uprobe manager
-func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) {
+// attachUprobesToCgroup reads the cgroup's procs file to find a PID and calls the uprobe manager.
+// Returns true if at least one uprobe was successfully attached.
+func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) bool {
 	if r.UprobeManager == nil {
-		return
+		return false
 	}
 
 	r.Log.Info("Trying to attach uprobes to new container", "cgroup", cgroupID)
@@ -191,29 +224,32 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) {
 		pids, err := cgroups.ReadCgroupProcs(containerCgroupPath)
 		if err != nil {
 			r.Log.Error(err, "failed to read cgroup.procs", "path", containerCgroupPath)
-			return
+			return false
 		}
 
 		if len(pids) == 0 {
 			r.Log.V(1).Info("no PIDs found in cgroup.procs", "path", containerCgroupPath)
-			return
+			return false
 		}
 
 		// Attempt to attach uprobes to every PID in the cgroup.
 		// Containers may run multiple processes; we probe all of them so that
 		// whichever process makes TLS calls is instrumented. AttachTLS skips
 		// PIDs that have no compatible TLS symbols.
+		attached := false
 		for _, pid := range pids {
 			if err := r.UprobeManager.AttachTLS(pid); err != nil {
 				r.Log.V(1).Info("could not attach TLS uprobes to pid (no compatible symbols or already attached)", "pid", pid, "container", status.Name, "err", err)
 			} else {
 				r.Log.Info("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
+				attached = true
 			}
 		}
-		return
+		return attached
 	}
 
 	r.Log.V(1).Info("could not find matching container for cgroup", "cgroupID", cgroupID)
+	return false
 }
 
 // handleDelete removes a pod from tracking. uid is the pod UID (trackedPods key),
