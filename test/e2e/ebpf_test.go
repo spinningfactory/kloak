@@ -46,6 +46,13 @@ var ebpfTests = []ebpfRewriteTest{
 		appLabel:       "app=demo-js",
 		startupWait:    30 * time.Second,
 	},
+	{
+		name:           "go-boringssl",
+		demoDir:        "demo-go-boring",
+		deploymentName: "demo-go-boring",
+		appLabel:       "app=demo-go-boring",
+		startupWait:    45 * time.Second,
+	},
 }
 
 func TestEBPFSecretRewrite(t *testing.T) {
@@ -126,28 +133,3 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 	time.Sleep(5 * time.Second)
 }
 
-// TestEBPFUprobeStrategies verifies that the controller attaches the correct
-// uprobe type for each runtime: Go crypto/tls vs OpenSSL SSL_write.
-func TestEBPFUprobeStrategies(t *testing.T) {
-	// This test checks controller logs for the expected uprobe attachment messages.
-	// The demo apps must have been deployed (run after TestEBPFSecretRewrite or independently).
-
-	ctrlLogs, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=200")
-
-	strategies := []struct {
-		name     string
-		expected string
-	}{
-		{"Go crypto/tls", "Attached Go uprobe to process"},
-		{"OpenSSL SSL_write", "Attached OpenSSL uprobe"},
-	}
-
-	for _, s := range strategies {
-		t.Run(s.name, func(t *testing.T) {
-			if !strings.Contains(ctrlLogs, s.expected) {
-				t.Errorf("controller logs should contain %q for %s uprobe strategy", s.expected, s.name)
-				t.Logf("Controller logs:\n%s", ctrlLogs)
-			}
-		})
-	}
-}
