@@ -1,11 +1,23 @@
-# Kloak E2E eBPF Test Overlay
+# Kloak E2E Test Overlay
 # Inherits base manifests with eBPF enabled (privileged, BPF/BTF volumes).
-# Only overrides image tags for e2e.
+# Sets GOCOVERDIR for integration test coverage collection.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
   - ../../manifests
+
+patches:
+  # Add GOCOVERDIR env var for coverage-instrumented binary
+  - patch: |-
+      - op: add
+        path: /spec/template/spec/containers/0/env/-
+        value:
+          name: GOCOVERDIR
+          value: /tmp/coverage
+    target:
+      kind: DaemonSet
+      name: kloak-controller
 
 images:
   - name: kloak

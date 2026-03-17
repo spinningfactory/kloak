@@ -31,7 +31,15 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       -target bpfeb -c bpf/tls_uprobe.c -o tlsuprobe_bpfeb.o
 
 # Cross-compile Go binary for the target platform (no CGO, pure Go).
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} go build -o /kloak ./cmd/kloak
+# When COVER=1, build with -cover for integration test coverage collection.
+ARG COVER=0
+RUN if [ "$COVER" = "1" ]; then \
+      CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+        go build -cover -covermode=atomic -o /kloak ./cmd/kloak; \
+    else \
+      CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
+        go build -o /kloak ./cmd/kloak; \
+    fi
 
 # Runtime stage — uses the target platform.
 FROM alpine:3.19
@@ -39,6 +47,9 @@ FROM alpine:3.19
 RUN apk add --no-cache ca-certificates
 
 COPY --from=builder /kloak /kloak
+
+# Coverage output directory (used when built with COVER=1)
+RUN mkdir -p /tmp/coverage
 
 RUN adduser -D -u 65532 kloak
 USER 65532

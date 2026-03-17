@@ -107,7 +107,7 @@ jobs:
     name: Coverage Report
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    needs: [test]
+    needs: [e2e]
     permissions:
       contents: read
       actions: read
@@ -115,14 +115,14 @@ jobs:
     steps:
       - uses: fgrosse/go-coverage-report@v1.3.0
         with:
-          coverage-artifact-name: coverage
-          coverage-file-name: coverage.out
+          coverage-artifact-name: combined-coverage
+          coverage-file-name: combined-coverage.out
 
   coverage-badge:
     name: Coverage Badge
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    needs: [test]
+    needs: [e2e]
     permissions:
       contents: write
     steps:
@@ -137,16 +137,15 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Install clang for eBPF generation
-        run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev
+      - name: Download combined coverage
+        uses: actions/download-artifact@v5
+        with:
+          name: combined-coverage
+          path: /tmp/combined-coverage
 
-      - name: Generate eBPF bindings
-        run: KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/
-
-      - name: Run tests with coverage
+      - name: Prepare coverage for badge
         run: |
-          go test -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/pkg/ebpf|/pkg/cgroups')
-          go tool cover -func=coverage.out -o=coverage.out
+          go tool cover -func=/tmp/combined-coverage/combined-coverage.out -o=coverage.out
 
       - name: Update coverage badge
         uses: tj-actions/coverage-badge-go@v3
@@ -239,7 +238,7 @@ jobs:
 
       - name: Build and import images into k3d
         run: |
-          docker build --build-arg TARGETARCH=amd64 -t kloak:e2e .
+          docker build --build-arg TARGETARCH=amd64 --build-arg COVER=1 -t kloak:e2e .
           k3d image import kloak:e2e -c kloak-e2e
           docker build -t kloak-demo-go:latest ./examples/demo-go/
           docker build -t kloak-demo-python:latest ./examples/demo-python/
@@ -253,6 +252,61 @@ jobs:
         run: go test -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
           KUBECONFIG: /tmp/kubeconfig-e2e.yaml
+
+      - name: Collect e2e coverage from controller pod
+        if: always()
+        env:
+          KUBECONFIG: /tmp/kubeconfig-e2e.yaml
+        run: |
+          mkdir -p /tmp/e2e-covdata
+          CTRL_POD=$(kubectl get pods -n kloak-system -l app.kubernetes.io/component=controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
+          if [ -n "$CTRL_POD" ]; then
+            # SIGTERM triggers graceful shutdown which flushes GOCOVERDIR
+            kubectl exec -n kloak-system "$CTRL_POD" -- kill -TERM 1 2>/dev/null || true
+            sleep 5
+            kubectl cp "kloak-system/$CTRL_POD:/tmp/coverage" /tmp/e2e-covdata/ 2>/dev/null || true
+          fi
+          echo "E2E coverage files:"
+          ls -la /tmp/e2e-covdata/ 2>/dev/null || echo "No coverage files collected"
+
+      - name: Download unit test coverage
+        if: always()
+        uses: actions/download-artifact@v5
+        with:
+          name: coverage
+          path: /tmp/unit-coverage
+
+      - name: Merge unit and e2e coverage
+        if: always()
+        run: |
+          # Convert e2e covdata (binary) to text format
+          if ls /tmp/e2e-covdata/covcounters.* 1>/dev/null 2>&1; then
+            go tool covdata textfmt -i=/tmp/e2e-covdata -o=/tmp/e2e-coverage.out
+            echo "E2E coverage converted to text format"
+          else
+            echo "No e2e coverage data found, using unit coverage only"
+          fi
+
+          # Merge: start with unit coverage, overlay e2e coverage
+          cp /tmp/unit-coverage/coverage.out /tmp/combined-coverage.out
+
+          if [ -f /tmp/e2e-coverage.out ]; then
+            # Append e2e coverage lines (skip the mode line) to combined file
+            tail -n +2 /tmp/e2e-coverage.out >> /tmp/combined-coverage.out
+            echo "Combined unit + e2e coverage"
+          fi
+
+          echo "=== Combined coverage summary ==="
+          go tool cover -func=/tmp/combined-coverage.out | tail -1
+
+      - name: Upload combined coverage
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: combined-coverage
+          path: /tmp/combined-coverage.out
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Collect logs on failure
         if: failure()
