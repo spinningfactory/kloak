@@ -175,13 +175,15 @@ jobs:
         run: |
           docker build --build-arg TARGETARCH=amd64 -t kloak:e2e .
           k3d image import kloak:e2e -c kloak-e2e
-          docker build -t kloak-demo-go:e2e -t kloak-demo-go:latest ./examples/demo-go/
-          k3d image import kloak-demo-go:e2e kloak-demo-go:latest -c kloak-e2e
+          docker build -t kloak-demo-go:latest ./examples/demo-go/
+          docker build -t kloak-demo-python:latest ./examples/demo-python/
+          docker build -t kloak-demo-js:latest ./examples/demo-js/
+          k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest -c kloak-e2e
           docker pull bitnami/kubectl:latest
           k3d image import bitnami/kubectl:latest -c kloak-e2e
 
       - name: Run E2E tests (with eBPF)
-        run: go test -v -timeout 600s -tags=e2e_ebpf -count=1 ./test/e2e/
+        run: go test -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
           KUBECONFIG: /tmp/kubeconfig-e2e.yaml
           KLOAK_E2E_OVERLAY: e2e-ebpf
@@ -195,8 +197,12 @@ jobs:
           kubectl logs -n kloak-system -l app.kubernetes.io/component=controller --tail=200 2>/dev/null || true
           echo "=== Kloak Webhook Logs ==="
           kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook --tail=100 2>/dev/null || true
-          echo "=== Demo App Logs ==="
-          kubectl logs -n kloak-e2e -l app=demo-go --tail=100 2>/dev/null || true
+          echo "=== Demo Go Logs ==="
+          kubectl logs -n kloak-e2e -l app=demo-go --tail=50 2>/dev/null || true
+          echo "=== Demo Python Logs ==="
+          kubectl logs -n kloak-e2e -l app=demo-python --tail=50 2>/dev/null || true
+          echo "=== Demo JS Logs ==="
+          kubectl logs -n kloak-e2e -l app=demo-js --tail=50 2>/dev/null || true
           echo "=== All Pods ==="
           kubectl get pods -A 2>/dev/null || true
           echo "=== Events ==="
