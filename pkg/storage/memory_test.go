@@ -76,6 +76,17 @@ func TestMemory_Delete(t *testing.T) {
 	}
 }
 
+func TestMemory_DeleteNonExistent(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemory()
+
+	// Deleting a pod that doesn't exist should not error
+	err := store.Delete(ctx, "nonexistent-pod")
+	if err != nil {
+		t.Fatalf("Delete of nonexistent pod should not error: %v", err)
+	}
+}
+
 func TestMemory_List(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemory()

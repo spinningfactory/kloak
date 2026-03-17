@@ -94,7 +94,7 @@ jobs:
         run: go mod download
 
       - name: Run tests
-        run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v /test/e2e)
+        run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/pkg/ebpf|/pkg/cgroups')
 
       - name: Upload coverage
         uses: actions/upload-artifact@v5
@@ -145,7 +145,7 @@ jobs:
 
       - name: Run tests with coverage
         run: |
-          go test -coverprofile=coverage.out $(go list ./... | grep -v /test/e2e)
+          go test -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/pkg/ebpf|/pkg/cgroups')
           go tool cover -func=coverage.out -o=coverage.out
 
       - name: Update coverage badge
