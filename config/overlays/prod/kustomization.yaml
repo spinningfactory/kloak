@@ -41,6 +41,3 @@ images:
   - name: bitnami/kubectl
     newName: bitnami/kubectl
     newTag: latest
-  - name: kloak-cni
-    newName: ghcr.io/your-org/kloak-cni
-    newTag: v1.0.0
