@@ -124,35 +124,34 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		m.log.Error(err, "failed to attach Go uprobe, but symbol may exist")
 	}
 
-	// 2. Try OpenSSL (Node.js, Python, Rust)
-	// Modern OpenSSL 3.x has both SSL_write (legacy) and SSL_write_ex (preferred).
-	// Python 3.11+ uses SSL_write_ex exclusively, so we must probe both.
-	// The calling convention is identical for the first 3 params (ssl, buf, len).
+	// 2. Try OpenSSL / BoringSSL (Node.js, Python, Rust, Envoy, gRPC)
+	// Modern OpenSSL 3.x and BoringSSL export both SSL_write and SSL_write_ex
+	// with identical C ABI calling convention.
 	sslSymbols := []string{"SSL_write", "SSL_write_ex"}
 	attached := false
 
-	// Try main executable first
+	// Try main executable first (catches statically linked BoringSSL/OpenSSL)
 	for _, sym := range sslSymbols {
 		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
 		if err == nil {
-			m.log.Info("Attached OpenSSL uprobe to main exe", "pid", pid, "symbol", sym)
+			m.log.Info("Attached SSL uprobe to main exe", "pid", pid, "symbol", sym)
 			m.links = append(m.links, up)
 			attached = true
 		}
 	}
 
-	// Try libssl.so shared library
-	libsslPath, err := findLibSSL(pid)
-	if err == nil && libsslPath != "" {
-		libEx, err := link.OpenExecutable(libsslPath)
-		if err == nil {
-			for _, sym := range sslSymbols {
-				up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
-				if err == nil {
-					m.log.Info("Attached OpenSSL uprobe to shared library", "pid", pid, "symbol", sym, "lib", libsslPath)
-					m.links = append(m.links, up)
-					attached = true
-				}
+	// Try all TLS shared libraries found in the process maps
+	for _, libPath := range findTLSLibraries(pid) {
+		libEx, err := link.OpenExecutable(libPath)
+		if err != nil {
+			continue
+		}
+		for _, sym := range sslSymbols {
+			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
+			if err == nil {
+				m.log.Info("Attached SSL uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
+				m.links = append(m.links, up)
+				attached = true
 			}
 		}
 	}
@@ -164,27 +163,58 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
 }
 
-func findLibSSL(pid int) (string, error) {
+// findTLSLibraries scans /proc/<pid>/maps for shared libraries that may export
+// SSL_write: OpenSSL (libssl.so), BoringSSL (libboringssl.so or libssl.so),
+// and libcrypto.so (some BoringSSL builds export SSL_write there).
+// Returns deduplicated paths accessible via /proc/<pid>/root.
+func findTLSLibraries(pid int) []string {
 	mapsPath := fmt.Sprintf("/proc/%d/maps", pid)
 	data, err := os.ReadFile(mapsPath)
 	if err != nil {
-		return "", err
+		return nil
 	}
 
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "libssl.so") {
-			parts := strings.Fields(line)
-			if len(parts) > 0 {
-				path := parts[len(parts)-1]
-				if strings.HasPrefix(path, "/") {
-					// We must access the file through the root namespace or /proc/pid/root
-					return fmt.Sprintf("/proc/%d/root%s", pid, path), nil
-				}
-			}
+	seen := make(map[string]bool)
+	var libs []string
+
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.Fields(line)
+		if len(parts) == 0 {
+			continue
+		}
+		path := parts[len(parts)-1]
+		if !strings.HasPrefix(path, "/") {
+			continue
+		}
+		// Match any shared library that could export SSL_write
+		base := path[strings.LastIndex(path, "/")+1:]
+		if !isTLSLibrary(base) {
+			continue
+		}
+		fullPath := fmt.Sprintf("/proc/%d/root%s", pid, path)
+		if !seen[fullPath] {
+			seen[fullPath] = true
+			libs = append(libs, fullPath)
 		}
 	}
-	return "", fmt.Errorf("libssl not found in maps")
+	return libs
+}
+
+// isTLSLibrary returns true if the filename looks like an SSL/TLS shared library.
+func isTLSLibrary(name string) bool {
+	// OpenSSL and BoringSSL shared builds
+	if strings.HasPrefix(name, "libssl.so") {
+		return true
+	}
+	// Custom BoringSSL builds
+	if strings.HasPrefix(name, "libboringssl.so") {
+		return true
+	}
+	// Some BoringSSL builds export SSL_write from libcrypto
+	if strings.HasPrefix(name, "libcrypto.so") {
+		return true
+	}
+	return false
 }
 
 // Close releases all links and the eBPF manager.
