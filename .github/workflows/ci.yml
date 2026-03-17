@@ -99,7 +99,7 @@ jobs:
           retention-days: 7
 
   docker:
-    name: Docker Build & Push (Multi-Arch)
+    name: Docker Build
     runs-on: ubuntu-latest
     needs: [lint, build, test]
     permissions:
@@ -111,36 +111,39 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Build multi-arch image (validate both platforms)
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: Login to GitHub Container Registry
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Docker metadata
-        id: meta
-        uses: docker/metadata-action@v6
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=sha
-            type=raw,value=e2e-${{ github.run_id }}
-
-      - name: Build and push multi-arch Docker image
+      - name: Push to GHCR (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/build-push-action@v7
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
           cache-from: type=gha
-          cache-to: type=gha,mode=max
 
   e2e:
     name: E2E Tests
     runs-on: ubuntu-latest
-    needs: [docker]
+    needs: [build, test]
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -161,10 +164,9 @@ jobs:
             --volume /sys/fs/bpf:/sys/fs/bpf:rw@server:0
           k3d kubeconfig get kloak-e2e > /tmp/kubeconfig-e2e.yaml
 
-      - name: Pull and import images into k3d
+      - name: Build and import images into k3d
         run: |
-          docker pull ghcr.io/${{ github.repository }}:e2e-${{ github.run_id }}
-          docker tag ghcr.io/${{ github.repository }}:e2e-${{ github.run_id }} kloak:e2e
+          docker build --build-arg TARGETARCH=amd64 -t kloak:e2e .
           k3d image import kloak:e2e -c kloak-e2e
           docker build -t kloak-demo-go:e2e -t kloak-demo-go:latest ./examples/demo-go/
           k3d image import kloak-demo-go:e2e kloak-demo-go:latest -c kloak-e2e
