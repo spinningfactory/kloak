@@ -50,7 +50,6 @@ jobs:
         run: go test -v -timeout 600s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
           KUBECONFIG: /tmp/kubeconfig-ebpf.yaml
-          KLOAK_E2E_OVERLAY: e2e-ebpf
 
       - name: Collect logs on failure
         if: failure()
