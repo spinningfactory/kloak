@@ -112,16 +112,24 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build multi-arch Docker image
+      - name: Build multi-arch Docker image (validate both platforms)
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Export amd64 image for e2e tests
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: false
           tags: kloak:${{ github.sha }},kloak:e2e
           outputs: type=docker,dest=/tmp/kloak.tar
           cache-from: type=gha
-          cache-to: type=gha,mode=max
 
       - name: Upload Docker image artifact
         uses: actions/upload-artifact@v4
