@@ -244,7 +244,8 @@ jobs:
           docker build -t kloak-demo-go:latest ./examples/demo-go/
           docker build -t kloak-demo-python:latest ./examples/demo-python/
           docker build -t kloak-demo-js:latest ./examples/demo-js/
-          k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest -c kloak-e2e
+          docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
+          k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest -c kloak-e2e
           docker pull bitnami/kubectl:latest
           k3d image import bitnami/kubectl:latest -c kloak-e2e
 
@@ -268,6 +269,8 @@ jobs:
           kubectl logs -n kloak-e2e -l app=demo-python --tail=50 2>/dev/null || true
           echo "=== Demo JS Logs ==="
           kubectl logs -n kloak-e2e -l app=demo-js --tail=50 2>/dev/null || true
+          echo "=== Demo Go BoringSSL Logs ==="
+          kubectl logs -n kloak-e2e -l app=demo-go-boring --tail=50 2>/dev/null || true
           echo "=== All Pods ==="
           kubectl get pods -A 2>/dev/null || true
           echo "=== Events ==="

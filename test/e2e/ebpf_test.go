@@ -46,6 +46,13 @@ var ebpfTests = []ebpfRewriteTest{
 		appLabel:       "app=demo-js",
 		startupWait:    30 * time.Second,
 	},
+	{
+		name:           "go-boringssl",
+		demoDir:        "demo-go-boring",
+		deploymentName: "demo-go-boring",
+		appLabel:       "app=demo-go-boring",
+		startupWait:    45 * time.Second,
+	},
 }
 
 func TestEBPFSecretRewrite(t *testing.T) {
