@@ -252,6 +252,7 @@ jobs:
         run: go test -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
           KUBECONFIG: /tmp/kubeconfig-e2e.yaml
+          KLOAK_SKIP_TEARDOWN: "1"
 
       - name: Collect e2e coverage from controller pod
         if: always()
@@ -261,10 +262,15 @@ jobs:
           mkdir -p /tmp/e2e-covdata
           CTRL_POD=$(kubectl get pods -n kloak-system -l app.kubernetes.io/component=controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
           if [ -n "$CTRL_POD" ]; then
+            echo "Found controller pod: $CTRL_POD"
             # SIGTERM triggers graceful shutdown which flushes GOCOVERDIR
             kubectl exec -n kloak-system "$CTRL_POD" -- kill -TERM 1 2>/dev/null || true
-            sleep 5
-            kubectl cp "kloak-system/$CTRL_POD:/tmp/coverage" /tmp/e2e-covdata/ 2>/dev/null || true
+            echo "Waiting for coverage flush..."
+            sleep 10
+            # Copy coverage files from the pod
+            kubectl cp "kloak-system/$CTRL_POD:/tmp/coverage/." /tmp/e2e-covdata/ 2>/dev/null || true
+          else
+            echo "Controller pod not found"
           fi
           echo "E2E coverage files:"
           ls -la /tmp/e2e-covdata/ 2>/dev/null || echo "No coverage files collected"
