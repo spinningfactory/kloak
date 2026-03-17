@@ -1,5 +1,4 @@
 .PHONY: all build build-linux test test-linux e2e e2e-setup e2e-run e2e-cleanup \
-        e2e-ebpf e2e-ebpf-setup e2e-ebpf-run e2e-ebpf-cleanup \
         clean deps docker-build generate-ebpf generate-vmlinux run help \
         lima-start lima-stop lima-delete lima-shell lima-exec lima-check
 
@@ -76,60 +75,34 @@ E2E_IMAGE_TAG=e2e
 # Full e2e: setup cluster, run tests, tear down.
 e2e: e2e-setup e2e-run e2e-cleanup
 
-# Create k3d cluster, build and import images.
+# Create k3d cluster with BPF mounts, build and import all images.
 e2e-setup:
 	@which k3d > /dev/null || (echo "Error: k3d not found. Install with: brew install k3d" && exit 1)
-	@echo "==> Creating k3d cluster '$(E2E_CLUSTER)'..."
-	@k3d cluster create $(E2E_CLUSTER) --wait --timeout 120s 2>/dev/null || true
-	@echo "==> Building kloak image..."
-	@docker build -t $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) .
-	@echo "==> Importing images into k3d..."
-	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) -c $(E2E_CLUSTER)
-	@docker pull bitnami/kubectl:latest
-	@k3d image import bitnami/kubectl:latest -c $(E2E_CLUSTER)
-	@echo "==> E2E environment ready."
-
-# Run e2e tests against an existing k3d cluster (use after e2e-setup).
-e2e-run:
-	KUBECONFIG=$$(k3d kubeconfig write $(E2E_CLUSTER)) $(GOTEST) -v -timeout 300s -count=1 ./test/e2e/
-
-# Tear down e2e k3d cluster.
-e2e-cleanup:
-	@k3d cluster delete $(E2E_CLUSTER) 2>/dev/null || true
-
-# eBPF E2E targets (requires Linux or k3d with privileged containers)
-E2E_EBPF_CLUSTER=kloak-ebpf-e2e
-
-# Full eBPF e2e: setup + run + cleanup.
-e2e-ebpf: e2e-ebpf-setup e2e-ebpf-run e2e-ebpf-cleanup
-
-# Create k3d cluster, build and import kloak + demo-go images.
-e2e-ebpf-setup:
-	@which k3d > /dev/null || (echo "Error: k3d not found. Install with: brew install k3d" && exit 1)
-	@echo "==> Creating k3d cluster '$(E2E_EBPF_CLUSTER)' with BPF mounts..."
-	@k3d cluster create $(E2E_EBPF_CLUSTER) --wait --timeout 120s \
+	@echo "==> Creating k3d cluster '$(E2E_CLUSTER)' with BPF mounts..."
+	@k3d cluster create $(E2E_CLUSTER) --wait --timeout 120s \
 		--volume /sys/kernel/btf:/sys/kernel/btf:ro@server:0 \
 		--volume /sys/fs/bpf:/sys/fs/bpf:rw@server:0 \
 		2>/dev/null || true
 	@echo "==> Building kloak image..."
 	@docker build -t $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) .
-	@echo "==> Building demo-go image..."
+	@echo "==> Building demo images..."
 	@docker build -t kloak-demo-go:$(E2E_IMAGE_TAG) -t kloak-demo-go:latest ./examples/demo-go/
+	@docker build -t kloak-demo-python:latest ./examples/demo-python/
+	@docker build -t kloak-demo-js:latest ./examples/demo-js/
 	@echo "==> Importing images into k3d..."
-	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:$(E2E_IMAGE_TAG) kloak-demo-go:latest -c $(E2E_EBPF_CLUSTER)
+	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest -c $(E2E_CLUSTER)
 	@docker pull bitnami/kubectl:latest
-	@k3d image import bitnami/kubectl:latest -c $(E2E_EBPF_CLUSTER)
-	@echo "==> eBPF E2E environment ready."
+	@k3d image import bitnami/kubectl:latest -c $(E2E_CLUSTER)
+	@echo "==> E2E environment ready."
 
-# Run eBPF e2e tests against an existing k3d cluster (use after e2e-ebpf-setup).
-e2e-ebpf-run:
-	KUBECONFIG=$$(k3d kubeconfig write $(E2E_EBPF_CLUSTER)) \
-	KLOAK_E2E_OVERLAY=e2e-ebpf \
-	$(GOTEST) -v -timeout 600s -tags=e2e_ebpf -count=1 ./test/e2e/
+# Run e2e tests (including eBPF) against an existing k3d cluster.
+e2e-run:
+	KUBECONFIG=$$(k3d kubeconfig write $(E2E_CLUSTER)) \
+	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
 
-# Tear down eBPF e2e k3d cluster.
-e2e-ebpf-cleanup:
-	@k3d cluster delete $(E2E_EBPF_CLUSTER) 2>/dev/null || true
+# Tear down e2e k3d cluster.
+e2e-cleanup:
+	@k3d cluster delete $(E2E_CLUSTER) 2>/dev/null || true
 
 clean:
 	$(GOCLEAN)
@@ -234,14 +207,10 @@ help:
 	@echo "  build-linux     - Build for Linux (uses Lima on macOS)"
 	@echo "  test            - Run unit tests"
 	@echo "  test-linux      - Run tests in Linux VM"
-	@echo "  e2e             - Full e2e: setup + run + cleanup"
-	@echo "  e2e-setup       - Create k3d cluster and import images"
+	@echo "  e2e             - Full e2e: setup + run + cleanup (includes eBPF tests)"
+	@echo "  e2e-setup       - Create k3d cluster with BPF mounts and import images"
 	@echo "  e2e-run         - Run e2e tests (requires e2e-setup first)"
 	@echo "  e2e-cleanup     - Delete e2e k3d cluster"
-	@echo "  e2e-ebpf        - Full eBPF e2e: setup + run + cleanup"
-	@echo "  e2e-ebpf-setup  - Create k3d cluster with kloak + demo-go images"
-	@echo "  e2e-ebpf-run    - Run eBPF e2e tests (requires e2e-ebpf-setup)"
-	@echo "  e2e-ebpf-cleanup - Delete eBPF e2e k3d cluster"
 	@echo "  clean           - Clean build artifacts"
 	@echo "  deps            - Download and tidy dependencies"
 	@echo "  docker-build    - Build Docker image"
