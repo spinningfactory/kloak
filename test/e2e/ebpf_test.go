@@ -139,7 +139,7 @@ func TestEBPFUprobeStrategies(t *testing.T) {
 	// This test checks controller logs for the expected uprobe attachment messages.
 	// The demo apps must have been deployed (run after TestEBPFSecretRewrite or independently).
 
-	ctrlLogs, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=200")
+	ctrlLogs, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller")
 
 	strategies := []struct {
 		name     string
