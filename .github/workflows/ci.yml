@@ -103,6 +103,21 @@ jobs:
           path: coverage.out
           retention-days: 7
 
+  coverage:
+    name: Coverage Report
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    needs: [test]
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    steps:
+      - uses: fgrosse/go-coverage-report@v1.3.0
+        with:
+          coverage-artifact-name: coverage
+          coverage-file-name: coverage.out
+
   docker:
     name: Docker Build
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
