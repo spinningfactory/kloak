@@ -35,6 +35,8 @@
 #define MAX_HOST_LEN 32
 // Max hostname to read from SNI
 #define MAX_SNI_LEN 64
+// OpenSSL SSL_ctrl cmd value for SSL_set_tlsext_host_name macro
+#define SSL_CTRL_SET_TLSEXT_HOSTNAME 55
 
 // BPF Map: shadow secret prefix -> real secret value
 struct secret_key {
@@ -172,6 +174,76 @@ int bpf_uprobe_ssl_set_host(void *ctx) {
 #ifdef KLOAK_DEBUG
   bpf_printk("kloak sni: tgid=%u ssl=%llx host=%s", tgid, (__u64)ssl_ptr,
              sni_buf);
+#endif
+
+  return 0;
+}
+
+// -----------------------------------------------------------------------------
+// OpenSSL SSL_ctrl uprobe — catches SNI via the macro expansion.
+//
+// In OpenSSL, SSL_set_tlsext_host_name(ssl, name) is a macro that expands to:
+//   SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, name)
+//
+// SSL_ctrl signature: long SSL_ctrl(SSL *ssl, int cmd, long larg, void *parg)
+//   x86_64: RDI=ssl, RSI=cmd, RDX=larg, RCX=parg
+//   ARM64:  X0=ssl,  X1=cmd,  X2=larg,  X3=parg
+//
+// BoringSSL exports SSL_set_tlsext_host_name as a real function, so it's
+// handled by bpf_uprobe_ssl_set_host above. This uprobe covers OpenSSL only.
+// -----------------------------------------------------------------------------
+SEC("uprobe/ssl_ctrl")
+int bpf_uprobe_ssl_ctrl(void *ctx) {
+  void *ssl_ptr;
+  int cmd;
+  void *parg;
+
+#if defined(bpf_target_x86)
+  // x86_64 C ABI: RDI=ssl, RSI=cmd, RDX=larg, RCX=parg
+  bpf_probe_read_kernel(&ssl_ptr, sizeof(void *), (char *)ctx + 112);
+  bpf_probe_read_kernel(&cmd, sizeof(int), (char *)ctx + 104);
+  bpf_probe_read_kernel(&parg, sizeof(void *), (char *)ctx + 88);
+#elif defined(bpf_target_arm64)
+  // ARM64 C ABI: X0=ssl, X1=cmd, X2=larg, X3=parg
+  bpf_probe_read_kernel(&ssl_ptr, sizeof(void *), (char *)ctx + 0);
+  bpf_probe_read_kernel(&cmd, sizeof(int), (char *)ctx + 8);
+  bpf_probe_read_kernel(&parg, sizeof(void *), (char *)ctx + 24);
+#else
+  return 0;
+#endif
+
+  // Only handle SSL_CTRL_SET_TLSEXT_HOSTNAME (55)
+  if (cmd != SSL_CTRL_SET_TLSEXT_HOSTNAME)
+    return 0;
+
+  if (!ssl_ptr || !parg)
+    return 0;
+
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+
+  char sni_buf[MAX_SNI_LEN] = {};
+  long ret = bpf_probe_read_user_str(sni_buf, sizeof(sni_buf), parg);
+  if (ret <= 1)
+    return 0;
+
+  struct conn_key key = {
+    .tgid = tgid,
+    .ssl_ptr = (__u64)ssl_ptr,
+  };
+
+  struct conn_host host = {};
+  __u32 copy_len = ret - 1;
+  if (copy_len > MAX_HOST_LEN)
+    copy_len = MAX_HOST_LEN;
+  __builtin_memcpy(host.hostname, sni_buf, MAX_HOST_LEN);
+  host.host_len = copy_len;
+
+  bpf_map_update_elem(&conn_hosts, &key, &host, BPF_ANY);
+
+#ifdef KLOAK_DEBUG
+  bpf_printk("kloak ssl_ctrl sni: tgid=%u ssl=%llx host=%s", tgid,
+             (__u64)ssl_ptr, sni_buf);
 #endif
 
   return 0;

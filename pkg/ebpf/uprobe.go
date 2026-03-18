@@ -130,7 +130,10 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	sslWriteSymbols := []string{"SSL_write", "SSL_write_ex"}
 	// SNI hostname capture — called once per connection before handshake.
 	// Populates the conn_hosts BPF map for protocol-agnostic host filtering.
+	// SSL_set_tlsext_host_name is a real function in BoringSSL but a macro in
+	// OpenSSL that expands to SSL_ctrl(ssl, 55, 0, name). Try both.
 	sniSymbols := []string{"SSL_set_tlsext_host_name"}
+	sniCtrlSymbols := []string{"SSL_ctrl"}
 	attached := false
 
 	// Try main executable first (catches statically linked BoringSSL/OpenSSL)
@@ -146,6 +149,13 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslSetHost, nil)
 		if err == nil {
 			m.log.Info("Attached SNI uprobe to main exe", "pid", pid, "symbol", sym)
+			m.links = append(m.links, up)
+		}
+	}
+	for _, sym := range sniCtrlSymbols {
+		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslCtrl, nil)
+		if err == nil {
+			m.log.Info("Attached SNI ctrl uprobe to main exe", "pid", pid, "symbol", sym)
 			m.links = append(m.links, up)
 		}
 	}
@@ -168,6 +178,13 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslSetHost, nil)
 			if err == nil {
 				m.log.Info("Attached SNI uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
+				m.links = append(m.links, up)
+			}
+		}
+		for _, sym := range sniCtrlSymbols {
+			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslCtrl, nil)
+			if err == nil {
+				m.log.Info("Attached SNI ctrl uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
 				m.links = append(m.links, up)
 			}
 		}
