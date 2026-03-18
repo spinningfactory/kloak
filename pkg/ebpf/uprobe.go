@@ -28,9 +28,9 @@ type tlsEvent struct {
 	_           [3]byte // padding for alignment
 }
 
-// secretKey matches C struct secret_key
+// secretKey matches C struct secret_key (SECRET_KEY_LEN = 8)
 type secretKey struct {
-	Prefix [16]byte
+	Prefix [8]byte
 }
 
 // secretValue matches C struct secret_value
@@ -39,6 +39,9 @@ type secretValue struct {
 	RealSecret  [128]byte
 	HostLen     uint32
 	AllowedHost [32]byte
+	PrefixLen   uint32
+	FullPrefix  [42]byte // SECRET_PREFIX_MAX
+	_           [2]byte  // padding to match C struct alignment
 }
 
 // Generate eBPF bindings. The KLOAK_TARGET_ARCH env var (set by Dockerfile or
@@ -67,7 +70,8 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 		// Retry with verifier log on failure to capture diagnostics.
 		opts := &ebpf.CollectionOptions{
 			Programs: ebpf.ProgramOptions{
-				LogLevel: ebpf.LogLevelBranch,
+				LogLevel:     ebpf.LogLevelBranch,
+				LogSizeStart: 1 << 20, // 1MB — bpf_loop callbacks generate large logs
 			},
 		}
 		if retryErr := loadTlsuprobeObjects(objs, opts); retryErr != nil {
@@ -352,14 +356,18 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 			shadowPrefix += strings.Repeat(" ", len(entry.Value)-len(shadowPrefix))
 		}
 
-		// The BPF program looks up the first 16 bytes of the shadow secret
-		if len(shadowPrefix) < 16 {
-			m.log.V(1).Info("Skipping secret too short for 16-byte BPF key", "hash", hash)
+		// The BPF program looks up the first 8 bytes, then verifies up to 42.
+		// Minimum secret size is 8 bytes (kloak: + 2 UUID chars).
+		if len(shadowPrefix) < 8 {
+			m.log.V(1).Info("Skipping secret too short for BPF key", "hash", hash, "len", len(shadowPrefix))
 			continue
 		}
 
 		var key secretKey
-		copy(key.Prefix[:], []byte(shadowPrefix)[:16])
+		copy(key.Prefix[:], []byte(shadowPrefix)[:8])
+		if _, exists := newKeys[key]; exists {
+			m.log.Info("WARNING: 8-byte BPF key collision detected — two secrets share the same prefix, one will be shadowed", "hash", hash, "prefix", shadowPrefix[:8])
+		}
 		newKeys[key] = struct{}{}
 
 		var val secretValue
@@ -369,6 +377,14 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 			val.Len = 128
 		}
 		copy(val.RealSecret[:], []byte(entry.Value)[:val.Len])
+
+		// Store the full prefix (up to 42 bytes) for post-lookup verification.
+		prefixLen := len(shadowPrefix)
+		if prefixLen > 42 {
+			prefixLen = 42
+		}
+		val.PrefixLen = uint32(prefixLen)
+		copy(val.FullPrefix[:], []byte(shadowPrefix)[:prefixLen])
 
 		// Set allowed host for host-based filtering
 		if len(entry.AllowedHosts) > 0 && entry.AllowedHosts[0] != "*" {
