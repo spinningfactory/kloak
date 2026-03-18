@@ -64,8 +64,9 @@ struct {
 // Uses LRU to auto-evict stale entries when connections close.
 // -----------------------------------------------------------------------------
 struct conn_key {
-  __u32 tgid;
   __u64 ssl_ptr; // pointer to SSL object (unique per connection)
+  __u32 tgid;
+  __u32 _pad;    // explicit padding — BPF hashes the full key including padding
 };
 
 struct conn_host {
@@ -155,11 +156,11 @@ int bpf_uprobe_ssl_set_host(void *ctx) {
   if (ret <= 1) // empty or error
     return 0;
 
-  // Store in conn_hosts map
-  struct conn_key key = {
-    .tgid = tgid,
-    .ssl_ptr = (__u64)ssl_ptr,
-  };
+  // Store in conn_hosts map — memset key to zero padding bytes
+  struct conn_key key;
+  __builtin_memset(&key, 0, sizeof(key));
+  key.tgid = tgid;
+  key.ssl_ptr = (__u64)ssl_ptr;
 
   struct conn_host host = {};
   // Copy up to MAX_HOST_LEN bytes
@@ -227,10 +228,10 @@ int bpf_uprobe_ssl_ctrl(void *ctx) {
   if (ret <= 1)
     return 0;
 
-  struct conn_key key = {
-    .tgid = tgid,
-    .ssl_ptr = (__u64)ssl_ptr,
-  };
+  struct conn_key key;
+  __builtin_memset(&key, 0, sizeof(key));
+  key.tgid = tgid;
+  key.ssl_ptr = (__u64)ssl_ptr;
 
   struct conn_host host = {};
   __u32 copy_len = ret - 1;
@@ -265,10 +266,10 @@ static __always_inline void resolve_host(struct scratch_buf *scratch,
     __u64 pid_tgid = bpf_get_current_pid_tgid();
     __u32 tgid = (__u32)(pid_tgid >> 32);
 
-    struct conn_key key = {
-      .tgid = tgid,
-      .ssl_ptr = ssl_ptr,
-    };
+    struct conn_key key;
+    __builtin_memset(&key, 0, sizeof(key));
+    key.tgid = tgid;
+    key.ssl_ptr = ssl_ptr;
 
     struct conn_host *cached = bpf_map_lookup_elem(&conn_hosts, &key);
     if (cached && cached->host_len > 0) {
