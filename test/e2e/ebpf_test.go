@@ -132,4 +132,3 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 	// Brief wait for pod termination
 	time.Sleep(5 * time.Second)
 }
-

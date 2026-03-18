@@ -4,6 +4,7 @@
 // Uses a per-CPU array as scratch buffer (not ringbuf) to avoid verifier
 // issues with ringbuf_mem pointer tracking in loops.
 // Supports both x86_64 and ARM64 architectures.
+// Host filtering uses TLS SNI (protocol-agnostic) with HTTP Host fallback.
 
 #include "vmlinux.h"
 #include <bpf/bpf_helpers.h>
@@ -32,6 +33,8 @@
 #define SECRET_MAX_LEN 128
 // Max host length for matching (compared as 4 x uint64, no loop needed)
 #define MAX_HOST_LEN 32
+// Max hostname to read from SNI
+#define MAX_SNI_LEN 64
 
 // BPF Map: shadow secret prefix -> real secret value
 struct secret_key {
@@ -52,13 +55,36 @@ struct {
   __type(value, struct secret_value);
 } secret_map SEC(".maps");
 
+// -----------------------------------------------------------------------------
+// SNI hostname cache: {tgid, ssl_ptr} → hostname
+// Populated by SSL_set_tlsext_host_name uprobe (runs once per connection).
+// Looked up by SSL_write uprobe to get the destination hostname.
+// Uses LRU to auto-evict stale entries when connections close.
+// -----------------------------------------------------------------------------
+struct conn_key {
+  __u32 tgid;
+  __u64 ssl_ptr; // pointer to SSL object (unique per connection)
+};
+
+struct conn_host {
+  __u32 host_len;
+  char hostname[MAX_HOST_LEN];
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 4096);
+  __type(key, struct conn_key);
+  __type(value, struct conn_host);
+} conn_hosts SEC(".maps");
+
 // Per-CPU array used as scratch space for reading and scanning data.
 struct scratch_buf {
   __u64 user_data_ptr;
   __u32 read_len;
   __u32 host_offset;
   __u32 host_value_len; // length of extracted host value
-  char host_value[MAX_HOST_LEN]; // extracted host bytes from HTTP header
+  char host_value[MAX_HOST_LEN]; // host from SNI cache or HTTP header
   char data[MAX_DATA_SIZE];
 };
 
@@ -91,21 +117,102 @@ struct tls_event {
 };
 
 // -----------------------------------------------------------------------------
-// Phase 1: Parse Host header and extract its value into scratch buffer.
-// This runs inline in the uprobe entry points (before tail-calling phase 2).
-// By extracting host bytes here, phase 2 can compare using fixed-size
-// uint64 comparisons with zero loops, staying under verifier limits.
+// SNI hostname extraction uprobe.
+// Hooks SSL_set_tlsext_host_name(SSL *ssl, const char *name).
+// Called once per connection before SSL_connect/handshake.
+// Caches {tgid, ssl_ptr} → hostname for later lookup in SSL_write.
+// Works for OpenSSL, BoringSSL, and any compatible TLS library.
 // -----------------------------------------------------------------------------
-static __always_inline void parse_host(struct scratch_buf *scratch) {
+SEC("uprobe/ssl_set_host")
+int bpf_uprobe_ssl_set_host(void *ctx) {
+  void *ssl_ptr;
+  void *name_ptr;
+
+#if defined(bpf_target_x86)
+  // x86_64 C ABI: RDI=ssl, RSI=name
+  // pt_regs offsets: rdi=112, rsi=104
+  bpf_probe_read_kernel(&ssl_ptr, sizeof(void *), (char *)ctx + 112);
+  bpf_probe_read_kernel(&name_ptr, sizeof(void *), (char *)ctx + 104);
+#elif defined(bpf_target_arm64)
+  // ARM64 C ABI: X0=ssl, X1=name
+  bpf_probe_read_kernel(&ssl_ptr, sizeof(void *), (char *)ctx + 0);
+  bpf_probe_read_kernel(&name_ptr, sizeof(void *), (char *)ctx + 8);
+#else
+  return 0;
+#endif
+
+  if (!ssl_ptr || !name_ptr)
+    return 0;
+
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+
+  // Read the hostname string from user space
+  char sni_buf[MAX_SNI_LEN] = {};
+  long ret = bpf_probe_read_user_str(sni_buf, sizeof(sni_buf), name_ptr);
+  if (ret <= 1) // empty or error
+    return 0;
+
+  // Store in conn_hosts map
+  struct conn_key key = {
+    .tgid = tgid,
+    .ssl_ptr = (__u64)ssl_ptr,
+  };
+
+  struct conn_host host = {};
+  // Copy up to MAX_HOST_LEN bytes
+  __u32 copy_len = ret - 1; // ret includes null terminator
+  if (copy_len > MAX_HOST_LEN)
+    copy_len = MAX_HOST_LEN;
+  __builtin_memcpy(host.hostname, sni_buf, MAX_HOST_LEN);
+  host.host_len = copy_len;
+
+  bpf_map_update_elem(&conn_hosts, &key, &host, BPF_ANY);
+
+#ifdef KLOAK_DEBUG
+  bpf_printk("kloak sni: tgid=%u ssl=%llx host=%s", tgid, (__u64)ssl_ptr,
+             sni_buf);
+#endif
+
+  return 0;
+}
+
+// -----------------------------------------------------------------------------
+// Resolve host for the current SSL connection.
+// First tries SNI cache (works for all protocols).
+// Falls back to HTTP Host header parsing (for Go and connections without SNI).
+// -----------------------------------------------------------------------------
+static __always_inline void resolve_host(struct scratch_buf *scratch,
+                                         __u64 ssl_ptr) {
   scratch->host_offset = 0;
   scratch->host_value_len = 0;
   __builtin_memset(scratch->host_value, 0, MAX_HOST_LEN);
 
+  // Try SNI cache first (protocol-agnostic)
+  if (ssl_ptr != 0) {
+    __u64 pid_tgid = bpf_get_current_pid_tgid();
+    __u32 tgid = (__u32)(pid_tgid >> 32);
+
+    struct conn_key key = {
+      .tgid = tgid,
+      .ssl_ptr = ssl_ptr,
+    };
+
+    struct conn_host *cached = bpf_map_lookup_elem(&conn_hosts, &key);
+    if (cached && cached->host_len > 0) {
+      __builtin_memcpy(scratch->host_value, cached->hostname, MAX_HOST_LEN);
+      scratch->host_value_len = cached->host_len;
+      return;
+    }
+  }
+
+  // Fallback: parse HTTP "Host: " header from the plaintext data.
+  // This handles Go connections (which don't call SSL_set_tlsext_host_name)
+  // and any connection where SNI wasn't captured.
   __u32 read_len = scratch->read_len;
   if (read_len > MAX_DATA_SIZE)
     read_len = MAX_DATA_SIZE;
 
-  // Scan the first 256 bytes to find "Host: "
   __u32 host_start = 0;
   for (__u32 i = 0; i < 256; i++) {
     if (i + 6 > read_len)
@@ -123,8 +230,6 @@ static __always_inline void parse_host(struct scratch_buf *scratch) {
   if (host_start == 0)
     return;
 
-  // Extract host value bytes into scratch->host_value (up to MAX_HOST_LEN)
-  // Stop at \r, \n, or : (end of host value)
   __u32 host_len = 0;
   for (__u32 j = 0; j < MAX_HOST_LEN; j++) {
     __u32 idx = host_start + j;
@@ -174,7 +279,7 @@ int bpf_phase2_rewrite(void *ctx) {
       struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
       if (val && val->len > 0 && val->len <= SECRET_MAX_LEN) {
 
-        // Host-based filtering: compare pre-extracted host against allowed_host
+        // Host-based filtering: compare resolved host against allowed_host
         // using fixed-size uint64 comparisons (no loop, no verifier complexity)
         if (val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
           if (scratch_data->host_value_len == 0)
@@ -234,6 +339,9 @@ int bpf_phase2_rewrite(void *ctx) {
 // Go register ABI (1.17+):
 //   x86_64: RAX=receiver, RBX=data, RCX=len  (pt_regs offsets: bx=40, cx=88)
 //   ARM64:  R0=receiver,  R1=data,  R2=len    (pt_regs: regs[1], regs[2])
+//
+// Go doesn't call SSL_set_tlsext_host_name, so SNI cache won't have an entry.
+// Falls back to HTTP Host header parsing in resolve_host().
 // -----------------------------------------------------------------------------
 
 SEC("uprobe/go_tls_write")
@@ -249,8 +357,6 @@ int bpf_uprobe_go_tls_write(void *ctx) {
 #elif defined(bpf_target_arm64)
   // ARM64 Go register ABI: R0=receiver, R1=data, R2=len
   // user_pt_regs offsets: regs[1]=8, regs[2]=16
-  // Use raw offsets instead of PT_REGS_PARMx to avoid CO-RE relocation
-  // failures (kernel BTF may expose user_pt_regs, not pt_regs).
   bpf_probe_read_kernel(&data_ptr, sizeof(void *), (char *)ctx + 8);
   bpf_probe_read_kernel(&data_len, sizeof(__u64), (char *)ctx + 16);
 #else
@@ -266,7 +372,6 @@ int bpf_uprobe_go_tls_write(void *ctx) {
   if (!data_ptr || data_len == 0)
     return 0;
 
-  // Get scratch buffer from per-CPU array
   __u32 zero = 0;
   struct scratch_buf *scratch_data = bpf_map_lookup_elem(&scratch, &zero);
   if (!scratch_data)
@@ -276,7 +381,6 @@ int bpf_uprobe_go_tls_write(void *ctx) {
   if (read_len > MAX_DATA_SIZE)
     read_len = MAX_DATA_SIZE;
 
-  // Read plaintext into scratch buffer (per-CPU array, not ringbuf)
   long ret __attribute__((unused)) =
       bpf_probe_read_user(scratch_data->data, read_len, data_ptr);
 #ifdef KLOAK_DEBUG
@@ -287,7 +391,8 @@ int bpf_uprobe_go_tls_write(void *ctx) {
   scratch_data->user_data_ptr = (__u64)data_ptr;
   scratch_data->read_len = read_len;
 
-  parse_host(scratch_data);
+  // Go doesn't use OpenSSL, no ssl_ptr for SNI lookup — pass 0.
+  resolve_host(scratch_data, 0);
 
   // Jump to Phase 2
   bpf_tail_call(ctx, &prog_array, 0);
@@ -299,25 +404,24 @@ int bpf_uprobe_go_tls_write(void *ctx) {
 // OpenSSL/BoringSSL SSL_write uprobe
 //
 // C calling convention:  SSL_write(SSL *ssl, const void *buf, int num)
-//   x86_64: RDI=ssl, RSI=buf, RDX=num  (pt_regs offsets: si=104, dx=96)
-//   ARM64:  X0=ssl,  X1=buf,  X2=num   (pt_regs: regs[1], regs[2])
+//   x86_64: RDI=ssl, RSI=buf, RDX=num  (pt_regs offsets: di=112, si=104, dx=96)
+//   ARM64:  X0=ssl,  X1=buf,  X2=num   (pt_regs: regs[0]=0, regs[1]=8, regs[2]=16)
 // -----------------------------------------------------------------------------
 
 SEC("uprobe/ssl_write")
 int bpf_uprobe_ssl_write(void *ctx) {
+  void *ssl_ptr;
   void *data_ptr;
   int num;
 
 #if defined(bpf_target_x86)
   // x86_64 C ABI: RDI=ssl, RSI=buf, RDX=num
-  // pt_regs offsets: rsi=104, rdx=96
+  bpf_probe_read_kernel(&ssl_ptr, sizeof(void *), (char *)ctx + 112);
   bpf_probe_read_kernel(&data_ptr, sizeof(void *), (char *)ctx + 104);
   bpf_probe_read_kernel(&num, sizeof(int), (char *)ctx + 96);
 #elif defined(bpf_target_arm64)
   // ARM64 C ABI: X0=ssl, X1=buf, X2=num
-  // user_pt_regs offsets: regs[1]=8, regs[2]=16
-  // Use raw offsets instead of PT_REGS_PARMx to avoid CO-RE relocation
-  // failures (kernel BTF may expose user_pt_regs, not pt_regs).
+  bpf_probe_read_kernel(&ssl_ptr, sizeof(void *), (char *)ctx + 0);
   bpf_probe_read_kernel(&data_ptr, sizeof(void *), (char *)ctx + 8);
   bpf_probe_read_kernel(&num, sizeof(int), (char *)ctx + 16);
 #else
@@ -326,7 +430,8 @@ int bpf_uprobe_ssl_write(void *ctx) {
 
 #ifdef KLOAK_DEBUG
   __u32 pid = bpf_get_current_pid_tgid();
-  bpf_printk("kloak ssl: ptr=%llx num=%d pid=%d", (__u64)data_ptr, num, pid);
+  bpf_printk("kloak ssl: ssl=%llx ptr=%llx num=%d pid=%d", (__u64)ssl_ptr,
+             (__u64)data_ptr, num, pid);
 #endif
 
   if (!data_ptr || num <= 0)
@@ -351,7 +456,8 @@ int bpf_uprobe_ssl_write(void *ctx) {
   scratch_data->user_data_ptr = (__u64)data_ptr;
   scratch_data->read_len = read_len;
 
-  parse_host(scratch_data);
+  // Look up SNI-cached hostname using the ssl pointer, fall back to HTTP Host
+  resolve_host(scratch_data, (__u64)ssl_ptr);
 
   // Jump to Phase 2
   bpf_tail_call(ctx, &prog_array, 0);

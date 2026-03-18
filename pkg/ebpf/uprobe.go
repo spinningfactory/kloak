@@ -127,16 +127,26 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	// 2. Try OpenSSL / BoringSSL (Node.js, Python, Rust, Envoy, gRPC)
 	// Modern OpenSSL 3.x and BoringSSL export both SSL_write and SSL_write_ex
 	// with identical C ABI calling convention.
-	sslSymbols := []string{"SSL_write", "SSL_write_ex"}
+	sslWriteSymbols := []string{"SSL_write", "SSL_write_ex"}
+	// SNI hostname capture — called once per connection before handshake.
+	// Populates the conn_hosts BPF map for protocol-agnostic host filtering.
+	sniSymbols := []string{"SSL_set_tlsext_host_name"}
 	attached := false
 
 	// Try main executable first (catches statically linked BoringSSL/OpenSSL)
-	for _, sym := range sslSymbols {
+	for _, sym := range sslWriteSymbols {
 		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
 		if err == nil {
-			m.log.Info("Attached SSL uprobe to main exe", "pid", pid, "symbol", sym)
+			m.log.Info("Attached SSL write uprobe to main exe", "pid", pid, "symbol", sym)
 			m.links = append(m.links, up)
 			attached = true
+		}
+	}
+	for _, sym := range sniSymbols {
+		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslSetHost, nil)
+		if err == nil {
+			m.log.Info("Attached SNI uprobe to main exe", "pid", pid, "symbol", sym)
+			m.links = append(m.links, up)
 		}
 	}
 
@@ -146,12 +156,19 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		if err != nil {
 			continue
 		}
-		for _, sym := range sslSymbols {
+		for _, sym := range sslWriteSymbols {
 			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
 			if err == nil {
-				m.log.Info("Attached SSL uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
+				m.log.Info("Attached SSL write uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
 				m.links = append(m.links, up)
 				attached = true
+			}
+		}
+		for _, sym := range sniSymbols {
+			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslSetHost, nil)
+			if err == nil {
+				m.log.Info("Attached SNI uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
+				m.links = append(m.links, up)
 			}
 		}
 	}
