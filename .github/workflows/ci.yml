@@ -252,26 +252,15 @@ jobs:
         run: go test -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
           KUBECONFIG: /tmp/kubeconfig-e2e.yaml
-          KLOAK_SKIP_TEARDOWN: "1"
 
-      - name: Collect e2e coverage from controller pod
+      - name: Collect e2e coverage
         if: always()
-        env:
-          KUBECONFIG: /tmp/kubeconfig-e2e.yaml
         run: |
           mkdir -p /tmp/e2e-covdata
-          CTRL_POD=$(kubectl get pods -n kloak-system -l app.kubernetes.io/component=controller -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-          if [ -n "$CTRL_POD" ]; then
-            echo "Found controller pod: $CTRL_POD"
-            # SIGTERM triggers graceful shutdown which flushes GOCOVERDIR
-            kubectl exec -n kloak-system "$CTRL_POD" -- kill -TERM 1 2>/dev/null || true
-            echo "Waiting for coverage flush..."
-            sleep 10
-            # Copy coverage files from the pod
-            kubectl cp "kloak-system/$CTRL_POD:/tmp/coverage/." /tmp/e2e-covdata/ 2>/dev/null || true
-          else
-            echo "Controller pod not found"
-          fi
+          # Coverage files are on the k3d node's hostPath (/tmp/kloak-coverage).
+          # The test teardown deleted kloak, which triggered a clean controller
+          # shutdown that flushed covcounters to the hostPath volume.
+          docker cp k3d-kloak-e2e-server-0:/tmp/kloak-coverage/. /tmp/e2e-covdata/ 2>/dev/null || true
           echo "E2E coverage files:"
           ls -la /tmp/e2e-covdata/ 2>/dev/null || echo "No coverage files collected"
 
@@ -293,12 +282,23 @@ jobs:
             echo "No e2e coverage data found, using unit coverage only"
           fi
 
-          # Merge: start with unit coverage, overlay e2e coverage
+          # Merge: start with unit coverage, overlay e2e coverage.
+          # Only include e2e lines for packages that exist in unit coverage
+          # (generated files like tlsuprobe_bpfel.go aren't on the runner).
           cp /tmp/unit-coverage/coverage.out /tmp/combined-coverage.out
 
           if [ -f /tmp/e2e-coverage.out ]; then
-            # Append e2e coverage lines (skip the mode line) to combined file
-            tail -n +2 /tmp/e2e-coverage.out >> /tmp/combined-coverage.out
+            # Extract package prefixes from unit coverage
+            UNIT_PKGS=$(grep -oP 'github\.com/spinningfactory/kloak/[^/]+/[^/]+' /tmp/unit-coverage/coverage.out | sort -u)
+            # Append only matching e2e lines (skip mode line)
+            while IFS= read -r line; do
+              for pkg in $UNIT_PKGS; do
+                if echo "$line" | grep -q "$pkg"; then
+                  echo "$line" >> /tmp/combined-coverage.out
+                  break
+                fi
+              done
+            done < <(tail -n +2 /tmp/e2e-coverage.out)
             echo "Combined unit + e2e coverage"
           fi
 

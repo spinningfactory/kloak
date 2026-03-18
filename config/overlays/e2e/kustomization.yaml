@@ -8,13 +8,27 @@ resources:
   - ../../manifests
 
 patches:
-  # Add GOCOVERDIR env var for coverage-instrumented binary
+  # Add GOCOVERDIR env var and hostPath volume for coverage data.
+  # hostPath persists coverage files after the controller exits
+  # (DaemonSet restart would overwrite in-container /tmp/coverage).
   - patch: |-
       - op: add
         path: /spec/template/spec/containers/0/env/-
         value:
           name: GOCOVERDIR
-          value: /tmp/coverage
+          value: /coverage
+      - op: add
+        path: /spec/template/spec/containers/0/volumeMounts/-
+        value:
+          name: coverage
+          mountPath: /coverage
+      - op: add
+        path: /spec/template/spec/volumes/-
+        value:
+          name: coverage
+          hostPath:
+            path: /tmp/kloak-coverage
+            type: DirectoryOrCreate
     target:
       kind: DaemonSet
       name: kloak-controller

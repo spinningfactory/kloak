@@ -122,13 +122,9 @@ func TestMain(m *testing.M) {
 func teardown() {
 	// Delete test namespace (cascade deletes all resources in it)
 	_ = clientset.CoreV1().Namespaces().Delete(context.Background(), testNamespace, metav1.DeleteOptions{})
-
-	// When KLOAK_SKIP_TEARDOWN=1, leave kloak running so CI can collect
-	// coverage data from the controller pod before the cluster is deleted.
-	if os.Getenv("KLOAK_SKIP_TEARDOWN") == "1" {
-		fmt.Println("KLOAK_SKIP_TEARDOWN=1: skipping kloak deployment deletion (CI will clean up)")
-		return
-	}
+	// Remove kloak deployment. The controller exits cleanly, flushing
+	// coverage data to the hostPath volume (/tmp/kloak-coverage on the
+	// k3d node) which CI copies after teardown.
 	overlayPath := filepath.Join(repoRoot, "config", "overlays", overlayDir)
 	_, _ = kubectl("delete", "-k", overlayPath, "--ignore-not-found")
 }
