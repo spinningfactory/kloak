@@ -282,12 +282,23 @@ jobs:
             echo "No e2e coverage data found, using unit coverage only"
           fi
 
-          # Merge: start with unit coverage, overlay e2e coverage
+          # Merge: start with unit coverage, overlay e2e coverage.
+          # Only include e2e lines for packages that exist in unit coverage
+          # (generated files like tlsuprobe_bpfel.go aren't on the runner).
           cp /tmp/unit-coverage/coverage.out /tmp/combined-coverage.out
 
           if [ -f /tmp/e2e-coverage.out ]; then
-            # Append e2e coverage lines (skip the mode line) to combined file
-            tail -n +2 /tmp/e2e-coverage.out >> /tmp/combined-coverage.out
+            # Extract package prefixes from unit coverage
+            UNIT_PKGS=$(grep -oP 'github\.com/spinningfactory/kloak/[^/]+/[^/]+' /tmp/unit-coverage/coverage.out | sort -u)
+            # Append only matching e2e lines (skip mode line)
+            while IFS= read -r line; do
+              for pkg in $UNIT_PKGS; do
+                if echo "$line" | grep -q "$pkg"; then
+                  echo "$line" >> /tmp/combined-coverage.out
+                  break
+                fi
+              done
+            done < <(tail -n +2 /tmp/e2e-coverage.out)
             echo "Combined unit + e2e coverage"
           fi
 
