@@ -39,10 +39,14 @@ jobs:
         run: |
           docker build --build-arg TARGETARCH=amd64 -t kloak:e2e .
           docker build -t kloak-demo-go:e2e -t kloak-demo-go:latest ./examples/demo-go/
+          docker build -t kloak-demo-python:latest ./examples/demo-python/
+          docker build -t kloak-demo-js:latest ./examples/demo-js/
+          docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
+          docker build -t kloak-demo-python-sni:latest ./examples/demo-python-sni/
 
       - name: Import images into k3d
         run: |
-          k3d image import kloak:e2e kloak-demo-go:e2e kloak-demo-go:latest -c kloak-ebpf
+          k3d image import kloak:e2e kloak-demo-go:e2e kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-python-sni:latest -c kloak-ebpf
           docker pull bitnami/kubectl:latest
           k3d image import bitnami/kubectl:latest -c kloak-ebpf
 
