@@ -55,7 +55,7 @@ def echo_server():
         conn, _ = srv.accept()
         try:
             tls_conn = ctx.wrap_socket(conn, server_side=True)
-            data = tls_conn.recv(4096)
+            data = tls_conn.recv(16384)
             if data:
                 tls_conn.sendall(data)
             tls_conn.shutdown(socket.SHUT_RDWR)
@@ -90,7 +90,7 @@ def send_and_echo(secret_allowed, secret_blocked, sni_host):
         with ctx.wrap_socket(sock, server_hostname=sni_host) as tls:
             payload = f"ALLOWED={secret_allowed}\nBLOCKED={secret_blocked}\n"
             tls.sendall(payload.encode())
-            return tls.recv(4096).decode()
+            return tls.recv(16384).decode()
 
 
 def main():

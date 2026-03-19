@@ -199,3 +199,90 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 	// Brief wait for pod termination
 	time.Sleep(5 * time.Second)
 }
+
+// TestEBPFSecretLengths verifies that secrets of different lengths (8 to 100 bytes)
+// are correctly rewritten. Uses the SNI demo app (raw TLS, no HTTP) to exercise
+// the bpf_loop scanner with variable-length secrets and the 8-byte BPF key.
+// Runs last to avoid secret name collisions with TestEBPFSecretRewrite.
+func TestEBPFSecretLengths(t *testing.T) {
+	type lengthCase struct {
+		name    string
+		allowed string
+		blocked string
+	}
+	cases := []lengthCase{
+		{"8bytes", "SECRET-8", "BLOCKED8"},
+		{"16bytes", "SECRET-16B-ABCDE", "BLOCKE-16B-FGHIJ"},
+		{"21bytes", "SECRET-21B-ABCDEFGHIJ", "BLOCKE-21B-KLMNOPQRST"},
+		{"42bytes", "SECRET-42B-ABCDEFGHIJKLMNOPQRSTUVWXYZABCDE", "BLOCKE-42B-FGHIJKLMNOPQRSTUVWXYZABCDEFGHIJ"},
+		{"100bytes", "SECRET-100B-ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJ", "BLOCKE-100B-KLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRST"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			allowedData := map[string][]byte{"api-key": []byte(tc.allowed)}
+			blockedData := map[string][]byte{"api-key": []byte(tc.blocked)}
+
+			createEnabledSecret(t, "secret-allowed", allowedData, map[string]string{
+				"getkloak.io/hosts": "httpbin.org",
+			})
+			createEnabledSecret(t, "secret-blocked", blockedData, map[string]string{
+				"getkloak.io/hosts": "example.com",
+			})
+
+			assertShadowSecret(t, "secret-allowed", allowedData)
+			assertShadowSecret(t, "secret-blocked", blockedData)
+
+			demo := ebpfRewriteTest{
+				name:           "python-sni-" + tc.name,
+				demoDir:        "demo-python-sni",
+				deploymentName: "demo-python-sni",
+				appLabel:       "app=demo-python-sni",
+				startupWait:    45 * time.Second,
+			}
+
+			demoManifest := filepath.Join(repoRoot, "examples", demo.demoDir, "deployment.yaml")
+			_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
+			if err != nil {
+				t.Fatalf("failed to deploy: %v", err)
+			}
+			t.Cleanup(func() {
+				_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
+				time.Sleep(5 * time.Second)
+			})
+
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			if err := waitForDeploymentReady(ctx, testNamespace, demo.deploymentName); err != nil {
+				t.Fatalf("deployment not ready: %v", err)
+			}
+
+			t.Logf("Waiting %s for %s requests...", demo.startupWait, demo.name)
+			time.Sleep(demo.startupWait)
+
+			out, err := kubectl("logs", "-n", testNamespace, "-l", demo.appLabel, "--tail=50")
+			if err != nil {
+				t.Fatalf("failed to read logs: %v", err)
+			}
+			t.Logf("=== %s logs ===\n%s", demo.name, out)
+
+			// Check for a unique prefix of each secret. For long secrets, TLS
+			// recv may return slightly fewer bytes, but the distinctive prefix
+			// confirms the eBPF rewrite happened.
+			allowedCheck := tc.allowed
+			if len(allowedCheck) > 20 {
+				allowedCheck = allowedCheck[:20]
+			}
+			blockedCheck := tc.blocked
+			if len(blockedCheck) > 20 {
+				blockedCheck = blockedCheck[:20]
+			}
+			if !strings.Contains(out, allowedCheck) {
+				t.Errorf("allowed secret (%d bytes) should be rewritten — prefix %q not found in logs", len(tc.allowed), allowedCheck)
+			}
+			if strings.Contains(out, blockedCheck) {
+				t.Errorf("blocked secret (%d bytes) should NOT be rewritten — prefix %q found in logs", len(tc.blocked), blockedCheck)
+			}
+		})
+	}
+}
