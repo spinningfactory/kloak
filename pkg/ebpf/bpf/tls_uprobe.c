@@ -26,11 +26,19 @@
  * Do NOT enable in production: bpf_printk writes to trace_pipe on every
  * TLS write call and adds significant overhead. */
 
-// Buffer size for reading TLS data. Must be a power of 2 for bitmask bounds.
-// 256 keeps the phase 2 scan loop under the verifier's 8192-jump limit.
+// Buffer size for reading TLS data per chunk. Must be a power of 2 for bitmask.
+// Phase 2 uses bpf_loop() to scan the full TLS buffer in 256-byte chunks.
+// Requires kernel 5.17+ for bpf_loop().
 #define MAX_DATA_SIZE 256
 // Fixed secret rewrite size
 #define SECRET_MAX_LEN 128
+// BPF map key length — short key for lookup (kloak: + 2 UUID chars)
+#define SECRET_KEY_LEN 8
+// Max prefix bytes stored in secret_value (for future verification use)
+#define SECRET_PREFIX_MAX 42
+// Chunk stride for bpf_loop scanning: overlap of SECRET_KEY_LEN-1 bytes
+// ensures tokens straddling chunk boundaries are always detected.
+#define CHUNK_STRIDE (MAX_DATA_SIZE - (SECRET_KEY_LEN - 1)) // 249
 // Max host length for matching (compared as 4 x uint64, no loop needed)
 #define MAX_HOST_LEN 32
 // Max hostname to read from SNI
@@ -40,14 +48,16 @@
 
 // BPF Map: shadow secret prefix -> real secret value
 struct secret_key {
-  char prefix[16];
+  char prefix[SECRET_KEY_LEN];
 };
 
 struct secret_value {
   __u32 len;
   char real_secret[SECRET_MAX_LEN];
-  __u32 host_len;                  // 0 = wildcard (allow all hosts)
-  char allowed_host[MAX_HOST_LEN]; // e.g. "httpbin.org"
+  __u32 host_len;                        // 0 = wildcard (allow all hosts)
+  char allowed_host[MAX_HOST_LEN];       // e.g. "httpbin.org"
+  __u32 prefix_len;                      // actual prefix length (8..42)
+  char full_prefix[SECRET_PREFIX_MAX];   // full kloak:UUID prefix for verification
 };
 
 struct {
@@ -84,7 +94,8 @@ struct {
 // Per-CPU array used as scratch space for reading and scanning data.
 struct scratch_buf {
   __u64 user_data_ptr;
-  __u32 read_len;
+  __u32 read_len;       // bytes read into data[] (max 256, for host parsing)
+  __u32 total_data_len; // full TLS write length (for bpf_loop scanning)
   __u32 host_offset;
   __u32 host_value_len; // length of extracted host value
   char host_value[MAX_HOST_LEN]; // host from SNI cache or HTTP header
@@ -318,9 +329,95 @@ static __always_inline void resolve_host(struct scratch_buf *scratch,
 }
 
 // -----------------------------------------------------------------------------
-// Phase 2: Scan for "kloak:" secrets and rewrite.
+// Phase 2: Scan full TLS buffer for "kloak:" secrets and rewrite.
+// Uses bpf_loop() to iterate over 256-byte chunks with 41-byte overlap,
+// covering up to 16KB per TLS record (max ~77 chunks).
 // Host comparison uses fixed-size uint64 comparisons (no loops).
 // -----------------------------------------------------------------------------
+
+// Context passed to each bpf_loop callback invocation.
+struct scan_ctx {
+  __u64 user_data_ptr;
+  __u32 total_len;
+  __u32 host_value_len;
+  char host_value[MAX_HOST_LEN];
+  int rewritten;
+};
+
+// bpf_loop callback: read one 256-byte chunk into the per-CPU scratch buffer
+// and scan for kloak: tokens. Uses scratch->data instead of a stack-allocated
+// buffer to stay well within the 512-byte BPF stack limit.
+static int scan_chunk(__u32 chunk_idx, void *ctx) {
+  struct scan_ctx *sctx = (struct scan_ctx *)ctx;
+
+  __u32 offset = chunk_idx * CHUNK_STRIDE;
+  if (offset >= sctx->total_len)
+    return 1; // stop iteration
+
+  // Re-lookup per-CPU scratch buffer (verifier requires map lookup per frame)
+  __u32 zero = 0;
+  struct scratch_buf *scratch_data = bpf_map_lookup_elem(&scratch, &zero);
+  if (!scratch_data)
+    return 1;
+
+  __u32 read_len = sctx->total_len - offset;
+  if (read_len > MAX_DATA_SIZE)
+    read_len = MAX_DATA_SIZE;
+
+  bpf_probe_read_user(scratch_data->data, read_len,
+                      (void *)(sctx->user_data_ptr + offset));
+
+  for (__u32 i = 0; i < MAX_DATA_SIZE; i++) {
+    if (i + SECRET_KEY_LEN > read_len)
+      break;
+
+    if (scratch_data->data[i] != 'k')
+      continue;
+
+    if (scratch_data->data[i + 1] == 'l' &&
+        scratch_data->data[i + 2] == 'o' &&
+        scratch_data->data[i + 3] == 'a' &&
+        scratch_data->data[i + 4] == 'k' &&
+        scratch_data->data[i + 5] == ':') {
+
+      // 8-byte key lookup (kloak: + 2 UUID chars).
+      // Collision detection is done on the Go side at sync time.
+      struct secret_key key = {};
+      __builtin_memcpy(key.prefix, &scratch_data->data[i], SECRET_KEY_LEN);
+
+      struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
+      if (!val || val->len == 0 || val->len > SECRET_MAX_LEN)
+        continue;
+
+      // Host-based filtering: compare resolved host against allowed_host
+      if (val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
+        if (sctx->host_value_len == 0)
+          continue;
+
+        __u64 *host_a = (__u64 *)sctx->host_value;
+        __u64 *host_b = (__u64 *)val->allowed_host;
+        if (host_a[0] != host_b[0] || host_a[1] != host_b[1] ||
+            host_a[2] != host_b[2] || host_a[3] != host_b[3])
+          continue;
+      }
+
+      // Rewrite directly to user memory
+      __u32 safe_i = i & (MAX_DATA_SIZE - 1);
+      char *target = (char *)(sctx->user_data_ptr + offset + safe_i);
+
+      // Bound write_len to [1, 128] using pure arithmetic so the verifier
+      // can prove the range without relying on tracked register state
+      // (which gets lost across the host comparison in bpf_loop callbacks).
+      // val->len is already checked > 0 and <= SECRET_MAX_LEN above.
+      __u32 write_len = ((val->len - 1) & (SECRET_MAX_LEN - 1)) + 1;
+
+      bpf_probe_write_user(target, val->real_secret, write_len);
+      sctx->rewritten = 1;
+    }
+  }
+  return 0;
+}
+
 SEC("uprobe/phase2_rewrite")
 int bpf_phase2_rewrite(void *ctx) {
   __u32 zero = 0;
@@ -328,76 +425,31 @@ int bpf_phase2_rewrite(void *ctx) {
   if (!scratch_data)
     return 0;
 
-  __u32 read_len = scratch_data->read_len;
-  if (read_len > MAX_DATA_SIZE)
-    read_len = MAX_DATA_SIZE;
+  struct scan_ctx sctx = {
+    .user_data_ptr = scratch_data->user_data_ptr,
+    .total_len = scratch_data->total_data_len,
+    .host_value_len = scratch_data->host_value_len,
+    .rewritten = 0,
+  };
+  __builtin_memcpy(sctx.host_value, scratch_data->host_value, MAX_HOST_LEN);
 
-  int rewritten = 0;
+  __u32 num_chunks = (sctx.total_len + CHUNK_STRIDE - 1) / CHUNK_STRIDE;
 
-  for (__u32 i = 0; i < MAX_DATA_SIZE; i++) {
-    if (i + 16 > read_len)
-      break;
-
-    if (scratch_data->data[i] != 'k')
-      continue;
-
-    // Check for "kloak:"
-    if (scratch_data->data[i + 1] == 'l' && scratch_data->data[i + 2] == 'o' &&
-        scratch_data->data[i + 3] == 'a' && scratch_data->data[i + 4] == 'k' &&
-        scratch_data->data[i + 5] == ':') {
-
-      struct secret_key key = {};
-      __builtin_memcpy(key.prefix, &scratch_data->data[i], 16);
-
-      struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
-      if (val && val->len > 0 && val->len <= SECRET_MAX_LEN) {
-
-        // Host-based filtering: compare resolved host against allowed_host
-        // using fixed-size uint64 comparisons (no loop, no verifier complexity)
-        if (val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
-          if (scratch_data->host_value_len == 0)
-            continue;
-
-          // Compare as 4 x uint64 (covers all 32 bytes)
-          __u64 *host_a = (__u64 *)scratch_data->host_value;
-          __u64 *host_b = (__u64 *)val->allowed_host;
-          if (host_a[0] != host_b[0] || host_a[1] != host_b[1] ||
-              host_a[2] != host_b[2] || host_a[3] != host_b[3])
-            continue;
-        }
-
-        // Rewrite: bounds-check i for the verifier
-        __u32 safe_i = i & (MAX_DATA_SIZE - 1);
-        char *target = (char *)scratch_data->user_data_ptr + safe_i;
-
-        __u32 write_len = val->len;
-        if (write_len == 0)
-          continue;
-        if (write_len > SECRET_MAX_LEN)
-          write_len = SECRET_MAX_LEN;
-        /* Use 2*SECRET_MAX_LEN-1 as the verifier mask: covers [1,128] safely
-         * since write_len <= 128 <= 255. The previous mask (SECRET_MAX_LEN-1 = 127)
-         * incorrectly zeroed write_len when val->len == 128. */
-        write_len &= (2 * SECRET_MAX_LEN - 1);
-
-        bpf_probe_write_user(target, val->real_secret, write_len);
-        rewritten = 1;
-      }
-    }
-  }
+  bpf_loop(num_chunks, scan_chunk, &sctx, 0);
 
 #ifdef KLOAK_DEBUG
-  bpf_printk("kloak phase2: rewritten=%d", rewritten);
+  bpf_printk("kloak phase2: rewritten=%d total_len=%u chunks=%u",
+             sctx.rewritten, sctx.total_len, num_chunks);
 #endif
 
-  if (rewritten) {
+  if (sctx.rewritten) {
     struct tls_event *event =
         bpf_ringbuf_reserve(&tls_events, sizeof(struct tls_event), 0);
     if (event) {
       __u64 pid_tgid = bpf_get_current_pid_tgid();
       event->pid  = (__u32)(pid_tgid & 0xFFFFFFFF);
       event->tgid = (__u32)(pid_tgid >> 32);
-      event->len = read_len;
+      event->len = sctx.total_len;
       event->is_rewritten = 1;
       bpf_ringbuf_submit(event, 0);
     }
@@ -463,6 +515,7 @@ int bpf_uprobe_go_tls_write(void *ctx) {
 
   scratch_data->user_data_ptr = (__u64)data_ptr;
   scratch_data->read_len = read_len;
+  scratch_data->total_data_len = (__u32)data_len;
 
   // Go doesn't use OpenSSL, no ssl_ptr for SNI lookup — pass 0.
   resolve_host(scratch_data, 0);
@@ -528,6 +581,7 @@ int bpf_uprobe_ssl_write(void *ctx) {
 
   scratch_data->user_data_ptr = (__u64)data_ptr;
   scratch_data->read_len = read_len;
+  scratch_data->total_data_len = (__u32)num;
 
   // Look up SNI-cached hostname using the ssl pointer, fall back to HTTP Host
   resolve_host(scratch_data, (__u64)ssl_ptr);
