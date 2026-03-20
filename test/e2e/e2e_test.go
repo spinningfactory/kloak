@@ -24,9 +24,9 @@ const (
 )
 
 var (
-	clientset  *kubernetes.Clientset
-	repoRoot   string
-	overlayDir string // set from KLOAK_E2E_OVERLAY env var, defaults to "e2e"
+	clientset *kubernetes.Clientset
+	repoRoot  string
+	chartDir  string // path to the Helm chart directory
 )
 
 // findRepoRoot returns the absolute path to the repository root
@@ -66,13 +66,10 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	// Deploy Kloak using absolute path to overlay
-	overlayDir = os.Getenv("KLOAK_E2E_OVERLAY")
-	if overlayDir == "" {
-		overlayDir = "e2e"
-	}
-	overlayPath := filepath.Join(repoRoot, "config", "overlays", overlayDir)
-	if _, err := kubectl("apply", "-k", overlayPath); err != nil {
+	// Deploy Kloak using Helm chart
+	chartDir = filepath.Join(repoRoot, "charts", "kloak")
+	valuesFile := filepath.Join(repoRoot, "test", "e2e", "values-e2e.yaml")
+	if _, err := helm("install", "kloak", chartDir, "-n", kloakNamespace, "--create-namespace", "-f", valuesFile, "--wait", "--timeout", "120s"); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to deploy kloak: %v\n", err)
 		os.Exit(1)
 	}
@@ -125,8 +122,7 @@ func teardown() {
 	// Remove kloak deployment. The controller exits cleanly, flushing
 	// coverage data to the hostPath volume (/tmp/kloak-coverage on the
 	// k3d node) which CI copies after teardown.
-	overlayPath := filepath.Join(repoRoot, "config", "overlays", overlayDir)
-	_, _ = kubectl("delete", "-k", overlayPath, "--ignore-not-found")
+	_, _ = helm("uninstall", "kloak", "-n", kloakNamespace)
 }
 
 func dumpLogs() {

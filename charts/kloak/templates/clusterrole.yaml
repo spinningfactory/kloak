@@ -1,24 +1,9 @@
-apiVersion: v1
-kind: Namespace
-metadata:
-  name: kloak-system
-  labels:
-    app.kubernetes.io/name: kloak
----
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: kloak-controller
-  namespace: kloak-system
-  labels:
-    app.kubernetes.io/name: kloak
----
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
   name: kloak-controller
   labels:
-    app.kubernetes.io/name: kloak
+    {{- include "kloak.labels" . | nindent 4 }}
 rules:
   # Pod watching for controller
   - apiGroups: [""]
@@ -32,7 +17,7 @@ rules:
   - apiGroups: [""]
     resources: ["namespaces"]
     verbs: ["get", "list", "watch"]
-  # Workload reading for webhook enablement inheritance (pod → owner chain)
+  # Workload reading for webhook enablement inheritance (pod -> owner chain)
   - apiGroups: ["apps"]
     resources: ["replicasets", "deployments", "daemonsets", "statefulsets"]
     verbs: ["get", "list", "watch"]
@@ -48,18 +33,3 @@ rules:
   - apiGroups: ["admissionregistration.k8s.io"]
     resources: ["mutatingwebhookconfigurations"]
     verbs: ["get", "update", "patch"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: kloak-controller
-  labels:
-    app.kubernetes.io/name: kloak
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: kloak-controller
-subjects:
-  - kind: ServiceAccount
-    name: kloak-controller
-    namespace: kloak-system

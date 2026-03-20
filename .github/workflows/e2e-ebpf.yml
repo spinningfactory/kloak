@@ -50,6 +50,9 @@ jobs:
           docker pull bitnami/kubectl:latest
           k3d image import bitnami/kubectl:latest -c kloak-ebpf
 
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
       - name: Run E2E tests (with eBPF)
         run: go test -v -timeout 600s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:

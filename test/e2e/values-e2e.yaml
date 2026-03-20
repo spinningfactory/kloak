@@ -1,0 +1,6 @@
+image:
+  tag: e2e
+  pullPolicy: Never
+coverage:
+  enabled: true
+  hostPath: /tmp/kloak-coverage
