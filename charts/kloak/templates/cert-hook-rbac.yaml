@@ -1,0 +1,52 @@
+{{- if eq .Values.certificates.mode "auto" }}
+# ServiceAccount, ClusterRole, and ClusterRoleBinding created as pre-install
+# hooks so they exist before the cert-gen Job runs.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kloak-cert-gen
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: hook-succeeded,before-hook-creation
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kloak-cert-gen
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: hook-succeeded,before-hook-creation
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "create", "update"]
+  - apiGroups: ["admissionregistration.k8s.io"]
+    resources: ["mutatingwebhookconfigurations"]
+    verbs: ["get", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kloak-cert-gen
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "-5"
+    helm.sh/hook-delete-policy: hook-succeeded,before-hook-creation
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kloak-cert-gen
+subjects:
+  - kind: ServiceAccount
+    name: kloak-cert-gen
+    namespace: {{ .Release.Namespace }}
+{{- end }}

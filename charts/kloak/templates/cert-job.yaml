@@ -16,7 +16,7 @@ spec:
       labels:
         {{- include "kloak.selectorLabels" . | nindent 8 }}
     spec:
-      serviceAccountName: kloak-controller
+      serviceAccountName: kloak-cert-gen
       containers:
         - name: cert-gen
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
