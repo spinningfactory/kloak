@@ -41,8 +41,6 @@ spec:
               value: /coverage
             {{- end }}
           ports:
-            - name: metrics
-              containerPort: 8080
             - name: health
               containerPort: 8081
           volumeMounts:
