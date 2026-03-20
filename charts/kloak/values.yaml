@@ -3,10 +3,6 @@ image:
   tag: latest
   pullPolicy: IfNotPresent
 
-kubectlImage:
-  repository: bitnami/kubectl
-  tag: latest
-
 controller:
   ebpf:
     enabled: true
