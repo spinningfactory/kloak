@@ -68,7 +68,7 @@ func TestMain(m *testing.M) {
 
 	// Deploy Kloak using Helm chart
 	chartDir = filepath.Join(repoRoot, "charts", "kloak")
-	valuesFile := filepath.Join(chartDir, "values-e2e.yaml")
+	valuesFile := filepath.Join(repoRoot, "test", "e2e", "values-e2e.yaml")
 	if _, err := helm("install", "kloak", chartDir, "-n", kloakNamespace, "--create-namespace", "-f", valuesFile, "--wait", "--timeout", "120s"); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to deploy kloak: %v\n", err)
 		os.Exit(1)
