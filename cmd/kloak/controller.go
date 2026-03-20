@@ -41,18 +41,14 @@ The controller is responsible for:
 }
 
 var (
-	controllerMetricsAddr string
-	controllerProbeAddr   string
-	enableLeaderElection  bool
-	enableEBPF            bool
-	cgroupPath            string
-	certMode              string
+	controllerProbeAddr string
+	enableEBPF          bool
+	cgroupPath          string
+	certMode            string
 )
 
 func init() {
-	controllerCmd.Flags().StringVar(&controllerMetricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	controllerCmd.Flags().StringVar(&controllerProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	controllerCmd.Flags().BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 	controllerCmd.Flags().BoolVar(&enableEBPF, "enable-ebpf", false, "Enable eBPF traffic redirection (requires Linux + CAP_BPF).")
 	controllerCmd.Flags().StringVar(&cgroupPath, "cgroup-path", "/sys/fs/cgroup", "Path to cgroup v2 filesystem.")
 	controllerCmd.Flags().StringVar(&certMode, "cert-mode", "auto", "Certificate mode: 'auto' (generate if missing) or 'provided' (expect existing secrets).")
@@ -112,8 +108,6 @@ func runController(cmd *cobra.Command, args []string) {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		HealthProbeBindAddress: controllerProbeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "kloak-controller-leader",
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
