@@ -136,22 +136,6 @@ make test-linux    # Run tests in Linux VM
 make lima-shell    # Open shell in Lima VM
 ```
 
-## 📁 Project Structure
-
-```
-kloak/
-├── cmd/kloak/           # CLI commands
-├── pkg/
-│   ├── cgroups/         # cgroup management
-│   ├── controller/      # Kubernetes controller logic
-│   ├── ebpf/            # eBPF programs and bindings
-│   ├── storage/         # Secret storage backend
-│   └── webhook/         # Admission webhook (mutates secret volumes)
-├── bpf/                 # eBPF C source code
-├── config/              # Envoy and K8s manifests
-└── examples/            # Demo applications
-```
-
 ## 📄 License
 
 Apache 2.0
