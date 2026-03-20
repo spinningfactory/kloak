@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="website/transparent-logo.svg" alt="Kloak Logo" width="120" />
+  <a href="https://getkloak.io/"><img src="website/transparent-logo.svg" alt="Kloak Logo" width="120"/></a>
 </div>
 
 <h1 align="center"><a href="https://getkloak.io/">Kloak</a></h1>
