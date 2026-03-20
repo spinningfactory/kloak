@@ -4,6 +4,10 @@ metadata:
   name: kloak-mutating-webhook
   labels:
     {{- include "kloak.labels" . | nindent 4 }}
+  {{- if eq .Values.certificates.mode "certManager" }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/kloak-webhook-cert
+  {{- end }}
 webhooks:
   - name: pod.mutate.getkloak.io
     admissionReviewVersions: ["v1"]
@@ -13,7 +17,9 @@ webhooks:
         namespace: {{ .Release.Namespace }}
         name: kloak-webhook
         path: /mutate-pods
-      # caBundle is patched automatically by the controller on startup
+      {{- if eq .Values.certificates.mode "auto" }}
+      # caBundle is patched automatically by the cert-gen job
+      {{- end }}
     rules:
       - operations: ["CREATE"]
         apiGroups: [""]

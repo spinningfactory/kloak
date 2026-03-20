@@ -1,0 +1,18 @@
+{{- if eq .Values.certificates.mode "certManager" }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: kloak-webhook-cert
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+spec:
+  secretName: kloak-webhook-certs
+  issuerRef:
+    name: {{ .Values.certificates.certManager.issuerRef.name }}
+    kind: {{ .Values.certificates.certManager.issuerRef.kind }}
+  dnsNames:
+    - kloak-webhook
+    - kloak-webhook.{{ .Release.Namespace }}
+    - kloak-webhook.{{ .Release.Namespace }}.svc
+{{- end }}

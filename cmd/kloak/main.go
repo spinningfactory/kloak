@@ -17,6 +17,7 @@ API key management without exposing secrets in plain text.`,
 func init() {
 	rootCmd.AddCommand(controllerCmd)
 	rootCmd.AddCommand(webhookCmd)
+	rootCmd.AddCommand(certGenCmd)
 }
 
 func main() {

@@ -43,3 +43,14 @@ Selector labels (used in matchLabels).
 app.kubernetes.io/name: {{ include "kloak.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
+
+{{/*
+Certificate secret name.
+*/}}
+{{- define "kloak.certSecretName" -}}
+{{- if eq .Values.certificates.mode "provided" -}}
+{{ .Values.certificates.provided.secretName }}
+{{- else -}}
+kloak-webhook-certs
+{{- end -}}
+{{- end -}}

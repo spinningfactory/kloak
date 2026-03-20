@@ -1,0 +1,11 @@
+{{- if eq .Values.certificates.mode "certManager" }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: {{ .Values.certificates.certManager.issuerRef.name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+spec:
+  selfSigned: {}
+{{- end }}

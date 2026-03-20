@@ -19,24 +19,6 @@ spec:
         app.kubernetes.io/component: webhook
     spec:
       serviceAccountName: kloak-controller
-      initContainers:
-        - name: wait-for-certs
-          image: "{{ .Values.kubectlImage.repository }}:{{ .Values.kubectlImage.tag }}"
-          env:
-            - name: POD_NAMESPACE
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.namespace
-          command:
-            - sh
-            - -c
-            - |
-              echo "Waiting for webhook TLS certificate secret..."
-              until kubectl get secret kloak-webhook-certs -n "$POD_NAMESPACE" 2>/dev/null; do
-                echo "Secret not found, waiting..."
-                sleep 2
-              done
-              echo "TLS certificate secret found!"
       containers:
         - name: webhook
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -70,4 +52,4 @@ spec:
       volumes:
         - name: webhook-certs
           secret:
-            secretName: kloak-webhook-certs
+            secretName: {{ include "kloak.certSecretName" . }}
