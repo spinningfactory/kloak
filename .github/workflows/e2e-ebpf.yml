@@ -47,8 +47,6 @@ jobs:
       - name: Import images into k3d
         run: |
           k3d image import kloak:e2e kloak-demo-go:e2e kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-python-sni:latest -c kloak-ebpf
-          docker pull bitnami/kubectl:latest
-          k3d image import bitnami/kubectl:latest -c kloak-ebpf
 
       - name: Install Helm
         uses: azure/setup-helm@v4

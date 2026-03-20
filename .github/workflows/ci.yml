@@ -252,8 +252,6 @@ jobs:
           docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
           docker build -t kloak-demo-python-sni:latest ./examples/demo-python-sni/
           k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-python-sni:latest -c kloak-e2e
-          docker pull bitnami/kubectl:latest
-          k3d image import bitnami/kubectl:latest -c kloak-e2e
 
       - name: Install Helm
         uses: azure/setup-helm@v4
