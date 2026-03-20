@@ -1,0 +1,35 @@
+image:
+  repository: kloak
+  tag: latest
+  pullPolicy: IfNotPresent
+
+kubectlImage:
+  repository: bitnami/kubectl
+  tag: latest
+
+controller:
+  ebpf:
+    enabled: true
+  cgroupPath: /host/sys/fs/cgroup
+  certMode: auto
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+webhook:
+  replicas: 1
+  resources:
+    requests:
+      cpu: 10m
+      memory: 64Mi
+    limits:
+      cpu: 500m
+      memory: 128Mi
+
+coverage:
+  enabled: false
+  hostPath: /tmp/kloak-coverage

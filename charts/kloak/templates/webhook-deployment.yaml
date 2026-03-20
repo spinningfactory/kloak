@@ -2,27 +2,26 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: kloak-webhook
-  namespace: kloak-system
+  namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: kloak
+    {{- include "kloak.labels" . | nindent 4 }}
     app.kubernetes.io/component: webhook
 spec:
-  replicas: 1
+  replicas: {{ .Values.webhook.replicas }}
   selector:
     matchLabels:
-      app.kubernetes.io/name: kloak
+      {{- include "kloak.selectorLabels" . | nindent 6 }}
       app.kubernetes.io/component: webhook
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: kloak
+        {{- include "kloak.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: webhook
     spec:
       serviceAccountName: kloak-controller
-      # Wait for controller to create TLS certs before starting webhook
       initContainers:
         - name: wait-for-certs
-          image: bitnami/kubectl:latest
+          image: "{{ .Values.kubectlImage.repository }}:{{ .Values.kubectlImage.tag }}"
           env:
             - name: POD_NAMESPACE
               valueFrom:
@@ -40,8 +39,8 @@ spec:
               echo "TLS certificate secret found!"
       containers:
         - name: webhook
-          image: kloak:latest
-          imagePullPolicy: IfNotPresent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/kloak", "webhook"]
           args:
             - --cert-dir=/certs
@@ -67,58 +66,8 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:
-            limits:
-              cpu: 500m
-              memory: 128Mi
-            requests:
-              cpu: 10m
-              memory: 64Mi
+            {{- toYaml .Values.webhook.resources | nindent 12 }}
       volumes:
         - name: webhook-certs
           secret:
             secretName: kloak-webhook-certs
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: kloak-webhook
-  namespace: kloak-system
-  labels:
-    app.kubernetes.io/name: kloak
-    app.kubernetes.io/component: webhook
-spec:
-  ports:
-    - port: 443
-      targetPort: webhook
-      protocol: TCP
-  selector:
-    app.kubernetes.io/name: kloak
-    app.kubernetes.io/component: webhook
----
-apiVersion: admissionregistration.k8s.io/v1
-kind: MutatingWebhookConfiguration
-metadata:
-  name: kloak-mutating-webhook
-  labels:
-    app.kubernetes.io/name: kloak
-webhooks:
-  - name: pod.mutate.getkloak.io
-    admissionReviewVersions: ["v1"]
-    sideEffects: None
-    clientConfig:
-      service:
-        namespace: kloak-system
-        name: kloak-webhook
-        path: /mutate-pods
-      # caBundle is patched automatically by the controller on startup
-    rules:
-      - operations: ["CREATE"]
-        apiGroups: [""]
-        apiVersions: ["v1"]
-        resources: ["pods"]
-    namespaceSelector:
-      matchExpressions:
-        - key: getkloak.io/enabled
-          operator: In
-          values: ["true"]
-    failurePolicy: Fail
