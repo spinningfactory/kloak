@@ -93,8 +93,23 @@ Authorization: Bearer sk-live-xyz123...
 ## 🛠 Quick Start
 
 ### Prerequisites
-- **macOS**: Docker, Lima, kubectl, openssl
-- **Linux**: Docker, kubectl, openssl
+- A Kubernetes cluster (1.28+) with Linux kernel 5.17+
+- [Helm](https://helm.sh/docs/intro/install/) 3.12+
+- `kubectl` configured with cluster access
+
+### Install with Helm
+
+```bash
+# Add the Kloak Helm repository
+helm repo add kloak https://getkloak.github.io/kloak
+helm repo update
+
+# Install Kloak
+helm install kloak kloak/kloak -n kloak-system --create-namespace
+
+# Verify the installation
+kubectl get pods -n kloak-system
+```
 
 ### Try the Demo
 

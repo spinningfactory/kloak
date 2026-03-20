@@ -39,6 +39,12 @@ jobs:
           version: v2.4
           args: --timeout=5m
 
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Lint Helm chart
+        run: helm lint charts/kloak
+
   build:
     name: Build
     runs-on: ubuntu-latest
@@ -248,6 +254,9 @@ jobs:
           k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-python-sni:latest -c kloak-e2e
           docker pull bitnami/kubectl:latest
           k3d image import bitnami/kubectl:latest -c kloak-e2e
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
 
       - name: Run E2E tests (with eBPF)
         run: go test -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/

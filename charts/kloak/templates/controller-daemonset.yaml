@@ -2,34 +2,32 @@ apiVersion: apps/v1
 kind: DaemonSet
 metadata:
   name: kloak-controller
-  namespace: kloak-system
+  namespace: {{ .Release.Namespace }}
   labels:
-    app.kubernetes.io/name: kloak
+    {{- include "kloak.labels" . | nindent 4 }}
     app.kubernetes.io/component: controller
 spec:
   selector:
     matchLabels:
-      app.kubernetes.io/name: kloak
+      {{- include "kloak.selectorLabels" . | nindent 6 }}
       app.kubernetes.io/component: controller
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: kloak
+        {{- include "kloak.selectorLabels" . | nindent 8 }}
         app.kubernetes.io/component: controller
     spec:
       serviceAccountName: kloak-controller
-      hostPID: true  # Required for cgroup access
+      hostPID: true
       containers:
         - name: controller
-          image: kloak:latest
-          imagePullPolicy: IfNotPresent
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           command: ["/kloak", "controller"]
           args:
-            - --enable-ebpf=true
-            - --cgroup-path=/host/sys/fs/cgroup
+            - --enable-ebpf={{ .Values.controller.ebpf.enabled }}
+            - --cgroup-path={{ .Values.controller.cgroupPath }}
           env:
-
-            # Node name for filtering pods to only those on this node
             - name: NODE_NAME
               valueFrom:
                 fieldRef:
@@ -38,6 +36,10 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.namespace
+            {{- if .Values.coverage.enabled }}
+            - name: GOCOVERDIR
+              value: /coverage
+            {{- end }}
           ports:
             - name: metrics
               containerPort: 8080
@@ -57,7 +59,10 @@ spec:
             - name: btf
               mountPath: /sys/kernel/btf
               readOnly: true
-
+            {{- if .Values.coverage.enabled }}
+            - name: coverage
+              mountPath: /coverage
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -71,16 +76,11 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:
-            limits:
-              cpu: 500m
-              memory: 512Mi
-            requests:
-              cpu: 10m
-              memory: 64Mi
+            {{- toYaml .Values.controller.resources | nindent 12 }}
           securityContext:
-            privileged: true  # Required for eBPF
-            runAsGroup: 0 
-            runAsUser: 0 
+            privileged: true
+            runAsUser: 0
+            runAsGroup: 0
             appArmorProfile:
               type: Unconfined
             capabilities:
@@ -102,28 +102,9 @@ spec:
           hostPath:
             path: /sys/kernel/btf
             type: Directory
-
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: kloak-controller
-  namespace: kloak-system
-  labels:
-    app.kubernetes.io/name: kloak
-    app.kubernetes.io/component: controller
-spec:
-  # Headless service since each node has its own controller
-  clusterIP: None
-  ports:
-    - name: http-store
-      port: 8090
-      targetPort: 8090
-      protocol: TCP
-    - name: grpc-sync
-      port: 9090
-      targetPort: 9090
-      protocol: TCP
-  selector:
-    app.kubernetes.io/name: kloak
-    app.kubernetes.io/component: controller
+        {{- if .Values.coverage.enabled }}
+        - name: coverage
+          hostPath:
+            path: {{ .Values.coverage.hostPath }}
+            type: DirectoryOrCreate
+        {{- end }}
