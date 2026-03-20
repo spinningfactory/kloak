@@ -10,18 +10,19 @@ import (
 	"time"
 )
 
+// controllerLogs fetches the latest controller log output.
+func controllerLogs() string {
+	out, _ := kubectl("logs", "-n", kloakNamespace, "-l",
+		"app.kubernetes.io/component=controller", "--tail=200")
+	return out
+}
+
 // ebpfRewriteTest describes a single eBPF rewrite test case for a specific runtime.
 type ebpfRewriteTest struct {
-	// name is the subtest name (e.g. "go", "python", "js")
-	name string
-	// demoDir is the directory under examples/ containing deployment.yaml and Dockerfile
-	demoDir string
-	// deploymentName is the Kubernetes Deployment name
+	name           string
+	demoDir        string
 	deploymentName string
-	// appLabel is the label selector for the demo app pods
-	appLabel string
-	// startupWait is extra time to wait after deployment ready for the app to make requests
-	startupWait time.Duration
+	appLabel       string
 }
 
 var ebpfTests = []ebpfRewriteTest{
@@ -30,28 +31,24 @@ var ebpfTests = []ebpfRewriteTest{
 		demoDir:        "demo-go",
 		deploymentName: "demo-go",
 		appLabel:       "app=demo-go",
-		startupWait:    45 * time.Second, // 15s startup delay + request cycles
 	},
 	{
 		name:           "python",
 		demoDir:        "demo-python",
 		deploymentName: "demo-python",
 		appLabel:       "app=demo-python",
-		startupWait:    30 * time.Second,
 	},
 	{
 		name:           "js",
 		demoDir:        "demo-js",
 		deploymentName: "demo-js",
 		appLabel:       "app=demo-js",
-		startupWait:    30 * time.Second,
 	},
 	{
 		name:           "go-boringssl",
 		demoDir:        "demo-go-boring",
 		deploymentName: "demo-go-boring",
 		appLabel:       "app=demo-go-boring",
-		startupWait:    45 * time.Second,
 	},
 }
 
@@ -72,18 +69,10 @@ func TestEBPFSNIHostFiltering(t *testing.T) {
 	assertShadowSecret(t, "secret-allowed", allowedData)
 	assertShadowSecret(t, "secret-blocked", blockedData)
 
-	tc := ebpfRewriteTest{
-		name:           "python-sni",
-		demoDir:        "demo-python-sni",
-		deploymentName: "demo-python-sni",
-		appLabel:       "app=demo-python-sni",
-		startupWait:    45 * time.Second,
-	}
-
-	demoManifest := filepath.Join(repoRoot, "examples", tc.demoDir, "deployment.yaml")
+	demoManifest := filepath.Join(repoRoot, "examples", "demo-python-sni", "deployment.yaml")
 	_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
 	if err != nil {
-		t.Fatalf("failed to deploy %s: %v", tc.demoDir, err)
+		t.Fatalf("failed to deploy demo-python-sni: %v", err)
 	}
 	t.Cleanup(func() {
 		_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
@@ -91,40 +80,42 @@ func TestEBPFSNIHostFiltering(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	if err := waitForDeploymentReady(ctx, testNamespace, tc.deploymentName); err != nil {
-		demoDesc, _ := kubectl("describe", "deployment", "-n", testNamespace, tc.deploymentName)
-		t.Logf("deployment describe:\n%s", demoDesc)
-		t.Fatalf("%s not ready: %v", tc.deploymentName, err)
+	if err := waitForDeploymentReady(ctx, testNamespace, "demo-python-sni"); err != nil {
+		t.Fatalf("demo-python-sni not ready: %v", err)
 	}
 
-	ctrlLogs, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=50")
-	t.Logf("=== Controller logs (after deploy %s) ===\n%s", tc.name, ctrlLogs)
-
-	t.Logf("Waiting %s for %s to make requests...", tc.startupWait, tc.name)
-	time.Sleep(tc.startupWait)
-
-	out, err := kubectl("logs", "-n", testNamespace, "-l", tc.appLabel, "--tail=50")
-	if err != nil {
-		t.Fatalf("failed to read %s logs: %v", tc.name, err)
+	// Poll app logs for the real secret value
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer pollCancel()
+	var out string
+	for {
+		select {
+		case <-pollCtx.Done():
+			t.Logf("=== demo-python-sni final logs ===\n%s", out)
+			t.Logf("=== Controller logs ===\n%s", controllerLogs())
+			t.Fatalf("timed out waiting for allowed secret in SNI demo logs")
+		default:
+		}
+		out, _ = kubectl("logs", "-n", testNamespace, "-l", "app=demo-python-sni", "--tail=200")
+		if strings.Contains(out, "REAL-ALLOWED-KEY-12345") {
+			break
+		}
+		time.Sleep(pollInterval)
 	}
-	t.Logf("=== %s demo app logs ===\n%s", tc.name, out)
+	t.Logf("=== demo-python-sni logs ===\n%s", out)
 
-	ctrlLogsAfter, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=50")
-	t.Logf("=== Controller logs (after %s requests) ===\n%s", tc.name, ctrlLogsAfter)
-
-	// The payload is raw TLS (non-HTTP), so there's no Host header fallback.
-	// Host filtering can only work via SNI captured from SSL_set_tlsext_host_name.
-	if !strings.Contains(out, "REAL-ALLOWED-KEY-12345") {
-		t.Errorf("[%s] allowed secret should be rewritten via SNI host filtering (SNI=httpbin.org matches hosts=httpbin.org)", tc.name)
-	}
 	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {
-		t.Errorf("[%s] blocked secret should NOT be rewritten (SNI=httpbin.org does not match hosts=example.com)", tc.name)
+		t.Errorf("blocked secret should NOT be rewritten (host mismatch)")
 	}
 }
 
 func TestEBPFSecretRewrite(t *testing.T) {
-	// Create secrets shared by all demo apps.
-	// Key must be "api-key" to match deployment volume mount paths.
+	// Wait for stale shadows from previous tests to be garbage-collected
+	gcCtx, gcCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer gcCancel()
+	_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-allowed-kloak")
+	_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-blocked-kloak")
+
 	allowedData := map[string][]byte{"api-key": []byte("REAL-ALLOWED-KEY-12345")}
 	blockedData := map[string][]byte{"api-key": []byte("REAL-BLOCKED-KEY-67890")}
 
@@ -146,7 +137,6 @@ func TestEBPFSecretRewrite(t *testing.T) {
 }
 
 func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
-	// Deploy the demo app
 	demoManifest := filepath.Join(repoRoot, "examples", tc.demoDir, "deployment.yaml")
 	_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
 	if err != nil {
@@ -156,7 +146,6 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 		_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
 	})
 
-	// Wait for deployment ready
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	if err := waitForDeploymentReady(ctx, testNamespace, tc.deploymentName); err != nil {
@@ -165,45 +154,39 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 		t.Fatalf("%s not ready: %v", tc.deploymentName, err)
 	}
 
-	// Dump controller logs to see uprobe attachment
-	ctrlLogs, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=50")
-	t.Logf("=== Controller logs (after deploy %s) ===\n%s", tc.name, ctrlLogs)
-
-	// Wait for startup + request cycles
-	t.Logf("Waiting %s for %s to make requests...", tc.startupWait, tc.name)
-	time.Sleep(tc.startupWait)
-
-	// Read demo app logs
-	out, err := kubectl("logs", "-n", testNamespace, "-l", tc.appLabel, "--tail=50")
-	if err != nil {
-		t.Fatalf("failed to read %s logs: %v", tc.name, err)
+	// Poll app logs for the real secret value (definitive per-app check).
+	// This replaces the old arbitrary sleep — we poll until the app has
+	// made at least one request and the eBPF rewrite is visible in output.
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer pollCancel()
+	var out string
+	for {
+		select {
+		case <-pollCtx.Done():
+			t.Logf("=== %s final logs ===\n%s", tc.name, out)
+			t.Logf("=== Controller logs ===\n%s", controllerLogs())
+			t.Fatalf("[%s] timed out waiting for allowed secret in app logs", tc.name)
+		default:
+		}
+		out, _ = kubectl("logs", "-n", testNamespace, "-l", tc.appLabel, "--tail=200")
+		if strings.Contains(out, "REAL-ALLOWED-KEY-12345") {
+			break
+		}
+		time.Sleep(pollInterval)
 	}
 	t.Logf("=== %s demo app logs ===\n%s", tc.name, out)
 
-	// Dump controller logs after requests
-	ctrlLogsAfter, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=50")
-	t.Logf("=== Controller logs (after %s requests) ===\n%s", tc.name, ctrlLogsAfter)
-
-	// Verify the allowed secret was rewritten to the real value
-	if !strings.Contains(out, "REAL-ALLOWED-KEY-12345") {
-		t.Errorf("[%s] logs should contain the real allowed secret (eBPF should have replaced kloak:UUID)", tc.name)
-	}
-
-	// Verify the blocked secret was NOT rewritten (wrong host restriction)
 	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {
-		t.Errorf("[%s] logs should NOT contain the real blocked secret (host restriction should prevent replacement)", tc.name)
+		t.Errorf("[%s] logs should NOT contain the real blocked secret", tc.name)
 	}
 
-	// Clean up deployment before next subtest to free resources
+	// Clean up deployment before next subtest
 	_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
-	// Brief wait for pod termination
-	time.Sleep(5 * time.Second)
+	time.Sleep(2 * time.Second)
 }
 
 // TestEBPFSecretLengths verifies that secrets of different lengths (8 to 100 bytes)
-// are correctly rewritten. Uses the SNI demo app (raw TLS, no HTTP) to exercise
-// the bpf_loop scanner with variable-length secrets and the 8-byte BPF key.
-// Runs last to avoid secret name collisions with TestEBPFSecretRewrite.
+// are correctly rewritten. Runs last to avoid secret name collisions.
 func TestEBPFSecretLengths(t *testing.T) {
 	type lengthCase struct {
 		name    string
@@ -220,6 +203,14 @@ func TestEBPFSecretLengths(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			// Wait for stale secrets and shadows from previous tests to be cleaned up
+			gcCtx, gcCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer gcCancel()
+			_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-allowed")
+			_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-blocked")
+			_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-allowed-kloak")
+			_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-blocked-kloak")
+
 			allowedData := map[string][]byte{"api-key": []byte(tc.allowed)}
 			blockedData := map[string][]byte{"api-key": []byte(tc.blocked)}
 
@@ -233,42 +224,23 @@ func TestEBPFSecretLengths(t *testing.T) {
 			assertShadowSecret(t, "secret-allowed", allowedData)
 			assertShadowSecret(t, "secret-blocked", blockedData)
 
-			demo := ebpfRewriteTest{
-				name:           "python-sni-" + tc.name,
-				demoDir:        "demo-python-sni",
-				deploymentName: "demo-python-sni",
-				appLabel:       "app=demo-python-sni",
-				startupWait:    45 * time.Second,
-			}
-
-			demoManifest := filepath.Join(repoRoot, "examples", demo.demoDir, "deployment.yaml")
+			demoManifest := filepath.Join(repoRoot, "examples", "demo-python-sni", "deployment.yaml")
 			_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
 			if err != nil {
 				t.Fatalf("failed to deploy: %v", err)
 			}
 			t.Cleanup(func() {
 				_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
-				time.Sleep(5 * time.Second)
+				time.Sleep(2 * time.Second)
 			})
 
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()
-			if err := waitForDeploymentReady(ctx, testNamespace, demo.deploymentName); err != nil {
+			if err := waitForDeploymentReady(ctx, testNamespace, "demo-python-sni"); err != nil {
 				t.Fatalf("deployment not ready: %v", err)
 			}
 
-			t.Logf("Waiting %s for %s requests...", demo.startupWait, demo.name)
-			time.Sleep(demo.startupWait)
-
-			out, err := kubectl("logs", "-n", testNamespace, "-l", demo.appLabel, "--tail=50")
-			if err != nil {
-				t.Fatalf("failed to read logs: %v", err)
-			}
-			t.Logf("=== %s logs ===\n%s", demo.name, out)
-
-			// Check for a unique prefix of each secret. For long secrets, TLS
-			// recv may return slightly fewer bytes, but the distinctive prefix
-			// confirms the eBPF rewrite happened.
+			// Check prefix to poll for (use first 20 chars for long secrets)
 			allowedCheck := tc.allowed
 			if len(allowedCheck) > 20 {
 				allowedCheck = allowedCheck[:20]
@@ -277,9 +249,27 @@ func TestEBPFSecretLengths(t *testing.T) {
 			if len(blockedCheck) > 20 {
 				blockedCheck = blockedCheck[:20]
 			}
-			if !strings.Contains(out, allowedCheck) {
-				t.Errorf("allowed secret (%d bytes) should be rewritten — prefix %q not found in logs", len(tc.allowed), allowedCheck)
+
+			// Poll app logs for the allowed secret prefix
+			pollCtx, pollCancel := context.WithTimeout(context.Background(), 90*time.Second)
+			defer pollCancel()
+			var out string
+			for {
+				select {
+				case <-pollCtx.Done():
+					t.Logf("=== python-sni-%s final logs ===\n%s", tc.name, out)
+					t.Logf("=== Controller logs ===\n%s", controllerLogs())
+					t.Fatalf("allowed secret (%d bytes) not rewritten — prefix %q not found", len(tc.allowed), allowedCheck)
+				default:
+				}
+				out, _ = kubectl("logs", "-n", testNamespace, "-l", "app=demo-python-sni", "--tail=200")
+				if strings.Contains(out, allowedCheck) {
+					break
+				}
+				time.Sleep(pollInterval)
 			}
+			t.Logf("=== python-sni-%s logs ===\n%s", tc.name, out)
+
 			if strings.Contains(out, blockedCheck) {
 				t.Errorf("blocked secret (%d bytes) should NOT be rewritten — prefix %q found in logs", len(tc.blocked), blockedCheck)
 			}

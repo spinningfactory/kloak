@@ -55,10 +55,7 @@ func TestShadowSecretUpdate(t *testing.T) {
 		t.Fatalf("failed to update secret: %v", err)
 	}
 
-	// Wait for reconciler to process
-	time.Sleep(3 * time.Second)
-
-	// Verify shadow is updated with new length
+	// Verify shadow is updated with new length (assertShadowSecret polls until ready)
 	updatedData := map[string][]byte{
 		"key": []byte("updated-value-here!!"),
 	}
@@ -97,11 +94,13 @@ func TestNonEnabledSecretIgnored(t *testing.T) {
 	}
 	createPlainSecret(t, "test-no-shadow", data)
 
-	// Wait a bit and verify no shadow is created
-	time.Sleep(5 * time.Second)
-
-	_, err := clientset.CoreV1().Secrets(testNamespace).Get(context.Background(), "test-no-shadow-kloak", metav1.GetOptions{})
+	// Poll briefly and verify no shadow is created.
+	// Use a short timeout — if the shadow doesn't appear in 10s, it won't.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	err := waitForSecret(ctx, testNamespace, "test-no-shadow-kloak")
 	if err == nil {
 		t.Fatal("shadow secret should NOT exist for non-enabled secret")
 	}
+	// Expected: timeout (no shadow created) — that's the passing case
 }

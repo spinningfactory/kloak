@@ -47,15 +47,19 @@ func TestPodDeletion(t *testing.T) {
 		t.Fatalf("failed to delete pod: %v", err)
 	}
 
-	// Brief wait to ensure controller processes the delete
-	time.Sleep(3 * time.Second)
-
-	// Verify controller is still healthy
-	out, err := kubectl("get", "pods", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "-o", "jsonpath={.items[0].status.phase}")
-	if err != nil {
-		t.Fatalf("failed to check controller pod: %v", err)
-	}
-	if out != "Running" {
-		t.Errorf("controller pod phase is %q, expected Running", out)
+	// Poll until controller has processed the deletion and is still healthy
+	healthCtx, healthCancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer healthCancel()
+	for {
+		select {
+		case <-healthCtx.Done():
+			t.Fatal("timed out waiting for controller to remain healthy after pod deletion")
+		default:
+		}
+		out, err := kubectl("get", "pods", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "-o", "jsonpath={.items[0].status.phase}")
+		if err == nil && out == "Running" {
+			break
+		}
+		time.Sleep(pollInterval)
 	}
 }
