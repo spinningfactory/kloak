@@ -1,8 +1,8 @@
 <div align="center">
-  <img src="website/transparent-logo.svg" alt="Kloak Logo" width="120" />
+  <a href="https://getkloak.io/"><img src="website/transparent-logo.svg" alt="Kloak Logo" width="120"/></a>
 </div>
 
-<h1 align="center">Kloak</h1>
+<h1 align="center"><a href="https://getkloak.io/">Kloak</a></h1>
 
 <p align="center">
   <b>Secure Your Secrets, Agentless</b><br>
@@ -149,22 +149,6 @@ make lima-start    # Start Lima VM
 make generate-ebpf # Generate eBPF code
 make test-linux    # Run tests in Linux VM
 make lima-shell    # Open shell in Lima VM
-```
-
-## 📁 Project Structure
-
-```
-kloak/
-├── cmd/kloak/           # CLI commands
-├── pkg/
-│   ├── cgroups/         # cgroup management
-│   ├── controller/      # Kubernetes controller logic
-│   ├── ebpf/            # eBPF programs and bindings
-│   ├── storage/         # Secret storage backend
-│   └── webhook/         # Admission webhook (mutates secret volumes)
-├── bpf/                 # eBPF C source code
-├── config/              # Envoy and K8s manifests
-└── examples/            # Demo applications
 ```
 
 ## 📄 License
