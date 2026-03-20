@@ -2,7 +2,7 @@
   <img src="website/transparent-logo.svg" alt="Kloak Logo" width="120" />
 </div>
 
-<h1 align="center">Kloak</h1>
+<h1 align="center"><a href="https://getkloak.io/">Kloak</a></h1>
 
 <p align="center">
   <b>Secure Your Secrets, Agentless</b><br>
