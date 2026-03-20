@@ -45,10 +45,6 @@ spec:
               containerPort: 8080
             - name: health
               containerPort: 8081
-            - name: http-store
-              containerPort: 8090
-            - name: grpc-sync
-              containerPort: 9090
           volumeMounts:
             - name: cgroup
               mountPath: /host/sys/fs/cgroup
