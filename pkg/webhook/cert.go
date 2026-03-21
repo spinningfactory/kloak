@@ -77,14 +77,14 @@ func EnsureWebhookCerts(ctx context.Context, c client.Client, namespace string) 
 		return nil, fmt.Errorf("failed to create secret %s: %w", SecretName, err)
 	}
 
-	if err := patchWebhookConfiguration(ctx, c, certPEM); err != nil {
+	if err := PatchWebhookConfiguration(ctx, c, certPEM); err != nil {
 		return nil, fmt.Errorf("failed to patch webhook configuration: %w", err)
 	}
 
 	return certPEM, nil
 }
 
-func patchWebhookConfiguration(ctx context.Context, c client.Client, certPEM []byte) error {
+func PatchWebhookConfiguration(ctx context.Context, c client.Client, certPEM []byte) error {
 	webhookConfig := &admissionregistrationv1.MutatingWebhookConfiguration{}
 	err := c.Get(ctx, types.NamespacedName{Name: "kloak-mutating-webhook"}, webhookConfig)
 	if err != nil {

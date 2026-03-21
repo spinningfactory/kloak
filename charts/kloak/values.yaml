@@ -7,7 +7,6 @@ controller:
   ebpf:
     enabled: true
   cgroupPath: /host/sys/fs/cgroup
-  certMode: auto
   resources:
     requests:
       cpu: 10m
@@ -25,6 +24,17 @@ webhook:
     limits:
       cpu: 500m
       memory: 128Mi
+
+certificates:
+  mode: auto  # auto | certManager | provided
+  provided:
+    secretName: kloak-webhook-certs
+    certKey: tls.crt
+    keyKey: tls.key
+  certManager:
+    issuerRef:
+      name: kloak-selfsigned
+      kind: Issuer
 
 coverage:
   enabled: false

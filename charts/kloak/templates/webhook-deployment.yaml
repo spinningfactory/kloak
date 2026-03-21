@@ -52,4 +52,11 @@ spec:
       volumes:
         - name: webhook-certs
           secret:
-            secretName: kloak-webhook-certs
+            secretName: {{ include "kloak.certSecretName" . }}
+            {{- if eq .Values.certificates.mode "provided" }}
+            items:
+              - key: {{ .Values.certificates.provided.certKey }}
+                path: tls.crt
+              - key: {{ .Values.certificates.provided.keyKey }}
+                path: tls.key
+            {{- end }}
