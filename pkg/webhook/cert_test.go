@@ -185,7 +185,7 @@ func TestPatchWebhookConfiguration_NotFound(t *testing.T) {
 	ctx := context.Background()
 
 	// Should not error when webhook config doesn't exist
-	err := patchWebhookConfiguration(ctx, c, []byte("cert-data"))
+	err := PatchWebhookConfiguration(ctx, c, []byte("cert-data"))
 	if err != nil {
 		t.Fatalf("should not error when webhook config is not found: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestPatchWebhookConfiguration_NoMatchingWebhook(t *testing.T) {
 	c := newFakeClient(webhookConfig)
 	ctx := context.Background()
 
-	err := patchWebhookConfiguration(ctx, c, []byte("cert-data"))
+	err := PatchWebhookConfiguration(ctx, c, []byte("cert-data"))
 	if err != nil {
 		t.Fatalf("should not error for non-matching webhook: %v", err)
 	}
