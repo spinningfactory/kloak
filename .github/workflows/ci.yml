@@ -13,6 +13,7 @@ env:
   GO_VERSION: '1.25'
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+
 jobs:
   lint:
     name: Lint
