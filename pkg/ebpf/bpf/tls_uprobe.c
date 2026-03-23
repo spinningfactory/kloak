@@ -622,35 +622,25 @@ int tp_exit_connect(struct trace_event_raw_sys_exit *ctx) {
 }
 
 // -----------------------------------------------------------------------------
-// sys_enter_write tracepoint — stage 2 of SSL_do_handshake fd correlation.
-//
-// Fires on every write(fd, buf, count) syscall. Filtered in three stages:
-//   1. tracked_tgids[tgid] — non-tracked processes exit in ~50ns
-//   2. handshake_pending[{tgid, tid}] — tracked processes without pending
-//      handshake exit in ~100ns (hash lookup miss)
-//   3. Only threads in active SSL handshake do real work: store fd in
-//      ssl_fd_map and delete the pending entry (one-shot).
-// -----------------------------------------------------------------------------
-
-SEC("tracepoint/syscalls/sys_enter_write")
-int tp_enter_write(struct trace_event_raw_sys_enter *ctx) {
-  __u64 pid_tgid = bpf_get_current_pid_tgid();
-  __u32 tgid = (__u32)(pid_tgid >> 32);
-
-  if (!bpf_map_lookup_elem(&tracked_tgids, &tgid))
-    return 0;
-
-  __u32 pid = (__u32)(pid_tgid & 0xFFFFFFFF);
-
+// Shared logic for write/writev fd correlation (stage 2 of SSL_do_handshake).
+// Called from tp_enter_write and tp_enter_writev with the socket fd.
+// Only stores the mapping if the fd is a tracked TCP connection (in conn_ip_map),
+// filtering out writes to pipes, files, stdout, etc.
+static __always_inline void try_complete_handshake(__u32 tgid, __u32 pid,
+                                                   __u32 fd) {
   struct handshake_pending_key hkey = {.tgid = tgid, .pid = pid};
   struct handshake_pending_val *hval =
       bpf_map_lookup_elem(&handshake_pending, &hkey);
   if (!hval)
-    return 0;
+    return;
 
-  __u32 fd = (__u32)ctx->args[0];
+  // Only accept fds that are tracked TCP connections (from connect tracepoint).
+  // This filters out writes to pipes, files, stdout, etc.
+  struct conn_ip_key cik = {.tgid = tgid, .fd = fd};
+  if (!bpf_map_lookup_elem(&conn_ip_map, &cik))
+    return;
+
   __u64 ssl_ptr = hval->ssl_ptr;
-
   bpf_map_delete_elem(&handshake_pending, &hkey);
 
   struct ssl_fd_key sfk;
@@ -662,9 +652,41 @@ int tp_enter_write(struct trace_event_raw_sys_enter *ctx) {
   bpf_map_update_elem(&ssl_fd_map, &sfk, &sfv, BPF_ANY);
 
 #ifdef KLOAK_DEBUG
-  bpf_printk("kloak hs_write: tgid=%u fd=%u ssl=%llx", tgid, fd, ssl_ptr);
+  bpf_printk("kloak hs_fd: tgid=%u fd=%u ssl=%llx", tgid, fd, ssl_ptr);
 #endif
+}
 
+// -----------------------------------------------------------------------------
+// sys_enter_write tracepoint — stage 2 of SSL_do_handshake fd correlation.
+// Catches Python (blocking OpenSSL) which uses write() for socket I/O.
+// write(fd, buf, count): args[0]=fd
+// -----------------------------------------------------------------------------
+
+SEC("tracepoint/syscalls/sys_enter_write")
+int tp_enter_write(struct trace_event_raw_sys_enter *ctx) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+  if (!bpf_map_lookup_elem(&tracked_tgids, &tgid))
+    return 0;
+  __u32 pid = (__u32)(pid_tgid & 0xFFFFFFFF);
+  try_complete_handshake(tgid, pid, (__u32)ctx->args[0]);
+  return 0;
+}
+
+// -----------------------------------------------------------------------------
+// sys_enter_writev tracepoint — same as tp_enter_write but for writev().
+// Catches Node.js (libuv) which uses writev() for socket I/O.
+// writev(fd, iov, iovcnt): args[0]=fd
+// -----------------------------------------------------------------------------
+
+SEC("tracepoint/syscalls/sys_enter_writev")
+int tp_enter_writev(struct trace_event_raw_sys_enter *ctx) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+  if (!bpf_map_lookup_elem(&tracked_tgids, &tgid))
+    return 0;
+  __u32 pid = (__u32)(pid_tgid & 0xFFFFFFFF);
+  try_complete_handshake(tgid, pid, (__u32)ctx->args[0]);
   return 0;
 }
 

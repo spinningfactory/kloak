@@ -143,6 +143,7 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 		{"syscalls", "sys_enter_connect", objs.TpEnterConnect},
 		{"syscalls", "sys_exit_connect", objs.TpExitConnect},
 		{"syscalls", "sys_enter_write", objs.TpEnterWrite},
+		{"syscalls", "sys_enter_writev", objs.TpEnterWritev},
 	}
 
 	var tpLinks []link.Link
