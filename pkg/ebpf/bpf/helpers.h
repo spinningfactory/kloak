@@ -7,6 +7,14 @@
 
 #ifdef __BPF__
 #define HELPER_INLINE static __always_inline
+// After a guard like "if (offset >= DNS_MAX_LEN) return 0", the compiler
+// proves offset < DNS_MAX_LEN and ELIMINATES "offset & (DNS_MAX_LEN-1)" as a
+// no-op. The BPF verifier then sees an unbounded register in pointer arithmetic.
+// This barrier breaks the compiler's value-range reasoning across the fence,
+// forcing the AND instruction to be emitted for the verifier.
+#ifndef barrier_var
+#define barrier_var(var) asm volatile("" : "+r"(var) : :)
+#endif
 #else
 #include <stdint.h>
 #include <string.h>
@@ -14,6 +22,9 @@ typedef uint8_t  __u8;
 typedef uint32_t __u32;
 typedef uint64_t __u64;
 #define HELPER_INLINE static inline
+#ifndef barrier_var
+#define barrier_var(var) ((void)(var))
+#endif
 #ifndef MAX_HOST_LEN
 #define MAX_HOST_LEN 32
 #endif
@@ -133,8 +144,11 @@ HELPER_INLINE __u32 dns_skip_name(const char *pkt, __u32 pkt_len,
   for (__u32 i = 0; i < 8; i++) {
     if (offset >= pkt_len || offset >= DNS_MAX_LEN)
       return 0; // out of bounds
-    // Mask with (DNS_MAX_LEN-1) so the BPF verifier sees a compile-time-constant
-    // bound on the pointer arithmetic, preventing "unbounded memory access".
+    // barrier_var prevents the compiler from eliminating the AND mask below.
+    // Without it, after the guard proves offset < DNS_MAX_LEN, the compiler
+    // optimizes away "offset & (DNS_MAX_LEN-1)" as a no-op, and the BPF
+    // verifier then sees an unbounded pointer arithmetic operation.
+    barrier_var(offset);
     __u8 b = (__u8)pkt[offset & (DNS_MAX_LEN - 1)];
     if (b == 0)
       return offset + 1; // null terminator: name ends here
@@ -157,36 +171,48 @@ HELPER_INLINE __u32 dns_skip_name(const char *pkt, __u32 pkt_len,
 // Returns the number of bytes written (not counting any null terminator),
 // or 0 if the name could not be decoded. host_out is NOT null-terminated
 // by this function (caller zeroes the buffer before calling).
+//
+// Implementation note: uses a FLAT single loop (not nested) to avoid BPF
+// verifier state explosion. Nested loops (8 outer × 63 inner = 504 iterations)
+// each produce unique concrete register states that defeat the verifier's state
+// pruning, hitting the 1M-instruction limit. A single loop of MAX_HOST_LEN+8
+// iterations produces at most 40 states and stays well within the budget.
 HELPER_INLINE __u32 dns_decode_qname(const char *pkt, __u32 pkt_len,
                                       __u32 offset, char *host_out,
                                       __u32 host_max) {
   __u32 host_len = 0;
-  // Outer loop: one iteration per label, max 8 labels
-  for (__u32 i = 0; i < 8; i++) {
+  __u32 label_rem = 0; // bytes remaining in the current label
+  __u8  after_first = 0; // have we emitted at least one label yet?
+
+  // Flat loop: reads at most MAX_HOST_LEN content bytes + 8 label-length bytes.
+  for (__u32 i = 0; i < MAX_HOST_LEN + 8; i++) {
     if (offset >= pkt_len || offset >= DNS_MAX_LEN)
       break;
-    // Mask so the BPF verifier sees a concrete bound on the pointer offset.
-    __u8 label_len = (__u8)pkt[offset & (DNS_MAX_LEN - 1)];
-    if (label_len == 0)
-      break; // end of name
-    if ((label_len & 0xC0) != 0)
-      break; // compression not expected in question section
-    if (label_len > 63)
-      break; // invalid per RFC 1035
+    // barrier_var prevents the compiler from eliminating the AND mask below.
+    // After the guard above, the compiler proves offset < DNS_MAX_LEN and would
+    // eliminate "offset & (DNS_MAX_LEN-1)" as a no-op, leaving the BPF verifier
+    // with an unbounded pointer arithmetic operation.
+    barrier_var(offset);
+    __u8 c = (__u8)pkt[offset & (DNS_MAX_LEN - 1)];
     offset++;
-    // Insert dot separator between labels
-    if (host_len > 0 && host_len < host_max)
-      host_out[host_len++] = '.';
-    // Copy label bytes — inner loop bounded at 63 (max label length per RFC)
-    for (__u32 j = 0; j < 63; j++) {
-      if (j >= (__u32)label_len)
-        break;
-      if (host_len >= host_max)
-        break; // truncate if output full
-      if (offset >= pkt_len || offset >= DNS_MAX_LEN)
-        break;
-      host_out[host_len++] = pkt[offset & (DNS_MAX_LEN - 1)];
-      offset++;
+
+    if (label_rem == 0) {
+      if (c == 0)
+        break;               // null terminator: name complete
+      if ((c & 0xC0) != 0)
+        break;               // compression pointer or reserved bits: stop
+      if (c > 63)
+        break;               // invalid label length per RFC 1035
+      label_rem = (__u32)c;
+      // Insert '.' separator between labels (not before the first one)
+      if (after_first && host_len < host_max)
+        host_out[host_len++] = '.';
+      after_first = 1;
+    } else {
+      // Content byte: copy to output if space remains
+      label_rem--;
+      if (host_len < host_max)
+        host_out[host_len++] = c;
     }
   }
   return host_len;

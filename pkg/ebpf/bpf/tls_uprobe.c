@@ -364,12 +364,16 @@ static __always_inline void process_dns_packet(struct dns_scratch_buf *scratch,
       break;
     off = name_end;
 
-    // Read TYPE (2), CLASS (2), TTL (4), RDLENGTH (2)
+    // Read TYPE (2), CLASS (2), TTL (4), RDLENGTH (2).
+    // Mask off with (DNS_MAX_LEN-1) at each access so the BPF verifier sees a
+    // concrete [0, 511] bound on the pointer offset — the u32 zero-extension
+    // shift pair (<<32 >>32) otherwise widens the verifier's range back to
+    // [0, 0xffffffff] even after the name_end + 10 > DNS_MAX_LEN guard above.
     __u16 rtype_be, rdlen_be;
     __u32 ttl_be;
-    __builtin_memcpy(&rtype_be, pkt + off,     2);
-    __builtin_memcpy(&ttl_be,   pkt + off + 4, 4);
-    __builtin_memcpy(&rdlen_be, pkt + off + 8, 2);
+    __builtin_memcpy(&rtype_be, pkt + (off & (DNS_MAX_LEN - 1)),     2);
+    __builtin_memcpy(&ttl_be,   pkt + (off & (DNS_MAX_LEN - 1)) + 4, 4);
+    __builtin_memcpy(&rdlen_be, pkt + (off & (DNS_MAX_LEN - 1)) + 8, 2);
     __u32 rtype = (__u32)__builtin_bswap16(rtype_be);
     __u32 ttl   = __builtin_bswap32(ttl_be);
     __u32 rdlen = (__u32)__builtin_bswap16(rdlen_be);
@@ -386,7 +390,8 @@ static __always_inline void process_dns_packet(struct dns_scratch_buf *scratch,
       struct dns_ip_key key;
       __builtin_memset(&key, 0, sizeof(key));
       key.tgid = tgid;
-      ipv4_to_mapped(key.ip, (__u8 *)(pkt + off));
+      // Mask ensures the verifier tracks a concrete [0,511] pointer offset.
+      ipv4_to_mapped(key.ip, (__u8 *)(pkt + (off & (DNS_MAX_LEN - 1))));
 
       struct dns_ip_val val = {};
       __builtin_memcpy(val.hostname, scratch->hostname, MAX_HOST_LEN);
@@ -409,7 +414,8 @@ static __always_inline void process_dns_packet(struct dns_scratch_buf *scratch,
       struct dns_ip_key key;
       __builtin_memset(&key, 0, sizeof(key));
       key.tgid = tgid;
-      __builtin_memcpy(key.ip, pkt + off, 16);
+      // Mask ensures the verifier tracks a concrete [0,511] pointer offset.
+      __builtin_memcpy(key.ip, pkt + (off & (DNS_MAX_LEN - 1)), 16);
 
       struct dns_ip_val val = {};
       __builtin_memcpy(val.hostname, scratch->hostname, MAX_HOST_LEN);
