@@ -131,9 +131,11 @@ HELPER_INLINE __u32 dns_skip_name(const char *pkt, __u32 pkt_len,
   // Fixed bound: a valid DNS name has at most 127 labels of 1 byte each,
   // but we cap at 8 to stay within BPF verifier complexity budget.
   for (__u32 i = 0; i < 8; i++) {
-    if (offset >= pkt_len)
+    if (offset >= pkt_len || offset >= DNS_MAX_LEN)
       return 0; // out of bounds
-    __u8 b = (__u8)pkt[offset];
+    // Mask with (DNS_MAX_LEN-1) so the BPF verifier sees a compile-time-constant
+    // bound on the pointer arithmetic, preventing "unbounded memory access".
+    __u8 b = (__u8)pkt[offset & (DNS_MAX_LEN - 1)];
     if (b == 0)
       return offset + 1; // null terminator: name ends here
     if ((b & 0xC0) == 0xC0)
@@ -142,7 +144,7 @@ HELPER_INLINE __u32 dns_skip_name(const char *pkt, __u32 pkt_len,
       return 0; // reserved bits set: malformed packet
     // Plain label: skip length byte + label_len bytes
     __u32 next = offset + 1 + (__u32)b;
-    if (next > pkt_len)
+    if (next > pkt_len || next > DNS_MAX_LEN)
       return 0; // label extends beyond packet
     offset = next;
   }
@@ -161,9 +163,10 @@ HELPER_INLINE __u32 dns_decode_qname(const char *pkt, __u32 pkt_len,
   __u32 host_len = 0;
   // Outer loop: one iteration per label, max 8 labels
   for (__u32 i = 0; i < 8; i++) {
-    if (offset >= pkt_len)
+    if (offset >= pkt_len || offset >= DNS_MAX_LEN)
       break;
-    __u8 label_len = (__u8)pkt[offset];
+    // Mask so the BPF verifier sees a concrete bound on the pointer offset.
+    __u8 label_len = (__u8)pkt[offset & (DNS_MAX_LEN - 1)];
     if (label_len == 0)
       break; // end of name
     if ((label_len & 0xC0) != 0)
@@ -180,9 +183,10 @@ HELPER_INLINE __u32 dns_decode_qname(const char *pkt, __u32 pkt_len,
         break;
       if (host_len >= host_max)
         break; // truncate if output full
-      if (offset >= pkt_len)
+      if (offset >= pkt_len || offset >= DNS_MAX_LEN)
         break;
-      host_out[host_len++] = pkt[offset++];
+      host_out[host_len++] = pkt[offset & (DNS_MAX_LEN - 1)];
+      offset++;
     }
   }
   return host_len;

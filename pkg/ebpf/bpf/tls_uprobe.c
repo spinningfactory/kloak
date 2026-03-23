@@ -286,20 +286,32 @@ struct tls_event {
 // -----------------------------------------------------------------------------
 
 // Returns 1 if src_ip (16-byte IPv4-mapped or IPv6) matches any dns_config entry.
+// Loop is fully unrolled with compile-time constant indices to satisfy the BPF
+// verifier: a for-loop over a map lookup creates a back-edge that the verifier
+// cannot prove terminates once the loop body updates abstract state.
 static __always_inline int is_dns_server(__u8 *src_ip) {
-  for (__u32 i = 0; i < 4; i++) {
-    struct dns_config_val *cfg = bpf_map_lookup_elem(&dns_config, &i);
-    if (!cfg)
-      continue;
-    // Compare 16 bytes using two 64-bit loads
-    __u64 a0, a1, b0, b1;
-    __builtin_memcpy(&a0, src_ip,     8);
-    __builtin_memcpy(&a1, src_ip + 8, 8);
-    __builtin_memcpy(&b0, cfg->ip,     8);
-    __builtin_memcpy(&b1, cfg->ip + 8, 8);
-    if (a0 == b0 && a1 == b1)
-      return 1;
-  }
+  __u64 a0, a1;
+  __builtin_memcpy(&a0, src_ip,     8);
+  __builtin_memcpy(&a1, src_ip + 8, 8);
+
+// Check one dns_config entry at compile-time constant index idx.
+#define _CHECK_DNS_ENTRY(idx) do {                                  \
+    __u32 _k = (idx);                                               \
+    struct dns_config_val *_cfg = bpf_map_lookup_elem(&dns_config, &_k); \
+    if (_cfg) {                                                     \
+      __u64 b0, b1;                                                 \
+      __builtin_memcpy(&b0, _cfg->ip,     8);                       \
+      __builtin_memcpy(&b1, _cfg->ip + 8, 8);                       \
+      if (a0 == b0 && a1 == b1) return 1;                           \
+    }                                                               \
+  } while (0)
+
+  _CHECK_DNS_ENTRY(0);
+  _CHECK_DNS_ENTRY(1);
+  _CHECK_DNS_ENTRY(2);
+  _CHECK_DNS_ENTRY(3);
+#undef _CHECK_DNS_ENTRY
+
   return 0;
 }
 
@@ -345,7 +357,10 @@ static __always_inline void process_dns_packet(struct dns_scratch_buf *scratch,
 
     // Skip answer NAME (usually a compressed pointer 0xC0xx, 2 bytes)
     __u32 name_end = dns_skip_name(pkt, pkt_len, off);
-    if (name_end == 0 || name_end + 10 > pkt_len)
+    // Require name_end + 10 fits in both pkt_len and DNS_MAX_LEN so the
+    // BPF verifier can prove all subsequent pkt[off..off+9] accesses are
+    // within the dns_scratch_buf.pkt[DNS_MAX_LEN] buffer.
+    if (name_end == 0 || name_end + 10 > pkt_len || name_end + 10 > DNS_MAX_LEN)
       break;
     off = name_end;
 
@@ -360,11 +375,14 @@ static __always_inline void process_dns_packet(struct dns_scratch_buf *scratch,
     __u32 rdlen = (__u32)__builtin_bswap16(rdlen_be);
     off += 10;
 
-    if (off + rdlen > pkt_len)
+    if (off + rdlen > pkt_len || off + rdlen > DNS_MAX_LEN)
       break;
 
     if (rtype == DNS_TYPE_A && rdlen == 4) {
-      // IPv4 answer: store as IPv4-mapped IPv6
+      // IPv4 answer: store as IPv4-mapped IPv6.
+      // Guard ensures off + 4 <= DNS_MAX_LEN so pkt + off is in-bounds.
+      if (off + 4 > DNS_MAX_LEN)
+        break;
       struct dns_ip_key key;
       __builtin_memset(&key, 0, sizeof(key));
       key.tgid = tgid;
@@ -384,7 +402,10 @@ static __always_inline void process_dns_packet(struct dns_scratch_buf *scratch,
 #endif
 
     } else if (rtype == DNS_TYPE_AAAA && rdlen == 16) {
-      // IPv6 answer
+      // IPv6 answer.
+      // Guard ensures off + 16 <= DNS_MAX_LEN so pkt + off is in-bounds.
+      if (off + 16 > DNS_MAX_LEN)
+        break;
       struct dns_ip_key key;
       __builtin_memset(&key, 0, sizeof(key));
       key.tgid = tgid;
