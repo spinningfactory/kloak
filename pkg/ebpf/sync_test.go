@@ -31,7 +31,7 @@ func createTestSecretMap(t *testing.T) *ciliumebpf.Map {
 	if err != nil {
 		t.Skipf("eBPF maps not available: %v", err)
 	}
-	t.Cleanup(func() { m.Close() })
+	t.Cleanup(func() { _ = m.Close() })
 	return m
 }
 

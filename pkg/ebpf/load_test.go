@@ -14,7 +14,7 @@ func loadTestObjects(t *testing.T) *tlsuprobeObjects {
 	if err := loadTlsuprobeObjects(objs, nil); err != nil {
 		t.Skipf("eBPF objects not available (need Linux kernel 5.17+): %v", err)
 	}
-	t.Cleanup(func() { objs.Close() })
+	t.Cleanup(func() { _ = objs.Close() })
 	return objs
 }
 
