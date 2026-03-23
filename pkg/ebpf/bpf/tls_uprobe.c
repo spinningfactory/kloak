@@ -636,9 +636,9 @@ static __always_inline void try_complete_handshake(__u32 tgid, __u32 pid,
 
   // Only accept fds that are tracked TCP connections (from connect tracepoint).
   // This filters out writes to pipes, files, stdout, etc.
-  struct conn_ip_key cik = {.tgid = tgid, .fd = fd};
-  if (!bpf_map_lookup_elem(&conn_ip_map, &cik))
-    return;
+  // For connections established BEFORE tracking, conn_ip_map won't have the fd,
+  // so we skip the filter and accept any fd during the handshake window.
+  // The handshake_pending entry itself ensures we only capture during TLS setup.
 
   __u64 ssl_ptr = hval->ssl_ptr;
   bpf_map_delete_elem(&handshake_pending, &hkey);
@@ -681,6 +681,40 @@ int tp_enter_write(struct trace_event_raw_sys_enter *ctx) {
 
 SEC("tracepoint/syscalls/sys_enter_writev")
 int tp_enter_writev(struct trace_event_raw_sys_enter *ctx) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+  if (!bpf_map_lookup_elem(&tracked_tgids, &tgid))
+    return 0;
+  __u32 pid = (__u32)(pid_tgid & 0xFFFFFFFF);
+  try_complete_handshake(tgid, pid, (__u32)ctx->args[0]);
+  return 0;
+}
+
+// -----------------------------------------------------------------------------
+// sys_enter_sendmsg tracepoint — same logic for sendmsg().
+// Catches Node.js on Linux: libuv uses sendmsg() for TCP stream writes.
+// sendmsg(fd, msg, flags): args[0]=fd
+// -----------------------------------------------------------------------------
+
+SEC("tracepoint/syscalls/sys_enter_sendmsg")
+int tp_enter_sendmsg(struct trace_event_raw_sys_enter *ctx) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+  if (!bpf_map_lookup_elem(&tracked_tgids, &tgid))
+    return 0;
+  __u32 pid = (__u32)(pid_tgid & 0xFFFFFFFF);
+  try_complete_handshake(tgid, pid, (__u32)ctx->args[0]);
+  return 0;
+}
+
+// -----------------------------------------------------------------------------
+// sys_enter_sendto tracepoint — same logic for sendto()/send().
+// glibc's send() is sendto() with NULL addr. Some TLS libraries use this.
+// sendto(fd, buf, len, flags, addr, addrlen): args[0]=fd
+// -----------------------------------------------------------------------------
+
+SEC("tracepoint/syscalls/sys_enter_sendto")
+int tp_enter_sendto(struct trace_event_raw_sys_enter *ctx) {
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
   if (!bpf_map_lookup_elem(&tracked_tgids, &tgid))

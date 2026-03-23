@@ -78,7 +78,7 @@ type sslFdKey struct {
 // Generate eBPF bindings. The KLOAK_TARGET_ARCH env var (set by Dockerfile or
 // Makefile) controls which __TARGET_ARCH_xxx define is passed to clang.
 // Defaults to arm64 for local development on macOS/Lima.
-//go:generate sh -c "ARCH=${KLOAK_TARGET_ARCH:-arm64}; go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags \"-O2 -g -Wall -Werror -D__TARGET_ARCH_${ARCH}\" tlsuprobe bpf/tls_uprobe.c -- -I../ebpf"
+//go:generate sh -c "ARCH=${KLOAK_TARGET_ARCH:-arm64}; go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags \"-O2 -g -Wall -Werror -D__TARGET_ARCH_${ARCH} -DKLOAK_DEBUG\" tlsuprobe bpf/tls_uprobe.c -- -I../ebpf"
 
 // TLSUprobeManager manages the loading and attaching of eBPF uprobes for TLS interception.
 type TLSUprobeManager struct {
@@ -144,6 +144,8 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 		{"syscalls", "sys_exit_connect", objs.TpExitConnect},
 		{"syscalls", "sys_enter_write", objs.TpEnterWrite},
 		{"syscalls", "sys_enter_writev", objs.TpEnterWritev},
+		{"syscalls", "sys_enter_sendmsg", objs.TpEnterSendmsg},
+		{"syscalls", "sys_enter_sendto", objs.TpEnterSendto},
 	}
 
 	var tpLinks []link.Link
