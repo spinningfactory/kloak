@@ -50,7 +50,7 @@ type secretValue struct {
 // Key: {tgid, _pad=0, ip[16]} — IPv4 stored as ::ffff:a.b.c.d.
 type dnsIPKey struct {
 	Tgid uint32
-	_    uint32  //nolint:structcheck
+	_    uint32 // padding to align IP to 8-byte boundary, must match C struct dns_ip_key
 	IP   [16]byte
 }
 
@@ -71,7 +71,7 @@ type connIPKey struct {
 // sslFdKey matches C struct ssl_fd_key used in ssl_fd_map.
 type sslFdKey struct {
 	Tgid   uint32
-	_      uint32 //nolint:structcheck
+	_      uint32 // padding to align SslPtr to 8-byte boundary, must match C struct ssl_fd_key
 	SslPtr uint64
 }
 
@@ -429,7 +429,7 @@ func readDNSServersFromResolvConf(pid int) []net.IP {
 	if err != nil {
 		return nil
 	}
-	defer f.Close() //nolint:errcheck
+	defer f.Close() //nolint:errcheck // read-only file, close error is inconsequential
 
 	var ips []net.IP
 	scanner := bufio.NewScanner(f)

@@ -7,7 +7,6 @@ import (
 	"crypto/x509"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"strings"
 	"testing"
@@ -69,7 +68,7 @@ func TestEBPFRewriteGoTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to start TLS listener: %v", err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() { _ = listener.Close() })
 	addr := listener.Addr().String()
 
 	// Server goroutine: accept one connection, read all data, send it to channel
@@ -80,7 +79,7 @@ func TestEBPFRewriteGoTLS(t *testing.T) {
 			received <- fmt.Sprintf("ERROR: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		data, err := io.ReadAll(conn)
 		if err != nil {
 			received <- fmt.Sprintf("ERROR: %v", err)
@@ -104,7 +103,7 @@ func TestEBPFRewriteGoTLS(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to open ringbuf reader: %v", err)
 	}
-	defer reader.Close()
+	t.Cleanup(func() { _ = reader.Close() })
 
 	// 7. Make a TLS connection and send the placeholder
 	certPool := x509.NewCertPool()
@@ -124,7 +123,9 @@ func TestEBPFRewriteGoTLS(t *testing.T) {
 	if _, err := conn.Write([]byte(payload)); err != nil {
 		t.Fatalf("failed to write: %v", err)
 	}
-	conn.Close()
+	if err := conn.Close(); err != nil {
+		t.Logf("conn.Close: %v", err)
+	}
 
 	// 8. Check what the server received
 	select {
@@ -203,7 +204,7 @@ func TestEBPFHostFiltering(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to start TLS listener: %v", err)
 	}
-	defer listener.Close()
+	t.Cleanup(func() { _ = listener.Close() })
 
 	received := make(chan string, 1)
 	go func() {
@@ -212,7 +213,7 @@ func TestEBPFHostFiltering(t *testing.T) {
 			received <- fmt.Sprintf("ERROR: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer func() { _ = conn.Close() }()
 		data, _ := io.ReadAll(conn)
 		received <- string(data)
 	}()
@@ -237,8 +238,12 @@ func TestEBPFHostFiltering(t *testing.T) {
 	}
 
 	payload := fmt.Sprintf("GET / HTTP/1.1\r\nHost: wrong.example.com\r\nX-Secret: %s\r\n\r\n", placeholder)
-	conn.Write([]byte(payload))
-	conn.Close()
+	if _, err := conn.Write([]byte(payload)); err != nil {
+		t.Fatalf("failed to write payload: %v", err)
+	}
+	if err := conn.Close(); err != nil {
+		t.Logf("conn.Close: %v", err)
+	}
 
 	select {
 	case data := <-received:
@@ -250,14 +255,4 @@ func TestEBPFHostFiltering(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("timeout")
 	}
-}
-
-// localListener creates a TCP listener on a random port, returning the listener and address.
-func localListener(t *testing.T) (net.Listener, string) {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("failed to listen: %v", err)
-	}
-	return l, l.Addr().String()
 }
