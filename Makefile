@@ -1,4 +1,4 @@
-.PHONY: all build build-linux test test-linux e2e e2e-setup e2e-run e2e-cleanup \
+.PHONY: all build build-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup \
         clean deps docker-build generate-ebpf generate-vmlinux run help \
         lima-start lima-stop lima-delete lima-shell lima-exec lima-check
 
@@ -67,6 +67,11 @@ test: deps
 # Run tests in Linux VM (for eBPF tests) - depends on Lima running
 test-linux: lima-ensure
 	$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go test -v ./..."
+
+# Run eBPF helper unit tests (pure C, no Linux/BPF required)
+test-bpf-helpers:
+	gcc -Wall -Werror -o /tmp/helpers_test pkg/ebpf/bpf/helpers_test.c
+	/tmp/helpers_test
 
 # E2E cluster and image configuration
 E2E_CLUSTER=kloak-e2e
