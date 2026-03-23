@@ -47,6 +47,11 @@ type Reconciler struct {
 	// delete event (where we only have the namespaced name) we can look up
 	// the UID and clean up trackedPods correctly.
 	podKeyToUID map[string]string
+
+	// podTGIDs maps pod UID -> slice of TGIDs registered in the tracked_tgids
+	// BPF map. Used to call UntrackTGID on pod deletion so the DNS/connect
+	// tracepoints stop processing syscalls for dead process groups.
+	podTGIDs map[string][]uint32
 }
 
 // NewReconciler creates a new pod reconciler.
@@ -63,6 +68,7 @@ func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, upr
 		NodeName:      nodeName,
 		trackedPods:   make(map[string]map[uint64]bool),
 		podKeyToUID:   make(map[string]string),
+		podTGIDs:      make(map[string][]uint32),
 	}
 }
 
@@ -159,11 +165,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Attach uprobes outside the lock — this involves filesystem I/O.
 	for _, cgroupID := range needsAttach {
-		if r.attachUprobesToCgroup(cgroupID, pod) {
+		if tgids := r.attachUprobesToCgroup(cgroupID, pod); len(tgids) > 0 {
 			r.mu.Lock()
 			if tracked := r.trackedPods[string(pod.UID)]; tracked != nil {
 				tracked[cgroupID] = true // mark as successfully attached
 			}
+			r.podTGIDs[string(pod.UID)] = append(r.podTGIDs[string(pod.UID)], tgids...)
 			r.mu.Unlock()
 		}
 	}
@@ -189,10 +196,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 }
 
 // attachUprobesToCgroup reads the cgroup's procs file to find a PID and calls the uprobe manager.
-// Returns true if at least one uprobe was successfully attached.
-func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) bool {
+// Returns the TGIDs (process group IDs) for which uprobes were successfully attached, or nil if none.
+func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) []uint32 {
 	if r.UprobeManager == nil {
-		return false
+		return nil
 	}
 
 	r.Log.Info("Trying to attach uprobes to new container", "cgroup", cgroupID)
@@ -224,32 +231,33 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) boo
 		pids, err := cgroups.ReadCgroupProcs(containerCgroupPath)
 		if err != nil {
 			r.Log.Error(err, "failed to read cgroup.procs", "path", containerCgroupPath)
-			return false
+			return nil
 		}
 
 		if len(pids) == 0 {
 			r.Log.V(1).Info("no PIDs found in cgroup.procs", "path", containerCgroupPath)
-			return false
+			return nil
 		}
 
 		// Attempt to attach uprobes to every PID in the cgroup.
 		// Containers may run multiple processes; we probe all of them so that
 		// whichever process makes TLS calls is instrumented. AttachTLS skips
 		// PIDs that have no compatible TLS symbols.
-		attached := false
+		// cgroup.procs lists TGIDs (process group leaders), so pid == tgid here.
+		var attachedTGIDs []uint32
 		for _, pid := range pids {
 			if err := r.UprobeManager.AttachTLS(pid); err != nil {
 				r.Log.V(1).Info("could not attach TLS uprobes to pid (no compatible symbols or already attached)", "pid", pid, "container", status.Name, "err", err)
 			} else {
 				r.Log.Info("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
-				attached = true
+				attachedTGIDs = append(attachedTGIDs, uint32(pid))
 			}
 		}
-		return attached
+		return attachedTGIDs
 	}
 
 	r.Log.V(1).Info("could not find matching container for cgroup", "cgroupID", cgroupID)
-	return false
+	return nil
 }
 
 // handleDelete removes a pod from tracking. uid is the pod UID (trackedPods key),
@@ -262,13 +270,23 @@ func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, erro
 		return ctrl.Result{}, nil
 	}
 
+	tgids := r.podTGIDs[uid]
 	// Uprobes will be automatically cleaned up by the uprobe component when
 	// the process dies, so we no longer have to detach them manually or remove cgroups from maps.
 	// Just remove the pod from our tracking.
 	delete(r.trackedPods, uid)
 	delete(r.podKeyToUID, namespacedName)
+	delete(r.podTGIDs, uid)
 	r.mu.Unlock()
 	r.Log.Info("stopped tracking pod", "pod", namespacedName, "uid", uid, "cgroupCount", len(cgroupIDs))
+
+	// Remove TGIDs from the tracked_tgids BPF map so DNS/connect tracepoints
+	// stop processing syscalls for these dead process groups.
+	if r.UprobeManager != nil {
+		for _, tgid := range tgids {
+			r.UprobeManager.UntrackTGID(tgid)
+		}
+	}
 
 	return ctrl.Result{}, nil
 }

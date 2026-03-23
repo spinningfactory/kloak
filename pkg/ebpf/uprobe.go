@@ -1,11 +1,13 @@
 package ebpf
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -44,6 +46,35 @@ type secretValue struct {
 	_           [2]byte  // padding to match C struct alignment
 }
 
+// dnsIPKey matches C struct dns_ip_key used in dns_ip_map.
+// Key: {tgid, _pad=0, ip[16]} — IPv4 stored as ::ffff:a.b.c.d.
+type dnsIPKey struct {
+	Tgid uint32
+	_    uint32  //nolint:structcheck
+	IP   [16]byte
+}
+
+// dnsIPVal matches C struct dns_ip_val.
+type dnsIPVal struct {
+	Hostname    [32]byte
+	HostLen     uint32
+	TTLSec      uint32
+	InsertedKNs uint64
+}
+
+// connIPKey matches C struct conn_ip_key used in conn_ip_map.
+type connIPKey struct {
+	Tgid uint32
+	Fd   uint32
+}
+
+// sslFdKey matches C struct ssl_fd_key used in ssl_fd_map.
+type sslFdKey struct {
+	Tgid   uint32
+	_      uint32 //nolint:structcheck
+	SslPtr uint64
+}
+
 // Generate eBPF bindings. The KLOAK_TARGET_ARCH env var (set by Dockerfile or
 // Makefile) controls which __TARGET_ARCH_xxx define is passed to clang.
 // Defaults to arm64 for local development on macOS/Lima.
@@ -58,6 +89,11 @@ type TLSUprobeManager struct {
 
 	// store provides access to secrets
 	store storage.Storage
+
+	// dnsConfigured is true once we've written at least one DNS server IP to
+	// the dns_config BPF map. We only need to do this once per node since all
+	// Kubernetes pods use the same cluster DNS server.
+	dnsConfigured bool
 }
 
 // NewTLSUprobeManager initializes a new uprobe manager.
@@ -96,11 +132,39 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 		return nil, fmt.Errorf("creating ringbuf reader: %w", err)
 	}
 
+	// Attach node-wide tracepoints for DNS response and TCP connect tracking.
+	// These are global hooks filtered by tracked_tgids in the BPF programs.
+	tpSpecs := []struct {
+		group, name string
+		prog        *ebpf.Program
+	}{
+		{"syscalls", "sys_enter_recvfrom", objs.TpEnterRecvfrom},
+		{"syscalls", "sys_exit_recvfrom", objs.TpExitRecvfrom},
+		{"syscalls", "sys_enter_connect", objs.TpEnterConnect},
+		{"syscalls", "sys_exit_connect", objs.TpExitConnect},
+	}
+
+	var tpLinks []link.Link
+	for _, tp := range tpSpecs {
+		l, tpErr := link.Tracepoint(tp.group, tp.name, tp.prog, nil)
+		if tpErr != nil {
+			log.Error(tpErr, "failed to attach tracepoint (DNS/connect tracking disabled)",
+				"tracepoint", tp.group+"/"+tp.name)
+			// Non-fatal: fall back to SNI-only host verification
+			break
+		}
+		tpLinks = append(tpLinks, l)
+	}
+
+	links := make([]link.Link, 0, len(tpLinks))
+	links = append(links, tpLinks...)
+
 	return &TLSUprobeManager{
 		objs:   objs,
 		reader: reader,
 		log:    log,
 		store:  store,
+		links:  links,
 	}, nil
 }
 
@@ -138,6 +202,9 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	// OpenSSL that expands to SSL_ctrl(ssl, 55, 0, name). Try both.
 	sniSymbols := []string{"SSL_set_tlsext_host_name"}
 	sniCtrlSymbols := []string{"SSL_ctrl"}
+	// SSL_set_fd links the SSL object to a socket fd, enabling the IP-verified
+	// host resolution chain: ssl_ptr → fd → peer IP → DNS hostname.
+	sslSetFdSymbols := []string{"SSL_set_fd"}
 	attached := false
 
 	// Try main executable first (catches statically linked BoringSSL/OpenSSL)
@@ -192,13 +259,52 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 				m.links = append(m.links, up)
 			}
 		}
+		for _, sym := range sslSetFdSymbols {
+			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslSetFd, nil)
+			if err == nil {
+				m.log.Info("Attached SSL_set_fd uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
+				m.links = append(m.links, up)
+			}
+		}
 	}
 
-	if attached {
-		return nil
+	// Also try SSL_set_fd on main executable (statically linked OpenSSL/BoringSSL)
+	for _, sym := range sslSetFdSymbols {
+		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslSetFd, nil)
+		if err == nil {
+			m.log.Info("Attached SSL_set_fd uprobe to main exe", "pid", pid, "symbol", sym)
+			m.links = append(m.links, up)
+		}
 	}
 
-	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
+	if !attached {
+		return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
+	}
+
+	// Mark this process group as monitored so DNS/connect tracepoints process it.
+	// In Kubernetes, cgroup.procs lists TGIDs (process group leaders) so pid == tgid.
+	tgid := uint32(pid)
+	if err := m.TrackTGID(tgid); err != nil {
+		m.log.Error(err, "failed to track TGID in BPF map", "tgid", tgid)
+	}
+
+	// Configure DNS server IP once per node (all Kubernetes pods share the same CoreDNS ClusterIP).
+	if !m.dnsConfigured {
+		dnsIPs := readDNSServersFromResolvConf(pid)
+		for i, ip := range dnsIPs {
+			if err := m.SetDNSServer(ip, uint32(i)); err != nil {
+				m.log.Error(err, "failed to set DNS server in BPF map", "ip", ip)
+			} else {
+				m.log.Info("Configured DNS server for interception", "ip", ip, "idx", i)
+				m.dnsConfigured = true
+			}
+		}
+		if !m.dnsConfigured {
+			m.log.Info("Could not read DNS server from resolv.conf — DNS-based host verification will be inactive", "pid", pid)
+		}
+	}
+
+	return nil
 }
 
 // findTLSLibraries scans /proc/<pid>/maps for shared libraries that may export
@@ -279,6 +385,68 @@ func (m *TLSUprobeManager) Close() error {
 		return fmt.Errorf("errors closing uprobe manager: %v", errs)
 	}
 	return nil
+}
+
+// TrackTGID marks a process group (tgid) as monitored in the tracked_tgids BPF
+// map so that node-wide tracepoints (DNS, connect) only process its syscalls.
+// Called from AttachTLS after a successful uprobe attachment.
+func (m *TLSUprobeManager) TrackTGID(tgid uint32) error {
+	val := uint8(1)
+	return m.objs.TrackedTgids.Put(tgid, val)
+}
+
+// UntrackTGID removes a process group from the tracked_tgids BPF map.
+// Best-effort: errors are logged but not propagated, since the process is
+// typically already dead (pod deletion) and LRU eviction handles overflow.
+func (m *TLSUprobeManager) UntrackTGID(tgid uint32) {
+	if err := m.objs.TrackedTgids.Delete(tgid); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+		m.log.V(1).Info("failed to untrack TGID", "tgid", tgid, "err", err)
+	}
+}
+
+// SetDNSServer stores a DNS server IP in the dns_config BPF map.
+// The map holds up to 4 entries (for resolv.conf with multiple nameservers).
+// idx 0 is always the primary server; subsequent calls add alternates.
+func (m *TLSUprobeManager) SetDNSServer(ip net.IP, idx uint32) error {
+	if idx >= 4 {
+		return nil // silently ignore extra entries
+	}
+	v16 := ip.To16()
+	if v16 == nil {
+		return fmt.Errorf("invalid IP: %v", ip)
+	}
+	var val [16]byte
+	copy(val[:], v16)
+	return m.objs.DnsConfig.Put(idx, val)
+}
+
+// readDNSServersFromResolvConf reads nameserver lines from a container's
+// /etc/resolv.conf via the process's mount namespace (/proc/<pid>/root).
+// Returns up to 4 IP addresses.
+func readDNSServersFromResolvConf(pid int) []net.IP {
+	path := fmt.Sprintf("/proc/%d/root/etc/resolv.conf", pid)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close() //nolint:errcheck
+
+	var ips []net.IP
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() && len(ips) < 4 {
+		line := strings.TrimSpace(scanner.Text())
+		if !strings.HasPrefix(line, "nameserver") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		if ip := net.ParseIP(fields[1]); ip != nil {
+			ips = append(ips, ip)
+		}
+	}
+	return ips
 }
 
 // PollEvents reads TLS events from the ring buffer and periodically syncs secrets to the eBPF map.

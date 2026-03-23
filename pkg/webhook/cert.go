@@ -111,6 +111,12 @@ func PatchWebhookConfiguration(ctx context.Context, c client.Client, certPEM []b
 	return nil
 }
 
+// GenerateSelfSignedCert creates a self-signed TLS certificate for the given namespace.
+// Exported for use by eBPF integration tests that need a test TLS server.
+func GenerateSelfSignedCert(namespace string) (certPEM, keyPEM []byte, err error) {
+	return generateSelfSignedCert(namespace)
+}
+
 func generateSelfSignedCert(namespace string) (certPEM, keyPEM []byte, err error) {
 	priv, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {

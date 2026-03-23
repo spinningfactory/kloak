@@ -190,6 +190,140 @@ static void test_prefix_exact_six(void) {
 }
 
 // ============================================================================
+// ipv4_to_mapped
+// ============================================================================
+
+static void test_ipv4_to_mapped_basic(void) {
+  __u8 out[16] = {0};
+  __u8 v4[4] = {1, 2, 3, 4};
+  ipv4_to_mapped(out, v4);
+  // bytes 0-9 must be zero
+  for (int i = 0; i < 10; i++) assert(out[i] == 0);
+  // bytes 10-11 must be 0xff
+  assert(out[10] == 0xff && out[11] == 0xff);
+  // bytes 12-15 must be the IPv4 address
+  assert(out[12] == 1 && out[13] == 2 && out[14] == 3 && out[15] == 4);
+}
+
+static void test_ipv4_to_mapped_loopback(void) {
+  __u8 out[16] = {0};
+  __u8 v4[4] = {127, 0, 0, 1};
+  ipv4_to_mapped(out, v4);
+  assert(out[10] == 0xff && out[11] == 0xff);
+  assert(out[12] == 127 && out[13] == 0 && out[14] == 0 && out[15] == 1);
+}
+
+static void test_ipv4_to_mapped_zeros(void) {
+  __u8 out[16];
+  // Fill with non-zero to confirm all bytes are set
+  memset(out, 0xAB, 16);
+  __u8 v4[4] = {0, 0, 0, 0};
+  ipv4_to_mapped(out, v4);
+  for (int i = 0; i < 10; i++) assert(out[i] == 0);
+  assert(out[10] == 0xff && out[11] == 0xff);
+  assert(out[12] == 0 && out[13] == 0 && out[14] == 0 && out[15] == 0);
+}
+
+// ============================================================================
+// dns_skip_name
+// ============================================================================
+
+// Simple label: \x03api\x06stripe\x03com\x00
+static void test_dns_skip_name_simple(void) {
+  const char pkt[] = "\x03" "api" "\x06" "stripe" "\x03" "com" "\x00";
+  __u32 pkt_len = (__u32)sizeof(pkt) - 1; // exclude C string null
+  __u32 result = dns_skip_name(pkt, pkt_len, 0);
+  // 1+3 + 1+6 + 1+3 + 1 = 16 bytes total
+  assert(result == 16);
+}
+
+// Compressed pointer: first two bytes = 0xC0 0x0C
+static void test_dns_skip_name_compressed(void) {
+  const char pkt[] = "\xC0\x0C" "extra";
+  __u32 pkt_len = (__u32)sizeof(pkt) - 1;
+  __u32 result = dns_skip_name(pkt, pkt_len, 0);
+  assert(result == 2); // compressed pointer is always exactly 2 bytes
+}
+
+// Root label: single null byte
+static void test_dns_skip_name_root(void) {
+  const char pkt[] = "\x00";
+  __u32 result = dns_skip_name(pkt, 1, 0);
+  assert(result == 1);
+}
+
+// Out-of-bounds: offset at end of packet
+static void test_dns_skip_name_oob(void) {
+  const char pkt[] = "\x03" "abc";
+  // pkt_len == 4, label says 3 bytes but offset=0 → next = 0+1+3 = 4, then
+  // loop continues, offset=4 >= pkt_len=4 → return 0
+  __u32 result = dns_skip_name(pkt, 4, 0);
+  // After consuming the label (offset moves to 4), loop tries to read pkt[4]
+  // which is out of bounds → return 0
+  assert(result == 0);
+}
+
+// Reserved bits (0x40xx) → error
+static void test_dns_skip_name_reserved_bits(void) {
+  const char pkt[] = "\x40\x03" "abc";
+  __u32 result = dns_skip_name(pkt, 5, 0);
+  assert(result == 0);
+}
+
+// ============================================================================
+// dns_decode_qname
+// ============================================================================
+
+// Single label: \x07example\x00 → "example"
+static void test_dns_decode_simple(void) {
+  const char pkt[] = "\x07" "example" "\x00";
+  __u32 pkt_len = (__u32)sizeof(pkt) - 1;
+  char host[MAX_HOST_LEN] = {0};
+  __u32 len = dns_decode_qname(pkt, pkt_len, 0, host, MAX_HOST_LEN);
+  assert(len == 7);
+  assert(memcmp(host, "example", 7) == 0);
+}
+
+// Three labels: \x03api\x06stripe\x03com\x00 → "api.stripe.com"
+static void test_dns_decode_multi_label(void) {
+  const char pkt[] = "\x03" "api" "\x06" "stripe" "\x03" "com" "\x00";
+  __u32 pkt_len = (__u32)sizeof(pkt) - 1;
+  char host[MAX_HOST_LEN] = {0};
+  __u32 len = dns_decode_qname(pkt, pkt_len, 0, host, MAX_HOST_LEN);
+  assert(len == 14); // "api.stripe.com"
+  assert(memcmp(host, "api.stripe.com", 14) == 0);
+}
+
+// Output truncation: small host_max clips result
+static void test_dns_decode_truncate(void) {
+  const char pkt[] = "\x03" "api" "\x06" "stripe" "\x03" "com" "\x00";
+  __u32 pkt_len = (__u32)sizeof(pkt) - 1;
+  char host[8] = {0}; // only 8 bytes
+  __u32 len = dns_decode_qname(pkt, pkt_len, 0, host, 8);
+  assert(len <= 8);
+  // First 3 bytes should be "api"
+  assert(memcmp(host, "api", 3) == 0);
+}
+
+// Root zone (single null byte) → empty result
+static void test_dns_decode_root(void) {
+  const char pkt[] = "\x00";
+  char host[MAX_HOST_LEN] = {0};
+  __u32 len = dns_decode_qname(pkt, 1, 0, host, MAX_HOST_LEN);
+  assert(len == 0);
+}
+
+// Out-of-bounds offset → returns 0 without crashing
+static void test_dns_decode_oob(void) {
+  const char pkt[] = "\x05" "hello"; // missing null terminator, label runs to end
+  __u32 pkt_len = (__u32)sizeof(pkt) - 1;
+  char host[MAX_HOST_LEN] = {0};
+  // offset already past packet length
+  __u32 len = dns_decode_qname(pkt, pkt_len, pkt_len + 10, host, MAX_HOST_LEN);
+  assert(len == 0);
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -224,6 +358,25 @@ int main(void) {
   RUN_TEST(test_prefix_uppercase);
   RUN_TEST(test_prefix_wrong_char);
   RUN_TEST(test_prefix_exact_six);
+
+  printf("ipv4_to_mapped:\n");
+  RUN_TEST(test_ipv4_to_mapped_basic);
+  RUN_TEST(test_ipv4_to_mapped_loopback);
+  RUN_TEST(test_ipv4_to_mapped_zeros);
+
+  printf("dns_skip_name:\n");
+  RUN_TEST(test_dns_skip_name_simple);
+  RUN_TEST(test_dns_skip_name_compressed);
+  RUN_TEST(test_dns_skip_name_root);
+  RUN_TEST(test_dns_skip_name_oob);
+  RUN_TEST(test_dns_skip_name_reserved_bits);
+
+  printf("dns_decode_qname:\n");
+  RUN_TEST(test_dns_decode_simple);
+  RUN_TEST(test_dns_decode_multi_label);
+  RUN_TEST(test_dns_decode_truncate);
+  RUN_TEST(test_dns_decode_root);
+  RUN_TEST(test_dns_decode_oob);
 
   printf("\n%d/%d tests passed.\n", tests_passed, tests_run);
   return 0;
