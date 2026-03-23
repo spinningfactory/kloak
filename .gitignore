@@ -23,6 +23,7 @@ bin/
 *_bpfel.go
 *_bpfeb.go
 *.o
+pkg/ebpf/bpf/bpf_helper_defs.h
 
 # Kubernetes
 kubeconfig
