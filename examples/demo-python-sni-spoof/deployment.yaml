@@ -1,0 +1,75 @@
+# Two ClusterIP Services back the same demo pod on port 8443.
+# Their different ClusterIPs are key to the test:
+#   svc-spoof-allowed → ClusterIP_A   (the hostname the secret is restricted to)
+#   svc-spoof-other   → ClusterIP_B   (a different hostname for the spoof target)
+# eBPF records dns_ip_map[ClusterIP_A] = "svc-spoof-allowed..." and
+#              dns_ip_map[ClusterIP_B] = "svc-spoof-other..."
+# Connecting to ClusterIP_B with SNI=svc-spoof-allowed fails the IP-hostname check.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-spoof-allowed
+  labels:
+    app: demo-python-sni-spoof
+spec:
+  selector:
+    app: demo-python-sni-spoof
+  ports:
+    - port: 8443
+      targetPort: 8443
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: svc-spoof-other
+  labels:
+    app: demo-python-sni-spoof
+spec:
+  selector:
+    app: demo-python-sni-spoof
+  ports:
+    - port: 8443
+      targetPort: 8443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-python-sni-spoof
+  labels:
+    app: demo-python-sni-spoof
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-python-sni-spoof
+  template:
+    metadata:
+      labels:
+        app: demo-python-sni-spoof
+      annotations:
+        getkloak.io/enabled: "true"
+    spec:
+      containers:
+        - name: demo-app
+          image: kloak-demo-python-sni-spoof:latest
+          imagePullPolicy: Never
+          env:
+            - name: SECRET_FILE
+              value: "/etc/secrets/api-key"
+            - name: ALLOWED_SVC
+              value: "svc-spoof-allowed.kloak-e2e.svc.cluster.local"
+            - name: OTHER_SVC
+              value: "svc-spoof-other.kloak-e2e.svc.cluster.local"
+            - name: REQUEST_INTERVAL
+              value: "5"
+          ports:
+            - containerPort: 8443
+          volumeMounts:
+            - name: secret-vol
+              mountPath: "/etc/secrets"
+              readOnly: true
+      volumes:
+        - name: secret-vol
+          secret:
+            secretName: secret-spoof

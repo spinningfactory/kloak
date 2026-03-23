@@ -185,6 +185,72 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 	time.Sleep(2 * time.Second)
 }
 
+// TestEBPFSNISpoofingPrevention verifies that Kloak's DNS-based host verification
+// prevents secret rewriting when an app connects to the wrong IP while claiming
+// to be connecting to the allowed hostname via SNI.
+//
+// Setup: two Kubernetes Services (svc-spoof-allowed, svc-spoof-other) back the
+// same demo pod on port 8443. They have different ClusterIPs. Kloak's eBPF
+// intercepts DNS responses and records dns_ip_map[ClusterIP] = hostname for each.
+//
+// Legitimate path: connect to ClusterIP_A (resolved for svc-spoof-allowed) with
+// SNI = svc-spoof-allowed → eBPF verifies IP matches DNS record → REWRITE.
+//
+// Spoof path: connect to ClusterIP_B (resolved for svc-spoof-other) but set
+// SNI = svc-spoof-allowed → eBPF sees IP_B maps to svc-spoof-other ≠ svc-spoof-allowed
+// → NO REWRITE.
+func TestEBPFSNISpoofingPrevention(t *testing.T) {
+	// Secret restricted to svc-spoof-allowed's DNS name (first 32 chars stored in BPF map).
+	secretData := map[string][]byte{"api-key": []byte("REAL-SPOOF-SECRET-12345678901234")}
+	createEnabledSecret(t, "secret-spoof", secretData, map[string]string{
+		"getkloak.io/hosts": "svc-spoof-allowed.kloak-e2e.svc.cluster.local",
+	})
+	assertShadowSecret(t, "secret-spoof", secretData)
+
+	demoManifest := filepath.Join(repoRoot, "examples", "demo-python-sni-spoof", "deployment.yaml")
+	_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
+	if err != nil {
+		t.Fatalf("failed to deploy demo-python-sni-spoof: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := waitForDeploymentReady(ctx, testNamespace, "demo-python-sni-spoof"); err != nil {
+		t.Fatalf("demo-python-sni-spoof not ready: %v", err)
+	}
+
+	// Poll until the legitimate path has been rewritten at least once.
+	// This confirms the eBPF DNS chain is working before we check the spoof path.
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer pollCancel()
+	var out string
+	for {
+		select {
+		case <-pollCtx.Done():
+			t.Logf("=== demo-python-sni-spoof final logs ===\n%s", out)
+			t.Logf("=== Controller logs ===\n%s", controllerLogs())
+			t.Fatalf("timed out: LEGIT_REWRITTEN never appeared — DNS verification chain may not be active")
+		default:
+		}
+		out, _ = kubectl("logs", "-n", testNamespace, "-l", "app=demo-python-sni-spoof", "--tail=200")
+		if strings.Contains(out, "LEGIT_REWRITTEN") {
+			break
+		}
+		time.Sleep(pollInterval)
+	}
+	t.Logf("=== demo-python-sni-spoof logs ===\n%s", out)
+
+	if strings.Contains(out, "SPOOF_REWRITTEN") {
+		t.Errorf("DNS spoofing prevention FAILED: secret was rewritten despite IP/hostname mismatch")
+	}
+	if !strings.Contains(out, "SPOOF_NOT_REWRITTEN") {
+		t.Logf("WARNING: SPOOF_NOT_REWRITTEN not yet seen in logs (may appear in next iteration)")
+	}
+}
+
 // TestEBPFSecretLengths verifies that secrets of different lengths (8 to 100 bytes)
 // are correctly rewritten. Runs last to avoid secret name collisions.
 func TestEBPFSecretLengths(t *testing.T) {

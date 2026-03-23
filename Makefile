@@ -95,8 +95,9 @@ e2e-setup:
 	@docker build -t kloak-demo-python:latest ./examples/demo-python/
 	@docker build -t kloak-demo-js:latest ./examples/demo-js/
 	@docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
+	@docker build -t kloak-demo-python-sni-spoof:latest ./examples/demo-python-sni-spoof/
 	@echo "==> Importing images into k3d..."
-	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest -c $(E2E_CLUSTER)
+	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-python-sni-spoof:latest -c $(E2E_CLUSTER)
 	@docker pull bitnami/kubectl:latest
 	@k3d image import bitnami/kubectl:latest -c $(E2E_CLUSTER)
 	@echo "==> E2E environment ready."
