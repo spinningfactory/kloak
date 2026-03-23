@@ -46,6 +46,8 @@
 // OpenSSL SSL_ctrl cmd value for SSL_set_tlsext_host_name macro
 #define SSL_CTRL_SET_TLSEXT_HOSTNAME 55
 
+#include "helpers.h"
+
 // BPF Map: shadow secret prefix -> real secret value
 struct secret_key {
   char prefix[SECRET_KEY_LEN];
@@ -293,39 +295,8 @@ static __always_inline void resolve_host(struct scratch_buf *scratch,
   // Fallback: parse HTTP "Host: " header from the plaintext data.
   // This handles Go connections (which don't call SSL_set_tlsext_host_name)
   // and any connection where SNI wasn't captured.
-  __u32 read_len = scratch->read_len;
-  if (read_len > MAX_DATA_SIZE)
-    read_len = MAX_DATA_SIZE;
-
-  __u32 host_start = 0;
-  for (__u32 i = 0; i < 256; i++) {
-    if (i + 6 > read_len)
-      break;
-
-    if (scratch->data[i] == 'H' && scratch->data[i + 1] == 'o' &&
-        scratch->data[i + 2] == 's' && scratch->data[i + 3] == 't' &&
-        scratch->data[i + 4] == ':' && scratch->data[i + 5] == ' ') {
-      host_start = i + 6;
-      scratch->host_offset = host_start;
-      break;
-    }
-  }
-
-  if (host_start == 0)
-    return;
-
-  __u32 host_len = 0;
-  for (__u32 j = 0; j < MAX_HOST_LEN; j++) {
-    __u32 idx = host_start + j;
-    if (idx >= read_len)
-      break;
-    char c = scratch->data[idx];
-    if (c == '\r' || c == '\n' || c == ':')
-      break;
-    scratch->host_value[j] = c;
-    host_len++;
-  }
-  scratch->host_value_len = host_len;
+  scratch->host_value_len = parse_http_host(scratch->data, scratch->read_len,
+                                            scratch->host_value, MAX_HOST_LEN);
 }
 
 // -----------------------------------------------------------------------------
@@ -371,49 +342,39 @@ static int scan_chunk(__u32 chunk_idx, void *ctx) {
     if (i + SECRET_KEY_LEN > read_len)
       break;
 
-    if (scratch_data->data[i] != 'k')
+    if (!is_kloak_prefix(&scratch_data->data[i]))
       continue;
 
-    if (scratch_data->data[i + 1] == 'l' &&
-        scratch_data->data[i + 2] == 'o' &&
-        scratch_data->data[i + 3] == 'a' &&
-        scratch_data->data[i + 4] == 'k' &&
-        scratch_data->data[i + 5] == ':') {
+    // 8-byte key lookup (kloak: + 2 UUID chars).
+    // Collision detection is done on the Go side at sync time.
+    struct secret_key key = {};
+    __builtin_memcpy(key.prefix, &scratch_data->data[i], SECRET_KEY_LEN);
 
-      // 8-byte key lookup (kloak: + 2 UUID chars).
-      // Collision detection is done on the Go side at sync time.
-      struct secret_key key = {};
-      __builtin_memcpy(key.prefix, &scratch_data->data[i], SECRET_KEY_LEN);
+    struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
+    if (!val || val->len == 0 || val->len > SECRET_MAX_LEN)
+      continue;
 
-      struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
-      if (!val || val->len == 0 || val->len > SECRET_MAX_LEN)
+    // Host-based filtering: compare resolved host against allowed_host
+    if (val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
+      if (sctx->host_value_len == 0)
         continue;
 
-      // Host-based filtering: compare resolved host against allowed_host
-      if (val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
-        if (sctx->host_value_len == 0)
-          continue;
-
-        __u64 *host_a = (__u64 *)sctx->host_value;
-        __u64 *host_b = (__u64 *)val->allowed_host;
-        if (host_a[0] != host_b[0] || host_a[1] != host_b[1] ||
-            host_a[2] != host_b[2] || host_a[3] != host_b[3])
-          continue;
-      }
-
-      // Rewrite directly to user memory
-      __u32 safe_i = i & (MAX_DATA_SIZE - 1);
-      char *target = (char *)(sctx->user_data_ptr + offset + safe_i);
-
-      // Bound write_len to [1, 128] using pure arithmetic so the verifier
-      // can prove the range without relying on tracked register state
-      // (which gets lost across the host comparison in bpf_loop callbacks).
-      // val->len is already checked > 0 and <= SECRET_MAX_LEN above.
-      __u32 write_len = ((val->len - 1) & (SECRET_MAX_LEN - 1)) + 1;
-
-      bpf_probe_write_user(target, val->real_secret, write_len);
-      sctx->rewritten = 1;
+      if (!hosts_match(sctx->host_value, val->allowed_host))
+        continue;
     }
+
+    // Rewrite directly to user memory
+    __u32 safe_i = i & (MAX_DATA_SIZE - 1);
+    char *target = (char *)(sctx->user_data_ptr + offset + safe_i);
+
+    // Bound write_len to [1, 128] using pure arithmetic so the verifier
+    // can prove the range without relying on tracked register state
+    // (which gets lost across the host comparison in bpf_loop callbacks).
+    // val->len is already checked > 0 and <= SECRET_MAX_LEN above.
+    __u32 write_len = clamp_write_len(val->len);
+
+    bpf_probe_write_user(target, val->real_secret, write_len);
+    sctx->rewritten = 1;
   }
   return 0;
 }

@@ -13,6 +13,7 @@ env:
   GO_VERSION: '1.25'
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
+
 jobs:
   lint:
     name: Lint
@@ -98,6 +99,9 @@ jobs:
 
       - name: Download dependencies
         run: go mod download
+
+      - name: Run eBPF helper C tests
+        run: make test-bpf-helpers
 
       - name: Run tests
         run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/pkg/ebpf|/pkg/cgroups')
