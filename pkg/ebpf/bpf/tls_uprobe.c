@@ -166,6 +166,26 @@ struct {
   __type(value, struct connect_pending_val);
 } connect_pending SEC(".maps");
 
+// handshake_pending: scratch storage for SSL_do_handshake → write() fd correlation.
+// When SSL_do_handshake(ssl) is called, we store the ssl_ptr here keyed by {tgid, tid}.
+// The next sys_enter_write on this thread captures the fd (OpenSSL's ClientHello write)
+// and stores it in ssl_fd_map. One-shot: deleted after the first write.
+struct handshake_pending_key {
+  __u32 tgid;
+  __u32 pid; // thread ID (what BPF calls pid)
+};
+
+struct handshake_pending_val {
+  __u64 ssl_ptr;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 1024);
+  __type(key, struct handshake_pending_key);
+  __type(value, struct handshake_pending_val);
+} handshake_pending SEC(".maps");
+
 // dns_config: DNS server IPs to accept responses from.
 // Array of up to 4 entries (supports multiple nameservers from resolv.conf).
 // Written by Go on startup. All 16-byte entries use IPv4-mapped form for IPv4.
@@ -602,6 +622,53 @@ int tp_exit_connect(struct trace_event_raw_sys_exit *ctx) {
 }
 
 // -----------------------------------------------------------------------------
+// sys_enter_write tracepoint — stage 2 of SSL_do_handshake fd correlation.
+//
+// Fires on every write(fd, buf, count) syscall. Filtered in three stages:
+//   1. tracked_tgids[tgid] — non-tracked processes exit in ~50ns
+//   2. handshake_pending[{tgid, tid}] — tracked processes without pending
+//      handshake exit in ~100ns (hash lookup miss)
+//   3. Only threads in active SSL handshake do real work: store fd in
+//      ssl_fd_map and delete the pending entry (one-shot).
+// -----------------------------------------------------------------------------
+
+SEC("tracepoint/syscalls/sys_enter_write")
+int tp_enter_write(struct trace_event_raw_sys_enter *ctx) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+
+  if (!bpf_map_lookup_elem(&tracked_tgids, &tgid))
+    return 0;
+
+  __u32 pid = (__u32)(pid_tgid & 0xFFFFFFFF);
+
+  struct handshake_pending_key hkey = {.tgid = tgid, .pid = pid};
+  struct handshake_pending_val *hval =
+      bpf_map_lookup_elem(&handshake_pending, &hkey);
+  if (!hval)
+    return 0;
+
+  __u32 fd = (__u32)ctx->args[0];
+  __u64 ssl_ptr = hval->ssl_ptr;
+
+  bpf_map_delete_elem(&handshake_pending, &hkey);
+
+  struct ssl_fd_key sfk;
+  __builtin_memset(&sfk, 0, sizeof(sfk));
+  sfk.tgid    = tgid;
+  sfk.ssl_ptr = ssl_ptr;
+
+  struct ssl_fd_val sfv = {.fd = fd};
+  bpf_map_update_elem(&ssl_fd_map, &sfk, &sfv, BPF_ANY);
+
+#ifdef KLOAK_DEBUG
+  bpf_printk("kloak hs_write: tgid=%u fd=%u ssl=%llx", tgid, fd, ssl_ptr);
+#endif
+
+  return 0;
+}
+
+// -----------------------------------------------------------------------------
 // SSL_set_fd uprobe — records ssl_ptr → fd so we can resolve peer IP at
 // SSL_write time via: ssl_ptr → fd (ssl_fd_map) → IP (conn_ip_map).
 // Called once per SSL object before SSL_connect/SSL_accept.
@@ -642,6 +709,63 @@ int bpf_uprobe_ssl_set_fd(void *ctx) {
 #ifdef KLOAK_DEBUG
   bpf_printk("kloak ssl_set_fd: tgid=%u ssl=%llx fd=%d", tgid,
              (__u64)ssl_ptr, fd_int);
+#endif
+
+  return 0;
+}
+
+// -----------------------------------------------------------------------------
+// SSL_do_handshake uprobe — stage 1 of BIO-based fd correlation.
+//
+// CPython 3.11+, Node.js, and other runtimes use BIO_new_socket(fd) +
+// SSL_set_bio(ssl, bio, bio) instead of SSL_set_fd(ssl, fd). This uprobe
+// captures ssl_ptr from SSL_do_handshake(SSL *ssl) and stores it in
+// handshake_pending[{tgid, tid}]. During the handshake, OpenSSL internally
+// calls write(fd, ClientHello) on the socket — tp_enter_write correlates
+// the fd to complete the ssl_ptr → fd mapping in ssl_fd_map.
+//
+// SSL_do_handshake(SSL *ssl):
+//   x86_64: RDI=ssl   (pt_regs offset: rdi=112)
+//   ARM64:  X0=ssl    (pt_regs offset: 0)
+// -----------------------------------------------------------------------------
+
+SEC("uprobe/ssl_do_handshake")
+int bpf_uprobe_ssl_do_handshake(void *ctx) {
+  void *ssl_ptr;
+
+#if defined(bpf_target_x86)
+  bpf_probe_read_kernel(&ssl_ptr, sizeof(void *), (char *)ctx + 112);
+#elif defined(bpf_target_arm64)
+  bpf_probe_read_kernel(&ssl_ptr, sizeof(void *), (char *)ctx + 0);
+#else
+  return 0;
+#endif
+
+  if (!ssl_ptr)
+    return 0;
+
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+
+  if (!bpf_map_lookup_elem(&tracked_tgids, &tgid))
+    return 0;
+
+  // If SSL_set_fd already populated ssl_fd_map, skip the handshake path.
+  struct ssl_fd_key sfk;
+  __builtin_memset(&sfk, 0, sizeof(sfk));
+  sfk.tgid    = tgid;
+  sfk.ssl_ptr = (__u64)ssl_ptr;
+  if (bpf_map_lookup_elem(&ssl_fd_map, &sfk))
+    return 0;
+
+  __u32 pid = (__u32)(pid_tgid & 0xFFFFFFFF);
+  struct handshake_pending_key key = {.tgid = tgid, .pid = pid};
+  struct handshake_pending_val val = {.ssl_ptr = (__u64)ssl_ptr};
+  bpf_map_update_elem(&handshake_pending, &key, &val, BPF_ANY);
+
+#ifdef KLOAK_DEBUG
+  bpf_printk("kloak handshake: tgid=%u tid=%u ssl=%llx", tgid, pid,
+             (__u64)ssl_ptr);
 #endif
 
   return 0;
@@ -779,17 +903,17 @@ int bpf_uprobe_ssl_ctrl(void *ctx) {
 }
 
 // -----------------------------------------------------------------------------
-// Resolve host for the current SSL connection.
+// Resolve host for the current SSL connection — DNS-verified path ONLY.
 //
-// Priority order:
-//   1. IP-verified path (OpenSSL only): ssl_ptr → ssl_fd_map → conn_ip_map
-//      → dns_ip_map. This is the strongest form — the hostname comes from what
-//      the kernel DNS resolver actually returned, not from app-controlled data.
-//   2. SNI cache (existing conn_hosts map). Requires ssl_ptr (OpenSSL).
-//   3. HTTP Host header parsing (Go crypto/tls fallback).
+// Walks: ssl_ptr → ssl_fd_map → fd → conn_ip_map → peer_ip → dns_ip_map → hostname
 //
-// Only path 1 provides full spoofing prevention. Paths 2 and 3 remain for
-// backward compatibility with runtimes that don't populate ssl_fd_map.
+// This is the ONLY host resolution path. SNI and HTTP Host header are app-controlled
+// and trivially spoofable, so they are NOT used. If any lookup in the chain fails,
+// host_value_len remains 0, and host-filtered secrets (getkloak.io/hosts) are blocked.
+// Secrets without host filtering (wildcard) are unaffected — they skip the host check.
+//
+// For Go crypto/tls (ssl_ptr=0): returns immediately with host_value_len=0.
+// Host-filtered secrets won't be rewritten until Go support is added (Phase 2).
 // -----------------------------------------------------------------------------
 static __always_inline void resolve_host(struct scratch_buf *scratch,
                                          __u64 ssl_ptr) {
@@ -797,54 +921,36 @@ static __always_inline void resolve_host(struct scratch_buf *scratch,
   scratch->host_value_len = 0;
   __builtin_memset(scratch->host_value, 0, MAX_HOST_LEN);
 
+  if (ssl_ptr == 0)
+    return; // Go crypto/tls — no ssl_ptr, cannot verify
+
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
 
-  // --- Path 1: IP-verified via DNS interception (OpenSSL only) ---
-  if (ssl_ptr != 0) {
-    struct ssl_fd_key sfk;
-    __builtin_memset(&sfk, 0, sizeof(sfk));
-    sfk.tgid    = tgid;
-    sfk.ssl_ptr = ssl_ptr;
+  struct ssl_fd_key sfk;
+  __builtin_memset(&sfk, 0, sizeof(sfk));
+  sfk.tgid    = tgid;
+  sfk.ssl_ptr = ssl_ptr;
 
-    struct ssl_fd_val *sfv = bpf_map_lookup_elem(&ssl_fd_map, &sfk);
-    if (sfv) {
-      struct conn_ip_key cik = {.tgid = tgid, .fd = sfv->fd};
-      struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
-      if (civ) {
-        struct dns_ip_key dik;
-        __builtin_memset(&dik, 0, sizeof(dik));
-        dik.tgid = tgid;
-        __builtin_memcpy(dik.ip, civ->ip, 16);
+  struct ssl_fd_val *sfv = bpf_map_lookup_elem(&ssl_fd_map, &sfk);
+  if (!sfv)
+    return;
 
-        struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
-        if (div && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
-          __builtin_memcpy(scratch->host_value, div->hostname, MAX_HOST_LEN);
-          scratch->host_value_len = div->host_len;
-          return; // AUTHORITATIVE: DNS-verified hostname
-        }
-      }
-    }
+  struct conn_ip_key cik = {.tgid = tgid, .fd = sfv->fd};
+  struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
+  if (!civ)
+    return;
+
+  struct dns_ip_key dik;
+  __builtin_memset(&dik, 0, sizeof(dik));
+  dik.tgid = tgid;
+  __builtin_memcpy(dik.ip, civ->ip, 16);
+
+  struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
+  if (div && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
+    __builtin_memcpy(scratch->host_value, div->hostname, MAX_HOST_LEN);
+    scratch->host_value_len = div->host_len;
   }
-
-  // --- Path 2: SNI cache (app-provided, unverified) ---
-  if (ssl_ptr != 0) {
-    struct conn_key key;
-    __builtin_memset(&key, 0, sizeof(key));
-    key.tgid    = tgid;
-    key.ssl_ptr = ssl_ptr;
-
-    struct conn_host *cached = bpf_map_lookup_elem(&conn_hosts, &key);
-    if (cached && cached->host_len > 0) {
-      __builtin_memcpy(scratch->host_value, cached->hostname, MAX_HOST_LEN);
-      scratch->host_value_len = cached->host_len;
-      return;
-    }
-  }
-
-  // --- Path 3: HTTP Host header (Go crypto/tls and HTTP/1.x fallback) ---
-  scratch->host_value_len = parse_http_host(scratch->data, scratch->read_len,
-                                            scratch->host_value, MAX_HOST_LEN);
 }
 
 // -----------------------------------------------------------------------------

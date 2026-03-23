@@ -142,15 +142,16 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 		{"syscalls", "sys_exit_recvfrom", objs.TpExitRecvfrom},
 		{"syscalls", "sys_enter_connect", objs.TpEnterConnect},
 		{"syscalls", "sys_exit_connect", objs.TpExitConnect},
+		{"syscalls", "sys_enter_write", objs.TpEnterWrite},
 	}
 
 	var tpLinks []link.Link
 	for _, tp := range tpSpecs {
 		l, tpErr := link.Tracepoint(tp.group, tp.name, tp.prog, nil)
 		if tpErr != nil {
-			log.Error(tpErr, "failed to attach tracepoint (DNS/connect tracking disabled)",
+			log.Error(tpErr, "failed to attach tracepoint (DNS/connect/write tracking disabled)",
 				"tracepoint", tp.group+"/"+tp.name)
-			// Non-fatal: fall back to SNI-only host verification
+			// Non-fatal: host-filtered secrets will be blocked without DNS verification
 			break
 		}
 		tpLinks = append(tpLinks, l)
@@ -205,6 +206,9 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	// SSL_set_fd links the SSL object to a socket fd, enabling the IP-verified
 	// host resolution chain: ssl_ptr → fd → peer IP → DNS hostname.
 	sslSetFdSymbols := []string{"SSL_set_fd"}
+	// SSL_do_handshake captures ssl_ptr for BIO-based fd correlation (CPython 3.11+, Node.js).
+	// Works with tp_enter_write to establish ssl_ptr → fd when SSL_set_fd is not called.
+	sslDoHandshakeSymbols := []string{"SSL_do_handshake"}
 	attached := false
 
 	// Try main executable first (catches statically linked BoringSSL/OpenSSL)
@@ -266,13 +270,27 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 				m.links = append(m.links, up)
 			}
 		}
+		for _, sym := range sslDoHandshakeSymbols {
+			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslDoHandshake, nil)
+			if err == nil {
+				m.log.Info("Attached SSL_do_handshake uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
+				m.links = append(m.links, up)
+			}
+		}
 	}
 
-	// Also try SSL_set_fd on main executable (statically linked OpenSSL/BoringSSL)
+	// Also try SSL_set_fd and SSL_do_handshake on main executable (statically linked OpenSSL/BoringSSL)
 	for _, sym := range sslSetFdSymbols {
 		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslSetFd, nil)
 		if err == nil {
 			m.log.Info("Attached SSL_set_fd uprobe to main exe", "pid", pid, "symbol", sym)
+			m.links = append(m.links, up)
+		}
+	}
+	for _, sym := range sslDoHandshakeSymbols {
+		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslDoHandshake, nil)
+		if err == nil {
+			m.log.Info("Attached SSL_do_handshake uprobe to main exe", "pid", pid, "symbol", sym)
 			m.links = append(m.links, up)
 		}
 	}
