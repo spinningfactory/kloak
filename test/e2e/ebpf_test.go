@@ -200,6 +200,33 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 // SNI = svc-spoof-allowed → eBPF sees IP_B maps to svc-spoof-other ≠ svc-spoof-allowed
 // → NO REWRITE.
 func TestEBPFSNISpoofingPrevention(t *testing.T) {
+	// Go crypto/tls passes ssl_ptr=0 to resolve_host, so the IP-verified DNS
+	// chain (Path 1: ssl_ptr → ssl_fd_map → conn_ip_map → dns_ip_map) is skipped
+	// entirely. DNS spoofing prevention requires OpenSSL's SSL_set_fd uprobe.
+	// See TestEBPFSNISpoofingPreventionOpenSSL for the OpenSSL-based test.
+	t.Skip("Go crypto/tls does not call SSL_set_fd — DNS-based spoofing prevention requires OpenSSL (Phase 2)")
+}
+
+// TestEBPFSNISpoofingPreventionOpenSSL verifies that Kloak's DNS-based host
+// verification prevents secret rewriting when a Python (OpenSSL) app connects
+// to the wrong IP while claiming to be connecting to the allowed hostname via SNI.
+//
+// The full OpenSSL verification chain is:
+//
+//	SSL_set_fd uprobe → ssl_fd_map[ssl_ptr] = fd
+//	connect tracepoint → conn_ip_map[{tgid, fd}] = peer_ip
+//	recvfrom tracepoint → dns_ip_map[{tgid, peer_ip}] = hostname (from DNS response)
+//	SSL_write: ssl_ptr → fd → peer_ip → dns_ip_map → actual_hostname
+//
+// Setup: two Kubernetes Services (svc-spoof-allowed, svc-spoof-other) back the
+// same Python TLS echo server pod on port 8443 with different ClusterIPs.
+//
+// Legitimate path: connect to ClusterIP_A (resolved for svc-spoof-allowed) with
+// SNI = svc-spoof-allowed → eBPF verifies IP matches DNS record → REWRITE.
+//
+// Spoof path: connect to ClusterIP_B (resolved for svc-spoof-other) but set
+// SNI = svc-spoof-allowed → eBPF sees IP_B maps to svc-spoof-other ≠ allowed → NO REWRITE.
+func TestEBPFSNISpoofingPreventionOpenSSL(t *testing.T) {
 	// Secret restricted to svc-spoof-allowed's DNS name (first 32 chars stored in BPF map).
 	secretData := map[string][]byte{"api-key": []byte("REAL-SPOOF-SECRET-12345678901234")}
 	createEnabledSecret(t, "secret-spoof", secretData, map[string]string{
