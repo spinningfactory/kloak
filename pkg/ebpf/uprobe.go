@@ -49,7 +49,6 @@ type watchedHostKey struct {
 	Host [32]byte
 }
 
-
 // Generate eBPF bindings. The KLOAK_TARGET_ARCH env var (set by Dockerfile or
 // Makefile) controls which __TARGET_ARCH_xxx define is passed to clang.
 // Defaults to arm64 for local development on macOS/Lima.

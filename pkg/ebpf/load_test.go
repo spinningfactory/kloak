@@ -109,7 +109,7 @@ func TestDnsIpMapOperations(t *testing.T) {
 	type dnsIpVal struct {
 		Hostname   [32]byte
 		HostLen    uint32
-		TtlSec    uint32
+		TtlSec     uint32
 		InsertedAt uint64
 	}
 

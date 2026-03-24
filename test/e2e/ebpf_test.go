@@ -52,15 +52,19 @@ var ebpfTests = []ebpfRewriteTest{
 	},
 }
 
-// TestEBPFSNIHostFiltering tests that SNI-based host filtering works for
-// non-HTTP TLS protocols. The demo app uses raw TLS sockets (no HTTP)
-// with a local echo server. The only hostname source is SSL_set_tlsext_host_name.
-func TestEBPFSNIHostFiltering(t *testing.T) {
+// TestEBPFRawTLSHostFiltering tests that DNS-verified host filtering works with
+// raw TLS sockets (non-HTTP). A TLS echo server runs as a sidecar behind a K8s
+// Service. The client resolves the Service name via DNS, which populates dns_ip_map,
+// enabling host-based secret filtering at the TCP level.
+func TestEBPFRawTLSHostFiltering(t *testing.T) {
+	// The Service FQDN as it appears in DNS responses from CoreDNS.
+	echoHostFQDN := "tls." + testNamespace + ".svc.cluster.local"
+
 	allowedData := map[string][]byte{"api-key": []byte("REAL-ALLOWED-KEY-12345")}
 	blockedData := map[string][]byte{"api-key": []byte("REAL-BLOCKED-KEY-67890")}
 
 	createEnabledSecret(t, "secret-allowed", allowedData, map[string]string{
-		"getkloak.io/hosts": "httpbin.org",
+		"getkloak.io/hosts": echoHostFQDN,
 	})
 	createEnabledSecret(t, "secret-blocked", blockedData, map[string]string{
 		"getkloak.io/hosts": "example.com",
@@ -93,7 +97,7 @@ func TestEBPFSNIHostFiltering(t *testing.T) {
 		case <-pollCtx.Done():
 			t.Logf("=== demo-python-sni final logs ===\n%s", out)
 			t.Logf("=== Controller logs ===\n%s", controllerLogs())
-			t.Fatalf("timed out waiting for allowed secret in SNI demo logs")
+			t.Fatalf("timed out waiting for allowed secret in raw TLS demo logs")
 		default:
 		}
 		out, _ = kubectl("logs", "-n", testNamespace, "-l", "app=demo-python-sni", "--tail=200")
@@ -188,6 +192,8 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 // TestEBPFSecretLengths verifies that secrets of different lengths (8 to 100 bytes)
 // are correctly rewritten. Runs last to avoid secret name collisions.
 func TestEBPFSecretLengths(t *testing.T) {
+	echoHostFQDN := "tls." + testNamespace + ".svc.cluster.local"
+
 	type lengthCase struct {
 		name    string
 		allowed string
@@ -215,7 +221,7 @@ func TestEBPFSecretLengths(t *testing.T) {
 			blockedData := map[string][]byte{"api-key": []byte(tc.blocked)}
 
 			createEnabledSecret(t, "secret-allowed", allowedData, map[string]string{
-				"getkloak.io/hosts": "httpbin.org",
+				"getkloak.io/hosts": echoHostFQDN,
 			})
 			createEnabledSecret(t, "secret-blocked", blockedData, map[string]string{
 				"getkloak.io/hosts": "example.com",

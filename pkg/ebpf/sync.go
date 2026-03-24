@@ -13,7 +13,7 @@ import (
 // syncSecrets updates the BPF secret_map with the latest shadow secret values
 // from the given storage, and syncs the watched_hosts map with unique hostnames
 // from secret entries (used for DNS filtering).
-func syncSecrets(secretMap *ebpf.Map, watchedHostsMap *ebpf.Map, store storage.Storage, log logr.Logger) error {
+func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, log logr.Logger) error {
 	secrets, err := store.List(context.Background())
 	if err != nil {
 		return err
