@@ -32,7 +32,8 @@ jobs:
         run: |
           k3d cluster create kloak-ebpf --wait --timeout 120s \
             --volume /sys/kernel/btf:/sys/kernel/btf:ro@server:0 \
-            --volume /sys/fs/bpf:/sys/fs/bpf:rw@server:0
+            --volume /sys/fs/bpf:/sys/fs/bpf:rw@server:0 \
+            --volume /sys/kernel/tracing:/sys/kernel/tracing:ro@server:0
           k3d kubeconfig get kloak-ebpf > /tmp/kubeconfig-ebpf.yaml
 
       - name: Build Docker images
