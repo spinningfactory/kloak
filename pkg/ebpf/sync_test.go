@@ -35,6 +35,22 @@ func createTestSecretMap(t *testing.T) *ciliumebpf.Map {
 	return m
 }
 
+// createTestWatchedHostsMap creates a BPF hash map matching the watched_hosts spec.
+func createTestWatchedHostsMap(t *testing.T) *ciliumebpf.Map {
+	t.Helper()
+	m, err := ciliumebpf.NewMap(&ciliumebpf.MapSpec{
+		Type:       ciliumebpf.Hash,
+		KeySize:    32, // MAX_HOST_LEN
+		ValueSize:  1,  // __u8
+		MaxEntries: 256,
+	})
+	if err != nil {
+		t.Skipf("eBPF maps not available: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	return m
+}
+
 func testLog() logr.Logger {
 	return ctrl.Log.WithName("test")
 }
@@ -46,7 +62,7 @@ func TestSyncSecrets_BasicSync(t *testing.T) {
 		Value: "my-real-secret-value!",
 	})
 
-	if err := syncSecrets(m, store, testLog()); err != nil {
+	if err := syncSecrets(m, nil, store, testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -75,7 +91,7 @@ func TestSyncSecrets_MinLength(t *testing.T) {
 		Value: "short",
 	})
 
-	if err := syncSecrets(m, store, testLog()); err != nil {
+	if err := syncSecrets(m, nil, store, testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -96,7 +112,7 @@ func TestSyncSecrets_Truncation(t *testing.T) {
 		Value: longValue,
 	})
 
-	if err := syncSecrets(m, store, testLog()); err != nil {
+	if err := syncSecrets(m, nil, store, testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -120,7 +136,7 @@ func TestSyncSecrets_HostFilter(t *testing.T) {
 		AllowedHosts: []string{"api.stripe.com"},
 	})
 
-	if err := syncSecrets(m, store, testLog()); err != nil {
+	if err := syncSecrets(m, nil, store, testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -148,7 +164,7 @@ func TestSyncSecrets_WildcardHost(t *testing.T) {
 		AllowedHosts: []string{"*"},
 	})
 
-	if err := syncSecrets(m, store, testLog()); err != nil {
+	if err := syncSecrets(m, nil, store, testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -172,7 +188,7 @@ func TestSyncSecrets_StaleEntryPruning(t *testing.T) {
 	_ = store.Store(context.Background(), "pod1", "kloak:abcd1234-5678-9abc", storage.Entry{
 		Value: "my-real-secret-value!",
 	})
-	if err := syncSecrets(m, store, testLog()); err != nil {
+	if err := syncSecrets(m, nil, store, testLog()); err != nil {
 		t.Fatalf("first sync failed: %v", err)
 	}
 
@@ -186,7 +202,7 @@ func TestSyncSecrets_StaleEntryPruning(t *testing.T) {
 
 	// Remove from storage and sync again
 	_ = store.Delete(context.Background(), "pod1")
-	if err := syncSecrets(m, store, testLog()); err != nil {
+	if err := syncSecrets(m, nil, store, testLog()); err != nil {
 		t.Fatalf("second sync failed: %v", err)
 	}
 
@@ -204,7 +220,7 @@ func TestSyncSecrets_Update(t *testing.T) {
 	_ = store.Store(context.Background(), "pod1", "kloak:abcd1234-5678-9abc", storage.Entry{
 		Value: "old-secret-value-here",
 	})
-	if err := syncSecrets(m, store, testLog()); err != nil {
+	if err := syncSecrets(m, nil, store, testLog()); err != nil {
 		t.Fatalf("first sync failed: %v", err)
 	}
 
@@ -212,7 +228,7 @@ func TestSyncSecrets_Update(t *testing.T) {
 	_ = store.Store(context.Background(), "pod1", "kloak:abcd1234-5678-9abc", storage.Entry{
 		Value: "new-secret-value-here",
 	})
-	if err := syncSecrets(m, store, testLog()); err != nil {
+	if err := syncSecrets(m, nil, store, testLog()); err != nil {
 		t.Fatalf("second sync failed: %v", err)
 	}
 
@@ -237,7 +253,7 @@ func TestSyncSecrets_FullPrefix(t *testing.T) {
 		Value: "kloak:abcd1234-5678-9abc-def0-123456789abc",
 	})
 
-	if err := syncSecrets(m, store, testLog()); err != nil {
+	if err := syncSecrets(m, nil, store, testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -254,5 +270,72 @@ func TestSyncSecrets_FullPrefix(t *testing.T) {
 	gotPrefix := string(val.FullPrefix[:val.PrefixLen])
 	if gotPrefix != hash[:42] {
 		t.Errorf("expected prefix %q, got %q", hash[:42], gotPrefix)
+	}
+}
+
+func TestSyncSecrets_WatchedHostsSync(t *testing.T) {
+	m := createTestSecretMap(t)
+	wh := createTestWatchedHostsMap(t)
+	store := storage.NewMemory()
+
+	_ = store.Store(context.Background(), "pod1", "kloak:abcd1234-5678-9abc", storage.Entry{
+		Value:        "my-real-secret-value!",
+		AllowedHosts: []string{"api.stripe.com"},
+	})
+	_ = store.Store(context.Background(), "pod2", "kloak:efgh5678-1234-5678", storage.Entry{
+		Value:        "another-secret-value!",
+		AllowedHosts: []string{"api.github.com"},
+	})
+
+	if err := syncSecrets(m, wh, store, testLog()); err != nil {
+		t.Fatalf("syncSecrets failed: %v", err)
+	}
+
+	// Verify both hosts are in watched_hosts map
+	var key1 watchedHostKey
+	copy(key1.Host[:], "api.stripe.com")
+	var val uint8
+	if err := wh.Lookup(&key1, &val); err != nil {
+		t.Fatalf("api.stripe.com not found in watched_hosts: %v", err)
+	}
+
+	var key2 watchedHostKey
+	copy(key2.Host[:], "api.github.com")
+	if err := wh.Lookup(&key2, &val); err != nil {
+		t.Fatalf("api.github.com not found in watched_hosts: %v", err)
+	}
+}
+
+func TestSyncSecrets_WatchedHostsPruning(t *testing.T) {
+	m := createTestSecretMap(t)
+	wh := createTestWatchedHostsMap(t)
+	store := storage.NewMemory()
+
+	// First sync: add a secret with host
+	_ = store.Store(context.Background(), "pod1", "kloak:abcd1234-5678-9abc", storage.Entry{
+		Value:        "my-real-secret-value!",
+		AllowedHosts: []string{"api.stripe.com"},
+	})
+	if err := syncSecrets(m, wh, store, testLog()); err != nil {
+		t.Fatalf("first sync failed: %v", err)
+	}
+
+	// Verify host exists
+	var key watchedHostKey
+	copy(key.Host[:], "api.stripe.com")
+	var val uint8
+	if err := wh.Lookup(&key, &val); err != nil {
+		t.Fatalf("host not found after first sync: %v", err)
+	}
+
+	// Remove secret and sync again
+	_ = store.Delete(context.Background(), "pod1")
+	if err := syncSecrets(m, wh, store, testLog()); err != nil {
+		t.Fatalf("second sync failed: %v", err)
+	}
+
+	// Host should be pruned
+	if err := wh.Lookup(&key, &val); err == nil {
+		t.Error("stale host should have been pruned from watched_hosts map")
 	}
 }

@@ -10,10 +10,10 @@ import (
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
-// syncSecrets updates a BPF secret_map with the latest shadow secret values
-// from the given storage. Returns the set of keys that were synced and any
-// stale keys that were pruned.
-func syncSecrets(secretMap *ebpf.Map, store storage.Storage, log logr.Logger) error {
+// syncSecrets updates the BPF secret_map with the latest shadow secret values
+// from the given storage, and syncs the watched_hosts map with unique hostnames
+// from secret entries (used for DNS filtering).
+func syncSecrets(secretMap *ebpf.Map, watchedHostsMap *ebpf.Map, store storage.Storage, log logr.Logger) error {
 	secrets, err := store.List(context.Background())
 	if err != nil {
 		return err
@@ -21,6 +21,8 @@ func syncSecrets(secretMap *ebpf.Map, store storage.Storage, log logr.Logger) er
 
 	// newKeys tracks which keys we upsert so we can prune stale entries afterwards.
 	newKeys := make(map[secretKey]struct{}, len(secrets))
+	// newHosts tracks unique hostnames to sync to watched_hosts map.
+	newHosts := make(map[watchedHostKey]struct{})
 
 	for hash, entry := range secrets {
 		// hash is already the full shadow value like "kloak:0a6dbc80-b38a-47"
@@ -71,6 +73,11 @@ func syncSecrets(secretMap *ebpf.Map, store storage.Storage, log logr.Logger) er
 			}
 			val.HostLen = uint32(len(host))
 			copy(val.AllowedHost[:], host)
+
+			// Track this hostname for the watched_hosts map
+			var whk watchedHostKey
+			copy(whk.Host[:], host)
+			newHosts[whk] = struct{}{}
 		}
 		// HostLen == 0 means wildcard (allow all hosts)
 
@@ -102,5 +109,43 @@ func syncSecrets(secretMap *ebpf.Map, store storage.Storage, log logr.Logger) er
 		}
 	}
 
+	// Sync watched_hosts map: add new hosts, prune stale ones.
+	if watchedHostsMap != nil {
+		syncWatchedHosts(watchedHostsMap, newHosts, log)
+	}
+
 	return nil
+}
+
+// syncWatchedHosts updates the watched_hosts BPF map with the given set of
+// hostnames. Adds missing entries and removes stale ones.
+func syncWatchedHosts(watchedHostsMap *ebpf.Map, newHosts map[watchedHostKey]struct{}, log logr.Logger) {
+	// Add all current hosts
+	val := uint8(1)
+	for host := range newHosts {
+		if err := watchedHostsMap.Update(&host, &val, 0); err != nil {
+			log.Error(err, "failed to update watched_hosts map", "host", string(host.Host[:]))
+		}
+	}
+
+	// Prune stale hosts
+	var staleHosts []watchedHostKey
+	var iterHost watchedHostKey
+	var iterVal uint8
+	iter := watchedHostsMap.Iterate()
+	for iter.Next(&iterHost, &iterVal) {
+		if _, exists := newHosts[iterHost]; !exists {
+			staleHosts = append(staleHosts, iterHost)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		log.Error(err, "error iterating watched_hosts map for pruning")
+	}
+	for i := range staleHosts {
+		if err := watchedHostsMap.Delete(&staleHosts[i]); err != nil {
+			log.Error(err, "failed to delete stale watched_hosts entry")
+		} else {
+			log.V(1).Info("Pruned stale watched host")
+		}
+	}
 }

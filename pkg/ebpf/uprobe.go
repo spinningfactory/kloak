@@ -1,11 +1,13 @@
 package ebpf
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"strings"
 	"time"
@@ -42,6 +44,16 @@ type secretValue struct {
 	PrefixLen   uint32
 	FullPrefix  [42]byte // SECRET_PREFIX_MAX
 	_           [2]byte  // padding to match C struct alignment
+}
+
+// watchedHostKey matches C struct watched_host_key
+type watchedHostKey struct {
+	Host [32]byte
+}
+
+// dnsServerIP matches C struct dns_server_ip
+type dnsServerIP struct {
+	IP [16]byte
 }
 
 // Generate eBPF bindings. The KLOAK_TARGET_ARCH env var (set by Dockerfile or
@@ -96,18 +108,115 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 		return nil, fmt.Errorf("creating ringbuf reader: %w", err)
 	}
 
-	return &TLSUprobeManager{
+	mgr := &TLSUprobeManager{
 		objs:   objs,
 		reader: reader,
 		log:    log,
 		store:  store,
-	}, nil
+	}
+
+	// Attach tracepoints for DNS interception and connect tracking.
+	// These are system-wide but filtered per-process via tracked_tgids map.
+	if err := mgr.attachTracepoints(); err != nil {
+		_ = mgr.Close()
+		return nil, fmt.Errorf("attaching tracepoints: %w", err)
+	}
+
+	// Load DNS server configuration from /etc/resolv.conf
+	mgr.loadDNSConfig()
+
+	return mgr, nil
+}
+
+// attachTracepoints attaches the syscall tracepoints for DNS and connect tracking.
+func (m *TLSUprobeManager) attachTracepoints() error {
+	type tp struct {
+		group string
+		name  string
+		prog  *ebpf.Program
+	}
+
+	tracepoints := []tp{
+		{"syscalls", "sys_enter_recvfrom", m.objs.TpEnterRecvfrom},
+		{"syscalls", "sys_exit_recvfrom", m.objs.TpExitRecvfrom},
+		{"syscalls", "sys_enter_connect", m.objs.TpEnterConnect},
+		{"syscalls", "sys_exit_connect", m.objs.TpExitConnect},
+	}
+
+	for _, t := range tracepoints {
+		l, err := link.Tracepoint(t.group, t.name, t.prog, nil)
+		if err != nil {
+			return fmt.Errorf("attaching tracepoint %s/%s: %w", t.group, t.name, err)
+		}
+		m.links = append(m.links, l)
+		m.log.Info("Attached tracepoint", "group", t.group, "name", t.name)
+	}
+	return nil
+}
+
+// loadDNSConfig reads DNS server IPs from /etc/resolv.conf and populates
+// the dns_config BPF array map.
+func (m *TLSUprobeManager) loadDNSConfig() {
+	servers := readDNSServersFromResolvConf("/etc/resolv.conf")
+	if len(servers) == 0 {
+		m.log.Info("No DNS servers found in /etc/resolv.conf, using 127.0.0.53 as default")
+		servers = []net.IP{net.ParseIP("127.0.0.53")}
+	}
+
+	for i, ip := range servers {
+		if i >= 4 { // MAX_DNS_SERVERS
+			break
+		}
+		if err := m.SetDNSServer(uint32(i), ip); err != nil {
+			m.log.Error(err, "failed to set DNS server", "index", i, "ip", ip)
+		} else {
+			m.log.Info("Configured DNS server", "index", i, "ip", ip)
+		}
+	}
+}
+
+// SetDNSServer sets a DNS server IP at the given index (0..3) in the dns_config map.
+func (m *TLSUprobeManager) SetDNSServer(index uint32, ip net.IP) error {
+	var val dnsServerIP
+	if ipv4 := ip.To4(); ipv4 != nil {
+		// IPv4-mapped-IPv6: ::ffff:a.b.c.d
+		val.IP[10] = 0xff
+		val.IP[11] = 0xff
+		copy(val.IP[12:], ipv4)
+	} else if ipv6 := ip.To16(); ipv6 != nil {
+		copy(val.IP[:], ipv6)
+	} else {
+		return fmt.Errorf("invalid IP address: %v", ip)
+	}
+	return m.objs.DnsConfig.Update(index, &val, 0)
+}
+
+// TrackTGID adds a process TGID to the tracked_tgids map, enabling
+// DNS/connect tracepoint processing for that process.
+func (m *TLSUprobeManager) TrackTGID(tgid uint32) error {
+	val := uint8(1)
+	return m.objs.TrackedTgids.Update(tgid, &val, 0)
+}
+
+// UntrackTGID removes a process TGID from the tracked_tgids map.
+func (m *TLSUprobeManager) UntrackTGID(tgid uint32) error {
+	return m.objs.TrackedTgids.Delete(tgid)
 }
 
 // AttachTLS attempts to automatically detect the runtime language and attach
 // the correct eBPF uprobes (Go crypto/tls or OpenSSL) to the given PID.
+// Also registers the PID's TGID in tracked_tgids for DNS/connect tracking.
 func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+
+	// Register the process for DNS/connect tracking.
+	// On Linux, PID == TGID for the main thread.
+	if err := m.TrackTGID(uint32(pid)); err != nil {
+		m.log.Error(err, "failed to track TGID for DNS/connect", "pid", pid)
+		// Non-fatal: continue with uprobe attachment
+	} else {
+		m.log.Info("Tracking TGID for DNS/connect verification", "pid", pid)
+	}
 
 	// Open the executable to figure out if it's Go or uses OpenSSL
 	ex, err := link.OpenExecutable(exePath)
@@ -132,12 +241,6 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	// Modern OpenSSL 3.x and BoringSSL export both SSL_write and SSL_write_ex
 	// with identical C ABI calling convention.
 	sslWriteSymbols := []string{"SSL_write", "SSL_write_ex"}
-	// SNI hostname capture — called once per connection before handshake.
-	// Populates the conn_hosts BPF map for protocol-agnostic host filtering.
-	// SSL_set_tlsext_host_name is a real function in BoringSSL but a macro in
-	// OpenSSL that expands to SSL_ctrl(ssl, 55, 0, name). Try both.
-	sniSymbols := []string{"SSL_set_tlsext_host_name"}
-	sniCtrlSymbols := []string{"SSL_ctrl"}
 	attached := false
 
 	// Try main executable first (catches statically linked BoringSSL/OpenSSL)
@@ -147,20 +250,6 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 			m.log.Info("Attached SSL write uprobe to main exe", "pid", pid, "symbol", sym)
 			m.links = append(m.links, up)
 			attached = true
-		}
-	}
-	for _, sym := range sniSymbols {
-		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslSetHost, nil)
-		if err == nil {
-			m.log.Info("Attached SNI uprobe to main exe", "pid", pid, "symbol", sym)
-			m.links = append(m.links, up)
-		}
-	}
-	for _, sym := range sniCtrlSymbols {
-		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslCtrl, nil)
-		if err == nil {
-			m.log.Info("Attached SNI ctrl uprobe to main exe", "pid", pid, "symbol", sym)
-			m.links = append(m.links, up)
 		}
 	}
 
@@ -176,20 +265,6 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 				m.log.Info("Attached SSL write uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
 				m.links = append(m.links, up)
 				attached = true
-			}
-		}
-		for _, sym := range sniSymbols {
-			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslSetHost, nil)
-			if err == nil {
-				m.log.Info("Attached SNI uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
-				m.links = append(m.links, up)
-			}
-		}
-		for _, sym := range sniCtrlSymbols {
-			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslCtrl, nil)
-			if err == nil {
-				m.log.Info("Attached SNI ctrl uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
-				m.links = append(m.links, up)
 			}
 		}
 	}
@@ -332,10 +407,41 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 	}
 }
 
-// syncSecretsToBPF updates the eBPF map with the latest shadow secret values.
+// syncSecretsToBPF updates the eBPF map with the latest shadow secret values
+// and the watched_hosts map with hostnames from secret entries.
 // Called on init and periodically. Delegates to the extracted syncSecrets function.
 func (m *TLSUprobeManager) syncSecretsToBPF() {
-	if err := syncSecrets(m.objs.SecretMap, m.store, m.log); err != nil {
+	if err := syncSecrets(m.objs.SecretMap, m.objs.WatchedHosts, m.store, m.log); err != nil {
 		m.log.Error(err, "failed to sync secrets to BPF map")
 	}
+}
+
+// readDNSServersFromResolvConf parses /etc/resolv.conf and returns DNS server IPs.
+func readDNSServersFromResolvConf(path string) []net.IP {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var servers []net.IP
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if strings.HasPrefix(line, "#") || line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "nameserver") {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) < 2 {
+			continue
+		}
+		ip := net.ParseIP(fields[1])
+		if ip != nil {
+			servers = append(servers, ip)
+		}
+	}
+	return servers
 }
