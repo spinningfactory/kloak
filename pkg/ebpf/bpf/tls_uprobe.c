@@ -431,18 +431,19 @@ static __always_inline void process_dns_packet(const char *pkt, __u32 pkt_len,
     if (off == 0 || off + 10 > pkt_len || off + 10 > MAX_DNS_PKT)
       break;
 
-    // Use barrier_var + bitmask for all pkt[] accesses in the answer section
+    // Read TYPE/CLASS/TTL/RDLENGTH (10 bytes) using __builtin_memcpy into
+    // stack variables. This avoids per-byte pkt[m+N] accesses that the verifier
+    // unrolls and fails to prove bounded after dns_skip_name.
+    if (off + 10 > pkt_len || off + 10 > MAX_DNS_PKT)
+      break;
     barrier_var(off);
-    __u32 m = off & (MAX_DNS_PKT - 1);
-
-    // TYPE (2 bytes) big-endian
-    __u16 rtype = ((__u16)(__u8)pkt[m] << 8) | (__u16)(__u8)pkt[m + 1];
-    // TTL (4 bytes) at offset +4
-    __u32 ttl = ((__u32)(__u8)pkt[m + 4] << 24) | ((__u32)(__u8)pkt[m + 5] << 16) |
-                ((__u32)(__u8)pkt[m + 6] << 8) | (__u32)(__u8)pkt[m + 7];
-    // RDLENGTH (2 bytes) at offset +8
-    __u16 rdlength = ((__u16)(__u8)pkt[m + 8] << 8) | (__u16)(__u8)pkt[m + 9];
-    off += 10; // TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2)
+    __u8 rr_hdr[10];
+    __builtin_memcpy(rr_hdr, pkt + (off & (MAX_DNS_PKT - 1)), 10);
+    __u16 rtype = ((__u16)rr_hdr[0] << 8) | (__u16)rr_hdr[1];
+    __u32 ttl = ((__u32)rr_hdr[4] << 24) | ((__u32)rr_hdr[5] << 16) |
+                ((__u32)rr_hdr[6] << 8) | (__u32)rr_hdr[7];
+    __u16 rdlength = ((__u16)rr_hdr[8] << 8) | (__u16)rr_hdr[9];
+    off += 10;
 
     if (off + rdlength > pkt_len || off + rdlength > MAX_DNS_PKT)
       break;
