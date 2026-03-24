@@ -82,7 +82,14 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 		if retryErr := loadTlsuprobeObjects(objs, opts); retryErr != nil {
 			var ve *ebpf.VerifierError
 			if errors.As(retryErr, &ve) {
-				log.Error(retryErr, "eBPF Verifier Error", "verifier_log", fmt.Sprintf("%+v", ve))
+				// Truncate verifier log to avoid OOM on huge outputs
+				vlog := fmt.Sprintf("%+v", ve)
+				if len(vlog) > 4096 {
+					vlog = vlog[:4096] + "\n... (truncated)"
+				}
+				log.Error(retryErr, "eBPF Verifier Error", "verifier_log", vlog)
+			} else {
+				log.Error(retryErr, "eBPF loading failed")
 			}
 			return nil, fmt.Errorf("loading eBPF objects: %w", retryErr)
 		}
