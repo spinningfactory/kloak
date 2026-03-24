@@ -1,13 +1,11 @@
 package ebpf
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"net"
 	"os"
 	"strings"
 	"time"
@@ -51,10 +49,6 @@ type watchedHostKey struct {
 	Host [32]byte
 }
 
-// dnsServerIP matches C struct dns_server_ip
-type dnsServerIP struct {
-	IP [16]byte
-}
 
 // Generate eBPF bindings. The KLOAK_TARGET_ARCH env var (set by Dockerfile or
 // Makefile) controls which __TARGET_ARCH_xxx define is passed to clang.
@@ -122,13 +116,10 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 		return nil, fmt.Errorf("attaching tracepoints: %w", err)
 	}
 
-	// Load DNS server configuration from /etc/resolv.conf
-	mgr.loadDNSConfig()
-
 	return mgr, nil
 }
 
-// attachTracepoints attaches the syscall tracepoints for DNS and connect tracking.
+// attachTracepoints attaches the syscall tracepoints and kprobes for DNS and connect tracking.
 func (m *TLSUprobeManager) attachTracepoints() error {
 	type tp struct {
 		group string
@@ -137,8 +128,6 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	}
 
 	tracepoints := []tp{
-		{"syscalls", "sys_enter_recvfrom", m.objs.TpEnterRecvfrom},
-		{"syscalls", "sys_exit_recvfrom", m.objs.TpExitRecvfrom},
 		{"syscalls", "sys_enter_connect", m.objs.TpEnterConnect},
 		{"syscalls", "sys_exit_connect", m.objs.TpExitConnect},
 	}
@@ -151,44 +140,23 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 		m.links = append(m.links, l)
 		m.log.Info("Attached tracepoint", "group", t.group, "name", t.name)
 	}
+
+	// Attach kprobe/kretprobe on udp_recvmsg for language-agnostic DNS interception.
+	kp, err := link.Kprobe("udp_recvmsg", m.objs.KprobeUdpRecvmsg, nil)
+	if err != nil {
+		return fmt.Errorf("attaching kprobe udp_recvmsg: %w", err)
+	}
+	m.links = append(m.links, kp)
+	m.log.Info("Attached kprobe", "function", "udp_recvmsg")
+
+	krp, err := link.Kretprobe("udp_recvmsg", m.objs.KretprobeUdpRecvmsg, nil)
+	if err != nil {
+		return fmt.Errorf("attaching kretprobe udp_recvmsg: %w", err)
+	}
+	m.links = append(m.links, krp)
+	m.log.Info("Attached kretprobe", "function", "udp_recvmsg")
+
 	return nil
-}
-
-// loadDNSConfig reads DNS server IPs from /etc/resolv.conf and populates
-// the dns_config BPF array map.
-func (m *TLSUprobeManager) loadDNSConfig() {
-	servers := readDNSServersFromResolvConf("/etc/resolv.conf")
-	if len(servers) == 0 {
-		m.log.Info("No DNS servers found in /etc/resolv.conf, using 127.0.0.53 as default")
-		servers = []net.IP{net.ParseIP("127.0.0.53")}
-	}
-
-	for i, ip := range servers {
-		if i >= 4 { // MAX_DNS_SERVERS
-			break
-		}
-		if err := m.SetDNSServer(uint32(i), ip); err != nil {
-			m.log.Error(err, "failed to set DNS server", "index", i, "ip", ip)
-		} else {
-			m.log.Info("Configured DNS server", "index", i, "ip", ip)
-		}
-	}
-}
-
-// SetDNSServer sets a DNS server IP at the given index (0..3) in the dns_config map.
-func (m *TLSUprobeManager) SetDNSServer(index uint32, ip net.IP) error {
-	var val dnsServerIP
-	if ipv4 := ip.To4(); ipv4 != nil {
-		// IPv4-mapped-IPv6: ::ffff:a.b.c.d
-		val.IP[10] = 0xff
-		val.IP[11] = 0xff
-		copy(val.IP[12:], ipv4)
-	} else if ipv6 := ip.To16(); ipv6 != nil {
-		copy(val.IP[:], ipv6)
-	} else {
-		return fmt.Errorf("invalid IP address: %v", ip)
-	}
-	return m.objs.DnsConfig.Update(index, &val, 0)
 }
 
 // TrackTGID adds a process TGID to the tracked_tgids map, enabling
@@ -414,34 +382,4 @@ func (m *TLSUprobeManager) syncSecretsToBPF() {
 	if err := syncSecrets(m.objs.SecretMap, m.objs.WatchedHosts, m.store, m.log); err != nil {
 		m.log.Error(err, "failed to sync secrets to BPF map")
 	}
-}
-
-// readDNSServersFromResolvConf parses /etc/resolv.conf and returns DNS server IPs.
-func readDNSServersFromResolvConf(path string) []net.IP {
-	f, err := os.Open(path)
-	if err != nil {
-		return nil
-	}
-	defer f.Close()
-
-	var servers []net.IP
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if strings.HasPrefix(line, "#") || line == "" {
-			continue
-		}
-		if !strings.HasPrefix(line, "nameserver") {
-			continue
-		}
-		fields := strings.Fields(line)
-		if len(fields) < 2 {
-			continue
-		}
-		ip := net.ParseIP(fields[1])
-		if ip != nil {
-			servers = append(servers, ip)
-		}
-	}
-	return servers
 }

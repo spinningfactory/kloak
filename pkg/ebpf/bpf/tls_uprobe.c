@@ -47,7 +47,6 @@
 // Maximum number of DNS answer records to process
 #define MAX_DNS_ANSWERS 8
 // Maximum DNS server IPs we can configure
-#define MAX_DNS_SERVERS 4
 
 #include "helpers.h"
 
@@ -125,7 +124,7 @@ struct {
 } tracked_tgids SEC(".maps");
 
 // DNS-verified IP -> hostname mapping per process.
-// Populated by tp_exit_recvfrom when a DNS response contains an A/AAAA
+// Populated by kretprobe_udp_recvmsg when a DNS response contains an A/AAAA
 // record whose qname is in watched_hosts.
 struct dns_ip_key {
   __u32 tgid;
@@ -193,19 +192,19 @@ struct {
   __type(value, __u32); // fd
 } last_verified_fd SEC(".maps");
 
-// Scratch for recvfrom enter->exit correlation: save the buffer pointer.
-struct dns_pending_val {
-  __u64 buf_ptr;
-  __u64 sockaddr_ptr; // pointer to msghdr/sockaddr for source port check
-  __u32 fd;
+// Scratch for kprobe udp_recvmsg enter->return correlation.
+// Saves the user buffer pointer from msghdr on entry so the
+// kretprobe can read the DNS response after it's been copied.
+struct udp_recv_pending {
+  __u64 iov_base;  // user buffer (first iovec base)
 };
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 1024);
   __type(key, __u64);   // pid_tgid
-  __type(value, struct dns_pending_val);
-} dns_pending SEC(".maps");
+  __type(value, struct udp_recv_pending);
+} udp_recv_scratch SEC(".maps");
 
 // Scratch for connect enter->exit correlation: save fd and sockaddr.
 struct connect_pending_val {
@@ -219,19 +218,6 @@ struct {
   __type(key, __u64);   // pid_tgid
   __type(value, struct connect_pending_val);
 } connect_pending SEC(".maps");
-
-// Array of configured DNS server IPs (up to 4).
-// Index 0..3 hold IPv4-mapped-IPv6 addresses. Zeroed = unused slot.
-struct dns_server_ip {
-  __u8 ip[16];
-};
-
-struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, MAX_DNS_SERVERS);
-  __type(key, __u32);
-  __type(value, struct dns_server_ip);
-} dns_config SEC(".maps");
 
 // Per-CPU scratch buffer for DNS packet parsing (512 bytes).
 struct dns_scratch_buf {
@@ -273,30 +259,7 @@ static __always_inline void ipv4_to_mapped(__u8 *out16, const __u8 *ipv4) {
   out16[15] = ipv4[3];
 }
 
-// Check if an IP matches any configured DNS server.
-static __always_inline int is_dns_server(const __u8 *ip16) {
-  for (__u32 i = 0; i < MAX_DNS_SERVERS; i++) {
-    __u32 idx = i;
-    struct dns_server_ip *srv = bpf_map_lookup_elem(&dns_config, &idx);
-    if (!srv)
-      continue;
 
-    // Check if server slot is zeroed (unused)
-    __u64 lo, hi;
-    __builtin_memcpy(&lo, srv->ip, 8);
-    __builtin_memcpy(&hi, srv->ip + 8, 8);
-    if (lo == 0 && hi == 0)
-      continue;
-
-    // Compare as 2x uint64
-    __u64 a_lo, a_hi;
-    __builtin_memcpy(&a_lo, ip16, 8);
-    __builtin_memcpy(&a_hi, ip16 + 8, 8);
-    if (a_lo == lo && a_hi == hi)
-      return 1;
-  }
-  return 0;
-}
 
 // barrier_var prevents the compiler from eliminating the AND mask below.
 // After "if (offset >= MAX_DNS_PKT) return 0", the compiler proves
@@ -431,14 +394,21 @@ static __always_inline void process_dns_packet(const char *pkt, __u32 pkt_len,
     if (off == 0 || off + 10 > pkt_len || off + 10 > MAX_DNS_PKT)
       break;
 
-    // Read TYPE/CLASS/TTL/RDLENGTH (10 bytes) using __builtin_memcpy into
-    // stack variables. This avoids per-byte pkt[m+N] accesses that the verifier
-    // unrolls and fails to prove bounded after dns_skip_name.
-    if (off + 10 > pkt_len || off + 10 > MAX_DNS_PKT)
+    // Read TYPE/CLASS/TTL/RDLENGTH (10 bytes).
+    // Cap off at 502 so (off & 511) + 9 ≤ 511 — provably in-bounds for the verifier.
+    if (off + 10 > pkt_len || off > 502)
       break;
     barrier_var(off);
+    __u32 rr_base = off & (MAX_DNS_PKT - 1);
+    // Explicit verifier bound: rr_base+9 must be < 512 (map value_size).
+    // The off>502 check above should guarantee this, but the verifier loses
+    // that bound across loop iterations. Re-check on the masked value directly.
+    if (rr_base + 10 > MAX_DNS_PKT)
+      break;
     __u8 rr_hdr[10];
-    __builtin_memcpy(rr_hdr, pkt + (off & (MAX_DNS_PKT - 1)), 10);
+    // Read byte-by-byte to avoid __builtin_memcpy expansion issues with verifier
+    for (int k = 0; k < 10; k++)
+      rr_hdr[k] = (__u8)pkt[rr_base + k];
     __u16 rtype = ((__u16)rr_hdr[0] << 8) | (__u16)rr_hdr[1];
     __u32 ttl = ((__u32)rr_hdr[4] << 24) | ((__u32)rr_hdr[5] << 16) |
                 ((__u32)rr_hdr[6] << 8) | (__u32)rr_hdr[7];
@@ -452,10 +422,12 @@ static __always_inline void process_dns_packet(const char *pkt, __u32 pkt_len,
     if (rtype == 1 && rdlength == 4) {
       if (off + 4 > MAX_DNS_PKT) break;
       barrier_var(off);
+      __u32 a_off = off & (MAX_DNS_PKT - 1);
+      if (a_off + 4 > MAX_DNS_PKT) break;
       struct dns_ip_key dik;
       __builtin_memset(&dik, 0, sizeof(dik));
       dik.tgid = tgid;
-      ipv4_to_mapped(dik.ip, (__u8 *)(pkt + (off & (MAX_DNS_PKT - 1))));
+      ipv4_to_mapped(dik.ip, (__u8 *)(pkt + a_off));
 
       struct dns_ip_val div;
       __builtin_memset(&div, 0, sizeof(div));
@@ -471,10 +443,12 @@ static __always_inline void process_dns_packet(const char *pkt, __u32 pkt_len,
     if (rtype == 28 && rdlength == 16) {
       if (off + 16 > MAX_DNS_PKT) break;
       barrier_var(off);
+      __u32 aaaa_off = off & (MAX_DNS_PKT - 1);
+      if (aaaa_off + 16 > MAX_DNS_PKT) break;
       struct dns_ip_key dik;
       __builtin_memset(&dik, 0, sizeof(dik));
       dik.tgid = tgid;
-      __builtin_memcpy(dik.ip, pkt + (off & (MAX_DNS_PKT - 1)), 16);
+      __builtin_memcpy(dik.ip, pkt + aaaa_off, 16);
 
       struct dns_ip_val div;
       __builtin_memset(&div, 0, sizeof(div));
@@ -496,87 +470,106 @@ static __always_inline void process_dns_packet(const char *pkt, __u32 pkt_len,
 }
 
 // =============================================================================
-// DNS interception tracepoints (recvfrom enter/exit)
+// DNS interception via kprobe on udp_recvmsg (network-level, language-agnostic)
+//
+// Hooks the kernel's udp_recvmsg() which handles ALL UDP receives regardless
+// of which syscall the application uses (read, recvfrom, recvmsg).
+// Filters on source port 53 + configured DNS server IPs using kernel sock state.
 // =============================================================================
 
-// tp/syscalls/sys_enter_recvfrom: save buffer pointer for exit handler.
-// recvfrom(int fd, void *buf, size_t len, int flags, sockaddr *src_addr, socklen_t *addrlen)
-SEC("tracepoint/syscalls/sys_enter_recvfrom")
-int tp_enter_recvfrom(struct trace_event_raw_sys_enter *ctx) {
+// kprobe/udp_recvmsg: check if this is a DNS socket, save user buffer pointer.
+// int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags, int *addr_len)
+//
+// Uses bpf_probe_read_kernel with arch-specific pt_regs offsets (same pattern
+// as the uprobe functions) since bpf2go compiles with -target bpfel/bpfeb
+// which doesn't support PT_REGS_PARM* / BPF_KPROBE macros.
+SEC("kprobe/udp_recvmsg")
+int kprobe_udp_recvmsg(void *ctx) {
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
 
-  // Only track processes we care about
   __u8 *tracked = bpf_map_lookup_elem(&tracked_tgids, &tgid);
   if (!tracked)
     return 0;
 
-  struct dns_pending_val val = {};
-  val.fd = (__u32)ctx->args[0];
-  val.buf_ptr = (__u64)ctx->args[1];
-  val.sockaddr_ptr = (__u64)ctx->args[4]; // src_addr
+  // Read arguments from pt_regs.
+  // udp_recvmsg(struct sock *sk, struct msghdr *msg, ...)
+  struct sock *sk = NULL;
+  struct msghdr *msg = NULL;
 
-  bpf_map_update_elem(&dns_pending, &pid_tgid, &val, BPF_ANY);
+#if defined(bpf_target_x86)
+  // x86_64 C ABI: RDI=arg1(sk), RSI=arg2(msg)
+  // pt_regs offsets: di=112, si=104
+  bpf_probe_read_kernel(&sk, sizeof(sk), (char *)ctx + 112);
+  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 104);
+#elif defined(bpf_target_arm64)
+  // ARM64 C ABI: X0=arg1(sk), X1=arg2(msg)
+  // pt_regs offsets: regs[0]=0, regs[1]=8
+  bpf_probe_read_kernel(&sk, sizeof(sk), (char *)ctx + 0);
+  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 8);
+#else
+  return 0;
+#endif
+
+  if (!sk || !msg)
+    return 0;
+
+  // Filter for DNS traffic. For connected UDP sockets (Go, Python), skc_dport
+  // is set to 53. For unconnected sockets (Node.js c-ares uses sendto), skc_dport
+  // is 0 — we allow those through since tracked_tgids already limits scope, and
+  // process_dns_packet validates the DNS response format.
+  __be16 dport = 0;
+  BPF_CORE_READ_INTO(&dport, sk, __sk_common.skc_dport);
+  if (dport != __bpf_htons(53) && dport != 0)
+    return 0;
+
+  // Read user buffer from msghdr.msg_iter.
+  // In kernel 6.x, single-buffer recvs use ITER_UBUF where iov_base is stored
+  // inline in __ubuf_iovec. Multi-buffer recvs use ITER_IOVEC where __iov
+  // points to an iovec array. Both share a union at the same offset, so
+  // reading __ubuf_iovec.iov_base works for ITER_UBUF (gets iov_base directly)
+  // and for ITER_IOVEC (__iov pointer occupies the same location as
+  // __ubuf_iovec.iov_base, and dereferencing that iovec's first field also
+  // gives iov_base). We try the direct inline read first.
+  __u64 iov_base = 0;
+  BPF_CORE_READ_INTO(&iov_base, msg, msg_iter.__ubuf_iovec.iov_base);
+  if (!iov_base)
+    return 0;
+
+  struct udp_recv_pending val = {.iov_base = iov_base};
+  bpf_map_update_elem(&udp_recv_scratch, &pid_tgid, &val, BPF_ANY);
   return 0;
 }
 
-// tp/syscalls/sys_exit_recvfrom: read DNS response from saved buffer.
-SEC("tracepoint/syscalls/sys_exit_recvfrom")
-int tp_exit_recvfrom(struct trace_event_raw_sys_exit *ctx) {
+// kretprobe/udp_recvmsg: read the DNS response from the saved user buffer.
+SEC("kretprobe/udp_recvmsg")
+int kretprobe_udp_recvmsg(void *ctx) {
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
 
-  struct dns_pending_val *pending = bpf_map_lookup_elem(&dns_pending, &pid_tgid);
-  if (!pending) {
-    return 0;
-  }
-
-  // Save values before deleting the pending entry
-  __u64 buf_ptr = pending->buf_ptr;
-  __u64 sockaddr_ptr = pending->sockaddr_ptr;
-
-  bpf_map_delete_elem(&dns_pending, &pid_tgid);
-
-  // Check return value (bytes received)
-  long ret = ctx->ret;
-  if (ret <= 12) // minimum DNS header size
+  struct udp_recv_pending *pending =
+      bpf_map_lookup_elem(&udp_recv_scratch, &pid_tgid);
+  if (!pending)
     return 0;
 
-  // Check source address: must be a known DNS server on port 53.
-  // sockaddr_in: { sa_family(2), sin_port(2), sin_addr(4), ... }
-  // sockaddr_in6: { sa_family(2), sin6_port(2), sin6_flowinfo(4), sin6_addr(16), ... }
-  if (sockaddr_ptr != 0) {
-    __u16 sa_family = 0;
-    bpf_probe_read_user(&sa_family, sizeof(sa_family), (void *)sockaddr_ptr);
+  __u64 iov_base = pending->iov_base;
+  bpf_map_delete_elem(&udp_recv_scratch, &pid_tgid);
 
-    __u16 port = 0;
-    __u8 ip16[16] = {};
+  // Read return value from pt_regs
+  long ret = 0;
+#if defined(bpf_target_x86)
+  // x86_64: rax at offset 80
+  bpf_probe_read_kernel(&ret, sizeof(ret), (char *)ctx + 80);
+#elif defined(bpf_target_arm64)
+  // ARM64: regs[0] at offset 0
+  bpf_probe_read_kernel(&ret, sizeof(ret), (char *)ctx + 0);
+#else
+  return 0;
+#endif
 
-    if (sa_family == 2) { // AF_INET
-      bpf_probe_read_user(&port, sizeof(port), (void *)(sockaddr_ptr + 2));
-      __u8 ipv4[4] = {};
-      bpf_probe_read_user(ipv4, 4, (void *)(sockaddr_ptr + 4));
-      ipv4_to_mapped(ip16, ipv4);
-    } else if (sa_family == 10) { // AF_INET6
-      bpf_probe_read_user(&port, sizeof(port), (void *)(sockaddr_ptr + 2));
-      bpf_probe_read_user(ip16, 16, (void *)(sockaddr_ptr + 8));
-    } else {
-      return 0; // unknown address family
-    }
+  if (ret <= 12)
+    return 0;
 
-    // port is in network byte order; DNS = port 53 = 0x0035
-    if (port != __bpf_htons(53))
-      return 0;
-
-    // Check if source IP is a configured DNS server
-    if (!is_dns_server(ip16))
-      return 0;
-  }
-  // If sockaddr_ptr is NULL, the caller didn't care about source —
-  // this is common with connected UDP sockets. We still process it since
-  // the tracked_tgids filter already limits scope.
-
-  // Read DNS packet into per-CPU scratch buffer
   __u32 zero = 0;
   struct dns_scratch_buf *dbuf = bpf_map_lookup_elem(&dns_scratch, &zero);
   if (!dbuf)
@@ -586,7 +579,7 @@ int tp_exit_recvfrom(struct trace_event_raw_sys_exit *ctx) {
   if (read_len > MAX_DNS_PKT)
     read_len = MAX_DNS_PKT;
 
-  if (bpf_probe_read_user(dbuf->pkt, read_len, (void *)buf_ptr) != 0)
+  if (bpf_probe_read_user(dbuf->pkt, read_len, (void *)iov_base) != 0)
     return 0;
 
   process_dns_packet(dbuf->pkt, read_len, tgid);

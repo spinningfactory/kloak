@@ -31,11 +31,11 @@ func TestLoadObjects(t *testing.T) {
 	if objs.BpfUprobeSslWrite == nil {
 		t.Error("BpfUprobeSslWrite program not loaded")
 	}
-	if objs.TpEnterRecvfrom == nil {
-		t.Error("TpEnterRecvfrom program not loaded")
+	if objs.KprobeUdpRecvmsg == nil {
+		t.Error("KprobeUdpRecvmsg program not loaded")
 	}
-	if objs.TpExitRecvfrom == nil {
-		t.Error("TpExitRecvfrom program not loaded")
+	if objs.KretprobeUdpRecvmsg == nil {
+		t.Error("KretprobeUdpRecvmsg program not loaded")
 	}
 	if objs.TpEnterConnect == nil {
 		t.Error("TpEnterConnect program not loaded")
