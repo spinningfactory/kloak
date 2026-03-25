@@ -89,9 +89,12 @@ struct {
   __type(value, struct scratch_buf);
 } scratch SEC(".maps");
 
+// Tail call program array:
+//   slot 0 = bpf_phase2_rewrite (TLS secret rewrite)
+//   slot 1 = dns_parse_packet   (DNS response parsing)
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-  __uint(max_entries, 1);
+  __uint(max_entries, 2);
   __type(key, __u32);
   __type(value, __u32);
 } prog_array SEC(".maps");
@@ -219,9 +222,12 @@ struct {
   __type(value, struct connect_pending_val);
 } connect_pending SEC(".maps");
 
-// Per-CPU scratch buffer for DNS packet parsing (512 bytes).
+// Per-CPU scratch buffer for DNS packet parsing.
+// Also carries tgid/pkt_len for the tail-called dns_parse_packet program.
 struct dns_scratch_buf {
   char pkt[MAX_DNS_PKT];
+  __u32 tgid;
+  __u32 pkt_len;
 };
 
 struct {
@@ -433,36 +439,46 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
   return 0; // continue
 }
 
-// Process a DNS response packet: extract A/AAAA answer IPs and map them to
-// the query hostname, but only if the hostname is in watched_hosts.
-// `tgid` is the process that received the DNS response.
-static __always_inline void process_dns_packet(const char *pkt, __u32 pkt_len,
-                                               __u32 tgid) {
+// Tail-called DNS parser program (slot 1 in prog_array).
+// Reads packet from dns_scratch_buf (per-CPU), parses the DNS response,
+// and stores A/AAAA records in dns_ip_map for watched hostnames.
+// Separated from kretprobe_udp_recvmsg to stay under the verifier's
+// 1M instruction limit on x86_64.
+SEC("kprobe/dns_parse_packet")
+int dns_parse_packet(void *ctx) {
+  __u32 zero = 0;
+  struct dns_scratch_buf *dbuf = bpf_map_lookup_elem(&dns_scratch, &zero);
+  if (!dbuf)
+    return 0;
+
+  const char *pkt = dbuf->pkt;
+  __u32 pkt_len = dbuf->pkt_len;
+  __u32 tgid = dbuf->tgid;
+
   // Minimum DNS header: 12 bytes
   if (pkt_len < 12)
-    return;
+    return 0;
 
   // Check QR bit (response) and RCODE == 0 (no error)
   __u8 flags0 = (__u8)pkt[2];
   __u8 flags1 = (__u8)pkt[3];
-  if (!(flags0 & 0x80)) // QR bit must be 1 (response)
-    return;
-  if ((flags1 & 0x0F) != 0) // RCODE must be 0
-    return;
+  if (!(flags0 & 0x80))
+    return 0;
+  if ((flags1 & 0x0F) != 0)
+    return 0;
 
-  // Parse question count and answer count (big-endian)
   __u16 qdcount = ((__u16)(__u8)pkt[4] << 8) | (__u16)(__u8)pkt[5];
   __u16 ancount = ((__u16)(__u8)pkt[6] << 8) | (__u16)(__u8)pkt[7];
 
   if (qdcount < 1 || ancount < 1)
-    return;
+    return 0;
 
   // Decode the qname from the question section (offset 12)
   char qname[MAX_HOST_LEN];
   __builtin_memset(qname, 0, sizeof(qname));
   __u32 qname_len = dns_decode_qname(pkt, pkt_len, 12, qname, MAX_HOST_LEN);
   if (qname_len == 0 || qname_len > MAX_HOST_LEN)
-    return;
+    return 0;
 
   // Check if this hostname is in watched_hosts
   struct watched_host_key wk;
@@ -470,20 +486,18 @@ static __always_inline void process_dns_packet(const char *pkt, __u32 pkt_len,
   __builtin_memcpy(wk.host, qname, MAX_HOST_LEN);
   __u8 *watched = bpf_map_lookup_elem(&watched_hosts, &wk);
   if (!watched)
-    return; // not a watched hostname, skip
+    return 0;
 
   // Skip past the question section to get to the answer section
   __u32 off = 12;
-  // Skip qname
   off = dns_skip_name(pkt, pkt_len, off);
   if (off == 0)
-    return;
-  // Skip QTYPE (2) + QCLASS (2)
-  off += 4;
+    return 0;
+  off += 4; // QTYPE + QCLASS
   if (off > pkt_len)
-    return;
+    return 0;
 
-  // Parse answer records using bpf_loop to avoid verifier instruction explosion.
+  // Parse answer records using bpf_loop
   struct dns_answer_ctx actx = {
     .off = off,
     .pkt_len = pkt_len,
@@ -495,6 +509,7 @@ static __always_inline void process_dns_packet(const char *pkt, __u32 pkt_len,
   __builtin_memcpy(actx.qname, qname, MAX_HOST_LEN);
 
   bpf_loop(MAX_DNS_ANSWERS, parse_dns_answer, &actx, 0);
+  return 0;
 }
 
 // =============================================================================
@@ -610,7 +625,12 @@ int kretprobe_udp_recvmsg(void *ctx) {
   if (bpf_probe_read_user(dbuf->pkt, read_len, (void *)iov_base) != 0)
     return 0;
 
-  process_dns_packet(dbuf->pkt, read_len, tgid);
+  // Store context for the tail-called DNS parser
+  dbuf->tgid = tgid;
+  dbuf->pkt_len = read_len;
+
+  // Tail call to dns_parse_packet (slot 1) — keeps kretprobe small
+  bpf_tail_call(ctx, &prog_array, 1);
   return 0;
 }
 

@@ -31,6 +31,9 @@ func TestLoadObjects(t *testing.T) {
 	if objs.BpfUprobeSslWrite == nil {
 		t.Error("BpfUprobeSslWrite program not loaded")
 	}
+	if objs.DnsParsePacket == nil {
+		t.Error("DnsParsePacket program not loaded")
+	}
 	if objs.KprobeUdpRecvmsg == nil {
 		t.Error("KprobeUdpRecvmsg program not loaded")
 	}
