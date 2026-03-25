@@ -160,11 +160,11 @@ struct {
   __type(value, __u8);  // 1 = tracked
 } tracked_tgids SEC(".maps");
 
-// DNS-verified IP -> hostname mapping per process.
+// DNS-verified IP -> hostname mapping (global, not per-process).
 // Populated by kretprobe_udp_recvmsg when a DNS response contains an A/AAAA
-// record whose qname is in watched_hosts.
+// record whose qname is in watched_hosts. Global because in containerized
+// environments (k3d/Docker), DNS may be resolved by a proxy process.
 struct dns_ip_key {
-  __u32 tgid;
   __u8 ip[16]; // IPv4-mapped-IPv6 or native IPv6
 };
 
@@ -260,7 +260,6 @@ struct {
 // Also carries tgid/pkt_len for the tail-called dns_parse_packet program.
 struct dns_scratch_buf {
   char pkt[MAX_DNS_PKT];
-  __u32 tgid;
   __u32 pkt_len;
 };
 
@@ -409,7 +408,6 @@ struct dns_answer_ctx {
   __u32 off;
   __u32 pkt_len;
   __u16 ancount;
-  __u32 tgid;
   __u32 qname_len;
   __u32 answers_processed;
   char qname[MAX_HOST_LEN];
@@ -466,7 +464,6 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
     if (a_off + 4 > MAX_DNS_PKT) return 1;
     struct dns_ip_key dik;
     __builtin_memset(&dik, 0, sizeof(dik));
-    dik.tgid = actx->tgid;
     ipv4_to_mapped(dik.ip, (__u8 *)(pkt + a_off));
 
     struct dns_ip_val div;
@@ -488,7 +485,6 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
     if (aaaa_off + 16 > MAX_DNS_PKT) return 1;
     struct dns_ip_key dik;
     __builtin_memset(&dik, 0, sizeof(dik));
-    dik.tgid = actx->tgid;
     __builtin_memcpy(dik.ip, pkt + aaaa_off, 16);
 
     struct dns_ip_val div;
@@ -524,7 +520,6 @@ static __noinline void do_dns_parse(void) {
 
   const char *pkt = dbuf->pkt;
   __u32 pkt_len = dbuf->pkt_len;
-  __u32 tgid = dbuf->tgid;
 
   if (pkt_len < 12)
     return;
@@ -564,7 +559,6 @@ static __noinline void do_dns_parse(void) {
     .off = off,
     .pkt_len = pkt_len,
     .ancount = ancount,
-    .tgid = tgid,
     .qname_len = qname_len,
     .answers_processed = 0,
   };
@@ -590,13 +584,6 @@ static __noinline void do_dns_parse(void) {
 SEC("kprobe/udp_recvmsg")
 int kprobe_udp_recvmsg(void *ctx) {
   dbg_inc(DBG_KPROBE_ENTRY);
-  __u64 pid_tgid = bpf_get_current_pid_tgid();
-  __u32 tgid = (__u32)(pid_tgid >> 32);
-
-  __u8 *tracked = bpf_map_lookup_elem(&tracked_tgids, &tgid);
-  if (!tracked)
-    return 0;
-  dbg_inc(DBG_KPROBE_TRACKED);
 
   // Read arguments from pt_regs.
   // udp_recvmsg(struct sock *sk, struct msghdr *msg, ...)
@@ -650,7 +637,6 @@ int kprobe_udp_recvmsg(void *ctx) {
 SEC("kretprobe/udp_recvmsg")
 int kretprobe_udp_recvmsg(void *ctx) {
   __u64 pid_tgid = bpf_get_current_pid_tgid();
-  __u32 tgid = (__u32)(pid_tgid >> 32);
 
   struct udp_recv_pending *pending =
       bpf_map_lookup_elem(&udp_recv_scratch, &pid_tgid);
@@ -691,7 +677,6 @@ int kretprobe_udp_recvmsg(void *ctx) {
   }
   dbg_inc(DBG_KRETPROBE_READ_OK);
 
-  dbuf->tgid = tgid;
   dbuf->pkt_len = read_len;
 
   do_dns_parse();
@@ -775,7 +760,6 @@ int tp_exit_connect(struct trace_event_raw_sys_exit *ctx) {
   // Check if this IP was DNS-verified (exists in dns_ip_map for this tgid)
   struct dns_ip_key dik;
   __builtin_memset(&dik, 0, sizeof(dik));
-  dik.tgid = tgid;
   __builtin_memcpy(dik.ip, ip, 16);
 
   struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
@@ -848,7 +832,6 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
 
   struct dns_ip_key dik;
   __builtin_memset(&dik, 0, sizeof(dik));
-  dik.tgid = tgid;
   __builtin_memcpy(dik.ip, civ->ip, 16);
 
   struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);

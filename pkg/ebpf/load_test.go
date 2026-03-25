@@ -103,8 +103,7 @@ func TestDnsIpMapOperations(t *testing.T) {
 	objs := loadTestObjects(t)
 
 	type dnsIpKey struct {
-		Tgid uint32
-		IP   [16]byte
+		IP [16]byte
 	}
 	type dnsIpVal struct {
 		Hostname   [32]byte
@@ -113,7 +112,7 @@ func TestDnsIpMapOperations(t *testing.T) {
 		InsertedAt uint64
 	}
 
-	key := dnsIpKey{Tgid: 1234}
+	key := dnsIpKey{}
 	// IPv4-mapped-IPv6 for 1.2.3.4
 	key.IP[10] = 0xff
 	key.IP[11] = 0xff
