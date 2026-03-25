@@ -584,6 +584,7 @@ static __noinline void do_dns_parse(void) {
 SEC("kprobe/udp_recvmsg")
 int kprobe_udp_recvmsg(void *ctx) {
   dbg_inc(DBG_KPROBE_ENTRY);
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
 
   // Read arguments from pt_regs.
   // udp_recvmsg(struct sock *sk, struct msghdr *msg, ...)
