@@ -70,29 +70,9 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 	log := ctrl.Log.WithName("ebpf-uprobe")
 
 	objs := &tlsuprobeObjects{}
-	// First attempt: no verifier log (avoids large memory allocation).
 	if err := loadTlsuprobeObjects(objs, nil); err != nil {
-		// Retry with verifier log on failure to capture diagnostics.
-		opts := &ebpf.CollectionOptions{
-			Programs: ebpf.ProgramOptions{
-				LogLevel:     ebpf.LogLevelBranch,
-				LogSizeStart: 1 << 20, // 1MB — bpf_loop callbacks generate large logs
-			},
-		}
-		if retryErr := loadTlsuprobeObjects(objs, opts); retryErr != nil {
-			var ve *ebpf.VerifierError
-			if errors.As(retryErr, &ve) {
-				// Truncate verifier log to avoid OOM on huge outputs
-				vlog := fmt.Sprintf("%+v", ve)
-				if len(vlog) > 4096 {
-					vlog = vlog[:4096] + "\n... (truncated)"
-				}
-				log.Error(retryErr, "eBPF Verifier Error", "verifier_log", vlog)
-			} else {
-				log.Error(retryErr, "eBPF loading failed")
-			}
-			return nil, fmt.Errorf("loading eBPF objects: %w", retryErr)
-		}
+		log.Error(err, "eBPF loading failed (no verifier log)")
+		return nil, fmt.Errorf("loading eBPF objects: %w", err)
 	}
 
 	// Wire up tail call map: index 0 -> bpf_phase2_rewrite
