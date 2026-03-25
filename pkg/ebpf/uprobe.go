@@ -378,6 +378,8 @@ var debugCounterNames = []string{
 	"kretprobe_read_fail", "kretprobe_read_ok", "dns_parse_entry", "dns_not_response",
 	"dns_no_answers", "dns_qname_fail", "dns_not_watched", "dns_watched_hit",
 	"dns_answer_stored", "phase2_entered",
+	"resolve_ssl_fd_hit", "resolve_last_vfd_hit", "resolve_fd_scan_hit",
+	"resolve_no_fd", "resolve_no_conn", "resolve_no_dns", "resolve_host_ok",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

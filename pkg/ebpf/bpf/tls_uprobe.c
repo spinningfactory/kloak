@@ -131,6 +131,13 @@ enum {
   DBG_DNS_WATCHED_HIT,        // hostname IS in watched_hosts
   DBG_DNS_ANSWER_STORED,      // A/AAAA record stored in dns_ip_map
   DBG_PHASE2_ENTERED,         // phase2_rewrite entered
+  DBG_RESOLVE_SSL_FD_HIT,     // ssl_fd_map cache hit
+  DBG_RESOLVE_LAST_VFD_HIT,   // last_verified_fd hit
+  DBG_RESOLVE_FD_SCAN_HIT,    // fd scan found DNS-verified connection
+  DBG_RESOLVE_NO_FD,          // no fd found at all
+  DBG_RESOLVE_NO_CONN,        // fd found but no conn_ip_map entry
+  DBG_RESOLVE_NO_DNS,         // conn found but IP not in dns_ip_map
+  DBG_RESOLVE_HOST_OK,        // hostname resolved successfully
   DBG_MAX,
 };
 
@@ -804,6 +811,7 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     if (sfv) {
       fd = sfv->fd;
       found = 1;
+      dbg_inc(DBG_RESOLVE_SSL_FD_HIT);
     }
   }
 
@@ -813,8 +821,8 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     if (vfd) {
       fd = *vfd;
       found = 1;
+      dbg_inc(DBG_RESOLVE_LAST_VFD_HIT);
 
-      // Cache for next time (OpenSSL only)
       if (ssl_ptr != 0) {
         struct ssl_fd_key sfk;
         __builtin_memset(&sfk, 0, sizeof(sfk));
@@ -826,14 +834,11 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     }
   }
 
-  // Path 3: scan common fds in conn_ip_map -> dns_ip_map.
-  // Handles the case where connect() happened before DNS was captured
-  // (common with Docker DNS proxy and persistent connections).
+  // If we have a cached fd, try it directly
   if (found) {
     struct conn_ip_key cik = {.tgid = tgid, .fd = fd};
     struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
-    if (!civ)
-      return;
+    if (!civ) { dbg_inc(DBG_RESOLVE_NO_CONN); return; }
     struct dns_ip_key dik;
     __builtin_memset(&dik, 0, sizeof(dik));
     __builtin_memcpy(dik.ip, civ->ip, 16);
@@ -841,12 +846,16 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     if (div && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
       __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
       scratch_data->host_value_len = div->host_len;
+      dbg_inc(DBG_RESOLVE_HOST_OK);
+    } else {
+      dbg_inc(DBG_RESOLVE_NO_DNS);
     }
     return;
   }
 
-  // No cached fd — scan fds 3..10 in conn_ip_map for a DNS-verified IP
-  for (__u32 try_fd = 3; try_fd <= 10; try_fd++) {
+  // Path 3: No cached fd — scan fds 3..30 in conn_ip_map for a DNS-verified IP.
+  // Handles the case where connect() happened before DNS was captured.
+  for (__u32 try_fd = 3; try_fd <= 30; try_fd++) {
     struct conn_ip_key cik = {.tgid = tgid, .fd = try_fd};
     struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
     if (!civ)
@@ -858,11 +867,12 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     if (div && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
       __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
       scratch_data->host_value_len = div->host_len;
-      // Cache this fd for future lookups
       bpf_map_update_elem(&last_verified_fd, &tgid, &try_fd, BPF_ANY);
+      dbg_inc(DBG_RESOLVE_FD_SCAN_HIT);
       return;
     }
   }
+  dbg_inc(DBG_RESOLVE_NO_FD);
 }
 
 // -----------------------------------------------------------------------------
