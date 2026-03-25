@@ -480,53 +480,48 @@ static __noinline void do_dns_parse(void) {
   __u32 zero = 0;
   struct dns_scratch_buf *dbuf = bpf_map_lookup_elem(&dns_scratch, &zero);
   if (!dbuf)
-    return 0;
+    return;
 
   const char *pkt = dbuf->pkt;
   __u32 pkt_len = dbuf->pkt_len;
   __u32 tgid = dbuf->tgid;
 
-  // Minimum DNS header: 12 bytes
   if (pkt_len < 12)
-    return 0;
+    return;
 
-  // Check QR bit (response) and RCODE == 0 (no error)
   __u8 flags0 = (__u8)pkt[2];
   __u8 flags1 = (__u8)pkt[3];
   if (!(flags0 & 0x80))
-    return 0;
+    return;
   if ((flags1 & 0x0F) != 0)
-    return 0;
+    return;
 
   __u16 qdcount = ((__u16)(__u8)pkt[4] << 8) | (__u16)(__u8)pkt[5];
   __u16 ancount = ((__u16)(__u8)pkt[6] << 8) | (__u16)(__u8)pkt[7];
 
   if (qdcount < 1 || ancount < 1)
-    return 0;
+    return;
 
-  // Decode the qname from the question section (offset 12)
   char qname[MAX_HOST_LEN];
   __builtin_memset(qname, 0, sizeof(qname));
   __u32 qname_len = dns_decode_qname(pkt, pkt_len, 12, qname, MAX_HOST_LEN);
   if (qname_len == 0 || qname_len > MAX_HOST_LEN)
-    return 0;
+    return;
 
-  // Check if this hostname is in watched_hosts
   struct watched_host_key wk;
   __builtin_memset(&wk, 0, sizeof(wk));
   __builtin_memcpy(wk.host, qname, MAX_HOST_LEN);
   __u8 *watched = bpf_map_lookup_elem(&watched_hosts, &wk);
   if (!watched)
-    return 0;
+    return;
 
-  // Skip past the question section to get to the answer section
   __u32 off = 12;
   off = dns_skip_name(pkt_len, off);
   if (off == 0)
-    return 0;
-  off += 4; // QTYPE + QCLASS
+    return;
+  off += 4;
   if (off > pkt_len)
-    return 0;
+    return;
 
   // Parse answer records using bpf_loop
   struct dns_answer_ctx actx = {
