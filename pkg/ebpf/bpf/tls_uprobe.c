@@ -276,27 +276,60 @@ static __always_inline void ipv4_to_mapped(__u8 *out16, const __u8 *ipv4) {
 #define barrier_var(var) asm volatile("" : "+r"(var) : :)
 #endif
 
-// Skip a DNS name in compressed wire format. Returns the new offset, or 0 on error.
-// Uses barrier_var + bitmask to satisfy BPF verifier bounds checking.
-static __always_inline __u32 dns_skip_name(const char *pkt, __u32 pkt_len,
-                                           __u32 off) {
-  for (int i = 0; i < 8; i++) {
-    if (off >= pkt_len || off >= MAX_DNS_PKT)
-      return 0;
-    barrier_var(off);
-    __u8 b = (__u8)pkt[off & (MAX_DNS_PKT - 1)];
-    if (b == 0)
-      return off + 1;
-    if ((b & 0xC0) == 0xC0)
-      return off + 2;
-    if ((b & 0xC0) != 0)
-      return 0; // reserved bits
-    __u32 next = off + 1 + (__u32)b;
-    if (next > pkt_len || next > MAX_DNS_PKT)
-      return 0;
-    off = next;
+// Context for dns_skip_name bpf_loop callback.
+struct skip_name_ctx {
+  __u32 off;
+  __u32 pkt_len;
+  __u32 result; // 0 = still running, >0 = final offset (success), set to pkt_len+1 on error
+};
+
+// bpf_loop callback: skip one label of a DNS name.
+static int skip_name_step(__u32 idx, void *ctx) {
+  struct skip_name_ctx *sctx = (struct skip_name_ctx *)ctx;
+  if (sctx->result)
+    return 1; // already done
+
+  __u32 off = sctx->off;
+  if (off >= sctx->pkt_len || off >= MAX_DNS_PKT) {
+    sctx->result = sctx->pkt_len + 1; // error
+    return 1;
   }
+
+  __u32 zero = 0;
+  struct dns_scratch_buf *dbuf = bpf_map_lookup_elem(&dns_scratch, &zero);
+  if (!dbuf) { sctx->result = sctx->pkt_len + 1; return 1; }
+
+  barrier_var(off);
+  __u8 b = (__u8)dbuf->pkt[off & (MAX_DNS_PKT - 1)];
+
+  if (b == 0) {
+    sctx->result = off + 1;
+    return 1;
+  }
+  if ((b & 0xC0) == 0xC0) {
+    sctx->result = off + 2;
+    return 1;
+  }
+  if ((b & 0xC0) != 0) {
+    sctx->result = sctx->pkt_len + 1; // reserved bits = error
+    return 1;
+  }
+  __u32 next = off + 1 + (__u32)b;
+  if (next > sctx->pkt_len || next > MAX_DNS_PKT) {
+    sctx->result = sctx->pkt_len + 1;
+    return 1;
+  }
+  sctx->off = next;
   return 0;
+}
+
+// Skip a DNS name in compressed wire format. Returns new offset, or 0 on error.
+static __always_inline __u32 dns_skip_name(__u32 pkt_len, __u32 off) {
+  struct skip_name_ctx sctx = { .off = off, .pkt_len = pkt_len, .result = 0 };
+  bpf_loop(64, skip_name_step, &sctx, 0);
+  if (sctx.result == 0 || sctx.result > pkt_len)
+    return 0;
+  return sctx.result;
 }
 
 // Decode a DNS qname using a FLAT single loop (not nested).
@@ -368,7 +401,7 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
   __u32 off = actx->off;
 
   // Skip the answer name (may be compressed)
-  off = dns_skip_name(pkt, pkt_len, off);
+  off = dns_skip_name(pkt_len, off);
   if (off == 0 || off + 10 > pkt_len || off + 10 > MAX_DNS_PKT)
     return 1;
 
@@ -490,7 +523,7 @@ int dns_parse_packet(void *ctx) {
 
   // Skip past the question section to get to the answer section
   __u32 off = 12;
-  off = dns_skip_name(pkt, pkt_len, off);
+  off = dns_skip_name(pkt_len, off);
   if (off == 0)
     return 0;
   off += 4; // QTYPE + QCLASS
