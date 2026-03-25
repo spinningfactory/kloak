@@ -331,6 +331,108 @@ static __always_inline __u32 dns_decode_qname(const char *pkt, __u32 pkt_len,
   return host_len;
 }
 
+// Context passed to each bpf_loop callback for DNS answer parsing.
+struct dns_answer_ctx {
+  __u32 off;
+  __u32 pkt_len;
+  __u16 ancount;
+  __u32 tgid;
+  __u32 qname_len;
+  __u32 answers_processed;
+  char qname[MAX_HOST_LEN];
+};
+
+// bpf_loop callback: parse one DNS answer record.
+// Reads from dns_scratch per-CPU buffer (must re-lookup per frame for verifier).
+static int parse_dns_answer(__u32 idx, void *ctx) {
+  struct dns_answer_ctx *actx = (struct dns_answer_ctx *)ctx;
+
+  if (actx->answers_processed >= actx->ancount)
+    return 1; // stop
+  if (actx->off >= actx->pkt_len)
+    return 1;
+
+  // Re-lookup per-CPU scratch buffer (verifier requires per-frame)
+  __u32 zero = 0;
+  struct dns_scratch_buf *dbuf = bpf_map_lookup_elem(&dns_scratch, &zero);
+  if (!dbuf)
+    return 1;
+  const char *pkt = dbuf->pkt;
+  __u32 pkt_len = actx->pkt_len;
+  __u32 off = actx->off;
+
+  // Skip the answer name (may be compressed)
+  off = dns_skip_name(pkt, pkt_len, off);
+  if (off == 0 || off + 10 > pkt_len || off + 10 > MAX_DNS_PKT)
+    return 1;
+
+  // Read TYPE/CLASS/TTL/RDLENGTH (10 bytes).
+  if (off + 10 > pkt_len || off > 502)
+    return 1;
+  barrier_var(off);
+  __u32 rr_base = off & (MAX_DNS_PKT - 1);
+  if (rr_base + 10 > MAX_DNS_PKT)
+    return 1;
+  __u8 rr_hdr[10];
+  for (int k = 0; k < 10; k++)
+    rr_hdr[k] = (__u8)pkt[rr_base + k];
+  __u16 rtype = ((__u16)rr_hdr[0] << 8) | (__u16)rr_hdr[1];
+  __u32 ttl = ((__u32)rr_hdr[4] << 24) | ((__u32)rr_hdr[5] << 16) |
+              ((__u32)rr_hdr[6] << 8) | (__u32)rr_hdr[7];
+  __u16 rdlength = ((__u16)rr_hdr[8] << 8) | (__u16)rr_hdr[9];
+  off += 10;
+
+  if (off + rdlength > pkt_len || off + rdlength > MAX_DNS_PKT)
+    return 1;
+
+  // A record (type 1, rdlength 4)
+  if (rtype == 1 && rdlength == 4) {
+    if (off + 4 > MAX_DNS_PKT) return 1;
+    barrier_var(off);
+    __u32 a_off = off & (MAX_DNS_PKT - 1);
+    if (a_off + 4 > MAX_DNS_PKT) return 1;
+    struct dns_ip_key dik;
+    __builtin_memset(&dik, 0, sizeof(dik));
+    dik.tgid = actx->tgid;
+    ipv4_to_mapped(dik.ip, (__u8 *)(pkt + a_off));
+
+    struct dns_ip_val div;
+    __builtin_memset(&div, 0, sizeof(div));
+    __builtin_memcpy(div.hostname, actx->qname, MAX_HOST_LEN);
+    div.host_len = actx->qname_len;
+    div.ttl_sec = ttl;
+    div.inserted_at = bpf_ktime_get_ns();
+
+    bpf_map_update_elem(&dns_ip_map, &dik, &div, BPF_ANY);
+  }
+
+  // AAAA record (type 28, rdlength 16)
+  if (rtype == 28 && rdlength == 16) {
+    if (off + 16 > MAX_DNS_PKT) return 1;
+    barrier_var(off);
+    __u32 aaaa_off = off & (MAX_DNS_PKT - 1);
+    if (aaaa_off + 16 > MAX_DNS_PKT) return 1;
+    struct dns_ip_key dik;
+    __builtin_memset(&dik, 0, sizeof(dik));
+    dik.tgid = actx->tgid;
+    __builtin_memcpy(dik.ip, pkt + aaaa_off, 16);
+
+    struct dns_ip_val div;
+    __builtin_memset(&div, 0, sizeof(div));
+    __builtin_memcpy(div.hostname, actx->qname, MAX_HOST_LEN);
+    div.host_len = actx->qname_len;
+    div.ttl_sec = ttl;
+    div.inserted_at = bpf_ktime_get_ns();
+
+    bpf_map_update_elem(&dns_ip_map, &dik, &div, BPF_ANY);
+  }
+
+  off += rdlength;
+  actx->off = off;
+  actx->answers_processed++;
+  return 0; // continue
+}
+
 // Process a DNS response packet: extract A/AAAA answer IPs and map them to
 // the query hostname, but only if the hostname is in watched_hosts.
 // `tgid` is the process that received the DNS response.
@@ -381,92 +483,18 @@ static __always_inline void process_dns_packet(const char *pkt, __u32 pkt_len,
   if (off > pkt_len)
     return;
 
-  // Parse answer records
-  __u32 answers_processed = 0;
-  for (int i = 0; i < MAX_DNS_ANSWERS; i++) {
-    if (answers_processed >= ancount)
-      break;
-    if (off >= pkt_len)
-      break;
+  // Parse answer records using bpf_loop to avoid verifier instruction explosion.
+  struct dns_answer_ctx actx = {
+    .off = off,
+    .pkt_len = pkt_len,
+    .ancount = ancount,
+    .tgid = tgid,
+    .qname_len = qname_len,
+    .answers_processed = 0,
+  };
+  __builtin_memcpy(actx.qname, qname, MAX_HOST_LEN);
 
-    // Skip the answer name (may be compressed)
-    off = dns_skip_name(pkt, pkt_len, off);
-    if (off == 0 || off + 10 > pkt_len || off + 10 > MAX_DNS_PKT)
-      break;
-
-    // Read TYPE/CLASS/TTL/RDLENGTH (10 bytes).
-    // Cap off at 502 so (off & 511) + 9 ≤ 511 — provably in-bounds for the verifier.
-    if (off + 10 > pkt_len || off > 502)
-      break;
-    barrier_var(off);
-    __u32 rr_base = off & (MAX_DNS_PKT - 1);
-    // Explicit verifier bound: rr_base+9 must be < 512 (map value_size).
-    // The off>502 check above should guarantee this, but the verifier loses
-    // that bound across loop iterations. Re-check on the masked value directly.
-    if (rr_base + 10 > MAX_DNS_PKT)
-      break;
-    __u8 rr_hdr[10];
-    // Read byte-by-byte to avoid __builtin_memcpy expansion issues with verifier
-    for (int k = 0; k < 10; k++)
-      rr_hdr[k] = (__u8)pkt[rr_base + k];
-    __u16 rtype = ((__u16)rr_hdr[0] << 8) | (__u16)rr_hdr[1];
-    __u32 ttl = ((__u32)rr_hdr[4] << 24) | ((__u32)rr_hdr[5] << 16) |
-                ((__u32)rr_hdr[6] << 8) | (__u32)rr_hdr[7];
-    __u16 rdlength = ((__u16)rr_hdr[8] << 8) | (__u16)rr_hdr[9];
-    off += 10;
-
-    if (off + rdlength > pkt_len || off + rdlength > MAX_DNS_PKT)
-      break;
-
-    // A record (type 1, rdlength 4)
-    if (rtype == 1 && rdlength == 4) {
-      if (off + 4 > MAX_DNS_PKT) break;
-      barrier_var(off);
-      __u32 a_off = off & (MAX_DNS_PKT - 1);
-      if (a_off + 4 > MAX_DNS_PKT) break;
-      struct dns_ip_key dik;
-      __builtin_memset(&dik, 0, sizeof(dik));
-      dik.tgid = tgid;
-      ipv4_to_mapped(dik.ip, (__u8 *)(pkt + a_off));
-
-      struct dns_ip_val div;
-      __builtin_memset(&div, 0, sizeof(div));
-      __builtin_memcpy(div.hostname, qname, MAX_HOST_LEN);
-      div.host_len = qname_len;
-      div.ttl_sec = ttl;
-      div.inserted_at = bpf_ktime_get_ns();
-
-      bpf_map_update_elem(&dns_ip_map, &dik, &div, BPF_ANY);
-    }
-
-    // AAAA record (type 28, rdlength 16)
-    if (rtype == 28 && rdlength == 16) {
-      if (off + 16 > MAX_DNS_PKT) break;
-      barrier_var(off);
-      __u32 aaaa_off = off & (MAX_DNS_PKT - 1);
-      if (aaaa_off + 16 > MAX_DNS_PKT) break;
-      struct dns_ip_key dik;
-      __builtin_memset(&dik, 0, sizeof(dik));
-      dik.tgid = tgid;
-      __builtin_memcpy(dik.ip, pkt + aaaa_off, 16);
-
-      struct dns_ip_val div;
-      __builtin_memset(&div, 0, sizeof(div));
-      __builtin_memcpy(div.hostname, qname, MAX_HOST_LEN);
-      div.host_len = qname_len;
-      div.ttl_sec = ttl;
-      div.inserted_at = bpf_ktime_get_ns();
-
-      bpf_map_update_elem(&dns_ip_map, &dik, &div, BPF_ANY);
-
-#ifdef KLOAK_DEBUG
-      bpf_printk("kloak dns: tgid=%u AAAA -> %s", tgid, qname);
-#endif
-    }
-
-    off += rdlength;
-    answers_processed++;
-  }
+  bpf_loop(MAX_DNS_ANSWERS, parse_dns_answer, &actx, 0);
 }
 
 // =============================================================================
