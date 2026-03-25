@@ -110,6 +110,43 @@ struct tls_event {
   __u8 is_rewritten; // 1 = secret was rewritten in-kernel
 };
 
+// Debug counters for diagnosing DNS interception issues.
+// Index: see DBG_* constants below.
+enum {
+  DBG_KPROBE_ENTRY = 0,       // udp_recvmsg kprobe entered
+  DBG_KPROBE_TRACKED,         // tracked_tgids hit
+  DBG_KPROBE_DPORT53,         // skc_dport == 53
+  DBG_KPROBE_DPORT0,          // skc_dport == 0 (unconnected)
+  DBG_KPROBE_DPORT_OTHER,     // skc_dport != 53 and != 0
+  DBG_KPROBE_IOV_OK,          // iov_base read successfully
+  DBG_KRETPROBE_ENTRY,        // kretprobe entered (has pending)
+  DBG_KRETPROBE_RET_SMALL,    // ret <= 12
+  DBG_KRETPROBE_READ_FAIL,    // bpf_probe_read_user failed
+  DBG_KRETPROBE_READ_OK,      // packet read into scratch
+  DBG_DNS_PARSE_ENTRY,        // do_dns_parse entered
+  DBG_DNS_NOT_RESPONSE,       // QR bit not set or RCODE != 0
+  DBG_DNS_NO_ANSWERS,         // qdcount < 1 or ancount < 1
+  DBG_DNS_QNAME_FAIL,         // qname decode failed
+  DBG_DNS_NOT_WATCHED,        // hostname not in watched_hosts
+  DBG_DNS_WATCHED_HIT,        // hostname IS in watched_hosts
+  DBG_DNS_ANSWER_STORED,      // A/AAAA record stored in dns_ip_map
+  DBG_PHASE2_ENTERED,         // phase2_rewrite entered
+  DBG_MAX,
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 32); // must be >= DBG_MAX
+  __type(key, __u32);
+  __type(value, __u64);
+} debug_counters SEC(".maps");
+
+static __always_inline void dbg_inc(__u32 idx) {
+  __u64 *val = bpf_map_lookup_elem(&debug_counters, &idx);
+  if (val)
+    __sync_fetch_and_add(val, 1);
+}
+
 // =============================================================================
 // DNS-verified host filtering maps
 // =============================================================================
@@ -440,6 +477,7 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
     div.inserted_at = bpf_ktime_get_ns();
 
     bpf_map_update_elem(&dns_ip_map, &dik, &div, BPF_ANY);
+    dbg_inc(DBG_DNS_ANSWER_STORED);
   }
 
   // AAAA record (type 28, rdlength 16)
@@ -461,6 +499,7 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
     div.inserted_at = bpf_ktime_get_ns();
 
     bpf_map_update_elem(&dns_ip_map, &dik, &div, BPF_ANY);
+    dbg_inc(DBG_DNS_ANSWER_STORED);
   }
 
   off += rdlength;
@@ -477,6 +516,7 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
 // Parse DNS response from dns_scratch per-CPU buffer.
 // __noinline to keep it as a single BPF subprogram, reducing verifier cost.
 static __noinline void do_dns_parse(void) {
+  dbg_inc(DBG_DNS_PARSE_ENTRY);
   __u32 zero = 0;
   struct dns_scratch_buf *dbuf = bpf_map_lookup_elem(&dns_scratch, &zero);
   if (!dbuf)
@@ -491,29 +531,25 @@ static __noinline void do_dns_parse(void) {
 
   __u8 flags0 = (__u8)pkt[2];
   __u8 flags1 = (__u8)pkt[3];
-  if (!(flags0 & 0x80))
-    return;
-  if ((flags1 & 0x0F) != 0)
-    return;
+  if (!(flags0 & 0x80)) { dbg_inc(DBG_DNS_NOT_RESPONSE); return; }
+  if ((flags1 & 0x0F) != 0) { dbg_inc(DBG_DNS_NOT_RESPONSE); return; }
 
   __u16 qdcount = ((__u16)(__u8)pkt[4] << 8) | (__u16)(__u8)pkt[5];
   __u16 ancount = ((__u16)(__u8)pkt[6] << 8) | (__u16)(__u8)pkt[7];
 
-  if (qdcount < 1 || ancount < 1)
-    return;
+  if (qdcount < 1 || ancount < 1) { dbg_inc(DBG_DNS_NO_ANSWERS); return; }
 
   char qname[MAX_HOST_LEN];
   __builtin_memset(qname, 0, sizeof(qname));
   __u32 qname_len = dns_decode_qname(pkt, pkt_len, 12, qname, MAX_HOST_LEN);
-  if (qname_len == 0 || qname_len > MAX_HOST_LEN)
-    return;
+  if (qname_len == 0 || qname_len > MAX_HOST_LEN) { dbg_inc(DBG_DNS_QNAME_FAIL); return; }
 
   struct watched_host_key wk;
   __builtin_memset(&wk, 0, sizeof(wk));
   __builtin_memcpy(wk.host, qname, MAX_HOST_LEN);
   __u8 *watched = bpf_map_lookup_elem(&watched_hosts, &wk);
-  if (!watched)
-    return;
+  if (!watched) { dbg_inc(DBG_DNS_NOT_WATCHED); return; }
+  dbg_inc(DBG_DNS_WATCHED_HIT);
 
   __u32 off = 12;
   off = dns_skip_name(pkt_len, off);
@@ -553,12 +589,14 @@ static __noinline void do_dns_parse(void) {
 // which doesn't support PT_REGS_PARM* / BPF_KPROBE macros.
 SEC("kprobe/udp_recvmsg")
 int kprobe_udp_recvmsg(void *ctx) {
+  dbg_inc(DBG_KPROBE_ENTRY);
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
 
   __u8 *tracked = bpf_map_lookup_elem(&tracked_tgids, &tgid);
   if (!tracked)
     return 0;
+  dbg_inc(DBG_KPROBE_TRACKED);
 
   // Read arguments from pt_regs.
   // udp_recvmsg(struct sock *sk, struct msghdr *msg, ...)
@@ -588,21 +626,20 @@ int kprobe_udp_recvmsg(void *ctx) {
   // process_dns_packet validates the DNS response format.
   __be16 dport = 0;
   BPF_CORE_READ_INTO(&dport, sk, __sk_common.skc_dport);
-  if (dport != __bpf_htons(53) && dport != 0)
+  if (dport == __bpf_htons(53))
+    dbg_inc(DBG_KPROBE_DPORT53);
+  else if (dport == 0)
+    dbg_inc(DBG_KPROBE_DPORT0);
+  else {
+    dbg_inc(DBG_KPROBE_DPORT_OTHER);
     return 0;
+  }
 
-  // Read user buffer from msghdr.msg_iter.
-  // In kernel 6.x, single-buffer recvs use ITER_UBUF where iov_base is stored
-  // inline in __ubuf_iovec. Multi-buffer recvs use ITER_IOVEC where __iov
-  // points to an iovec array. Both share a union at the same offset, so
-  // reading __ubuf_iovec.iov_base works for ITER_UBUF (gets iov_base directly)
-  // and for ITER_IOVEC (__iov pointer occupies the same location as
-  // __ubuf_iovec.iov_base, and dereferencing that iovec's first field also
-  // gives iov_base). We try the direct inline read first.
   __u64 iov_base = 0;
   BPF_CORE_READ_INTO(&iov_base, msg, msg_iter.__ubuf_iovec.iov_base);
   if (!iov_base)
     return 0;
+  dbg_inc(DBG_KPROBE_IOV_OK);
 
   struct udp_recv_pending val = {.iov_base = iov_base};
   bpf_map_update_elem(&udp_recv_scratch, &pid_tgid, &val, BPF_ANY);
@@ -619,6 +656,7 @@ int kretprobe_udp_recvmsg(void *ctx) {
       bpf_map_lookup_elem(&udp_recv_scratch, &pid_tgid);
   if (!pending)
     return 0;
+  dbg_inc(DBG_KRETPROBE_ENTRY);
 
   __u64 iov_base = pending->iov_base;
   bpf_map_delete_elem(&udp_recv_scratch, &pid_tgid);
@@ -626,17 +664,17 @@ int kretprobe_udp_recvmsg(void *ctx) {
   // Read return value from pt_regs
   long ret = 0;
 #if defined(bpf_target_x86)
-  // x86_64: rax at offset 80
   bpf_probe_read_kernel(&ret, sizeof(ret), (char *)ctx + 80);
 #elif defined(bpf_target_arm64)
-  // ARM64: regs[0] at offset 0
   bpf_probe_read_kernel(&ret, sizeof(ret), (char *)ctx + 0);
 #else
   return 0;
 #endif
 
-  if (ret <= 12)
+  if (ret <= 12) {
+    dbg_inc(DBG_KRETPROBE_RET_SMALL);
     return 0;
+  }
 
   __u32 zero = 0;
   struct dns_scratch_buf *dbuf = bpf_map_lookup_elem(&dns_scratch, &zero);
@@ -647,8 +685,11 @@ int kretprobe_udp_recvmsg(void *ctx) {
   if (read_len > MAX_DNS_PKT)
     read_len = MAX_DNS_PKT;
 
-  if (bpf_probe_read_user(dbuf->pkt, read_len, (void *)iov_base) != 0)
+  if (bpf_probe_read_user(dbuf->pkt, read_len, (void *)iov_base) != 0) {
+    dbg_inc(DBG_KRETPROBE_READ_FAIL);
     return 0;
+  }
+  dbg_inc(DBG_KRETPROBE_READ_OK);
 
   dbuf->tgid = tgid;
   dbuf->pkt_len = read_len;
@@ -899,6 +940,7 @@ static int scan_chunk(__u32 chunk_idx, void *ctx) {
 
 SEC("uprobe/phase2_rewrite")
 int bpf_phase2_rewrite(void *ctx) {
+  dbg_inc(DBG_PHASE2_ENTERED);
   __u32 zero = 0;
   struct scratch_buf *scratch_data = bpf_map_lookup_elem(&scratch, &zero);
   if (!scratch_data)

@@ -328,6 +328,7 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 			return ctx.Err()
 		case <-syncTicker.C:
 			m.syncSecretsToBPF()
+			m.DumpDebugCounters()
 		default:
 		}
 
@@ -367,5 +368,35 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 func (m *TLSUprobeManager) syncSecretsToBPF() {
 	if err := syncSecrets(m.objs.SecretMap, m.objs.WatchedHosts, m.store, m.log); err != nil {
 		m.log.Error(err, "failed to sync secrets to BPF map")
+	}
+}
+
+// debugCounterNames maps index to human-readable name (must match C enum).
+var debugCounterNames = []string{
+	"kprobe_entry", "kprobe_tracked", "kprobe_dport53", "kprobe_dport0",
+	"kprobe_dport_other", "kprobe_iov_ok", "kretprobe_entry", "kretprobe_ret_small",
+	"kretprobe_read_fail", "kretprobe_read_ok", "dns_parse_entry", "dns_not_response",
+	"dns_no_answers", "dns_qname_fail", "dns_not_watched", "dns_watched_hit",
+	"dns_answer_stored", "phase2_entered",
+}
+
+// DumpDebugCounters reads and logs all debug counters from the BPF map.
+func (m *TLSUprobeManager) DumpDebugCounters() {
+	if m.objs.DebugCounters == nil {
+		return
+	}
+	for i, name := range debugCounterNames {
+		var vals []uint64
+		key := uint32(i)
+		if err := m.objs.DebugCounters.Lookup(key, &vals); err != nil {
+			continue
+		}
+		var total uint64
+		for _, v := range vals {
+			total += v
+		}
+		if total > 0 {
+			m.log.Info("eBPF debug counter", "name", name, "count", total)
+		}
 	}
 }
