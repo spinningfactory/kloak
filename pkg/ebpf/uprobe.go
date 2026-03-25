@@ -75,16 +75,11 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 		return nil, fmt.Errorf("loading eBPF objects: %w", err)
 	}
 
-	// Wire up tail call map:
-	//   slot 0 -> bpf_phase2_rewrite (TLS secret rewrite)
-	//   slot 1 -> dns_parse_packet   (DNS response parsing)
-	if err := objs.ProgArray.Put(uint32(0), uint32(objs.BpfPhase2Rewrite.FD())); err != nil {
+	// Wire up tail call map: index 0 -> bpf_phase2_rewrite
+	fd := uint32(objs.BpfPhase2Rewrite.FD())
+	if err := objs.ProgArray.Put(uint32(0), fd); err != nil {
 		_ = objs.Close()
-		return nil, fmt.Errorf("configuring tail call slot 0: %w", err)
-	}
-	if err := objs.ProgArray.Put(uint32(1), uint32(objs.DnsParsePacket.FD())); err != nil {
-		_ = objs.Close()
-		return nil, fmt.Errorf("configuring tail call slot 1: %w", err)
+		return nil, fmt.Errorf("configuring tail call map: %w", err)
 	}
 
 	reader, err := ringbuf.NewReader(objs.TlsEvents)

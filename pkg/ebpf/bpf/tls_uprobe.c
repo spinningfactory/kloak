@@ -89,12 +89,9 @@ struct {
   __type(value, struct scratch_buf);
 } scratch SEC(".maps");
 
-// Tail call program array:
-//   slot 0 = bpf_phase2_rewrite (TLS secret rewrite)
-//   slot 1 = dns_parse_packet   (DNS response parsing)
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-  __uint(max_entries, 2);
+  __uint(max_entries, 1);
   __type(key, __u32);
   __type(value, __u32);
 } prog_array SEC(".maps");
@@ -477,8 +474,9 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
 // and stores A/AAAA records in dns_ip_map for watched hostnames.
 // Separated from kretprobe_udp_recvmsg to stay under the verifier's
 // 1M instruction limit on x86_64.
-SEC("kprobe/dns_parse_packet")
-int dns_parse_packet(void *ctx) {
+// Parse DNS response from dns_scratch per-CPU buffer.
+// __noinline to keep it as a single BPF subprogram, reducing verifier cost.
+static __noinline void do_dns_parse(void) {
   __u32 zero = 0;
   struct dns_scratch_buf *dbuf = bpf_map_lookup_elem(&dns_scratch, &zero);
   if (!dbuf)
@@ -542,6 +540,12 @@ int dns_parse_packet(void *ctx) {
   __builtin_memcpy(actx.qname, qname, MAX_HOST_LEN);
 
   bpf_loop(MAX_DNS_ANSWERS, parse_dns_answer, &actx, 0);
+}
+
+// SEC program wrapper — kept for future use as tail call target if needed.
+SEC("kprobe/dns_parse_packet")
+int dns_parse_packet(void *ctx) {
+  do_dns_parse();
   return 0;
 }
 
@@ -658,12 +662,10 @@ int kretprobe_udp_recvmsg(void *ctx) {
   if (bpf_probe_read_user(dbuf->pkt, read_len, (void *)iov_base) != 0)
     return 0;
 
-  // Store context for the tail-called DNS parser
   dbuf->tgid = tgid;
   dbuf->pkt_len = read_len;
 
-  // Tail call to dns_parse_packet (slot 1) — keeps kretprobe small
-  bpf_tail_call(ctx, &prog_array, 1);
+  do_dns_parse();
   return 0;
 }
 
