@@ -21,8 +21,10 @@ ARG TARGETARCH
 ARG TARGETOS
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
       ARCH_DEFINE=__TARGET_ARCH_x86; \
+      export KLOAK_TARGET_ARCH=x86; \
     else \
       ARCH_DEFINE=__TARGET_ARCH_${TARGETARCH}; \
+      export KLOAK_TARGET_ARCH=${TARGETARCH}; \
     fi && \
     cd pkg/ebpf && go generate && \
     clang -O2 -g -Wall -Werror -D${ARCH_DEFINE} \
