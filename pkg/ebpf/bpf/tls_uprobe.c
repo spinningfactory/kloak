@@ -727,7 +727,6 @@ int kretprobe_udp_recvmsg(void *ctx) {
 SEC("tracepoint/syscalls/sys_enter_connect")
 int tp_enter_connect(struct trace_event_raw_sys_enter *ctx) {
   __u64 pid_tgid = bpf_get_current_pid_tgid();
-  __u32 tgid = (__u32)(pid_tgid >> 32);
 
   __u32 fd = (__u32)ctx->args[0];
   __u64 addr_ptr = (__u64)ctx->args[1];
