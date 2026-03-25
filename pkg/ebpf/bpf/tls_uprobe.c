@@ -807,38 +807,61 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     }
   }
 
-  // Path 2: last_verified_fd (works for ALL languages)
+  // Path 2: last_verified_fd (fast path if connect happened after DNS)
   if (!found) {
     __u32 *vfd = bpf_map_lookup_elem(&last_verified_fd, &tgid);
-    if (!vfd)
-      return;
-    fd = *vfd;
+    if (vfd) {
+      fd = *vfd;
+      found = 1;
 
-    // Cache for next time (OpenSSL only)
-    if (ssl_ptr != 0) {
-      struct ssl_fd_key sfk;
-      __builtin_memset(&sfk, 0, sizeof(sfk));
-      sfk.tgid = tgid;
-      sfk.ssl_ptr = ssl_ptr;
-      struct ssl_fd_val new_sfv = {.fd = fd};
-      bpf_map_update_elem(&ssl_fd_map, &sfk, &new_sfv, BPF_ANY);
+      // Cache for next time (OpenSSL only)
+      if (ssl_ptr != 0) {
+        struct ssl_fd_key sfk;
+        __builtin_memset(&sfk, 0, sizeof(sfk));
+        sfk.tgid = tgid;
+        sfk.ssl_ptr = ssl_ptr;
+        struct ssl_fd_val new_sfv = {.fd = fd};
+        bpf_map_update_elem(&ssl_fd_map, &sfk, &new_sfv, BPF_ANY);
+      }
     }
   }
 
-  // fd -> conn_ip_map -> dns_ip_map -> hostname
-  struct conn_ip_key cik = {.tgid = tgid, .fd = fd};
-  struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
-  if (!civ)
+  // Path 3: scan common fds in conn_ip_map -> dns_ip_map.
+  // Handles the case where connect() happened before DNS was captured
+  // (common with Docker DNS proxy and persistent connections).
+  if (found) {
+    struct conn_ip_key cik = {.tgid = tgid, .fd = fd};
+    struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
+    if (!civ)
+      return;
+    struct dns_ip_key dik;
+    __builtin_memset(&dik, 0, sizeof(dik));
+    __builtin_memcpy(dik.ip, civ->ip, 16);
+    struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
+    if (div && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
+      __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
+      scratch_data->host_value_len = div->host_len;
+    }
     return;
+  }
 
-  struct dns_ip_key dik;
-  __builtin_memset(&dik, 0, sizeof(dik));
-  __builtin_memcpy(dik.ip, civ->ip, 16);
-
-  struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
-  if (div && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
-    __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
-    scratch_data->host_value_len = div->host_len;
+  // No cached fd — scan fds 3..10 in conn_ip_map for a DNS-verified IP
+  for (__u32 try_fd = 3; try_fd <= 10; try_fd++) {
+    struct conn_ip_key cik = {.tgid = tgid, .fd = try_fd};
+    struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
+    if (!civ)
+      continue;
+    struct dns_ip_key dik;
+    __builtin_memset(&dik, 0, sizeof(dik));
+    __builtin_memcpy(dik.ip, civ->ip, 16);
+    struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
+    if (div && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
+      __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
+      scratch_data->host_value_len = div->host_len;
+      // Cache this fd for future lookups
+      bpf_map_update_elem(&last_verified_fd, &tgid, &try_fd, BPF_ANY);
+      return;
+    }
   }
 }
 
