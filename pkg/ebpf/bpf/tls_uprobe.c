@@ -537,13 +537,6 @@ static __noinline void do_dns_parse(void) {
   bpf_loop(MAX_DNS_ANSWERS, parse_dns_answer, &actx, 0);
 }
 
-// SEC program wrapper — kept for future use as tail call target if needed.
-SEC("kprobe/dns_parse_packet")
-int dns_parse_packet(void *ctx) {
-  do_dns_parse();
-  return 0;
-}
-
 // =============================================================================
 // DNS interception via kprobe on udp_recvmsg (network-level, language-agnostic)
 //
