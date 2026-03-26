@@ -116,6 +116,7 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	tracepoints := []tp{
 		{"syscalls", "sys_enter_connect", m.objs.TpEnterConnect},
 		{"syscalls", "sys_exit_connect", m.objs.TpExitConnect},
+		{"syscalls", "sys_enter_close", m.objs.TpEnterClose},
 	}
 
 	for _, t := range tracepoints {

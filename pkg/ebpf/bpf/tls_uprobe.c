@@ -787,6 +787,27 @@ int tp_exit_connect(struct trace_event_raw_sys_exit *ctx) {
   return 0;
 }
 
+// tp/syscalls/sys_enter_close: clean up connection state when an fd is closed.
+// Prevents stale conn_ip_map entries from being used after fd reuse.
+// close(int fd)
+SEC("tracepoint/syscalls/sys_enter_close")
+int tp_enter_close(struct trace_event_raw_sys_enter *ctx) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+  __u32 fd = (__u32)ctx->args[0];
+
+  // Clean up conn_ip_map entry for this fd (no-op if fd wasn't a tracked connection)
+  struct conn_ip_key cik = {.tgid = tgid, .fd = fd};
+  bpf_map_delete_elem(&conn_ip_map, &cik);
+
+  // Clean up last_verified_fd if it pointed to this fd
+  __u32 *vfd = bpf_map_lookup_elem(&last_verified_fd, &tgid);
+  if (vfd && *vfd == fd)
+    bpf_map_delete_elem(&last_verified_fd, &tgid);
+
+  return 0;
+}
+
 // =============================================================================
 // Resolve host for the current SSL/TLS connection using DNS chain.
 //
