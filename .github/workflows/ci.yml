@@ -367,3 +367,38 @@ jobs:
       - name: Delete k3d cluster
         if: always()
         run: k3d cluster delete kloak-e2e
+
+  docs-build:
+    name: Docs Build
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Check for website changes
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            website:
+              - 'website/**'
+
+      - name: Checkout code
+        if: steps.filter.outputs.website == 'true'
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        if: steps.filter.outputs.website == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: website/docs/package-lock.json
+
+      - name: Install dependencies
+        if: steps.filter.outputs.website == 'true'
+        run: npm ci
+        working-directory: website/docs
+
+      - name: Build docs
+        if: steps.filter.outputs.website == 'true'
+        run: npm run build
+        working-directory: website/docs
