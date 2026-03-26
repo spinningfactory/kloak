@@ -38,30 +38,30 @@ Kloak separates concerns into a robust control plane and an ultra-fast data plan
 
 ```mermaid
 graph TD
-    subgraph Control Plane
-        C[Kloak Controller<br/>DaemonSet]
-        W[Mutating Webhook<br/>Deployment]
+    subgraph Control_Plane [Control Plane]
+        C[Kloak Controller - DaemonSet]
+        W[Mutating Webhook - Deployment]
     end
 
-    subgraph Data Plane - eBPF in Kernel
-        UP[TLS Uprobes<br/>SSL_write / crypto/tls.Write]
-        KP[DNS Kprobe<br/>udp_recvmsg]
-        TP[Connect Tracepoints<br/>sys_enter/exit_connect]
-        P2[Phase 2 Rewrite<br/>Tail Call]
+    subgraph Data_Plane [Data Plane - eBPF in Kernel]
+        UP[TLS Uprobes]
+        KP[DNS Kprobe]
+        TP[Connect Tracepoints]
+        P2[Phase 2 Rewrite]
     end
 
-    subgraph Application
+    subgraph App [Application]
         P[Pod with Shadow Secret]
     end
 
-    C -->|Creates shadow secrets<br/>Syncs BPF maps| UP
-    C -->|Attaches uprobes to<br/>container processes| UP
-    W -->|Rewrites volume mounts<br/>to shadow secrets| P
+    C -->|Creates shadow secrets and syncs BPF maps| UP
+    C -->|Attaches uprobes to container processes| UP
+    W -->|Rewrites volume mounts to shadow secrets| P
     P -->|TLS write with kloak:UUID| UP
     UP -->|Tail call| P2
-    P2 -->|bpf_probe_write_user<br/>Real secret injected| Internet
+    P2 -->|Real secret injected| Internet
     KP -->|Populates dns_ip_map| UP
-    TP -->|Populates conn_ip_map<br/>last_verified_fd| UP
+    TP -->|Populates conn_ip_map| UP
 ```
 
 ### Component Breakdown
@@ -82,35 +82,35 @@ Secrets with `getkloak.io/hosts` are only rewritten when the destination is veri
 sequenceDiagram
     participant App as Application
     participant DNS as DNS Server
-    participant KP as eBPF: udp_recvmsg<br/>kprobe
-    participant TP as eBPF: connect<br/>tracepoint
-    participant UP as eBPF: SSL_write<br/>uprobe
-    participant P2 as eBPF: Phase 2<br/>Rewrite
+    participant KP as eBPF kprobe
+    participant TP as eBPF tracepoint
+    participant UP as eBPF uprobe
+    participant P2 as Phase 2 Rewrite
     participant Srv as api.stripe.com
 
-    Note over App,Srv: Step 1: DNS Resolution
+    Note over App,Srv: Step 1 - DNS Resolution
     App->>DNS: resolve api.stripe.com
     DNS-->>App: A 52.55.108.115
-    KP-->>KP: Capture response<br/>dns_ip_map[52.55.108.115] = "api.stripe.com"
+    KP->>KP: dns_ip_map[52.55.108.115] = api.stripe.com
 
-    Note over App,Srv: Step 2: TCP Connect
+    Note over App,Srv: Step 2 - TCP Connect
     App->>Srv: connect(fd=7, 52.55.108.115:443)
-    TP-->>TP: conn_ip_map[{tgid, fd=7}] = 52.55.108.115
-    TP-->>TP: IP in dns_ip_map → set last_verified_fd[tgid] = 7
+    TP->>TP: conn_ip_map[tgid,fd=7] = 52.55.108.115
+    TP->>TP: IP in dns_ip_map, set last_verified_fd = 7
 
-    Note over App,Srv: Step 3: TLS Write with Secret
-    App->>UP: SSL_write("Authorization: kloak:a1b2c3d4...")
-    UP->>UP: resolve_host()<br/>last_verified_fd → conn_ip_map → dns_ip_map<br/>hostname = "api.stripe.com"
-    UP->>P2: Tail call to Phase 2
-    P2->>P2: Scan for kloak: prefix<br/>Lookup secret_map<br/>Check: allowed_host == "api.stripe.com" ✓
-    P2->>Srv: bpf_probe_write_user<br/>"Authorization: sk-live-xyz123..."
+    Note over App,Srv: Step 3 - TLS Write (Allowed)
+    App->>UP: SSL_write with kloak:a1b2c3d4
+    UP->>UP: resolve_host -> api.stripe.com
+    UP->>P2: Tail call
+    P2->>P2: allowed_host matches, rewrite secret
+    P2->>Srv: Real secret sent to api.stripe.com
 
-    Note over App,Srv: Blocked: Wrong Host
-    App->>UP: SSL_write to evil.com with kloak:a1b2c3d4...
-    UP->>UP: resolve_host()<br/>hostname = "evil.com"
-    UP->>P2: Tail call to Phase 2
-    P2->>P2: Check: allowed_host == "api.stripe.com"<br/>hostname == "evil.com" ✗ BLOCKED
-    P2--xApp: Secret NOT rewritten<br/>Placeholder sent as-is
+    Note over App,Srv: Step 4 - TLS Write (Blocked)
+    App->>UP: SSL_write to evil.com with kloak:a1b2c3d4
+    UP->>UP: resolve_host -> evil.com
+    UP->>P2: Tail call
+    P2->>P2: allowed_host mismatch, BLOCKED
+    P2--xApp: Placeholder sent as-is
 ```
 
 ### How Host Verification Works
