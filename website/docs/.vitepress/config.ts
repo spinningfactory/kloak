@@ -17,6 +17,7 @@ export default defineConfig({
     nav: [
       { text: 'Getting Started', link: '/getting-started/quick-start' },
       { text: 'Guides', link: '/guides/protecting-secrets' },
+      { text: 'Tutorials', link: '/tutorials/openclaw-with-kloak' },
       { text: 'Architecture', link: '/architecture/overview' },
       { text: 'Reference', link: '/reference/labels-annotations' },
     ],
@@ -36,6 +37,12 @@ export default defineConfig({
           { text: 'Protecting Secrets', link: '/guides/protecting-secrets' },
           { text: 'Host Filtering', link: '/guides/host-filtering' },
           { text: 'Supported Runtimes', link: '/guides/supported-runtimes' },
+        ],
+      },
+      {
+        text: 'Tutorials',
+        items: [
+          { text: 'OpenClaw with Kloak', link: '/tutorials/openclaw-with-kloak' },
         ],
       },
       {
