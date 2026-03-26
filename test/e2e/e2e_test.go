@@ -126,8 +126,11 @@ func teardown() {
 }
 
 func dumpLogs() {
+	fmt.Println("=== Kloak Controller Logs (previous) ===")
+	out, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=50", "--previous")
+	fmt.Println(out)
 	fmt.Println("=== Kloak Controller Logs ===")
-	out, _ := kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=50")
+	out, _ = kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=controller", "--tail=50")
 	fmt.Println(out)
 	fmt.Println("=== Kloak Webhook Logs ===")
 	out, _ = kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=webhook", "--tail=50")
