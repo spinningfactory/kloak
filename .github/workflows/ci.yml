@@ -255,8 +255,8 @@ jobs:
           docker build -t kloak-demo-python:latest ./examples/demo-python/
           docker build -t kloak-demo-js:latest ./examples/demo-js/
           docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
-          docker build -t kloak-demo-python-sni:latest ./examples/demo-python-sni/
-          k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-python-sni:latest -c kloak-e2e
+          docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
+          k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-python-raw-tls:latest -c kloak-e2e
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -344,8 +344,8 @@ jobs:
           kubectl logs -n kloak-e2e -l app=demo-js --tail=50 2>/dev/null || true
           echo "=== Demo Go BoringSSL Logs ==="
           kubectl logs -n kloak-e2e -l app=demo-go-boring --tail=50 2>/dev/null || true
-          echo "=== Demo Python SNI Logs ==="
-          kubectl logs -n kloak-e2e -l app=demo-python-sni --tail=50 2>/dev/null || true
+          echo "=== Demo Python Raw TLS Logs ==="
+          kubectl logs -n kloak-e2e -l app=demo-python-raw-tls --tail=50 2>/dev/null || true
           echo "=== All Pods ==="
           kubectl get pods -A 2>/dev/null || true
           echo "=== Events ==="

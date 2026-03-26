@@ -6,7 +6,7 @@ metadata:
     app: tls
 spec:
   selector:
-    app: demo-python-sni
+    app: demo-python-raw-tls
   ports:
     - port: 8443
       targetPort: 8443
@@ -14,24 +14,24 @@ spec:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: demo-python-sni
+  name: demo-python-raw-tls
   labels:
-    app: demo-python-sni
+    app: demo-python-raw-tls
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: demo-python-sni
+      app: demo-python-raw-tls
   template:
     metadata:
       labels:
-        app: demo-python-sni
+        app: demo-python-raw-tls
       annotations:
         getkloak.io/enabled: "true"
     spec:
       containers:
         - name: demo-app
-          image: kloak-demo-python-sni:latest
+          image: kloak-demo-python-raw-tls:latest
           imagePullPolicy: Never
           command: ["python", "-u", "app.py"]
           env:
@@ -51,7 +51,7 @@ spec:
               mountPath: "/etc/secrets/blocked"
               readOnly: true
         - name: echo-server
-          image: kloak-demo-python-sni:latest
+          image: kloak-demo-python-raw-tls:latest
           imagePullPolicy: Never
           command: ["python", "-u", "echo_server.py"]
           ports:
