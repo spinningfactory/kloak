@@ -41,9 +41,10 @@ The eBPF programs run in-kernel and are loaded by the controller. They use a **t
 
 - **Phase 2 (rewrite program):** Verifies the full prefix (up to 42 bytes), checks the allowed host against the cached connection hostname, and if everything matches, overwrites the placeholder bytes in the user-space write buffer with the real secret value.
 
-Additional uprobes capture SNI hostnames:
-- `SSL_set_tlsext_host_name` (BoringSSL) -- captures hostname directly
-- `SSL_ctrl` with `SSL_CTRL_SET_TLSEXT_HOSTNAME` (cmd=55) -- captures hostname for OpenSSL
+Additional eBPF programs provide DNS-verified host resolution:
+- **DNS Kprobe** (`udp_recvmsg`) -- intercepts all DNS responses on the node, parses A/AAAA records for watched hostnames, and stores IP → hostname mappings in `dns_ip_map`
+- **Connect Tracepoints** (`sys_enter/exit_connect`) -- tracks TCP connections (fd → destination IP) in `conn_ip_map`. When the IP exists in `dns_ip_map`, caches the fd in `last_verified_fd`
+- **Close Tracepoint** (`sys_enter_close`) -- cleans up `conn_ip_map` entries when file descriptors are closed, preventing stale mappings after fd reuse
 
 ## Data Flow
 
@@ -101,10 +102,12 @@ graph TB
 
     subgraph "Kernel"
         BPF_MAP[BPF Hash Map<br/>secret_map]
-        BPF_HOST[BPF Hash Map<br/>conn_hosts]
+        DNS_MAP[BPF LRU Hash<br/>dns_ip_map]
+        CONN_MAP[BPF Hash Map<br/>conn_ip_map]
         UP1[Uprobe: SSL_write<br/>Phase 1 - Lookup]
         UP2[Tail Call: Phase 2<br/>Rewrite]
-        SNI_UP[Uprobe: SSL_set_host<br/>SNI Capture]
+        KP[Kprobe: udp_recvmsg<br/>DNS Capture]
+        TP[Tracepoint: connect/close<br/>Connection Tracking]
         RB[Ring Buffer<br/>tls_events]
     end
 
@@ -134,9 +137,10 @@ graph TB
     POD -->|SSL_write| UP1
     UP1 -->|key lookup| BPF_MAP
     UP1 -->|tail call| UP2
-    UP2 -->|checks host| BPF_HOST
+    UP2 -->|resolve_host| DNS_MAP
     UP2 -->|emits event| RB
-    SNI_UP -->|caches hostname| BPF_HOST
+    KP -->|DNS responses| DNS_MAP
+    TP -->|fd to IP| CONN_MAP
 ```
 
 ## Security Model
@@ -198,6 +202,9 @@ The controller runs as a privileged DaemonSet. Restrict access to the `kloak-sys
 | Map | Type | Key | Value | Purpose |
 |---|---|---|---|---|
 | `secret_map` | Hash | 8-byte prefix (`kloak:XX`) | Real value (128B) + host (32B) + full prefix (42B) | UUID-to-secret lookup |
-| `conn_hosts` | Hash | SSL connection pointer | Hostname (32B) | Per-connection SNI cache |
+| `dns_ip_map` | LRU Hash | IP address (16B) | Hostname (32B) + TTL + timestamp | DNS response → IP-to-hostname cache |
+| `conn_ip_map` | Hash | {tgid, fd} | IP address (16B) | TCP connection → destination IP |
+| `last_verified_fd` | Hash | tgid | fd | Last fd whose IP matched a DNS-verified host |
+| `watched_hosts` | Hash | Hostname (32B) | 1 | Set of hostnames to capture DNS for |
 | `prog_array` | ProgArray | Index 0 | Phase 2 program FD | Tail call from Phase 1 to Phase 2 |
 | `tls_events` | RingBuf | -- | Event struct (pid, len, is_rewritten) | Observability: rewrite events |

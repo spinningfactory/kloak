@@ -220,8 +220,8 @@ The application reads `kloak:a1b2c3d4-...` from the mounted secret, but httpbin.
 If you see the `kloak:` UUID in the httpbin response, the eBPF rewrite did not trigger. Common causes:
 - The controller pod is not running or not ready on the node
 - The eBPF map has not synced yet (wait 10-15 seconds after pod startup)
-- The application uses HTTP/2 (binary HPACK frames cannot be scanned; force HTTP/1.1)
 - The secret value is shorter than 8 bytes
+- The DNS resolution for the target host was not captured (check controller logs for DNS debug counters)
 :::
 
 ## What Happens Under the Hood

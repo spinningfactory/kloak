@@ -76,55 +76,36 @@ This is equivalent to `AllowedHosts: ["*"]` internally.
 
 ## How Host Resolution Works
 
-The eBPF program needs to know the hostname of the TLS connection to enforce filtering. Kloak uses two mechanisms depending on the TLS library:
+Kloak uses **DNS-verified host filtering** — a language-agnostic approach that works identically for all TLS runtimes (Go, Python, Node.js, Rust, etc.) without depending on SNI or HTTP headers.
 
-### SNI-Based Resolution (OpenSSL / BoringSSL)
+### DNS-Verified Trust Chain
 
-For applications using OpenSSL or BoringSSL (Python, Node.js, Go+BoringSSL, and any dynamically linked application), Kloak captures the hostname from the **SNI (Server Name Indication)** extension:
+The eBPF program builds a chain of trust from DNS resolution to TLS write:
 
-1. The application calls `SSL_set_tlsext_host_name(ssl, "api.stripe.com")` before the TLS handshake
-2. Kloak's eBPF uprobe on this function captures the hostname and stores it in a per-connection BPF map (`conn_hosts`)
-3. When `SSL_write` is called later, the eBPF program looks up the cached hostname for that SSL connection pointer
-4. The hostname is compared against the secret's `AllowedHost` field
+1. **DNS Capture** — A kprobe on the kernel's `udp_recvmsg` function intercepts all DNS responses on the node. For hostnames listed in `getkloak.io/hosts` labels (the `watched_hosts` set), the resolved A/AAAA record IPs are stored in `dns_ip_map` with their TTL.
+
+2. **Connection Tracking** — Tracepoints on `sys_enter_connect` and `sys_exit_connect` record every TCP connection's file descriptor → destination IP mapping in `conn_ip_map`. If the destination IP exists in `dns_ip_map`, the fd is cached in `last_verified_fd` for that process.
+
+3. **Host Resolution at TLS Write Time** — When `SSL_write` or `crypto/tls.Write` is called, the `resolve_host()` function chains: `last_verified_fd` → `conn_ip_map[{tgid, fd}]` → `dns_ip_map[ip]` to determine the hostname of the current TLS connection.
+
+4. **Secret Filtering** — The resolved hostname is compared against the secret's `allowed_host`. Match → secret is rewritten. Mismatch → placeholder sent as-is.
+
+5. **TTL Enforcement** — DNS entries include a TTL from the original DNS response. Expired entries are skipped on lookup, forcing re-verification through fresh DNS responses.
+
+6. **Connection Cleanup** — A tracepoint on `sys_enter_close` removes `conn_ip_map` entries when file descriptors are closed, preventing stale mappings from being used after fd reuse.
 
 ::: tip
-SNI capture happens **once** per connection, before the handshake. It is the most reliable method because the hostname is set explicitly by the TLS library.
+This approach is **language-agnostic** — it works the same way for Go, Python, Node.js, and any OpenSSL/BoringSSL-based runtime. No SNI capture or HTTP header parsing is needed.
 :::
 
-For OpenSSL specifically, `SSL_set_tlsext_host_name` is actually a macro that expands to `SSL_ctrl(ssl, 55, 0, name)`. Kloak attaches uprobes to both `SSL_set_tlsext_host_name` (for BoringSSL where it is a real function) and `SSL_ctrl` (for OpenSSL) to catch both variants.
+### Host Resolution Flow
 
-### HTTP Host Header Fallback (Go crypto/tls)
-
-Go's standard `crypto/tls` package does not use OpenSSL. Since Go handles SNI internally without a hookable function call, Kloak falls back to scanning the TLS write buffer for the HTTP `Host:` header:
-
-1. Go's `net/http` writes the full HTTP request (including headers) through `tls.(*Conn).Write`
-2. The eBPF uprobe scans the write buffer for `Host: ` followed by the hostname
-3. The extracted hostname is used for the host filter check
-
-This fallback works well for HTTP/1.1 traffic but has limitations:
-
-::: warning
-**HTTP/2 is not supported for Go host resolution.** Go defaults to HTTP/2 via ALPN negotiation, which uses binary HPACK-encoded headers that the eBPF scanner cannot parse. Force HTTP/1.1 in your Go client:
-
-```go
-client := &http.Client{
-    Transport: &http.Transport{
-        TLSClientConfig: &tls.Config{
-            NextProtos: []string{"http/1.1"},
-        },
-        ForceAttemptHTTP2: false,
-    },
-}
-```
-:::
-
-### Resolution Priority
-
-| TLS Library | Host Resolution Method | Reliability |
+| Runtime | TLS Hook | Host Resolution Method |
 |---|---|---|
-| OpenSSL (libssl.so) | SNI via `SSL_ctrl` | High -- captured before handshake |
-| BoringSSL | SNI via `SSL_set_tlsext_host_name` | High -- captured before handshake |
-| Go `crypto/tls` | HTTP `Host:` header scan | Medium -- HTTP/1.1 only |
+| Python (OpenSSL) | `SSL_write` uprobe | DNS-verified via `udp_recvmsg` kprobe |
+| Node.js (BoringSSL) | `SSL_write` uprobe | DNS-verified via `udp_recvmsg` kprobe |
+| Go (crypto/tls) | `crypto/tls.(*Conn).Write` uprobe | DNS-verified via `udp_recvmsg` kprobe |
+| Rust, Ruby, PHP, curl | `SSL_write` / `SSL_write_ex` uprobe | DNS-verified via `udp_recvmsg` kprobe |
 
 ## Practical Examples
 
@@ -176,18 +157,18 @@ X-Secret-Allowed: REAL-ALLOWED-KEY-12345    # Replaced -- host matches
 X-Secret-Blocked: kloak:b2c3d4e5-f6a7-...  # NOT replaced -- host mismatch
 ```
 
-### Example 3: SNI-Based Filtering (Non-HTTP)
+### Example 3: Raw TLS Filtering (Non-HTTP)
 
-Host filtering works even for non-HTTP TLS protocols, as long as the application sets the SNI hostname:
+Host filtering works even for non-HTTP TLS protocols. The DNS resolution of the hostname is what enables host verification — no HTTP headers or SNI capture required:
 
 ```python
 import ssl
 import socket
 
 ctx = ssl.create_default_context()
+# DNS resolution of "api.stripe.com" is captured by the kprobe
+# and stored in dns_ip_map for host verification
 with socket.create_connection(("api.stripe.com", 443)) as sock:
-    # wrap_socket calls SSL_set_tlsext_host_name("api.stripe.com")
-    # which the eBPF uprobe captures for host filtering
     with ctx.wrap_socket(sock, server_hostname="api.stripe.com") as tls:
         tls.sendall(b"secret data containing kloak:UUID here")
 ```
@@ -222,7 +203,9 @@ You should see the allowed secret replaced with the real value and the blocked s
 
 ## Security Considerations
 
-- **Hostname is checked at TLS write time**, not at connection time. If an application reuses a TLS connection for multiple logical requests, all writes on that connection use the same cached hostname.
+- **Host verification is DNS-based.** The trust chain depends on the integrity of DNS responses. DNS spoofing could potentially trick the host filter. Use DNSSEC or trusted DNS resolvers to mitigate this.
+- **DNS entries have TTL enforcement.** Expired entries are skipped, forcing re-verification through fresh DNS responses. This limits the window for stale IP → hostname mappings.
 - **Hostname length is limited to 32 bytes** in the BPF map. Hostnames longer than 32 characters are truncated. This covers the vast majority of real-world API endpoints.
 - **Wildcard matching is not supported.** You must specify exact hostnames. `*.stripe.com` will not work -- use `api.stripe.com` explicitly.
 - **Host filtering is enforced in-kernel by eBPF.** Application code cannot bypass it, even with arbitrary code execution in the container.
+- **DNS and connection tracking are global** on the node. All DNS responses and TCP connections are monitored (filtered by `watched_hosts` for DNS). This is necessary for containerized environments where DNS proxies may handle resolution in a different process context.

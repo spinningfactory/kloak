@@ -131,7 +131,7 @@ labels:
   getkloak.io/hosts: "api.example.com,cdn.example.com"    # Multiple hosts
 ```
 
-When a TLS write is intercepted, the eBPF program checks the SNI (Server Name Indication) of the connection against the allowed hosts list. If the destination does not match, the placeholder is **not** replaced -- the remote server receives the harmless `kloak:...` UUID.
+When a TLS write is intercepted, the eBPF program resolves the destination hostname via the DNS-verified trust chain (DNS capture → connection tracking → host resolution). If the resolved hostname does not match the allowed hosts list, the placeholder is **not** replaced -- the remote server receives the harmless `kloak:...` UUID. See the [Host Filtering guide](/guides/host-filtering) for details.
 
 Omitting `getkloak.io/hosts` allows the secret to be sent to any destination.
 

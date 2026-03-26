@@ -31,6 +31,8 @@ The following kernel configuration options must be enabled (they are enabled by 
 | `CONFIG_BPF_SYSCALL` | BPF system call |
 | `CONFIG_BPF_JIT` | JIT compilation for BPF programs |
 | `CONFIG_UPROBES` | User-space probes (uprobe attachment) |
+| `CONFIG_KPROBES` | Kernel probes (kprobe on `udp_recvmsg` for DNS capture) |
+| `CONFIG_TRACEPOINTS` | Tracepoints (connect/close tracking) |
 | `CONFIG_BPF_EVENTS` | BPF-based event tracing |
 | `CONFIG_DEBUG_INFO_BTF` | BTF type information for CO-RE |
 
@@ -185,9 +187,11 @@ kubectl get nodes -o wide  # Check KERNEL-VERSION column
 | Resource | Size | Notes |
 |---|---|---|
 | BPF map: `secret_map` | Scales with number of secrets | ~212 bytes per entry (8B key + 204B value) |
-| BPF map: `conn_hosts` | Scales with active TLS connections | ~40 bytes per entry |
+| BPF map: `dns_ip_map` | Scales with resolved DNS entries | LRU, max 1024 entries |
+| BPF map: `conn_ip_map` | Scales with active TCP connections | ~24 bytes per entry |
+| BPF map: `watched_hosts` | Scales with unique host filters | ~36 bytes per entry |
 | Ring buffer: `tls_events` | Fixed size (configurable) | Default 256KB |
-| eBPF programs | ~50KB total | Two programs (phase 1 + phase 2) + SNI capture |
+| eBPF programs | ~80KB total | Two TLS programs (phase 1 + phase 2) + DNS kprobe + connect/close tracepoints |
 
 ## Verification Checklist
 
