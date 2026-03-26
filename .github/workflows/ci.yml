@@ -268,11 +268,18 @@ jobs:
 
       - name: Collect e2e coverage
         if: always()
+        env:
+          KUBECONFIG: /tmp/kubeconfig-e2e.yaml
         run: |
           mkdir -p /tmp/e2e-covdata
-          # Coverage files are on the k3d node's hostPath (/tmp/kloak-coverage).
-          # The test teardown deleted kloak, which triggered a clean controller
-          # shutdown that flushed covcounters to the hostPath volume.
+          # Wait for the controller pod to fully terminate after helm uninstall
+          # (triggered by test teardown). The Go coverage runtime writes
+          # covcounters on clean exit, which needs time to flush to the
+          # hostPath volume.
+          echo "Waiting for controller pod to terminate..."
+          kubectl wait --for=delete pod -l app.kubernetes.io/component=controller \
+            -n kloak-system --timeout=30s 2>/dev/null || true
+          # Copy coverage files from the k3d node's hostPath
           docker cp k3d-kloak-e2e-server-0:/tmp/kloak-coverage/. /tmp/e2e-covdata/ 2>/dev/null || true
           echo "E2E coverage files:"
           ls -la /tmp/e2e-covdata/ 2>/dev/null || echo "No coverage files collected"
