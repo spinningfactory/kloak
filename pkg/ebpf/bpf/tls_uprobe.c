@@ -297,6 +297,16 @@ struct {
   __type(value, __u8);
 } watched_hosts SEC(".maps");
 
+// Check if a dns_ip_map entry has expired based on its TTL.
+// Returns 1 if expired, 0 if still valid. TTL of 0 means never expires.
+static __always_inline int dns_entry_expired(struct dns_ip_val *div) {
+  if (div->ttl_sec == 0)
+    return 0;
+  __u64 age_ns = bpf_ktime_get_ns() - div->inserted_at;
+  __u64 ttl_ns = (__u64)div->ttl_sec * 1000000000ULL;
+  return age_ns > ttl_ns;
+}
+
 // =============================================================================
 // DNS helpers (inline, used by tracepoint programs)
 // =============================================================================
@@ -774,7 +784,7 @@ int tp_exit_connect(struct trace_event_raw_sys_exit *ctx) {
   __builtin_memcpy(dik.ip, ip, 16);
 
   struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
-  if (div) {
+  if (div && !dns_entry_expired(div)) {
     // DNS-verified connection! Record as last_verified_fd
     bpf_map_update_elem(&last_verified_fd, &tgid, &fd, BPF_ANY);
 
@@ -867,7 +877,7 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     __builtin_memset(&dik, 0, sizeof(dik));
     __builtin_memcpy(dik.ip, civ->ip, 16);
     struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
-    if (div && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
+    if (div && !dns_entry_expired(div) && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
       __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
       scratch_data->host_value_len = div->host_len;
       dbg_inc(DBG_RESOLVE_HOST_OK);
@@ -888,7 +898,7 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     __builtin_memset(&dik, 0, sizeof(dik));
     __builtin_memcpy(dik.ip, civ->ip, 16);
     struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
-    if (div && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
+    if (div && !dns_entry_expired(div) && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
       __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
       scratch_data->host_value_len = div->host_len;
       bpf_map_update_elem(&last_verified_fd, &tgid, &try_fd, BPF_ANY);
