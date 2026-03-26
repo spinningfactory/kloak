@@ -6,7 +6,12 @@
 // Supports both x86_64 and ARM64 architectures.
 // Host filtering uses DNS-verified connect-time resolution.
 
-#include "vmlinux.h"
+// Include arch-specific vmlinux.h (generated, committed per-arch).
+#if defined(__TARGET_ARCH_x86) || defined(__x86_64__) || defined(__amd64__)
+#include "vmlinux_x86.h"
+#else
+#include "vmlinux_arm64.h"
+#endif
 #include <bpf/bpf_helpers.h>
 
 // Architecture detection
