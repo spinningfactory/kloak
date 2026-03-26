@@ -318,6 +318,15 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
+      - name: Upload e2e coverage
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: e2e-coverage
+          path: /tmp/e2e-coverage.out
+          retention-days: 7
+          if-no-files-found: ignore
+
       - name: Collect logs on failure
         if: failure()
         env:
