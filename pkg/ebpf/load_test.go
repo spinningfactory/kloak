@@ -31,6 +31,18 @@ func TestLoadObjects(t *testing.T) {
 	if objs.BpfUprobeSslWrite == nil {
 		t.Error("BpfUprobeSslWrite program not loaded")
 	}
+	if objs.KprobeUdpRecvmsg == nil {
+		t.Error("KprobeUdpRecvmsg program not loaded")
+	}
+	if objs.KretprobeUdpRecvmsg == nil {
+		t.Error("KretprobeUdpRecvmsg program not loaded")
+	}
+	if objs.TpEnterConnect == nil {
+		t.Error("TpEnterConnect program not loaded")
+	}
+	if objs.TpExitConnect == nil {
+		t.Error("TpExitConnect program not loaded")
+	}
 }
 
 func TestTailCallWiring(t *testing.T) {
@@ -87,35 +99,119 @@ func TestSecretMapOperations(t *testing.T) {
 	}
 }
 
-func TestConnHostsMapOperations(t *testing.T) {
+func TestDnsIpMapOperations(t *testing.T) {
 	objs := loadTestObjects(t)
 
-	type connKey struct {
-		SslPtr uint64
-		Tgid   uint32
-		Pad    uint32
+	type dnsIpKey struct {
+		IP [16]byte
 	}
-	type connHost struct {
-		HostLen  uint32
-		Hostname [32]byte
-	}
-
-	key := connKey{SslPtr: 0xdeadbeef, Tgid: 1234}
-	val := connHost{HostLen: 11}
-	copy(val.Hostname[:], "httpbin.org")
-
-	if err := objs.ConnHosts.Update(&key, &val, ebpf.UpdateAny); err != nil {
-		t.Fatalf("failed to update conn_hosts: %v", err)
+	type dnsIpVal struct {
+		Hostname   [32]byte
+		HostLen    uint32
+		TtlSec     uint32
+		InsertedAt uint64
 	}
 
-	var got connHost
-	if err := objs.ConnHosts.Lookup(&key, &got); err != nil {
-		t.Fatalf("failed to lookup conn_hosts: %v", err)
+	key := dnsIpKey{}
+	// IPv4-mapped-IPv6 for 1.2.3.4
+	key.IP[10] = 0xff
+	key.IP[11] = 0xff
+	key.IP[12] = 1
+	key.IP[13] = 2
+	key.IP[14] = 3
+	key.IP[15] = 4
+
+	val := dnsIpVal{HostLen: 11, TtlSec: 300}
+	copy(val.Hostname[:], "example.com")
+
+	if err := objs.DnsIpMap.Update(&key, &val, ebpf.UpdateAny); err != nil {
+		t.Fatalf("failed to update dns_ip_map: %v", err)
+	}
+
+	var got dnsIpVal
+	if err := objs.DnsIpMap.Lookup(&key, &got); err != nil {
+		t.Fatalf("failed to lookup dns_ip_map: %v", err)
 	}
 	if got.HostLen != 11 {
 		t.Errorf("expected hostLen=11, got %d", got.HostLen)
 	}
-	if string(got.Hostname[:got.HostLen]) != "httpbin.org" {
-		t.Errorf("expected 'httpbin.org', got %q", string(got.Hostname[:got.HostLen]))
+	if string(got.Hostname[:got.HostLen]) != "example.com" {
+		t.Errorf("expected 'example.com', got %q", string(got.Hostname[:got.HostLen]))
+	}
+}
+
+func TestConnIpMapOperations(t *testing.T) {
+	objs := loadTestObjects(t)
+
+	type connIpKey struct {
+		Tgid uint32
+		Fd   uint32
+	}
+	type connIpVal struct {
+		IP [16]byte
+	}
+
+	key := connIpKey{Tgid: 1234, Fd: 5}
+	val := connIpVal{}
+	// IPv4-mapped-IPv6 for 10.0.0.1
+	val.IP[10] = 0xff
+	val.IP[11] = 0xff
+	val.IP[12] = 10
+	val.IP[13] = 0
+	val.IP[14] = 0
+	val.IP[15] = 1
+
+	if err := objs.ConnIpMap.Update(&key, &val, ebpf.UpdateAny); err != nil {
+		t.Fatalf("failed to update conn_ip_map: %v", err)
+	}
+
+	var got connIpVal
+	if err := objs.ConnIpMap.Lookup(&key, &got); err != nil {
+		t.Fatalf("failed to lookup conn_ip_map: %v", err)
+	}
+	if got.IP[15] != 1 || got.IP[12] != 10 {
+		t.Errorf("expected IP 10.0.0.1 mapped, got different IP")
+	}
+}
+
+func TestTrackedTgidsMapOperations(t *testing.T) {
+	objs := loadTestObjects(t)
+
+	tgid := uint32(5678)
+	val := uint8(1)
+	if err := objs.TrackedTgids.Update(tgid, &val, 0); err != nil {
+		t.Fatalf("failed to track tgid: %v", err)
+	}
+
+	var got uint8
+	if err := objs.TrackedTgids.Lookup(tgid, &got); err != nil {
+		t.Fatalf("failed to lookup tracked tgid: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("expected tracked=1, got %d", got)
+	}
+
+	if err := objs.TrackedTgids.Delete(tgid); err != nil {
+		t.Fatalf("failed to untrack tgid: %v", err)
+	}
+}
+
+func TestWatchedHostsMapOperations(t *testing.T) {
+	objs := loadTestObjects(t)
+
+	var key watchedHostKey
+	copy(key.Host[:], "api.stripe.com")
+	val := uint8(1)
+
+	if err := objs.WatchedHosts.Update(&key, &val, 0); err != nil {
+		t.Fatalf("failed to update watched_hosts: %v", err)
+	}
+
+	var got uint8
+	if err := objs.WatchedHosts.Lookup(&key, &got); err != nil {
+		t.Fatalf("failed to lookup watched_hosts: %v", err)
+	}
+	if got != 1 {
+		t.Errorf("expected 1, got %d", got)
 	}
 }

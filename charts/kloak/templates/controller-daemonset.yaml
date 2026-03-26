@@ -53,6 +53,9 @@ spec:
             - name: btf
               mountPath: /sys/kernel/btf
               readOnly: true
+            - name: tracefs
+              mountPath: /sys/kernel/tracing
+              readOnly: true
             {{- if .Values.coverage.enabled }}
             - name: coverage
               mountPath: /coverage
@@ -96,6 +99,10 @@ spec:
           hostPath:
             path: /sys/kernel/btf
             type: Directory
+        - name: tracefs
+          hostPath:
+            path: /sys/kernel/tracing
+            type: DirectoryOrCreate
         {{- if .Values.coverage.enabled }}
         - name: coverage
           hostPath:
