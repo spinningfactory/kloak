@@ -205,20 +205,7 @@ struct conn_ip_val {
   __u8 ip[16]; // IPv4-mapped-IPv6 or native IPv6
 };
 
-// Reverse mapping: peer IP -> {tgid, fd}.
-// Used to retroactively set last_verified_fd when DNS is captured
-// after the connect (common with Docker DNS proxy timing).
-struct ip_conn_val {
-  __u32 tgid;
-  __u32 fd;
-};
 
-struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __uint(max_entries, 4096);
-  __type(key, struct dns_ip_key); // IP only
-  __type(value, struct ip_conn_val);
-} ip_to_conn SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -309,6 +296,16 @@ struct {
   __type(key, struct watched_host_key);
   __type(value, __u8);
 } watched_hosts SEC(".maps");
+
+// Check if a dns_ip_map entry has expired based on its TTL.
+// Returns 1 if expired, 0 if still valid. TTL of 0 means never expires.
+static __always_inline int dns_entry_expired(struct dns_ip_val *div) {
+  if (div->ttl_sec == 0)
+    return 0;
+  __u64 age_ns = bpf_ktime_get_ns() - div->inserted_at;
+  __u64 ttl_ns = (__u64)div->ttl_sec * 1000000000ULL;
+  return age_ns > ttl_ns;
+}
 
 // =============================================================================
 // DNS helpers (inline, used by tracepoint programs)
@@ -503,11 +500,6 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
     bpf_map_update_elem(&dns_ip_map, &dik, &div, BPF_ANY);
     dbg_inc(DBG_DNS_ANSWER_STORED);
 
-    // Retroactively verify connections that happened before DNS was captured
-    struct ip_conn_val *icv = bpf_map_lookup_elem(&ip_to_conn, &dik);
-    if (icv) {
-      bpf_map_update_elem(&last_verified_fd, &icv->tgid, &icv->fd, BPF_ANY);
-    }
   }
 
   // AAAA record (type 28, rdlength 16)
@@ -530,11 +522,6 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
     bpf_map_update_elem(&dns_ip_map, &dik, &div, BPF_ANY);
     dbg_inc(DBG_DNS_ANSWER_STORED);
 
-    // Retroactively verify connections that happened before DNS was captured
-    struct ip_conn_val *icv = bpf_map_lookup_elem(&ip_to_conn, &dik);
-    if (icv) {
-      bpf_map_update_elem(&last_verified_fd, &icv->tgid, &icv->fd, BPF_ANY);
-    }
   }
 
   off += rdlength;
@@ -791,20 +778,13 @@ int tp_exit_connect(struct trace_event_raw_sys_exit *ctx) {
   __builtin_memcpy(civ.ip, ip, 16);
   bpf_map_update_elem(&conn_ip_map, &cik, &civ, BPF_ANY);
 
-  // Reverse mapping for retroactive DNS verification
-  struct dns_ip_key rev_key;
-  __builtin_memset(&rev_key, 0, sizeof(rev_key));
-  __builtin_memcpy(rev_key.ip, ip, 16);
-  struct ip_conn_val rev_val = {.tgid = tgid, .fd = fd};
-  bpf_map_update_elem(&ip_to_conn, &rev_key, &rev_val, BPF_ANY);
-
   // Check if this IP was already DNS-verified
   struct dns_ip_key dik;
   __builtin_memset(&dik, 0, sizeof(dik));
   __builtin_memcpy(dik.ip, ip, 16);
 
   struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
-  if (div) {
+  if (div && !dns_entry_expired(div)) {
     // DNS-verified connection! Record as last_verified_fd
     bpf_map_update_elem(&last_verified_fd, &tgid, &fd, BPF_ANY);
 
@@ -813,6 +793,27 @@ int tp_exit_connect(struct trace_event_raw_sys_exit *ctx) {
                div->hostname);
 #endif
   }
+
+  return 0;
+}
+
+// tp/syscalls/sys_enter_close: clean up connection state when an fd is closed.
+// Prevents stale conn_ip_map entries from being used after fd reuse.
+// close(int fd)
+SEC("tracepoint/syscalls/sys_enter_close")
+int tp_enter_close(struct trace_event_raw_sys_enter *ctx) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+  __u32 fd = (__u32)ctx->args[0];
+
+  // Clean up conn_ip_map entry for this fd (no-op if fd wasn't a tracked connection)
+  struct conn_ip_key cik = {.tgid = tgid, .fd = fd};
+  bpf_map_delete_elem(&conn_ip_map, &cik);
+
+  // Clean up last_verified_fd if it pointed to this fd
+  __u32 *vfd = bpf_map_lookup_elem(&last_verified_fd, &tgid);
+  if (vfd && *vfd == fd)
+    bpf_map_delete_elem(&last_verified_fd, &tgid);
 
   return 0;
 }
@@ -876,7 +877,7 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     __builtin_memset(&dik, 0, sizeof(dik));
     __builtin_memcpy(dik.ip, civ->ip, 16);
     struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
-    if (div && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
+    if (div && !dns_entry_expired(div) && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
       __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
       scratch_data->host_value_len = div->host_len;
       dbg_inc(DBG_RESOLVE_HOST_OK);
@@ -897,7 +898,7 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     __builtin_memset(&dik, 0, sizeof(dik));
     __builtin_memcpy(dik.ip, civ->ip, 16);
     struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
-    if (div && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
+    if (div && !dns_entry_expired(div) && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
       __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
       scratch_data->host_value_len = div->host_len;
       bpf_map_update_elem(&last_verified_fd, &tgid, &try_fd, BPF_ANY);

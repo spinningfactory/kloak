@@ -43,6 +43,9 @@ func TestLoadObjects(t *testing.T) {
 	if objs.TpExitConnect == nil {
 		t.Error("TpExitConnect program not loaded")
 	}
+	if objs.TpEnterClose == nil {
+		t.Error("TpEnterClose program not loaded")
+	}
 }
 
 func TestTailCallWiring(t *testing.T) {
