@@ -205,20 +205,7 @@ struct conn_ip_val {
   __u8 ip[16]; // IPv4-mapped-IPv6 or native IPv6
 };
 
-// Reverse mapping: peer IP -> {tgid, fd}.
-// Used to retroactively set last_verified_fd when DNS is captured
-// after the connect (common with Docker DNS proxy timing).
-struct ip_conn_val {
-  __u32 tgid;
-  __u32 fd;
-};
 
-struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __uint(max_entries, 4096);
-  __type(key, struct dns_ip_key); // IP only
-  __type(value, struct ip_conn_val);
-} ip_to_conn SEC(".maps");
 
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -503,11 +490,6 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
     bpf_map_update_elem(&dns_ip_map, &dik, &div, BPF_ANY);
     dbg_inc(DBG_DNS_ANSWER_STORED);
 
-    // Retroactively verify connections that happened before DNS was captured
-    struct ip_conn_val *icv = bpf_map_lookup_elem(&ip_to_conn, &dik);
-    if (icv) {
-      bpf_map_update_elem(&last_verified_fd, &icv->tgid, &icv->fd, BPF_ANY);
-    }
   }
 
   // AAAA record (type 28, rdlength 16)
@@ -530,11 +512,6 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
     bpf_map_update_elem(&dns_ip_map, &dik, &div, BPF_ANY);
     dbg_inc(DBG_DNS_ANSWER_STORED);
 
-    // Retroactively verify connections that happened before DNS was captured
-    struct ip_conn_val *icv = bpf_map_lookup_elem(&ip_to_conn, &dik);
-    if (icv) {
-      bpf_map_update_elem(&last_verified_fd, &icv->tgid, &icv->fd, BPF_ANY);
-    }
   }
 
   off += rdlength;
@@ -790,13 +767,6 @@ int tp_exit_connect(struct trace_event_raw_sys_exit *ctx) {
   struct conn_ip_val civ;
   __builtin_memcpy(civ.ip, ip, 16);
   bpf_map_update_elem(&conn_ip_map, &cik, &civ, BPF_ANY);
-
-  // Reverse mapping for retroactive DNS verification
-  struct dns_ip_key rev_key;
-  __builtin_memset(&rev_key, 0, sizeof(rev_key));
-  __builtin_memcpy(rev_key.ip, ip, 16);
-  struct ip_conn_val rev_val = {.tgid = tgid, .fd = fd};
-  bpf_map_update_elem(&ip_to_conn, &rev_key, &rev_val, BPF_ANY);
 
   // Check if this IP was already DNS-verified
   struct dns_ip_key dik;
