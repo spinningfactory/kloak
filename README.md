@@ -1,8 +1,8 @@
 <div align="center">
-  <img src="website/transparent-logo.svg" alt="Kloak Logo" width="120" />
+  <a href="https://getkloak.io/"><img src="website/transparent-logo.svg" alt="Kloak Logo" width="120"/></a>
 </div>
 
-<h1 align="center">Kloak</h1>
+<h1 align="center"><a href="https://getkloak.io/">Kloak</a></h1>
 
 <p align="center">
   <b>Secure Your Secrets, Agentless</b><br>
@@ -12,7 +12,7 @@
 <div align="center">
 
 [![CI](https://github.com/spinningfactory/kloak/actions/workflows/ci.yml/badge.svg)](https://github.com/spinningfactory/kloak/actions/workflows/ci.yml)
-![Coverage](https://img.shields.io/badge/Coverage-87.0%25-brightgreen)
+![Coverage](https://img.shields.io/badge/Coverage-69.3%25-yellow)
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://go.dev/)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.28+-326CE5?logo=kubernetes)](https://kubernetes.io/)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
@@ -93,8 +93,23 @@ Authorization: Bearer sk-live-xyz123...
 ## 🛠 Quick Start
 
 ### Prerequisites
-- **macOS**: Docker, Lima, kubectl, openssl
-- **Linux**: Docker, kubectl, openssl
+- A Kubernetes cluster (1.28+) with Linux kernel 5.17+
+- [Helm](https://helm.sh/docs/intro/install/) 3.12+
+- `kubectl` configured with cluster access
+
+### Install with Helm
+
+```bash
+# Add the Kloak Helm repository
+helm repo add kloak https://getkloak.github.io/kloak
+helm repo update
+
+# Install Kloak
+helm install kloak kloak/kloak -n kloak-system --create-namespace
+
+# Verify the installation
+kubectl get pods -n kloak-system
+```
 
 ### Try the Demo
 
@@ -134,22 +149,6 @@ make lima-start    # Start Lima VM
 make generate-ebpf # Generate eBPF code
 make test-linux    # Run tests in Linux VM
 make lima-shell    # Open shell in Lima VM
-```
-
-## 📁 Project Structure
-
-```
-kloak/
-├── cmd/kloak/           # CLI commands
-├── pkg/
-│   ├── cgroups/         # cgroup management
-│   ├── controller/      # Kubernetes controller logic
-│   ├── ebpf/            # eBPF programs and bindings
-│   ├── storage/         # Secret storage backend
-│   └── webhook/         # Admission webhook (mutates secret volumes)
-├── bpf/                 # eBPF C source code
-├── config/              # Envoy and K8s manifests
-└── examples/            # Demo applications
 ```
 
 ## 📄 License

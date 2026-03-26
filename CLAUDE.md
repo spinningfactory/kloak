@@ -74,6 +74,5 @@ The binary (`cmd/kloak/main.go`) has two subcommands via cobra:
 - `pkg/webhook/` — admission webhook handler and cert generation
 - `pkg/storage/` — secret storage interface and implementations
 - `pkg/cgroups/` — cgroup path resolution and inode lookup (Linux-only impl + stub)
-- `config/manifests/` — Kubernetes deployment manifests (controller DaemonSet, webhook Deployment, RBAC)
-- `config/overlays/` — Kustomize overlays (dev, prod, k3s)
+- `charts/kloak/` — Helm chart for deploying Kloak (controller DaemonSet, webhook Deployment, RBAC, values.yaml)
 - `examples/` — demo applications (Go, Node.js, Python)

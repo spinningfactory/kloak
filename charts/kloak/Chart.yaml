@@ -1,0 +1,16 @@
+apiVersion: v2
+name: kloak
+description: Kubernetes eBPF Secret Interceptor — secure secret management without sidecars
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://getkloak.io
+sources:
+  - https://github.com/getkloak/kloak
+keywords:
+  - kubernetes
+  - ebpf
+  - secrets
+  - security
+maintainers:
+  - name: Kloak Team

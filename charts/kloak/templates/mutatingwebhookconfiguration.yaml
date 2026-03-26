@@ -1,0 +1,67 @@
+{{- /* Resolve cert data for auto mode — generate once, use for both Secret and caBundle */ -}}
+{{- $caBundle := "" }}
+{{- $certPEM := "" }}
+{{- $keyPEM := "" }}
+{{- if eq .Values.certificates.mode "auto" }}
+  {{- $secretName := "kloak-webhook-certs" }}
+  {{- $existing := lookup "v1" "Secret" .Release.Namespace $secretName }}
+  {{- if and $existing $existing.data (index $existing.data "tls.crt") (index $existing.data "tls.key") }}
+    {{- $certPEM = index $existing.data "tls.crt" }}
+    {{- $keyPEM = index $existing.data "tls.key" }}
+  {{- else }}
+    {{- $cn := printf "kloak-webhook.%s.svc" .Release.Namespace }}
+    {{- $dnsNames := list "kloak-webhook" (printf "kloak-webhook.%s" .Release.Namespace) (printf "kloak-webhook.%s.svc" .Release.Namespace) }}
+    {{- $generated := genSelfSignedCert $cn nil $dnsNames 3650 }}
+    {{- $certPEM = $generated.Cert | b64enc }}
+    {{- $keyPEM = $generated.Key | b64enc }}
+  {{- end }}
+  {{- $caBundle = $certPEM }}
+{{- end }}
+{{- /* --- Secret (auto mode only) --- */ -}}
+{{- if eq .Values.certificates.mode "auto" }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: kloak-webhook-certs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+type: kubernetes.io/tls
+data:
+  tls.crt: {{ $certPEM }}
+  tls.key: {{ $keyPEM }}
+{{- end }}
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: MutatingWebhookConfiguration
+metadata:
+  name: kloak-mutating-webhook
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+  {{- if eq .Values.certificates.mode "certManager" }}
+  annotations:
+    cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/kloak-webhook-cert
+  {{- end }}
+webhooks:
+  - name: pod.mutate.getkloak.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    clientConfig:
+      service:
+        namespace: {{ .Release.Namespace }}
+        name: kloak-webhook
+        path: /mutate-pods
+      {{- if $caBundle }}
+      caBundle: {{ $caBundle }}
+      {{- end }}
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchExpressions:
+        - key: getkloak.io/enabled
+          operator: In
+          values: ["true"]
+    failurePolicy: Fail

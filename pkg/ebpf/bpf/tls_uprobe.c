@@ -4,9 +4,14 @@
 // Uses a per-CPU array as scratch buffer (not ringbuf) to avoid verifier
 // issues with ringbuf_mem pointer tracking in loops.
 // Supports both x86_64 and ARM64 architectures.
-// Host filtering uses TLS SNI (protocol-agnostic) with HTTP Host fallback.
+// Host filtering uses DNS-verified connect-time resolution.
 
-#include "vmlinux.h"
+// Include arch-specific vmlinux.h (generated, committed per-arch).
+#if defined(__TARGET_ARCH_x86) || defined(__x86_64__) || defined(__amd64__)
+#include "vmlinux_x86.h"
+#else
+#include "vmlinux_arm64.h"
+#endif
 #include <bpf/bpf_helpers.h>
 
 // Architecture detection
@@ -19,6 +24,7 @@
 #endif
 
 #include <bpf/bpf_core_read.h>
+#include <bpf/bpf_endian.h>
 #include <bpf/bpf_tracing.h>
 
 /* Define KLOAK_DEBUG at compile time to enable verbose bpf_printk tracing.
@@ -41,10 +47,13 @@
 #define CHUNK_STRIDE (MAX_DATA_SIZE - (SECRET_KEY_LEN - 1)) // 249
 // Max host length for matching (compared as 4 x uint64, no loop needed)
 #define MAX_HOST_LEN 32
-// Max hostname to read from SNI
-#define MAX_SNI_LEN 64
-// OpenSSL SSL_ctrl cmd value for SSL_set_tlsext_host_name macro
-#define SSL_CTRL_SET_TLSEXT_HOSTNAME 55
+// Maximum DNS packet size we can parse in BPF
+#define MAX_DNS_PKT 512
+// Maximum number of DNS answer records to process
+#define MAX_DNS_ANSWERS 8
+// Maximum DNS server IPs we can configure
+
+#include "helpers.h"
 
 // BPF Map: shadow secret prefix -> real secret value
 struct secret_key {
@@ -54,10 +63,10 @@ struct secret_key {
 struct secret_value {
   __u32 len;
   char real_secret[SECRET_MAX_LEN];
-  __u32 host_len;                        // 0 = wildcard (allow all hosts)
-  char allowed_host[MAX_HOST_LEN];       // e.g. "httpbin.org"
-  __u32 prefix_len;                      // actual prefix length (8..42)
-  char full_prefix[SECRET_PREFIX_MAX];   // full kloak:UUID prefix for verification
+  __u32 host_len;                      // 0 = wildcard (allow all hosts)
+  char allowed_host[MAX_HOST_LEN];     // e.g. "httpbin.org"
+  __u32 prefix_len;                    // actual prefix length (8..42)
+  char full_prefix[SECRET_PREFIX_MAX]; // full kloak:UUID prefix for verification
 };
 
 struct {
@@ -67,30 +76,6 @@ struct {
   __type(value, struct secret_value);
 } secret_map SEC(".maps");
 
-// -----------------------------------------------------------------------------
-// SNI hostname cache: {tgid, ssl_ptr} → hostname
-// Populated by SSL_set_tlsext_host_name uprobe (runs once per connection).
-// Looked up by SSL_write uprobe to get the destination hostname.
-// Uses LRU to auto-evict stale entries when connections close.
-// -----------------------------------------------------------------------------
-struct conn_key {
-  __u64 ssl_ptr; // pointer to SSL object (unique per connection)
-  __u32 tgid;
-  __u32 _pad;    // explicit padding — BPF hashes the full key including padding
-};
-
-struct conn_host {
-  __u32 host_len;
-  char hostname[MAX_HOST_LEN];
-};
-
-struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __uint(max_entries, 4096);
-  __type(key, struct conn_key);
-  __type(value, struct conn_host);
-} conn_hosts SEC(".maps");
-
 // Per-CPU array used as scratch space for reading and scanning data.
 struct scratch_buf {
   __u64 user_data_ptr;
@@ -98,7 +83,7 @@ struct scratch_buf {
   __u32 total_data_len; // full TLS write length (for bpf_loop scanning)
   __u32 host_offset;
   __u32 host_value_len; // length of extracted host value
-  char host_value[MAX_HOST_LEN]; // host from SNI cache or HTTP header
+  char host_value[MAX_HOST_LEN]; // host from DNS chain
   char data[MAX_DATA_SIZE];
 };
 
@@ -130,202 +115,797 @@ struct tls_event {
   __u8 is_rewritten; // 1 = secret was rewritten in-kernel
 };
 
-// -----------------------------------------------------------------------------
-// SNI hostname extraction uprobe.
-// Hooks SSL_set_tlsext_host_name(SSL *ssl, const char *name).
-// Called once per connection before SSL_connect/handshake.
-// Caches {tgid, ssl_ptr} → hostname for later lookup in SSL_write.
-// Works for OpenSSL, BoringSSL, and any compatible TLS library.
-// -----------------------------------------------------------------------------
-SEC("uprobe/ssl_set_host")
-int bpf_uprobe_ssl_set_host(void *ctx) {
-  void *ssl_ptr;
-  void *name_ptr;
+// Debug counters for diagnosing DNS interception issues.
+// Index: see DBG_* constants below.
+enum {
+  DBG_KPROBE_ENTRY = 0,       // udp_recvmsg kprobe entered
+  DBG_KPROBE_TRACKED,         // tracked_tgids hit
+  DBG_KPROBE_DPORT53,         // skc_dport == 53
+  DBG_KPROBE_DPORT0,          // skc_dport == 0 (unconnected)
+  DBG_KPROBE_DPORT_OTHER,     // skc_dport != 53 and != 0
+  DBG_KPROBE_IOV_OK,          // iov_base read successfully
+  DBG_KRETPROBE_ENTRY,        // kretprobe entered (has pending)
+  DBG_KRETPROBE_RET_SMALL,    // ret <= 12
+  DBG_KRETPROBE_READ_FAIL,    // bpf_probe_read_user failed
+  DBG_KRETPROBE_READ_OK,      // packet read into scratch
+  DBG_DNS_PARSE_ENTRY,        // do_dns_parse entered
+  DBG_DNS_NOT_RESPONSE,       // QR bit not set or RCODE != 0
+  DBG_DNS_NO_ANSWERS,         // qdcount < 1 or ancount < 1
+  DBG_DNS_QNAME_FAIL,         // qname decode failed
+  DBG_DNS_NOT_WATCHED,        // hostname not in watched_hosts
+  DBG_DNS_WATCHED_HIT,        // hostname IS in watched_hosts
+  DBG_DNS_ANSWER_STORED,      // A/AAAA record stored in dns_ip_map
+  DBG_PHASE2_ENTERED,         // phase2_rewrite entered
+  DBG_RESOLVE_SSL_FD_HIT,     // ssl_fd_map cache hit
+  DBG_RESOLVE_LAST_VFD_HIT,   // last_verified_fd hit
+  DBG_RESOLVE_FD_SCAN_HIT,    // fd scan found DNS-verified connection
+  DBG_RESOLVE_NO_FD,          // no fd found at all
+  DBG_RESOLVE_NO_CONN,        // fd found but no conn_ip_map entry
+  DBG_RESOLVE_NO_DNS,         // conn found but IP not in dns_ip_map
+  DBG_RESOLVE_HOST_OK,        // hostname resolved successfully
+  DBG_MAX,
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 32); // must be >= DBG_MAX
+  __type(key, __u32);
+  __type(value, __u64);
+} debug_counters SEC(".maps");
+
+static __always_inline void dbg_inc(__u32 idx) {
+  __u64 *val = bpf_map_lookup_elem(&debug_counters, &idx);
+  if (val)
+    __sync_fetch_and_add(val, 1);
+}
+
+// =============================================================================
+// DNS-verified host filtering maps
+// =============================================================================
+
+// Per-process opt-in filter: only track DNS/connect for these TGIDs.
+// Populated from userspace when attaching uprobes to a process.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 1024);
+  __type(key, __u32);   // tgid
+  __type(value, __u8);  // 1 = tracked
+} tracked_tgids SEC(".maps");
+
+// DNS-verified IP -> hostname mapping (global, not per-process).
+// Populated by kretprobe_udp_recvmsg when a DNS response contains an A/AAAA
+// record whose qname is in watched_hosts. Global because in containerized
+// environments (k3d/Docker), DNS may be resolved by a proxy process.
+struct dns_ip_key {
+  __u8 ip[16]; // IPv4-mapped-IPv6 or native IPv6
+};
+
+struct dns_ip_val {
+  char hostname[MAX_HOST_LEN];
+  __u32 host_len;
+  __u32 ttl_sec;
+  __u64 inserted_at;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 8192);
+  __type(key, struct dns_ip_key);
+  __type(value, struct dns_ip_val);
+} dns_ip_map SEC(".maps");
+
+// TCP connection fd -> peer IP per process.
+// Populated by tp_exit_connect for every connect() call.
+struct conn_ip_key {
+  __u32 tgid;
+  __u32 fd;
+};
+
+struct conn_ip_val {
+  __u8 ip[16]; // IPv4-mapped-IPv6 or native IPv6
+};
+
+// Reverse mapping: peer IP -> {tgid, fd}.
+// Used to retroactively set last_verified_fd when DNS is captured
+// after the connect (common with Docker DNS proxy timing).
+struct ip_conn_val {
+  __u32 tgid;
+  __u32 fd;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 4096);
+  __type(key, struct dns_ip_key); // IP only
+  __type(value, struct ip_conn_val);
+} ip_to_conn SEC(".maps");
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 16384);
+  __type(key, struct conn_ip_key);
+  __type(value, struct conn_ip_val);
+} conn_ip_map SEC(".maps");
+
+// SSL pointer -> fd cache per process.
+// Populated lazily in resolve_host when last_verified_fd provides an fd.
+struct ssl_fd_key {
+  __u32 tgid;
+  __u32 _pad;
+  __u64 ssl_ptr;
+};
+
+struct ssl_fd_val {
+  __u32 fd;
+  __u32 _pad;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 4096);
+  __type(key, struct ssl_fd_key);
+  __type(value, struct ssl_fd_val);
+} ssl_fd_map SEC(".maps");
+
+// Most recent DNS-verified connect fd per tgid.
+// Written by tp_exit_connect when the destination IP has a dns_ip_map entry.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 1024);
+  __type(key, __u32);   // tgid
+  __type(value, __u32); // fd
+} last_verified_fd SEC(".maps");
+
+// Scratch for kprobe udp_recvmsg enter->return correlation.
+// Saves the user buffer pointer from msghdr on entry so the
+// kretprobe can read the DNS response after it's been copied.
+struct udp_recv_pending {
+  __u64 iov_base;  // user buffer (first iovec base)
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 1024);
+  __type(key, __u64);   // pid_tgid
+  __type(value, struct udp_recv_pending);
+} udp_recv_scratch SEC(".maps");
+
+// Scratch for connect enter->exit correlation: save fd and sockaddr.
+struct connect_pending_val {
+  __u32 fd;
+  __u8 ip[16]; // destination IP (IPv4-mapped-IPv6)
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 1024);
+  __type(key, __u64);   // pid_tgid
+  __type(value, struct connect_pending_val);
+} connect_pending SEC(".maps");
+
+// Per-CPU scratch buffer for DNS packet parsing.
+// Also carries tgid/pkt_len for the tail-called dns_parse_packet program.
+struct dns_scratch_buf {
+  char pkt[MAX_DNS_PKT];
+  __u32 pkt_len;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct dns_scratch_buf);
+} dns_scratch SEC(".maps");
+
+// Watched hostnames: only DNS responses for these hosts are recorded.
+// Populated from userspace with the unique AllowedHosts from synced secrets.
+struct watched_host_key {
+  char host[MAX_HOST_LEN];
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 256);
+  __type(key, struct watched_host_key);
+  __type(value, __u8);
+} watched_hosts SEC(".maps");
+
+// =============================================================================
+// DNS helpers (inline, used by tracepoint programs)
+// =============================================================================
+
+// Convert an IPv4 address (4 bytes, network order) to IPv4-mapped-IPv6 (16 bytes).
+static __always_inline void ipv4_to_mapped(__u8 *out16, const __u8 *ipv4) {
+  __builtin_memset(out16, 0, 10);
+  out16[10] = 0xff;
+  out16[11] = 0xff;
+  out16[12] = ipv4[0];
+  out16[13] = ipv4[1];
+  out16[14] = ipv4[2];
+  out16[15] = ipv4[3];
+}
+
+
+
+// barrier_var prevents the compiler from eliminating the AND mask below.
+// After "if (offset >= MAX_DNS_PKT) return 0", the compiler proves
+// offset < 512 and would optimize away "offset & 511" as a no-op.
+// The BPF verifier then sees an unbounded pointer arithmetic operation.
+// This asm barrier breaks the compiler's value-range reasoning.
+#ifndef barrier_var
+#define barrier_var(var) asm volatile("" : "+r"(var) : :)
+#endif
+
+// Context for dns_skip_name bpf_loop callback.
+struct skip_name_ctx {
+  __u32 off;
+  __u32 pkt_len;
+  __u32 result; // 0 = still running, >0 = final offset (success), set to pkt_len+1 on error
+};
+
+// bpf_loop callback: skip one label of a DNS name.
+static int skip_name_step(__u32 idx, void *ctx) {
+  struct skip_name_ctx *sctx = (struct skip_name_ctx *)ctx;
+  if (sctx->result)
+    return 1; // already done
+
+  __u32 off = sctx->off;
+  if (off >= sctx->pkt_len || off >= MAX_DNS_PKT) {
+    sctx->result = sctx->pkt_len + 1; // error
+    return 1;
+  }
+
+  __u32 zero = 0;
+  struct dns_scratch_buf *dbuf = bpf_map_lookup_elem(&dns_scratch, &zero);
+  if (!dbuf) { sctx->result = sctx->pkt_len + 1; return 1; }
+
+  barrier_var(off);
+  __u8 b = (__u8)dbuf->pkt[off & (MAX_DNS_PKT - 1)];
+
+  if (b == 0) {
+    sctx->result = off + 1;
+    return 1;
+  }
+  if ((b & 0xC0) == 0xC0) {
+    sctx->result = off + 2;
+    return 1;
+  }
+  if ((b & 0xC0) != 0) {
+    sctx->result = sctx->pkt_len + 1; // reserved bits = error
+    return 1;
+  }
+  __u32 next = off + 1 + (__u32)b;
+  if (next > sctx->pkt_len || next > MAX_DNS_PKT) {
+    sctx->result = sctx->pkt_len + 1;
+    return 1;
+  }
+  sctx->off = next;
+  return 0;
+}
+
+// Skip a DNS name in compressed wire format. Returns new offset, or 0 on error.
+static __always_inline __u32 dns_skip_name(__u32 pkt_len, __u32 off) {
+  struct skip_name_ctx sctx = { .off = off, .pkt_len = pkt_len, .result = 0 };
+  bpf_loop(64, skip_name_step, &sctx, 0);
+  if (sctx.result == 0 || sctx.result > pkt_len)
+    return 0;
+  return sctx.result;
+}
+
+// Decode a DNS qname using a FLAT single loop (not nested).
+// Nested loops (8 outer × 63 inner = 504 iterations) create multiplicative
+// verifier state explosion, hitting the 1M-instruction limit. A single loop
+// of MAX_HOST_LEN+8 iterations stays well within budget.
+static __always_inline __u32 dns_decode_qname(const char *pkt, __u32 pkt_len,
+                                              __u32 off, char *out,
+                                              __u32 out_len) {
+  __u32 host_len = 0;
+  __u32 label_rem = 0;
+  __u8 after_first = 0;
+
+  for (__u32 i = 0; i < MAX_HOST_LEN + 8; i++) {
+    if (off >= pkt_len || off >= MAX_DNS_PKT)
+      break;
+    barrier_var(off);
+    __u8 c = (__u8)pkt[off & (MAX_DNS_PKT - 1)];
+    off++;
+
+    if (label_rem == 0) {
+      if (c == 0)
+        break;
+      if ((c & 0xC0) != 0)
+        break;
+      if (c > 63)
+        break;
+      label_rem = (__u32)c;
+      if (after_first && host_len < out_len)
+        out[host_len++] = '.';
+      after_first = 1;
+    } else {
+      label_rem--;
+      if (host_len < out_len)
+        out[host_len++] = c;
+    }
+  }
+  return host_len;
+}
+
+// Context passed to each bpf_loop callback for DNS answer parsing.
+struct dns_answer_ctx {
+  __u32 off;
+  __u32 pkt_len;
+  __u16 ancount;
+  __u32 qname_len;
+  __u32 answers_processed;
+  char qname[MAX_HOST_LEN];
+};
+
+// bpf_loop callback: parse one DNS answer record.
+// Reads from dns_scratch per-CPU buffer (must re-lookup per frame for verifier).
+static int parse_dns_answer(__u32 idx, void *ctx) {
+  struct dns_answer_ctx *actx = (struct dns_answer_ctx *)ctx;
+
+  if (actx->answers_processed >= actx->ancount)
+    return 1; // stop
+  if (actx->off >= actx->pkt_len)
+    return 1;
+
+  // Re-lookup per-CPU scratch buffer (verifier requires per-frame)
+  __u32 zero = 0;
+  struct dns_scratch_buf *dbuf = bpf_map_lookup_elem(&dns_scratch, &zero);
+  if (!dbuf)
+    return 1;
+  const char *pkt = dbuf->pkt;
+  __u32 pkt_len = actx->pkt_len;
+  __u32 off = actx->off;
+
+  // Skip the answer name (may be compressed)
+  off = dns_skip_name(pkt_len, off);
+  if (off == 0 || off + 10 > pkt_len || off + 10 > MAX_DNS_PKT)
+    return 1;
+
+  // Read TYPE/CLASS/TTL/RDLENGTH (10 bytes).
+  if (off + 10 > pkt_len || off > 502)
+    return 1;
+  barrier_var(off);
+  __u32 rr_base = off & (MAX_DNS_PKT - 1);
+  if (rr_base + 10 > MAX_DNS_PKT)
+    return 1;
+  __u8 rr_hdr[10];
+  for (int k = 0; k < 10; k++)
+    rr_hdr[k] = (__u8)pkt[rr_base + k];
+  __u16 rtype = ((__u16)rr_hdr[0] << 8) | (__u16)rr_hdr[1];
+  __u32 ttl = ((__u32)rr_hdr[4] << 24) | ((__u32)rr_hdr[5] << 16) |
+              ((__u32)rr_hdr[6] << 8) | (__u32)rr_hdr[7];
+  __u16 rdlength = ((__u16)rr_hdr[8] << 8) | (__u16)rr_hdr[9];
+  off += 10;
+
+  if (off + rdlength > pkt_len || off + rdlength > MAX_DNS_PKT)
+    return 1;
+
+  // A record (type 1, rdlength 4)
+  if (rtype == 1 && rdlength == 4) {
+    if (off + 4 > MAX_DNS_PKT) return 1;
+    barrier_var(off);
+    __u32 a_off = off & (MAX_DNS_PKT - 1);
+    if (a_off + 4 > MAX_DNS_PKT) return 1;
+    struct dns_ip_key dik;
+    __builtin_memset(&dik, 0, sizeof(dik));
+    ipv4_to_mapped(dik.ip, (__u8 *)(pkt + a_off));
+
+    struct dns_ip_val div;
+    __builtin_memset(&div, 0, sizeof(div));
+    __builtin_memcpy(div.hostname, actx->qname, MAX_HOST_LEN);
+    div.host_len = actx->qname_len;
+    div.ttl_sec = ttl;
+    div.inserted_at = bpf_ktime_get_ns();
+
+    bpf_map_update_elem(&dns_ip_map, &dik, &div, BPF_ANY);
+    dbg_inc(DBG_DNS_ANSWER_STORED);
+
+    // Retroactively verify connections that happened before DNS was captured
+    struct ip_conn_val *icv = bpf_map_lookup_elem(&ip_to_conn, &dik);
+    if (icv) {
+      bpf_map_update_elem(&last_verified_fd, &icv->tgid, &icv->fd, BPF_ANY);
+    }
+  }
+
+  // AAAA record (type 28, rdlength 16)
+  if (rtype == 28 && rdlength == 16) {
+    if (off + 16 > MAX_DNS_PKT) return 1;
+    barrier_var(off);
+    __u32 aaaa_off = off & (MAX_DNS_PKT - 1);
+    if (aaaa_off + 16 > MAX_DNS_PKT) return 1;
+    struct dns_ip_key dik;
+    __builtin_memset(&dik, 0, sizeof(dik));
+    __builtin_memcpy(dik.ip, pkt + aaaa_off, 16);
+
+    struct dns_ip_val div;
+    __builtin_memset(&div, 0, sizeof(div));
+    __builtin_memcpy(div.hostname, actx->qname, MAX_HOST_LEN);
+    div.host_len = actx->qname_len;
+    div.ttl_sec = ttl;
+    div.inserted_at = bpf_ktime_get_ns();
+
+    bpf_map_update_elem(&dns_ip_map, &dik, &div, BPF_ANY);
+    dbg_inc(DBG_DNS_ANSWER_STORED);
+
+    // Retroactively verify connections that happened before DNS was captured
+    struct ip_conn_val *icv = bpf_map_lookup_elem(&ip_to_conn, &dik);
+    if (icv) {
+      bpf_map_update_elem(&last_verified_fd, &icv->tgid, &icv->fd, BPF_ANY);
+    }
+  }
+
+  off += rdlength;
+  actx->off = off;
+  actx->answers_processed++;
+  return 0; // continue
+}
+
+// Tail-called DNS parser program (slot 1 in prog_array).
+// Reads packet from dns_scratch_buf (per-CPU), parses the DNS response,
+// and stores A/AAAA records in dns_ip_map for watched hostnames.
+// Separated from kretprobe_udp_recvmsg to stay under the verifier's
+// 1M instruction limit on x86_64.
+// Parse DNS response from dns_scratch per-CPU buffer.
+// __noinline to keep it as a single BPF subprogram, reducing verifier cost.
+static __noinline void do_dns_parse(void) {
+  dbg_inc(DBG_DNS_PARSE_ENTRY);
+  __u32 zero = 0;
+  struct dns_scratch_buf *dbuf = bpf_map_lookup_elem(&dns_scratch, &zero);
+  if (!dbuf)
+    return;
+
+  const char *pkt = dbuf->pkt;
+  __u32 pkt_len = dbuf->pkt_len;
+
+  if (pkt_len < 12)
+    return;
+
+  __u8 flags0 = (__u8)pkt[2];
+  __u8 flags1 = (__u8)pkt[3];
+  if (!(flags0 & 0x80)) { dbg_inc(DBG_DNS_NOT_RESPONSE); return; }
+  if ((flags1 & 0x0F) != 0) { dbg_inc(DBG_DNS_NOT_RESPONSE); return; }
+
+  __u16 qdcount = ((__u16)(__u8)pkt[4] << 8) | (__u16)(__u8)pkt[5];
+  __u16 ancount = ((__u16)(__u8)pkt[6] << 8) | (__u16)(__u8)pkt[7];
+
+  if (qdcount < 1 || ancount < 1) { dbg_inc(DBG_DNS_NO_ANSWERS); return; }
+
+  char qname[MAX_HOST_LEN];
+  __builtin_memset(qname, 0, sizeof(qname));
+  __u32 qname_len = dns_decode_qname(pkt, pkt_len, 12, qname, MAX_HOST_LEN);
+  if (qname_len == 0 || qname_len > MAX_HOST_LEN) { dbg_inc(DBG_DNS_QNAME_FAIL); return; }
+
+  struct watched_host_key wk;
+  __builtin_memset(&wk, 0, sizeof(wk));
+  __builtin_memcpy(wk.host, qname, MAX_HOST_LEN);
+  __u8 *watched = bpf_map_lookup_elem(&watched_hosts, &wk);
+  if (!watched) { dbg_inc(DBG_DNS_NOT_WATCHED); return; }
+  dbg_inc(DBG_DNS_WATCHED_HIT);
+
+  __u32 off = 12;
+  off = dns_skip_name(pkt_len, off);
+  if (off == 0)
+    return;
+  off += 4;
+  if (off > pkt_len)
+    return;
+
+  // Parse answer records using bpf_loop
+  struct dns_answer_ctx actx = {
+    .off = off,
+    .pkt_len = pkt_len,
+    .ancount = ancount,
+    .qname_len = qname_len,
+    .answers_processed = 0,
+  };
+  __builtin_memcpy(actx.qname, qname, MAX_HOST_LEN);
+
+  bpf_loop(MAX_DNS_ANSWERS, parse_dns_answer, &actx, 0);
+}
+
+// =============================================================================
+// DNS interception via kprobe on udp_recvmsg (network-level, language-agnostic)
+//
+// Hooks the kernel's udp_recvmsg() which handles ALL UDP receives regardless
+// of which syscall the application uses (read, recvfrom, recvmsg).
+// Filters on source port 53 + configured DNS server IPs using kernel sock state.
+// =============================================================================
+
+// kprobe/udp_recvmsg: check if this is a DNS socket, save user buffer pointer.
+// int udp_recvmsg(struct sock *sk, struct msghdr *msg, size_t len, int flags, int *addr_len)
+//
+// Uses bpf_probe_read_kernel with arch-specific pt_regs offsets (same pattern
+// as the uprobe functions) since bpf2go compiles with -target bpfel/bpfeb
+// which doesn't support PT_REGS_PARM* / BPF_KPROBE macros.
+SEC("kprobe/udp_recvmsg")
+int kprobe_udp_recvmsg(void *ctx) {
+  dbg_inc(DBG_KPROBE_ENTRY);
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+  // Read arguments from pt_regs.
+  // udp_recvmsg(struct sock *sk, struct msghdr *msg, ...)
+  struct sock *sk = NULL;
+  struct msghdr *msg = NULL;
 
 #if defined(bpf_target_x86)
-  // x86_64 C ABI: RDI=ssl, RSI=name
-  // pt_regs offsets: rdi=112, rsi=104
-  bpf_probe_read_kernel(&ssl_ptr, sizeof(void *), (char *)ctx + 112);
-  bpf_probe_read_kernel(&name_ptr, sizeof(void *), (char *)ctx + 104);
+  // x86_64 C ABI: RDI=arg1(sk), RSI=arg2(msg)
+  // pt_regs offsets: di=112, si=104
+  bpf_probe_read_kernel(&sk, sizeof(sk), (char *)ctx + 112);
+  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 104);
 #elif defined(bpf_target_arm64)
-  // ARM64 C ABI: X0=ssl, X1=name
-  bpf_probe_read_kernel(&ssl_ptr, sizeof(void *), (char *)ctx + 0);
-  bpf_probe_read_kernel(&name_ptr, sizeof(void *), (char *)ctx + 8);
+  // ARM64 C ABI: X0=arg1(sk), X1=arg2(msg)
+  // pt_regs offsets: regs[0]=0, regs[1]=8
+  bpf_probe_read_kernel(&sk, sizeof(sk), (char *)ctx + 0);
+  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 8);
 #else
   return 0;
 #endif
 
-  if (!ssl_ptr || !name_ptr)
+  if (!sk || !msg)
     return 0;
 
-  __u64 pid_tgid = bpf_get_current_pid_tgid();
-  __u32 tgid = (__u32)(pid_tgid >> 32);
-
-  // Read the hostname string from user space
-  char sni_buf[MAX_SNI_LEN] = {};
-  long ret = bpf_probe_read_user_str(sni_buf, sizeof(sni_buf), name_ptr);
-  if (ret <= 1) // empty or error
+  // Filter for DNS traffic. For connected UDP sockets (Go, Python), skc_dport
+  // is set to 53. For unconnected sockets (Node.js c-ares uses sendto), skc_dport
+  // is 0 — we allow those through since tracked_tgids already limits scope, and
+  // process_dns_packet validates the DNS response format.
+  __be16 dport = 0;
+  BPF_CORE_READ_INTO(&dport, sk, __sk_common.skc_dport);
+  if (dport == __bpf_htons(53))
+    dbg_inc(DBG_KPROBE_DPORT53);
+  else if (dport == 0)
+    dbg_inc(DBG_KPROBE_DPORT0);
+  else {
+    dbg_inc(DBG_KPROBE_DPORT_OTHER);
     return 0;
+  }
 
-  // Store in conn_hosts map — memset key to zero padding bytes
-  struct conn_key key;
-  __builtin_memset(&key, 0, sizeof(key));
-  key.tgid = tgid;
-  key.ssl_ptr = (__u64)ssl_ptr;
+  __u64 iov_base = 0;
+  BPF_CORE_READ_INTO(&iov_base, msg, msg_iter.__ubuf_iovec.iov_base);
+  if (!iov_base)
+    return 0;
+  dbg_inc(DBG_KPROBE_IOV_OK);
 
-  struct conn_host host = {};
-  // Copy up to MAX_HOST_LEN bytes
-  __u32 copy_len = ret - 1; // ret includes null terminator
-  if (copy_len > MAX_HOST_LEN)
-    copy_len = MAX_HOST_LEN;
-  __builtin_memcpy(host.hostname, sni_buf, MAX_HOST_LEN);
-  host.host_len = copy_len;
-
-  bpf_map_update_elem(&conn_hosts, &key, &host, BPF_ANY);
-
-#ifdef KLOAK_DEBUG
-  bpf_printk("kloak sni: tgid=%u ssl=%llx host=%s", tgid, (__u64)ssl_ptr,
-             sni_buf);
-#endif
-
+  struct udp_recv_pending val = {.iov_base = iov_base};
+  bpf_map_update_elem(&udp_recv_scratch, &pid_tgid, &val, BPF_ANY);
   return 0;
 }
 
-// -----------------------------------------------------------------------------
-// OpenSSL SSL_ctrl uprobe — catches SNI via the macro expansion.
-//
-// In OpenSSL, SSL_set_tlsext_host_name(ssl, name) is a macro that expands to:
-//   SSL_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_host_name, name)
-//
-// SSL_ctrl signature: long SSL_ctrl(SSL *ssl, int cmd, long larg, void *parg)
-//   x86_64: RDI=ssl, RSI=cmd, RDX=larg, RCX=parg
-//   ARM64:  X0=ssl,  X1=cmd,  X2=larg,  X3=parg
-//
-// BoringSSL exports SSL_set_tlsext_host_name as a real function, so it's
-// handled by bpf_uprobe_ssl_set_host above. This uprobe covers OpenSSL only.
-// -----------------------------------------------------------------------------
-SEC("uprobe/ssl_ctrl")
-int bpf_uprobe_ssl_ctrl(void *ctx) {
-  void *ssl_ptr;
-  int cmd;
-  void *parg;
+// kretprobe/udp_recvmsg: read the DNS response from the saved user buffer.
+SEC("kretprobe/udp_recvmsg")
+int kretprobe_udp_recvmsg(void *ctx) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
 
+  struct udp_recv_pending *pending =
+      bpf_map_lookup_elem(&udp_recv_scratch, &pid_tgid);
+  if (!pending)
+    return 0;
+  dbg_inc(DBG_KRETPROBE_ENTRY);
+
+  __u64 iov_base = pending->iov_base;
+  bpf_map_delete_elem(&udp_recv_scratch, &pid_tgid);
+
+  // Read return value from pt_regs
+  long ret = 0;
 #if defined(bpf_target_x86)
-  // x86_64 C ABI: RDI=ssl, RSI=cmd, RDX=larg, RCX=parg
-  bpf_probe_read_kernel(&ssl_ptr, sizeof(void *), (char *)ctx + 112);
-  bpf_probe_read_kernel(&cmd, sizeof(int), (char *)ctx + 104);
-  bpf_probe_read_kernel(&parg, sizeof(void *), (char *)ctx + 88);
+  bpf_probe_read_kernel(&ret, sizeof(ret), (char *)ctx + 80);
 #elif defined(bpf_target_arm64)
-  // ARM64 C ABI: X0=ssl, X1=cmd, X2=larg, X3=parg
-  bpf_probe_read_kernel(&ssl_ptr, sizeof(void *), (char *)ctx + 0);
-  bpf_probe_read_kernel(&cmd, sizeof(int), (char *)ctx + 8);
-  bpf_probe_read_kernel(&parg, sizeof(void *), (char *)ctx + 24);
+  bpf_probe_read_kernel(&ret, sizeof(ret), (char *)ctx + 0);
 #else
   return 0;
 #endif
 
-  // Only handle SSL_CTRL_SET_TLSEXT_HOSTNAME (55)
-  if (cmd != SSL_CTRL_SET_TLSEXT_HOSTNAME)
+  if (ret <= 12) {
+    dbg_inc(DBG_KRETPROBE_RET_SMALL);
+    return 0;
+  }
+
+  __u32 zero = 0;
+  struct dns_scratch_buf *dbuf = bpf_map_lookup_elem(&dns_scratch, &zero);
+  if (!dbuf)
     return 0;
 
-  if (!ssl_ptr || !parg)
+  __u32 read_len = (__u32)ret;
+  if (read_len > MAX_DNS_PKT)
+    read_len = MAX_DNS_PKT;
+
+  if (bpf_probe_read_user(dbuf->pkt, read_len, (void *)iov_base) != 0) {
+    dbg_inc(DBG_KRETPROBE_READ_FAIL);
+    return 0;
+  }
+  dbg_inc(DBG_KRETPROBE_READ_OK);
+
+  dbuf->pkt_len = read_len;
+
+  do_dns_parse();
+  return 0;
+}
+
+// =============================================================================
+// TCP connect tracepoints (connect enter/exit)
+// =============================================================================
+
+// tp/syscalls/sys_enter_connect: save fd and destination IP.
+// connect(int fd, const struct sockaddr *addr, socklen_t addrlen)
+SEC("tracepoint/syscalls/sys_enter_connect")
+int tp_enter_connect(struct trace_event_raw_sys_enter *ctx) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+  __u32 fd = (__u32)ctx->args[0];
+  __u64 addr_ptr = (__u64)ctx->args[1];
+
+  if (addr_ptr == 0)
     return 0;
 
+  // Read sa_family
+  __u16 sa_family = 0;
+  bpf_probe_read_user(&sa_family, sizeof(sa_family), (void *)addr_ptr);
+
+  struct connect_pending_val val = {};
+  val.fd = fd;
+
+  if (sa_family == 2) { // AF_INET
+    __u8 ipv4[4] = {};
+    bpf_probe_read_user(ipv4, 4, (void *)(addr_ptr + 4));
+    ipv4_to_mapped(val.ip, ipv4);
+  } else if (sa_family == 10) { // AF_INET6
+    bpf_probe_read_user(val.ip, 16, (void *)(addr_ptr + 8));
+  } else {
+    return 0;
+  }
+
+  bpf_map_update_elem(&connect_pending, &pid_tgid, &val, BPF_ANY);
+  return 0;
+}
+
+// tp/syscalls/sys_exit_connect: on success (or EINPROGRESS), record fd->IP
+// and check if the IP was DNS-verified. If so, set last_verified_fd.
+SEC("tracepoint/syscalls/sys_exit_connect")
+int tp_exit_connect(struct trace_event_raw_sys_exit *ctx) {
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
 
-  char sni_buf[MAX_SNI_LEN] = {};
-  long ret = bpf_probe_read_user_str(sni_buf, sizeof(sni_buf), parg);
-  if (ret <= 1)
+  struct connect_pending_val *pending =
+      bpf_map_lookup_elem(&connect_pending, &pid_tgid);
+  if (!pending) {
+    return 0;
+  }
+
+  // Save before delete
+  __u32 fd = pending->fd;
+  __u8 ip[16];
+  __builtin_memcpy(ip, pending->ip, 16);
+
+  bpf_map_delete_elem(&connect_pending, &pid_tgid);
+
+  // connect returns 0 on success, or -EINPROGRESS (-115) for non-blocking.
+  long ret = ctx->ret;
+  if (ret != 0 && ret != -115)
     return 0;
 
-  struct conn_key key;
-  __builtin_memset(&key, 0, sizeof(key));
-  key.tgid = tgid;
-  key.ssl_ptr = (__u64)ssl_ptr;
+  // Always record fd -> IP and IP -> {tgid,fd}
+  struct conn_ip_key cik = {.tgid = tgid, .fd = fd};
+  struct conn_ip_val civ;
+  __builtin_memcpy(civ.ip, ip, 16);
+  bpf_map_update_elem(&conn_ip_map, &cik, &civ, BPF_ANY);
 
-  struct conn_host host = {};
-  __u32 copy_len = ret - 1;
-  if (copy_len > MAX_HOST_LEN)
-    copy_len = MAX_HOST_LEN;
-  __builtin_memcpy(host.hostname, sni_buf, MAX_HOST_LEN);
-  host.host_len = copy_len;
+  // Reverse mapping for retroactive DNS verification
+  struct dns_ip_key rev_key;
+  __builtin_memset(&rev_key, 0, sizeof(rev_key));
+  __builtin_memcpy(rev_key.ip, ip, 16);
+  struct ip_conn_val rev_val = {.tgid = tgid, .fd = fd};
+  bpf_map_update_elem(&ip_to_conn, &rev_key, &rev_val, BPF_ANY);
 
-  bpf_map_update_elem(&conn_hosts, &key, &host, BPF_ANY);
+  // Check if this IP was already DNS-verified
+  struct dns_ip_key dik;
+  __builtin_memset(&dik, 0, sizeof(dik));
+  __builtin_memcpy(dik.ip, ip, 16);
+
+  struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
+  if (div) {
+    // DNS-verified connection! Record as last_verified_fd
+    bpf_map_update_elem(&last_verified_fd, &tgid, &fd, BPF_ANY);
 
 #ifdef KLOAK_DEBUG
-  bpf_printk("kloak ssl_ctrl sni: tgid=%u ssl=%llx host=%s", tgid,
-             (__u64)ssl_ptr, sni_buf);
+    bpf_printk("kloak connect: tgid=%u fd=%u -> dns-verified host=%s", tgid, fd,
+               div->hostname);
 #endif
+  }
 
   return 0;
 }
 
-// -----------------------------------------------------------------------------
-// Resolve host for the current SSL connection.
-// First tries SNI cache (works for all protocols).
-// Falls back to HTTP Host header parsing (for Go and connections without SNI).
-// -----------------------------------------------------------------------------
-static __always_inline void resolve_host(struct scratch_buf *scratch,
+// =============================================================================
+// Resolve host for the current SSL/TLS connection using DNS chain.
+//
+// Chain: ssl_fd_map (cache) -> last_verified_fd -> conn_ip_map -> dns_ip_map
+// =============================================================================
+static __always_inline void resolve_host(struct scratch_buf *scratch_data,
                                          __u64 ssl_ptr) {
-  scratch->host_offset = 0;
-  scratch->host_value_len = 0;
-  __builtin_memset(scratch->host_value, 0, MAX_HOST_LEN);
+  scratch_data->host_offset = 0;
+  scratch_data->host_value_len = 0;
+  __builtin_memset(scratch_data->host_value, 0, MAX_HOST_LEN);
 
-  // Try SNI cache first (protocol-agnostic)
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+
+  __u32 fd = 0;
+  int found = 0;
+
+  // Path 1: ssl_fd_map cache (OpenSSL fast path)
   if (ssl_ptr != 0) {
-    __u64 pid_tgid = bpf_get_current_pid_tgid();
-    __u32 tgid = (__u32)(pid_tgid >> 32);
+    struct ssl_fd_key sfk;
+    __builtin_memset(&sfk, 0, sizeof(sfk));
+    sfk.tgid = tgid;
+    sfk.ssl_ptr = ssl_ptr;
+    struct ssl_fd_val *sfv = bpf_map_lookup_elem(&ssl_fd_map, &sfk);
+    if (sfv) {
+      fd = sfv->fd;
+      found = 1;
+      dbg_inc(DBG_RESOLVE_SSL_FD_HIT);
+    }
+  }
 
-    struct conn_key key;
-    __builtin_memset(&key, 0, sizeof(key));
-    key.tgid = tgid;
-    key.ssl_ptr = ssl_ptr;
+  // Path 2: last_verified_fd (fast path if connect happened after DNS)
+  if (!found) {
+    __u32 *vfd = bpf_map_lookup_elem(&last_verified_fd, &tgid);
+    if (vfd) {
+      fd = *vfd;
+      found = 1;
+      dbg_inc(DBG_RESOLVE_LAST_VFD_HIT);
 
-    struct conn_host *cached = bpf_map_lookup_elem(&conn_hosts, &key);
-    if (cached && cached->host_len > 0) {
-      __builtin_memcpy(scratch->host_value, cached->hostname, MAX_HOST_LEN);
-      scratch->host_value_len = cached->host_len;
+      if (ssl_ptr != 0) {
+        struct ssl_fd_key sfk;
+        __builtin_memset(&sfk, 0, sizeof(sfk));
+        sfk.tgid = tgid;
+        sfk.ssl_ptr = ssl_ptr;
+        struct ssl_fd_val new_sfv = {.fd = fd};
+        bpf_map_update_elem(&ssl_fd_map, &sfk, &new_sfv, BPF_ANY);
+      }
+    }
+  }
+
+  // If we have a cached fd, try it directly
+  if (found) {
+    struct conn_ip_key cik = {.tgid = tgid, .fd = fd};
+    struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
+    if (!civ) { dbg_inc(DBG_RESOLVE_NO_CONN); return; }
+    struct dns_ip_key dik;
+    __builtin_memset(&dik, 0, sizeof(dik));
+    __builtin_memcpy(dik.ip, civ->ip, 16);
+    struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
+    if (div && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
+      __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
+      scratch_data->host_value_len = div->host_len;
+      dbg_inc(DBG_RESOLVE_HOST_OK);
+    } else {
+      dbg_inc(DBG_RESOLVE_NO_DNS);
+    }
+    return;
+  }
+
+  // Path 3: No cached fd — scan fds 3..30 in conn_ip_map for a DNS-verified IP.
+  // Handles the case where connect() happened before DNS was captured.
+  for (__u32 try_fd = 3; try_fd <= 30; try_fd++) {
+    struct conn_ip_key cik = {.tgid = tgid, .fd = try_fd};
+    struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
+    if (!civ)
+      continue;
+    struct dns_ip_key dik;
+    __builtin_memset(&dik, 0, sizeof(dik));
+    __builtin_memcpy(dik.ip, civ->ip, 16);
+    struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
+    if (div && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
+      __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
+      scratch_data->host_value_len = div->host_len;
+      bpf_map_update_elem(&last_verified_fd, &tgid, &try_fd, BPF_ANY);
+      dbg_inc(DBG_RESOLVE_FD_SCAN_HIT);
       return;
     }
   }
-
-  // Fallback: parse HTTP "Host: " header from the plaintext data.
-  // This handles Go connections (which don't call SSL_set_tlsext_host_name)
-  // and any connection where SNI wasn't captured.
-  __u32 read_len = scratch->read_len;
-  if (read_len > MAX_DATA_SIZE)
-    read_len = MAX_DATA_SIZE;
-
-  __u32 host_start = 0;
-  for (__u32 i = 0; i < 256; i++) {
-    if (i + 6 > read_len)
-      break;
-
-    if (scratch->data[i] == 'H' && scratch->data[i + 1] == 'o' &&
-        scratch->data[i + 2] == 's' && scratch->data[i + 3] == 't' &&
-        scratch->data[i + 4] == ':' && scratch->data[i + 5] == ' ') {
-      host_start = i + 6;
-      scratch->host_offset = host_start;
-      break;
-    }
-  }
-
-  if (host_start == 0)
-    return;
-
-  __u32 host_len = 0;
-  for (__u32 j = 0; j < MAX_HOST_LEN; j++) {
-    __u32 idx = host_start + j;
-    if (idx >= read_len)
-      break;
-    char c = scratch->data[idx];
-    if (c == '\r' || c == '\n' || c == ':')
-      break;
-    scratch->host_value[j] = c;
-    host_len++;
-  }
-  scratch->host_value_len = host_len;
+  dbg_inc(DBG_RESOLVE_NO_FD);
 }
 
 // -----------------------------------------------------------------------------
@@ -371,55 +951,46 @@ static int scan_chunk(__u32 chunk_idx, void *ctx) {
     if (i + SECRET_KEY_LEN > read_len)
       break;
 
-    if (scratch_data->data[i] != 'k')
+    if (!is_kloak_prefix(&scratch_data->data[i]))
       continue;
 
-    if (scratch_data->data[i + 1] == 'l' &&
-        scratch_data->data[i + 2] == 'o' &&
-        scratch_data->data[i + 3] == 'a' &&
-        scratch_data->data[i + 4] == 'k' &&
-        scratch_data->data[i + 5] == ':') {
+    // 8-byte key lookup (kloak: + 2 UUID chars).
+    // Collision detection is done on the Go side at sync time.
+    struct secret_key key = {};
+    __builtin_memcpy(key.prefix, &scratch_data->data[i], SECRET_KEY_LEN);
 
-      // 8-byte key lookup (kloak: + 2 UUID chars).
-      // Collision detection is done on the Go side at sync time.
-      struct secret_key key = {};
-      __builtin_memcpy(key.prefix, &scratch_data->data[i], SECRET_KEY_LEN);
+    struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
+    if (!val || val->len == 0 || val->len > SECRET_MAX_LEN)
+      continue;
 
-      struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
-      if (!val || val->len == 0 || val->len > SECRET_MAX_LEN)
+    // Host-based filtering: compare resolved host against allowed_host
+    if (val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
+      if (sctx->host_value_len == 0)
         continue;
 
-      // Host-based filtering: compare resolved host against allowed_host
-      if (val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
-        if (sctx->host_value_len == 0)
-          continue;
-
-        __u64 *host_a = (__u64 *)sctx->host_value;
-        __u64 *host_b = (__u64 *)val->allowed_host;
-        if (host_a[0] != host_b[0] || host_a[1] != host_b[1] ||
-            host_a[2] != host_b[2] || host_a[3] != host_b[3])
-          continue;
-      }
-
-      // Rewrite directly to user memory
-      __u32 safe_i = i & (MAX_DATA_SIZE - 1);
-      char *target = (char *)(sctx->user_data_ptr + offset + safe_i);
-
-      // Bound write_len to [1, 128] using pure arithmetic so the verifier
-      // can prove the range without relying on tracked register state
-      // (which gets lost across the host comparison in bpf_loop callbacks).
-      // val->len is already checked > 0 and <= SECRET_MAX_LEN above.
-      __u32 write_len = ((val->len - 1) & (SECRET_MAX_LEN - 1)) + 1;
-
-      bpf_probe_write_user(target, val->real_secret, write_len);
-      sctx->rewritten = 1;
+      if (!hosts_match(sctx->host_value, val->allowed_host))
+        continue;
     }
+
+    // Rewrite directly to user memory
+    __u32 safe_i = i & (MAX_DATA_SIZE - 1);
+    char *target = (char *)(sctx->user_data_ptr + offset + safe_i);
+
+    // Bound write_len to [1, 128] using pure arithmetic so the verifier
+    // can prove the range without relying on tracked register state
+    // (which gets lost across the host comparison in bpf_loop callbacks).
+    // val->len is already checked > 0 and <= SECRET_MAX_LEN above.
+    __u32 write_len = clamp_write_len(val->len);
+
+    bpf_probe_write_user(target, val->real_secret, write_len);
+    sctx->rewritten = 1;
   }
   return 0;
 }
 
 SEC("uprobe/phase2_rewrite")
 int bpf_phase2_rewrite(void *ctx) {
+  dbg_inc(DBG_PHASE2_ENTERED);
   __u32 zero = 0;
   struct scratch_buf *scratch_data = bpf_map_lookup_elem(&scratch, &zero);
   if (!scratch_data)
@@ -465,8 +1036,8 @@ int bpf_phase2_rewrite(void *ctx) {
 //   x86_64: RAX=receiver, RBX=data, RCX=len  (pt_regs offsets: bx=40, cx=88)
 //   ARM64:  R0=receiver,  R1=data,  R2=len    (pt_regs: regs[1], regs[2])
 //
-// Go doesn't call SSL_set_tlsext_host_name, so SNI cache won't have an entry.
-// Falls back to HTTP Host header parsing in resolve_host().
+// Go doesn't call SSL_set_tlsext_host_name.
+// resolve_host() uses the DNS chain (last_verified_fd -> conn_ip_map -> dns_ip_map).
 // -----------------------------------------------------------------------------
 
 SEC("uprobe/go_tls_write")
@@ -517,7 +1088,8 @@ int bpf_uprobe_go_tls_write(void *ctx) {
   scratch_data->read_len = read_len;
   scratch_data->total_data_len = (__u32)data_len;
 
-  // Go doesn't use OpenSSL, no ssl_ptr for SNI lookup — pass 0.
+  // Go doesn't use OpenSSL, no ssl_ptr — pass 0.
+  // resolve_host will use last_verified_fd -> conn_ip_map -> dns_ip_map.
   resolve_host(scratch_data, 0);
 
   // Jump to Phase 2
@@ -583,7 +1155,7 @@ int bpf_uprobe_ssl_write(void *ctx) {
   scratch_data->read_len = read_len;
   scratch_data->total_data_len = (__u32)num;
 
-  // Look up SNI-cached hostname using the ssl pointer, fall back to HTTP Host
+  // Look up hostname via DNS chain: ssl_fd_map -> conn_ip_map -> dns_ip_map
   resolve_host(scratch_data, (__u64)ssl_ptr);
 
   // Jump to Phase 2

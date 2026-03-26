@@ -9,14 +9,12 @@ import (
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/ebpf"
 	"github.com/spinningfactory/kloak/pkg/storage"
-	"github.com/spinningfactory/kloak/pkg/webhook"
 )
 
 var (
@@ -35,27 +33,20 @@ and manages eBPF uprobe programs for in-kernel TLS secret rewriting.
 
 The controller is responsible for:
 - Watching K8s Secrets labeled getkloak.io/enabled=true and creating shadow secrets
-- Generating and patching TLS certs for the mutating webhook
 - Attaching eBPF TLS uprobes to tracked pod processes`,
 	Run: runController,
 }
 
 var (
-	controllerMetricsAddr string
-	controllerProbeAddr   string
-	enableLeaderElection  bool
-	enableEBPF            bool
-	cgroupPath            string
-	certMode              string
+	controllerProbeAddr string
+	enableEBPF          bool
+	cgroupPath          string
 )
 
 func init() {
-	controllerCmd.Flags().StringVar(&controllerMetricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
 	controllerCmd.Flags().StringVar(&controllerProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	controllerCmd.Flags().BoolVar(&enableLeaderElection, "leader-elect", false, "Enable leader election for controller manager.")
 	controllerCmd.Flags().BoolVar(&enableEBPF, "enable-ebpf", false, "Enable eBPF traffic redirection (requires Linux + CAP_BPF).")
 	controllerCmd.Flags().StringVar(&cgroupPath, "cgroup-path", "/sys/fs/cgroup", "Path to cgroup v2 filesystem.")
-	controllerCmd.Flags().StringVar(&certMode, "cert-mode", "auto", "Certificate mode: 'auto' (generate if missing) or 'provided' (expect existing secrets).")
 }
 
 func runController(cmd *cobra.Command, args []string) {
@@ -68,43 +59,17 @@ func runController(cmd *cobra.Command, args []string) {
 	// Create shared storage
 	store := storage.NewMemory()
 
-	// Load or Generate CA using K8s Secret
-	namespace := os.Getenv("POD_NAMESPACE")
-	if namespace == "" {
-		namespace = "kloak-system"
-	}
-
-	// Generate TLS certs for the mutating webhook if they don't already exist.
-	// The K8s apiserver requires HTTPS for webhook endpoints.
-	k8sConfig := ctrl.GetConfigOrDie()
-	directClient, err := client.New(k8sConfig, client.Options{Scheme: scheme})
-	if err != nil {
-		setupLog.Error(err, "failed to create direct client")
-		os.Exit(1)
-	}
-
-	if certMode == "auto" {
-		_, err = webhook.EnsureWebhookCerts(context.Background(), directClient, namespace)
-		if err != nil {
-			setupLog.Error(err, "failed to ensure webhook TLS certificates")
-			// The webhook might fail to start since the secret won't exist.
-		} else {
-			setupLog.Info("Webhook TLS certificates ensured")
-		}
-	} else {
-		setupLog.Info("Cert mode is 'provided'; skipping certificate generation — expecting kloak-webhook-certs secret to exist")
-	}
-
 	// Create uprobe manager instances
 	var uprobeMgr *ebpf.TLSUprobeManager
+	var err error
 
 	if enableEBPF {
 		uprobeMgr, err = ebpf.NewTLSUprobeManager(store)
 		if err != nil {
 			setupLog.Error(err, "failed to initialize eBPF uprobe manager")
-		} else {
-			setupLog.Info("eBPF TLS uprobes enabled")
+			os.Exit(1)
 		}
+		setupLog.Info("eBPF TLS uprobes enabled")
 	} else {
 		setupLog.Info("eBPF disabled")
 	}
@@ -112,8 +77,6 @@ func runController(cmd *cobra.Command, args []string) {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		HealthProbeBindAddress: controllerProbeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "kloak-controller-leader",
 	})
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")

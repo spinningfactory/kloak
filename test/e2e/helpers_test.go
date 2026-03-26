@@ -23,6 +23,16 @@ func kubectl(args ...string) (string, error) {
 	return string(out), nil
 }
 
+// helm runs a helm command and returns its combined output.
+func helm(args ...string) (string, error) {
+	cmd := exec.Command("helm", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(out), fmt.Errorf("helm %s: %w\n%s", strings.Join(args, " "), err, out)
+	}
+	return string(out), nil
+}
+
 // waitForSecret polls until a secret exists in the given namespace.
 func waitForSecret(ctx context.Context, namespace, name string) error {
 	for {

@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kloak-webhook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+    app.kubernetes.io/component: webhook
+spec:
+  replicas: {{ .Values.webhook.replicas }}
+  selector:
+    matchLabels:
+      {{- include "kloak.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: webhook
+  template:
+    metadata:
+      labels:
+        {{- include "kloak.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: webhook
+    spec:
+      serviceAccountName: kloak-controller
+      containers:
+        - name: webhook
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/kloak", "webhook"]
+          args:
+            - --cert-dir=/certs
+          ports:
+            - name: webhook
+              containerPort: 9443
+            - name: health
+              containerPort: 8081
+          volumeMounts:
+            - name: webhook-certs
+              mountPath: /certs
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml .Values.webhook.resources | nindent 12 }}
+      volumes:
+        - name: webhook-certs
+          secret:
+            secretName: {{ include "kloak.certSecretName" . }}
+            {{- if eq .Values.certificates.mode "provided" }}
+            items:
+              - key: {{ .Values.certificates.provided.certKey }}
+                path: tls.crt
+              - key: {{ .Values.certificates.provided.keyKey }}
+                path: tls.key
+            {{- end }}

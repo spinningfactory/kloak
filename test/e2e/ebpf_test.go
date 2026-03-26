@@ -52,15 +52,19 @@ var ebpfTests = []ebpfRewriteTest{
 	},
 }
 
-// TestEBPFSNIHostFiltering tests that SNI-based host filtering works for
-// non-HTTP TLS protocols. The demo app uses raw TLS sockets (no HTTP)
-// with a local echo server. The only hostname source is SSL_set_tlsext_host_name.
-func TestEBPFSNIHostFiltering(t *testing.T) {
+// TestEBPFRawTLSHostFiltering tests that DNS-verified host filtering works with
+// raw TLS sockets (non-HTTP). A TLS echo server runs as a sidecar behind a K8s
+// Service. The client resolves the Service name via DNS, which populates dns_ip_map,
+// enabling host-based secret filtering at the TCP level.
+func TestEBPFRawTLSHostFiltering(t *testing.T) {
+	// The Service FQDN as it appears in DNS responses from CoreDNS.
+	echoHostFQDN := "tls." + testNamespace + ".svc.cluster.local"
+
 	allowedData := map[string][]byte{"api-key": []byte("REAL-ALLOWED-KEY-12345")}
 	blockedData := map[string][]byte{"api-key": []byte("REAL-BLOCKED-KEY-67890")}
 
 	createEnabledSecret(t, "secret-allowed", allowedData, map[string]string{
-		"getkloak.io/hosts": "httpbin.org",
+		"getkloak.io/hosts": echoHostFQDN,
 	})
 	createEnabledSecret(t, "secret-blocked", blockedData, map[string]string{
 		"getkloak.io/hosts": "example.com",
@@ -69,10 +73,10 @@ func TestEBPFSNIHostFiltering(t *testing.T) {
 	assertShadowSecret(t, "secret-allowed", allowedData)
 	assertShadowSecret(t, "secret-blocked", blockedData)
 
-	demoManifest := filepath.Join(repoRoot, "examples", "demo-python-sni", "deployment.yaml")
+	demoManifest := filepath.Join(repoRoot, "examples", "demo-python-raw-tls", "deployment.yaml")
 	_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
 	if err != nil {
-		t.Fatalf("failed to deploy demo-python-sni: %v", err)
+		t.Fatalf("failed to deploy demo-python-raw-tls: %v", err)
 	}
 	t.Cleanup(func() {
 		_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
@@ -80,8 +84,8 @@ func TestEBPFSNIHostFiltering(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
-	if err := waitForDeploymentReady(ctx, testNamespace, "demo-python-sni"); err != nil {
-		t.Fatalf("demo-python-sni not ready: %v", err)
+	if err := waitForDeploymentReady(ctx, testNamespace, "demo-python-raw-tls"); err != nil {
+		t.Fatalf("demo-python-raw-tls not ready: %v", err)
 	}
 
 	// Poll app logs for the real secret value
@@ -91,18 +95,18 @@ func TestEBPFSNIHostFiltering(t *testing.T) {
 	for {
 		select {
 		case <-pollCtx.Done():
-			t.Logf("=== demo-python-sni final logs ===\n%s", out)
+			t.Logf("=== demo-python-raw-tls final logs ===\n%s", out)
 			t.Logf("=== Controller logs ===\n%s", controllerLogs())
-			t.Fatalf("timed out waiting for allowed secret in SNI demo logs")
+			t.Fatalf("timed out waiting for allowed secret in raw TLS demo logs")
 		default:
 		}
-		out, _ = kubectl("logs", "-n", testNamespace, "-l", "app=demo-python-sni", "--tail=200")
+		out, _ = kubectl("logs", "-n", testNamespace, "-l", "app=demo-python-raw-tls", "--tail=200")
 		if strings.Contains(out, "REAL-ALLOWED-KEY-12345") {
 			break
 		}
 		time.Sleep(pollInterval)
 	}
-	t.Logf("=== demo-python-sni logs ===\n%s", out)
+	t.Logf("=== demo-python-raw-tls logs ===\n%s", out)
 
 	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {
 		t.Errorf("blocked secret should NOT be rewritten (host mismatch)")
@@ -188,6 +192,8 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 // TestEBPFSecretLengths verifies that secrets of different lengths (8 to 100 bytes)
 // are correctly rewritten. Runs last to avoid secret name collisions.
 func TestEBPFSecretLengths(t *testing.T) {
+	echoHostFQDN := "tls." + testNamespace + ".svc.cluster.local"
+
 	type lengthCase struct {
 		name    string
 		allowed string
@@ -215,7 +221,7 @@ func TestEBPFSecretLengths(t *testing.T) {
 			blockedData := map[string][]byte{"api-key": []byte(tc.blocked)}
 
 			createEnabledSecret(t, "secret-allowed", allowedData, map[string]string{
-				"getkloak.io/hosts": "httpbin.org",
+				"getkloak.io/hosts": echoHostFQDN,
 			})
 			createEnabledSecret(t, "secret-blocked", blockedData, map[string]string{
 				"getkloak.io/hosts": "example.com",
@@ -224,7 +230,7 @@ func TestEBPFSecretLengths(t *testing.T) {
 			assertShadowSecret(t, "secret-allowed", allowedData)
 			assertShadowSecret(t, "secret-blocked", blockedData)
 
-			demoManifest := filepath.Join(repoRoot, "examples", "demo-python-sni", "deployment.yaml")
+			demoManifest := filepath.Join(repoRoot, "examples", "demo-python-raw-tls", "deployment.yaml")
 			_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
 			if err != nil {
 				t.Fatalf("failed to deploy: %v", err)
@@ -236,7 +242,7 @@ func TestEBPFSecretLengths(t *testing.T) {
 
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 			defer cancel()
-			if err := waitForDeploymentReady(ctx, testNamespace, "demo-python-sni"); err != nil {
+			if err := waitForDeploymentReady(ctx, testNamespace, "demo-python-raw-tls"); err != nil {
 				t.Fatalf("deployment not ready: %v", err)
 			}
 
@@ -257,18 +263,18 @@ func TestEBPFSecretLengths(t *testing.T) {
 			for {
 				select {
 				case <-pollCtx.Done():
-					t.Logf("=== python-sni-%s final logs ===\n%s", tc.name, out)
+					t.Logf("=== python-raw-tls-%s final logs ===\n%s", tc.name, out)
 					t.Logf("=== Controller logs ===\n%s", controllerLogs())
 					t.Fatalf("allowed secret (%d bytes) not rewritten — prefix %q not found", len(tc.allowed), allowedCheck)
 				default:
 				}
-				out, _ = kubectl("logs", "-n", testNamespace, "-l", "app=demo-python-sni", "--tail=200")
+				out, _ = kubectl("logs", "-n", testNamespace, "-l", "app=demo-python-raw-tls", "--tail=200")
 				if strings.Contains(out, allowedCheck) {
 					break
 				}
 				time.Sleep(pollInterval)
 			}
-			t.Logf("=== python-sni-%s logs ===\n%s", tc.name, out)
+			t.Logf("=== python-raw-tls-%s logs ===\n%s", tc.name, out)
 
 			if strings.Contains(out, blockedCheck) {
 				t.Errorf("blocked secret (%d bytes) should NOT be rewritten — prefix %q found in logs", len(tc.blocked), blockedCheck)
