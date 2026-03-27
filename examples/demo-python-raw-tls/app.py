@@ -66,6 +66,20 @@ def main():
     print("=" * 60)
     sys.stdout.flush()
 
+    # Wait for the echo server sidecar to start (cert generation + listen)
+    print("Waiting for echo server sidecar to be ready...")
+    sys.stdout.flush()
+    for attempt in range(30):
+        try:
+            import socket
+            s = socket.create_connection((target_host, LISTEN_PORT), timeout=1)
+            s.close()
+            print("Echo server is ready.")
+            sys.stdout.flush()
+            break
+        except (ConnectionRefusedError, OSError):
+            time.sleep(1)
+
     count = 0
     while True:
         count += 1
