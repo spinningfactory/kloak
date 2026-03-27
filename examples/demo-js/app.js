@@ -78,10 +78,6 @@ async function main() {
   );
   console.log("=".repeat(60));
 
-  // Startup delay to wait for Kloak controller to sync
-  console.log("Waiting 15s for Kloak controller to sync...");
-  await new Promise((r) => setTimeout(r, 15000));
-
   let requestCount = 0;
   while (true) {
     requestCount++;

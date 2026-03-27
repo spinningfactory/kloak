@@ -165,6 +165,14 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 				tracked[cgroupID] = true // mark as successfully attached
 			}
 			r.mu.Unlock()
+
+			// Register the cgroup for exec/exit tracepoint tracking so new
+			// processes spawned inside the container are automatically detected.
+			if r.UprobeManager != nil {
+				if err := r.UprobeManager.TrackCgroup(cgroupID); err != nil {
+					log.Error(err, "failed to track cgroup for exec events", "cgroupID", cgroupID)
+				}
+			}
 		}
 	}
 
@@ -183,7 +191,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	r.mu.RUnlock()
 
 	if needsRetry {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		return ctrl.Result{RequeueAfter: 500 * time.Millisecond}, nil
 	}
 	return ctrl.Result{}, nil
 }
@@ -264,7 +272,16 @@ func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, erro
 
 	// Uprobes will be automatically cleaned up by the uprobe component when
 	// the process dies, so we no longer have to detach them manually or remove cgroups from maps.
-	// Just remove the pod from our tracking.
+	// Untrack cgroups from exec/exit tracepoint filtering.
+	if r.UprobeManager != nil {
+		for cgroupID := range cgroupIDs {
+			if err := r.UprobeManager.UntrackCgroup(cgroupID); err != nil {
+				r.Log.V(1).Info("failed to untrack cgroup", "cgroupID", cgroupID, "err", err)
+			}
+		}
+	}
+
+	// Remove the pod from our tracking.
 	delete(r.trackedPods, uid)
 	delete(r.podKeyToUID, namespacedName)
 	r.mu.Unlock()

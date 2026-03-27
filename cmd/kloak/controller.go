@@ -134,6 +134,11 @@ func runController(cmd *cobra.Command, args []string) {
 				setupLog.Error(err, "eBPF TLS event poller failed")
 			}
 		}()
+		go func() {
+			if err := uprobeMgr.PollExecEvents(ctx); err != nil && ctx.Err() == nil {
+				setupLog.Error(err, "eBPF process exec event poller failed")
+			}
+		}()
 	}
 
 	setupLog.Info("starting manager")

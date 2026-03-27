@@ -66,12 +66,6 @@ def main():
     print("=" * 60)
     sys.stdout.flush()
 
-    # Wait for eBPF attachment and echo server readiness
-    startup_delay = int(os.getenv("STARTUP_DELAY", "10"))
-    print(f"Waiting {startup_delay}s for eBPF attachment...")
-    sys.stdout.flush()
-    time.sleep(startup_delay)
-
     count = 0
     while True:
         count += 1

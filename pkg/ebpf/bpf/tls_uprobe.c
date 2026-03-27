@@ -297,6 +297,32 @@ struct {
   __type(value, __u8);
 } watched_hosts SEC(".maps");
 
+// =============================================================================
+// Container process lifecycle tracking
+// =============================================================================
+
+// Tracked container cgroups: cgroup inode ID -> enabled.
+// Populated from userspace when a container is discovered by the reconciler.
+// Used by sched_process_exec/exit tracepoints to filter events to tracked containers.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 256);
+  __type(key, __u64);  // cgroup id (inode)
+  __type(value, __u8); // 1 = tracked
+} tracked_cgroups SEC(".maps");
+
+// Ring buffer for process lifecycle events (exec) to notify userspace.
+struct {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 64 * 1024);
+} proc_events SEC(".maps");
+
+// Event sent to userspace when a tracked process execs a new binary.
+struct proc_event {
+  __u32 tgid;
+  __u8 type; // 1 = exec, 2 = exit
+};
+
 // Check if a dns_ip_map entry has expired based on its TTL.
 // Returns 1 if expired, 0 if still valid. TTL of 0 means never expires.
 static __always_inline int dns_entry_expired(struct dns_ip_val *div) {
@@ -1161,6 +1187,60 @@ int bpf_uprobe_ssl_write(void *ctx) {
 
   // Jump to Phase 2
   bpf_tail_call(ctx, &prog_array, 0);
+
+  return 0;
+}
+
+// =============================================================================
+// Container process lifecycle tracepoints
+// =============================================================================
+
+// tp/sched/sched_process_exec: detect when a process in a tracked container
+// execs a new binary. Notifies userspace via ring buffer to attach uprobes.
+SEC("tracepoint/sched/sched_process_exec")
+int tp_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
+  __u64 cgroup_id = bpf_get_current_cgroup_id();
+  __u8 *tracked = bpf_map_lookup_elem(&tracked_cgroups, &cgroup_id);
+  if (!tracked)
+    return 0;
+
+  __u32 tgid = ctx->pid; // pid field is the TGID in this context
+
+  // Ensure the new process is in tracked_tgids for DNS/connect tracking
+  __u8 val = 1;
+  bpf_map_update_elem(&tracked_tgids, &tgid, &val, BPF_ANY);
+
+  // Notify userspace to attach uprobes to the new binary
+  struct proc_event *evt = bpf_ringbuf_reserve(&proc_events, sizeof(*evt), 0);
+  if (evt) {
+    evt->tgid = tgid;
+    evt->type = 1; // exec
+    bpf_ringbuf_submit(evt, 0);
+  }
+  return 0;
+}
+
+// tp/sched/sched_process_exit: clean up stale map entries when a tracked
+// process exits. Prevents map pollution from dead processes.
+SEC("tracepoint/sched/sched_process_exit")
+int tp_sched_process_exit(struct trace_event_raw_sched_process_template *ctx) {
+  __u64 cgroup_id = bpf_get_current_cgroup_id();
+  __u8 *tracked = bpf_map_lookup_elem(&tracked_cgroups, &cgroup_id);
+  if (!tracked)
+    return 0;
+
+  __u32 tgid = ctx->pid;
+
+  // Clean up tracked_tgids
+  bpf_map_delete_elem(&tracked_tgids, &tgid);
+
+  // Clean up last_verified_fd
+  bpf_map_delete_elem(&last_verified_fd, &tgid);
+
+  // Clean up ssl_fd_map entries for this tgid.
+  // We cannot iterate the LRU map in BPF, so we rely on LRU eviction
+  // for ssl_fd_map and conn_ip_map entries keyed by (tgid, *).
+  // The LRU will naturally evict stale entries over time.
 
   return 0;
 }

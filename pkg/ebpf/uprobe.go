@@ -28,6 +28,12 @@ type tlsEvent struct {
 	_           [3]byte // padding for alignment
 }
 
+// procEvent must match the C struct proc_event
+type procEvent struct {
+	Tgid uint32
+	Type uint8 // 1 = exec, 2 = exit
+}
+
 // secretKey matches C struct secret_key (SECRET_KEY_LEN = 8)
 type secretKey struct {
 	Prefix [8]byte
@@ -56,10 +62,11 @@ type watchedHostKey struct {
 
 // TLSUprobeManager manages the loading and attaching of eBPF uprobes for TLS interception.
 type TLSUprobeManager struct {
-	objs   *tlsuprobeObjects
-	reader *ringbuf.Reader
-	log    logr.Logger
-	links  []link.Link
+	objs       *tlsuprobeObjects
+	reader     *ringbuf.Reader
+	procReader *ringbuf.Reader
+	log        logr.Logger
+	links      []link.Link
 
 	// store provides access to secrets
 	store storage.Storage
@@ -88,11 +95,19 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 		return nil, fmt.Errorf("creating ringbuf reader: %w", err)
 	}
 
+	procReader, err := ringbuf.NewReader(objs.ProcEvents)
+	if err != nil {
+		_ = reader.Close()
+		_ = objs.Close()
+		return nil, fmt.Errorf("creating proc events ringbuf reader: %w", err)
+	}
+
 	mgr := &TLSUprobeManager{
-		objs:   objs,
-		reader: reader,
-		log:    log,
-		store:  store,
+		objs:       objs,
+		reader:     reader,
+		procReader: procReader,
+		log:        log,
+		store:      store,
 	}
 
 	// Attach tracepoints for DNS interception and connect tracking.
@@ -117,6 +132,8 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 		{"syscalls", "sys_enter_connect", m.objs.TpEnterConnect},
 		{"syscalls", "sys_exit_connect", m.objs.TpExitConnect},
 		{"syscalls", "sys_enter_close", m.objs.TpEnterClose},
+		{"sched", "sched_process_exec", m.objs.TpSchedProcessExec},
+		{"sched", "sched_process_exit", m.objs.TpSchedProcessExit},
 	}
 
 	for _, t := range tracepoints {
@@ -156,6 +173,18 @@ func (m *TLSUprobeManager) TrackTGID(tgid uint32) error {
 // UntrackTGID removes a process TGID from the tracked_tgids map.
 func (m *TLSUprobeManager) UntrackTGID(tgid uint32) error {
 	return m.objs.TrackedTgids.Delete(tgid)
+}
+
+// TrackCgroup adds a container cgroup ID to the tracked_cgroups map,
+// enabling exec/exit tracepoint processing for processes in that cgroup.
+func (m *TLSUprobeManager) TrackCgroup(cgroupID uint64) error {
+	val := uint8(1)
+	return m.objs.TrackedCgroups.Update(cgroupID, &val, 0)
+}
+
+// UntrackCgroup removes a container cgroup ID from the tracked_cgroups map.
+func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
+	return m.objs.TrackedCgroups.Delete(cgroupID)
 }
 
 // AttachTLS attempts to automatically detect the runtime language and attach
@@ -330,6 +359,11 @@ func (m *TLSUprobeManager) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	if m.procReader != nil {
+		if err := m.procReader.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
 	if m.objs != nil {
 		if err := m.objs.Close(); err != nil {
 			errs = append(errs, err)
@@ -339,6 +373,45 @@ func (m *TLSUprobeManager) Close() error {
 		return fmt.Errorf("errors closing uprobe manager: %v", errs)
 	}
 	return nil
+}
+
+// PollExecEvents reads process exec events from the proc_events ring buffer
+// and attaches TLS uprobes to newly exec'd processes in tracked containers.
+func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
+	m.log.Info("Starting process exec event poller")
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		m.procReader.SetDeadline(time.Now().Add(1 * time.Second))
+		record, err := m.procReader.Read()
+		if err != nil {
+			if errors.Is(err, ringbuf.ErrClosed) {
+				return nil
+			}
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				continue
+			}
+			m.log.Error(err, "reading from proc events ringbuf")
+			continue
+		}
+
+		var event procEvent
+		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
+			m.log.Error(err, "failed to parse proc event")
+			continue
+		}
+
+		if event.Type == 1 { // exec
+			m.log.Info("Detected exec in tracked container, attaching uprobes", "tgid", event.Tgid)
+			if err := m.AttachTLS(int(event.Tgid)); err != nil {
+				m.log.V(1).Info("could not attach TLS uprobes to exec'd process", "tgid", event.Tgid, "err", err)
+			}
+		}
+	}
 }
 
 // PollEvents reads TLS events from the ring buffer and periodically syncs secrets to the eBPF map.
