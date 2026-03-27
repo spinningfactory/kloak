@@ -92,12 +92,12 @@ func GetCgroupPathForPID(cgroupRoot string, pid int) (string, error) {
 // FreezeCgroup writes "1" to the cgroup.freeze file, suspending all processes
 // in the cgroup. Returns nil if the freeze file doesn't exist (non-fatal).
 func FreezeCgroup(cgroupPath string) error {
-	return os.WriteFile(filepath.Join(cgroupPath, "cgroup.freeze"), []byte("1"), 0644)
+	return os.WriteFile(filepath.Join(cgroupPath, "cgroup.freeze"), []byte("1"), 0o644)
 }
 
 // UnfreezeCgroup writes "0" to the cgroup.freeze file, resuming all processes.
 func UnfreezeCgroup(cgroupPath string) error {
-	return os.WriteFile(filepath.Join(cgroupPath, "cgroup.freeze"), []byte("0"), 0644)
+	return os.WriteFile(filepath.Join(cgroupPath, "cgroup.freeze"), []byte("0"), 0o644)
 }
 
 // ReadCgroupProcs reads the PIDs from a cgroup's cgroup.procs file.
