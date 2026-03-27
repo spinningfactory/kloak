@@ -63,7 +63,6 @@ func main() {
 			TLSClientConfig: &tls.Config{
 				NextProtos: []string{"http/1.1"},
 			},
-			DialTLSContext:    nil,
 			ForceAttemptHTTP2: false,
 			DialContext: (&net.Dialer{
 				Timeout: 10 * time.Second,

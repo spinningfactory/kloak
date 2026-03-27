@@ -64,7 +64,7 @@ func runController(cmd *cobra.Command, args []string) {
 	var err error
 
 	if enableEBPF {
-		uprobeMgr, err = ebpf.NewTLSUprobeManager(store)
+		uprobeMgr, err = ebpf.NewTLSUprobeManager(store, cgroupPath)
 		if err != nil {
 			setupLog.Error(err, "failed to initialize eBPF uprobe manager")
 			os.Exit(1)

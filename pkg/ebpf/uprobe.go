@@ -16,6 +16,7 @@ import (
 	"github.com/go-logr/logr"
 	ctrl "sigs.k8s.io/controller-runtime"
 
+	"github.com/spinningfactory/kloak/pkg/cgroups"
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
@@ -70,10 +71,12 @@ type TLSUprobeManager struct {
 
 	// store provides access to secrets
 	store storage.Storage
+	// cgroupRoot is the path to the cgroup v2 filesystem (e.g. /sys/fs/cgroup)
+	cgroupRoot string
 }
 
 // NewTLSUprobeManager initializes a new uprobe manager.
-func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
+func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeManager, error) {
 	log := ctrl.Log.WithName("ebpf-uprobe")
 
 	objs := &tlsuprobeObjects{}
@@ -108,6 +111,7 @@ func NewTLSUprobeManager(store storage.Storage) (*TLSUprobeManager, error) {
 		procReader: procReader,
 		log:        log,
 		store:      store,
+		cgroupRoot: cgroupRoot,
 	}
 
 	// Attach tracepoints for DNS interception and connect tracking.
@@ -407,10 +411,36 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 
 		if event.Type == 1 { // exec
 			m.log.Info("Detected exec in tracked container, attaching uprobes", "tgid", event.Tgid)
-			if err := m.AttachTLS(int(event.Tgid)); err != nil {
-				m.log.V(1).Info("could not attach TLS uprobes to exec'd process", "tgid", event.Tgid, "err", err)
-			}
+			m.freezeAttachUnfreeze(int(event.Tgid))
 		}
+	}
+}
+
+// freezeAttachUnfreeze freezes the process's cgroup, attaches TLS uprobes,
+// then unfreezes. This eliminates the race where a process makes TLS calls
+// before uprobes are attached.
+func (m *TLSUprobeManager) freezeAttachUnfreeze(pid int) {
+	cgroupPath, err := cgroups.GetCgroupPathForPID(m.cgroupRoot, pid)
+	if err != nil {
+		m.log.V(1).Info("could not resolve cgroup for freeze, attaching without freeze", "pid", pid, "err", err)
+		if err := m.AttachTLS(pid); err != nil {
+			m.log.V(1).Info("could not attach TLS uprobes to exec'd process", "pid", pid, "err", err)
+		}
+		return
+	}
+
+	if err := cgroups.FreezeCgroup(cgroupPath); err != nil {
+		m.log.V(1).Info("could not freeze cgroup, attaching without freeze", "pid", pid, "err", err)
+	} else {
+		defer func() {
+			if err := cgroups.UnfreezeCgroup(cgroupPath); err != nil {
+				m.log.Error(err, "failed to unfreeze cgroup — processes may be stuck!", "pid", pid, "cgroup", cgroupPath)
+			}
+		}()
+	}
+
+	if err := m.AttachTLS(pid); err != nil {
+		m.log.V(1).Info("could not attach TLS uprobes to exec'd process", "pid", pid, "err", err)
 	}
 }
 
