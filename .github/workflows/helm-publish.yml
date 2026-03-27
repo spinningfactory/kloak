@@ -37,7 +37,8 @@ jobs:
         run: |
           git fetch origin gh-pages || true
           if git rev-parse --verify origin/gh-pages >/dev/null 2>&1; then
-            git worktree add gh-pages origin/gh-pages
+            git branch gh-pages origin/gh-pages
+            git worktree add gh-pages gh-pages
           else
             git worktree add --detach gh-pages
             cd gh-pages
