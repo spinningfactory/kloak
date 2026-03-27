@@ -87,6 +87,7 @@ e2e-setup:
 	@k3d cluster create $(E2E_CLUSTER) --wait --timeout 120s \
 		--volume /sys/kernel/btf:/sys/kernel/btf:ro@server:0 \
 		--volume /sys/fs/bpf:/sys/fs/bpf:rw@server:0 \
+		--volume /sys/kernel/tracing:/sys/kernel/tracing:ro@server:0 \
 		2>/dev/null || true
 	@echo "==> Building kloak image..."
 	@docker build -t $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) .
