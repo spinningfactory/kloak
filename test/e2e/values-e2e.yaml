@@ -1,4 +1,5 @@
 image:
+  repository: kloak
   tag: e2e
   pullPolicy: Never
 coverage:
