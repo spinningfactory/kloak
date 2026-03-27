@@ -49,7 +49,7 @@ jobs:
       - name: Update Helm repo
         run: |
           cp .helm-pkg/*.tgz gh-pages/
-          helm repo index gh-pages --url https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+          helm repo index gh-pages --url https://chart.getkloak.io
 
       - name: Push to gh-pages
         run: |
