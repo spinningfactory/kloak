@@ -50,6 +50,12 @@ var ebpfTests = []ebpfRewriteTest{
 		deploymentName: "demo-go-boring",
 		appLabel:       "app=demo-go-boring",
 	},
+	{
+		name:           "gnutls",
+		demoDir:        "demo-gnutls",
+		deploymentName: "demo-gnutls",
+		appLabel:       "app=demo-gnutls",
+	},
 }
 
 // TestEBPFRawTLSHostFiltering tests that DNS-verified host filtering works with
