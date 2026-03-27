@@ -1,6 +1,6 @@
 image:
-  repository: kloak
-  tag: latest
+  repository: dhiaayachi/kloak
+  tag: dev
   pullPolicy: IfNotPresent
 
 controller:

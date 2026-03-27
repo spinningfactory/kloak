@@ -1,0 +1,56 @@
+name: Publish Helm Chart
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  publish:
+    name: Publish Helm Chart
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set chart version
+        run: |
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          VERSION="0.0.1-nightly-${SHORT_SHA}"
+          echo "VERSION=${VERSION}" >> "$GITHUB_ENV"
+          sed -i "s/^version:.*/version: ${VERSION}/" charts/kloak/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/kloak/Chart.yaml
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Package chart
+        run: helm package charts/kloak -d .helm-pkg
+
+      - name: Checkout or create gh-pages branch
+        run: |
+          git fetch origin gh-pages || true
+          if git rev-parse --verify origin/gh-pages >/dev/null 2>&1; then
+            git worktree add gh-pages origin/gh-pages
+          else
+            git worktree add --detach gh-pages
+            cd gh-pages
+            git checkout --orphan gh-pages
+            git rm -rf . 2>/dev/null || true
+            git commit --allow-empty -m "initialize gh-pages"
+          fi
+
+      - name: Update Helm repo
+        run: |
+          cp .helm-pkg/*.tgz gh-pages/
+          helm repo index gh-pages --url https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}
+
+      - name: Push to gh-pages
+        run: |
+          cd gh-pages
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .
+          git commit -m "publish helm chart ${VERSION}"
+          git push origin gh-pages
