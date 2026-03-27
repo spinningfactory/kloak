@@ -61,7 +61,10 @@ webhooks:
         resources: ["pods"]
     namespaceSelector:
       matchExpressions:
-        - key: getkloak.io/enabled
-          operator: In
-          values: ["true"]
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - {{ .Release.Namespace }}
+            - kube-system
+            - kube-public
     failurePolicy: Fail
