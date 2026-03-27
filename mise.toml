@@ -1,0 +1,258 @@
+# mise.toml — Task runner for Kloak (feature-parity with Makefile)
+# Run `mise tasks` to see all available tasks.
+# Run `mise run <task>` or `mise <task>` to execute.
+
+[env]
+BINARY_NAME = "kloak"
+BUILD_DIR = "bin"
+CMD_DIR = "cmd"
+BPF_DIR = "pkg/ebpf"
+EBPF_PKG = "pkg/ebpf"
+DOCKER_IMAGE = "kloak"
+DOCKER_TAG = "latest"
+LIMA_VM = "kloak"
+LIMA_CONFIG = "lima.yaml"
+E2E_CLUSTER = "kloak-e2e"
+E2E_IMAGE_TAG = "e2e"
+
+# ============================================================================
+# Build targets
+# ============================================================================
+
+[tasks.build]
+description = "Build the kloak binary (native)"
+depends = ["deps"]
+run = """
+mkdir -p $BUILD_DIR
+go build -o $BUILD_DIR/$BINARY_NAME ./$CMD_DIR/kloak
+"""
+
+[tasks.build-linux]
+description = "Build for Linux (uses Lima on macOS)"
+depends = ["lima:ensure"]
+run = """
+if [ "$(uname)" = "Linux" ]; then
+  GOOS=linux GOARCH=amd64 go build -o $BUILD_DIR/$BINARY_NAME-linux ./$CMD_DIR/kloak
+else
+  limactl shell $LIMA_VM -- bash -lc "cd $(pwd) && go build -o $BUILD_DIR/$BINARY_NAME-linux ./$CMD_DIR/kloak"
+fi
+"""
+
+# ============================================================================
+# Test targets
+# ============================================================================
+
+[tasks.test]
+description = "Run unit tests"
+depends = ["deps"]
+run = "go test -v ./..."
+
+[tasks.test-linux]
+description = "Run tests in Linux VM (needed for eBPF)"
+depends = ["lima:ensure"]
+run = """
+limactl shell $LIMA_VM -- bash -lc "cd $(pwd) && go test -v ./..."
+"""
+
+[tasks.test-bpf-helpers]
+description = "Run pure C eBPF helper unit tests (no Linux/BPF required)"
+run = """
+gcc -Wall -Werror -o /tmp/helpers_test pkg/ebpf/bpf/helpers_test.c
+/tmp/helpers_test
+"""
+
+# ============================================================================
+# E2E targets
+# ============================================================================
+
+[tasks.e2e]
+description = "Full e2e: setup + run + cleanup"
+depends = ["e2e:setup"]
+run = """
+mise run e2e:run
+mise run e2e:cleanup
+"""
+
+[tasks."e2e:setup"]
+description = "Create k3d cluster with BPF mounts and import images"
+run = """
+set -e
+which k3d > /dev/null || { echo "Error: k3d not found. Install with: brew install k3d"; exit 1; }
+
+echo "==> Creating k3d cluster '$E2E_CLUSTER' with BPF mounts..."
+k3d cluster create $E2E_CLUSTER --wait --timeout 120s \
+  --volume /sys/kernel/btf:/sys/kernel/btf:ro@server:0 \
+  --volume /sys/fs/bpf:/sys/fs/bpf:rw@server:0 \
+  --volume /sys/kernel/tracing:/sys/kernel/tracing:ro@server:0 \
+  2>/dev/null || true
+
+echo "==> Building kloak image..."
+docker build -t $DOCKER_IMAGE:$E2E_IMAGE_TAG .
+
+echo "==> Building demo images..."
+docker build -t kloak-demo-go:$E2E_IMAGE_TAG -t kloak-demo-go:latest ./examples/demo-go/
+docker build -t kloak-demo-python:latest ./examples/demo-python/
+docker build -t kloak-demo-js:latest ./examples/demo-js/
+docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
+docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
+docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
+
+echo "==> Importing images into k3d..."
+k3d image import \
+  $DOCKER_IMAGE:$E2E_IMAGE_TAG \
+  kloak-demo-go:$E2E_IMAGE_TAG kloak-demo-go:latest \
+  kloak-demo-python:latest kloak-demo-js:latest \
+  kloak-demo-go-boring:latest kloak-demo-gnutls:latest \
+  kloak-demo-python-raw-tls:latest \
+  -c $E2E_CLUSTER
+
+docker pull bitnami/kubectl:latest
+k3d image import bitnami/kubectl:latest -c $E2E_CLUSTER
+
+echo "==> E2E environment ready."
+"""
+
+[tasks."e2e:run"]
+description = "Run e2e tests (requires e2e:setup first)"
+run = """
+KUBECONFIG=$(k3d kubeconfig write $E2E_CLUSTER) \
+go test -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
+"""
+
+[tasks."e2e:cleanup"]
+description = "Delete e2e k3d cluster"
+run = "k3d cluster delete $E2E_CLUSTER 2>/dev/null || true"
+
+# ============================================================================
+# Docker
+# ============================================================================
+
+[tasks.docker-build]
+description = "Build Docker image"
+depends = ["build"]
+run = "docker build -t $DOCKER_IMAGE:$DOCKER_TAG ."
+
+# ============================================================================
+# eBPF generation
+# ============================================================================
+
+[tasks.generate-ebpf]
+description = "Generate eBPF Go bindings (uses Lima on macOS)"
+depends = ["lima:ensure"]
+run = """
+ARCH=${KLOAK_TARGET_ARCH:-arm64}
+echo "Generating eBPF code (arch=$ARCH)..."
+if [ "$(uname)" = "Linux" ]; then
+  cd $EBPF_PKG && go generate
+else
+  echo "Using Lima VM for eBPF generation..."
+  limactl shell $LIMA_VM -- bash -lc "cd $(pwd)/$EBPF_PKG && KLOAK_TARGET_ARCH=$ARCH go generate"
+fi
+echo "eBPF generation complete."
+"""
+
+[tasks.generate-vmlinux]
+description = "Generate vmlinux.h from kernel BTF"
+depends = ["lima:ensure"]
+run = """
+echo "Generating vmlinux.h from kernel BTF..."
+if [ "$(uname)" = "Linux" ]; then
+  bpftool btf dump file /sys/kernel/btf/vmlinux format c > $BPF_DIR/vmlinux.h
+else
+  limactl shell $LIMA_VM -- bash -lc "bpftool btf dump file /sys/kernel/btf/vmlinux format c > $(pwd)/$BPF_DIR/vmlinux.h"
+fi
+"""
+
+# ============================================================================
+# Protobuf
+# ============================================================================
+
+[tasks.proto]
+description = "Generate protobuf code"
+run = "buf generate"
+
+# ============================================================================
+# Utility
+# ============================================================================
+
+[tasks.deps]
+description = "Download and tidy Go dependencies"
+run = """
+go mod download
+go mod tidy
+"""
+
+[tasks.run]
+description = "Build and run locally"
+depends = ["build"]
+run = "./$BUILD_DIR/$BINARY_NAME"
+
+[tasks.clean]
+description = "Clean build artifacts and generated eBPF files"
+run = """
+go clean
+rm -rf $BUILD_DIR
+rm -f $EBPF_PKG/tlsuprobe_bpfel.go $EBPF_PKG/tlsuprobe_bpfeb.go
+rm -f $EBPF_PKG/tlsuprobe_bpfel.o $EBPF_PKG/tlsuprobe_bpfeb.o
+"""
+
+# ============================================================================
+# Lima VM (for eBPF development on macOS)
+# ============================================================================
+
+[tasks."lima:check"]
+description = "Verify limactl is installed"
+run = """
+which limactl > /dev/null || { echo "Error: limactl not found. Install with: brew install lima"; exit 1; }
+"""
+
+[tasks."lima:ensure"]
+description = "Ensure Lima VM is running (idempotent)"
+depends = ["lima:check"]
+run = """
+if [ "$(uname)" = "Linux" ]; then
+  exit 0
+elif ! limactl list 2>/dev/null | grep -q "^$LIMA_VM"; then
+  echo "Creating Lima VM '$LIMA_VM'..."
+  limactl start --name=$LIMA_VM $LIMA_CONFIG
+elif limactl list | grep "^$LIMA_VM" | grep -q "Stopped"; then
+  echo "Starting Lima VM '$LIMA_VM'..."
+  limactl start $LIMA_VM
+fi
+"""
+
+[tasks."lima:start"]
+description = "Start the Lima VM"
+depends = ["lima:check"]
+run = """
+if ! limactl list 2>/dev/null | grep -q "^$LIMA_VM"; then
+  echo "Creating Lima VM '$LIMA_VM'..."
+  limactl start --name=$LIMA_VM $LIMA_CONFIG
+elif limactl list | grep "^$LIMA_VM" | grep -q "Stopped"; then
+  echo "Starting Lima VM '$LIMA_VM'..."
+  limactl start $LIMA_VM
+else
+  echo "Lima VM '$LIMA_VM' is already running"
+fi
+"""
+
+[tasks."lima:stop"]
+description = "Stop the Lima VM"
+run = "limactl stop $LIMA_VM 2>/dev/null || true"
+
+[tasks."lima:delete"]
+description = "Delete the Lima VM"
+depends = ["lima:stop"]
+run = "limactl delete $LIMA_VM 2>/dev/null || true"
+
+[tasks."lima:shell"]
+description = "Open shell in Lima VM"
+depends = ["lima:ensure"]
+run = "limactl shell $LIMA_VM"
+
+[tasks."lima:exec"]
+description = "Execute command in Lima VM (use: mise run lima:exec -- 'your command')"
+depends = ["lima:ensure"]
+run = """
+limactl shell $LIMA_VM -- bash -lc "$@"
+"""

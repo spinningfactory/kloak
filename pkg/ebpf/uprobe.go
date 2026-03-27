@@ -159,7 +159,7 @@ func (m *TLSUprobeManager) UntrackTGID(tgid uint32) error {
 }
 
 // AttachTLS attempts to automatically detect the runtime language and attach
-// the correct eBPF uprobes (Go crypto/tls or OpenSSL) to the given PID.
+// the correct eBPF uprobes (Go crypto/tls, OpenSSL, or GnuTLS) to the given PID.
 // Also registers the PID's TGID in tracked_tgids for DNS/connect tracking.
 func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	exePath := fmt.Sprintf("/proc/%d/exe", pid)
@@ -224,6 +224,32 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		}
 	}
 
+	// 3. Try GnuTLS (same C ABI as OpenSSL — reuse BpfUprobeSslWrite)
+	gnutlsSymbols := []string{"gnutls_record_send", "gnutls_record_send2"}
+	for _, sym := range gnutlsSymbols {
+		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
+		if err == nil {
+			m.log.Info("Attached GnuTLS uprobe to main exe", "pid", pid, "symbol", sym)
+			m.links = append(m.links, up)
+			attached = true
+		}
+	}
+
+	for _, libPath := range findTLSLibraries(pid) {
+		libEx, err := link.OpenExecutable(libPath)
+		if err != nil {
+			continue
+		}
+		for _, sym := range gnutlsSymbols {
+			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
+			if err == nil {
+				m.log.Info("Attached GnuTLS uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
+				m.links = append(m.links, up)
+				attached = true
+			}
+		}
+	}
+
 	if attached {
 		return nil
 	}
@@ -232,8 +258,8 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 }
 
 // findTLSLibraries scans /proc/<pid>/maps for shared libraries that may export
-// SSL_write: OpenSSL (libssl.so), BoringSSL (libboringssl.so or libssl.so),
-// and libcrypto.so (some BoringSSL builds export SSL_write there).
+// TLS write functions: OpenSSL (libssl.so), BoringSSL (libboringssl.so or libssl.so),
+// libcrypto.so (some BoringSSL builds), and GnuTLS (libgnutls.so).
 // Returns deduplicated paths accessible via /proc/<pid>/root.
 func findTLSLibraries(pid int) []string {
 	mapsPath := fmt.Sprintf("/proc/%d/maps", pid)
@@ -280,6 +306,10 @@ func isTLSLibrary(name string) bool {
 	}
 	// Some BoringSSL builds export SSL_write from libcrypto
 	if strings.HasPrefix(name, "libcrypto.so") {
+		return true
+	}
+	// GnuTLS
+	if strings.HasPrefix(name, "libgnutls.so") {
 		return true
 	}
 	return false
