@@ -318,7 +318,7 @@ struct {
 } proc_events SEC(".maps");
 
 // Event sent to userspace when a tracked process execs a new binary.
-struct proc_event {
+struct kloak_proc_event {
   __u32 tgid;
   __u8 type; // 1 = exec, 2 = exit
 };
@@ -1211,7 +1211,7 @@ int tp_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
   bpf_map_update_elem(&tracked_tgids, &tgid, &val, BPF_ANY);
 
   // Notify userspace to attach uprobes to the new binary
-  struct proc_event *evt = bpf_ringbuf_reserve(&proc_events, sizeof(*evt), 0);
+  struct kloak_proc_event *evt = bpf_ringbuf_reserve(&proc_events, sizeof(*evt), 0);
   if (evt) {
     evt->tgid = tgid;
     evt->type = 1; // exec
