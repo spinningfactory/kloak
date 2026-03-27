@@ -110,6 +110,9 @@ static int read_tls_cb(void *userdata, uint8_t *buf, size_t len, size_t *out_n) 
 }
 
 int main(void) {
+    setbuf(stdout, NULL);
+    setbuf(stderr, NULL);
+
     const char *allowed_file = getenv("SECRET_ALLOWED_FILE");
     const char *blocked_file = getenv("SECRET_BLOCKED_FILE");
     const char *target_url = getenv("TARGET_URL");
@@ -153,7 +156,7 @@ int main(void) {
     /* 1. Build root certificate store from system CA bundle */
     struct rustls_root_cert_store_builder *store_builder = rustls_root_cert_store_builder_new();
     result = rustls_root_cert_store_builder_load_roots_from_file(store_builder,
-        "/etc/ssl/certs/ca-certificates.crt", true);
+        "/etc/ssl/certs/ca-certificates.crt", false);
     if (result != RUSTLS_RESULT_OK) {
         fprintf(stderr, "Failed to load root certificates\n");
         return 1;
