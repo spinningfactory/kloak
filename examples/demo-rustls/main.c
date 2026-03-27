@@ -213,20 +213,22 @@ int main(void) {
 
         rustls_connection_set_userdata(conn, &sockfd);
 
-        /* Handshake loop */
+        /* Handshake loop -- drive I/O until handshake completes */
         size_t n = 0;
         while (rustls_connection_is_handshaking(conn)) {
-            /* Write any pending TLS data to socket */
-            rustls_connection_write_tls(conn, write_tls_cb, &sockfd, &n);
+            /* Write any pending TLS data to socket (e.g. ClientHello) */
+            while (rustls_connection_wants_write(conn)) {
+                rustls_connection_write_tls(conn, write_tls_cb, &sockfd, &n);
+            }
 
-            /* Read TLS data from socket */
-            rustls_connection_read_tls(conn, read_tls_cb, &sockfd, &n);
-
-            /* Process the data */
-            result = rustls_connection_process_new_packets(conn);
-            if (result != RUSTLS_RESULT_OK) {
-                fprintf(stderr, "TLS handshake error during process_new_packets\n");
-                break;
+            /* Read TLS data from socket (e.g. ServerHello) */
+            if (rustls_connection_wants_read(conn)) {
+                rustls_connection_read_tls(conn, read_tls_cb, &sockfd, &n);
+                result = rustls_connection_process_new_packets(conn);
+                if (result != RUSTLS_RESULT_OK) {
+                    fprintf(stderr, "TLS handshake error during process_new_packets\n");
+                    break;
+                }
             }
         }
 
@@ -262,12 +264,15 @@ int main(void) {
         }
 
         /* Flush encrypted data to socket */
-        rustls_connection_write_tls(conn, write_tls_cb, &sockfd, &n);
+        while (rustls_connection_wants_write(conn)) {
+            rustls_connection_write_tls(conn, write_tls_cb, &sockfd, &n);
+        }
 
         /* Read response */
         printf("Response:\n");
         char buf[MAX_BUF];
-        while (1) {
+        int done = 0;
+        while (!done) {
             n = 0;
             rustls_connection_read_tls(conn, read_tls_cb, &sockfd, &n);
             if (n == 0) break;
@@ -275,12 +280,14 @@ int main(void) {
             result = rustls_connection_process_new_packets(conn);
             if (result != RUSTLS_RESULT_OK) break;
 
-            n = 0;
-            result = rustls_connection_read(conn, (uint8_t *)buf, sizeof(buf) - 1, &n);
-            if (n == 0) break;
-            if (result != RUSTLS_RESULT_OK) break;
-            buf[n] = '\0';
-            printf("%s", buf);
+            /* Drain all available plaintext */
+            while (1) {
+                n = 0;
+                result = rustls_connection_read(conn, (uint8_t *)buf, sizeof(buf) - 1, &n);
+                if (n == 0 || result != RUSTLS_RESULT_OK) { done = 1; break; }
+                buf[n] = '\0';
+                printf("%s", buf);
+            }
         }
         printf("\n");
 
