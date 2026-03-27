@@ -54,6 +54,8 @@ func main() {
 	fmt.Println("  - X-Secret-Blocked: Should show UUID in response (not replaced)")
 	fmt.Println(strings.Repeat("=", 60))
 
+	// TODO: Remove this delay once the controller can freeze the cgroup and attach
+	// uprobes before PID 1 makes its first TLS connection.
 	// Brief delay to allow eBPF uprobe attachment before the first TLS connection.
 	// Go starts faster than the controller can discover and instrument the process.
 	fmt.Println("Waiting 2s for Kloak controller to sync...")
