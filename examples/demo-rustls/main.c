@@ -146,23 +146,40 @@ int main(void) {
     printf("Waiting 15 seconds for kloak controller to sync...\n");
     sleep(15);
 
-    /* Build rustls client config */
-    struct rustls_client_config_builder *builder = NULL;
-    const struct rustls_client_config *config = NULL;
+    /* Build rustls client config with system root certificates */
     rustls_result result;
 
-    result = rustls_client_config_builder_new(&builder);
-    if (result != RUSTLS_RESULT_OK) {
-        fprintf(stderr, "Failed to create rustls config builder\n");
-        return 1;
-    }
-
-    result = rustls_client_config_builder_load_roots_from_file(builder, "/etc/ssl/certs/ca-certificates.crt");
+    /* 1. Build root certificate store from system CA bundle */
+    struct rustls_root_cert_store_builder *store_builder = rustls_root_cert_store_builder_new();
+    result = rustls_root_cert_store_builder_load_roots_from_file(store_builder,
+        "/etc/ssl/certs/ca-certificates.crt");
     if (result != RUSTLS_RESULT_OK) {
         fprintf(stderr, "Failed to load root certificates\n");
         return 1;
     }
 
+    const struct rustls_root_cert_store *root_store = NULL;
+    result = rustls_root_cert_store_builder_build(store_builder, &root_store);
+    if (result != RUSTLS_RESULT_OK) {
+        fprintf(stderr, "Failed to build root cert store\n");
+        return 1;
+    }
+
+    /* 2. Build server certificate verifier using the root store */
+    struct rustls_web_pki_server_cert_verifier_builder *verifier_builder =
+        rustls_web_pki_server_cert_verifier_builder_new(root_store);
+    struct rustls_server_cert_verifier *verifier = NULL;
+    result = rustls_web_pki_server_cert_verifier_builder_build(verifier_builder, &verifier);
+    if (result != RUSTLS_RESULT_OK) {
+        fprintf(stderr, "Failed to build server cert verifier\n");
+        return 1;
+    }
+
+    /* 3. Build client config with the verifier */
+    struct rustls_client_config_builder *builder = rustls_client_config_builder_new();
+    rustls_client_config_builder_set_server_verifier(builder, verifier);
+
+    const struct rustls_client_config *config = NULL;
     result = rustls_client_config_builder_build(builder, &config);
     if (result != RUSTLS_RESULT_OK) {
         fprintf(stderr, "Failed to build rustls config\n");
@@ -278,5 +295,7 @@ int main(void) {
     free(secret_allowed);
     free(secret_blocked);
     rustls_client_config_free(config);
+    rustls_server_cert_verifier_free(verifier);
+    rustls_root_cert_store_free(root_store);
     return 0;
 }
