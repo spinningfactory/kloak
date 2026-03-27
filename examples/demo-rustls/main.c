@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <stdbool.h>
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -152,7 +153,7 @@ int main(void) {
     /* 1. Build root certificate store from system CA bundle */
     struct rustls_root_cert_store_builder *store_builder = rustls_root_cert_store_builder_new();
     result = rustls_root_cert_store_builder_load_roots_from_file(store_builder,
-        "/etc/ssl/certs/ca-certificates.crt");
+        "/etc/ssl/certs/ca-certificates.crt", true);
     if (result != RUSTLS_RESULT_OK) {
         fprintf(stderr, "Failed to load root certificates\n");
         return 1;
