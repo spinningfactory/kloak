@@ -56,6 +56,12 @@ var ebpfTests = []ebpfRewriteTest{
 		deploymentName: "demo-gnutls",
 		appLabel:       "app=demo-gnutls",
 	},
+	{
+		name:           "rustls-ffi",
+		demoDir:        "demo-rustls",
+		deploymentName: "demo-rustls",
+		appLabel:       "app=demo-rustls",
+	},
 }
 
 // TestEBPFRawTLSHostFiltering tests that DNS-verified host filtering works with

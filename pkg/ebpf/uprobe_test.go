@@ -23,6 +23,10 @@ func TestIsTLSLibrary(t *testing.T) {
 		{"libgnutls.so", true},
 		{"libgnutls.so.30", true},
 		{"libgnutls.so.30.34.2", true},
+		// rustls-ffi
+		{"librustls.so", true},
+		{"librustls.so.0", true},
+		{"librustls.so.0.14.0", true},
 		// Non-TLS libraries
 		{"libc.so.6", false},
 		{"libpthread.so.0", false},

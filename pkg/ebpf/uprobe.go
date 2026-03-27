@@ -159,7 +159,7 @@ func (m *TLSUprobeManager) UntrackTGID(tgid uint32) error {
 }
 
 // AttachTLS attempts to automatically detect the runtime language and attach
-// the correct eBPF uprobes (Go crypto/tls, OpenSSL, or GnuTLS) to the given PID.
+// the correct eBPF uprobes (Go crypto/tls, OpenSSL, GnuTLS, or rustls-ffi) to the given PID.
 // Also registers the PID's TGID in tracked_tgids for DNS/connect tracking.
 func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	exePath := fmt.Sprintf("/proc/%d/exe", pid)
@@ -250,6 +250,32 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		}
 	}
 
+	// 4. Try rustls-ffi (same C ABI as OpenSSL — reuse BpfUprobeSslWrite)
+	rustlsSymbols := []string{"rustls_connection_write"}
+	for _, sym := range rustlsSymbols {
+		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
+		if err == nil {
+			m.log.Info("Attached rustls-ffi uprobe to main exe", "pid", pid, "symbol", sym)
+			m.links = append(m.links, up)
+			attached = true
+		}
+	}
+
+	for _, libPath := range findTLSLibraries(pid) {
+		libEx, err := link.OpenExecutable(libPath)
+		if err != nil {
+			continue
+		}
+		for _, sym := range rustlsSymbols {
+			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
+			if err == nil {
+				m.log.Info("Attached rustls-ffi uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
+				m.links = append(m.links, up)
+				attached = true
+			}
+		}
+	}
+
 	if attached {
 		return nil
 	}
@@ -259,7 +285,7 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 
 // findTLSLibraries scans /proc/<pid>/maps for shared libraries that may export
 // TLS write functions: OpenSSL (libssl.so), BoringSSL (libboringssl.so or libssl.so),
-// libcrypto.so (some BoringSSL builds), and GnuTLS (libgnutls.so).
+// libcrypto.so (some BoringSSL builds), GnuTLS (libgnutls.so), and rustls-ffi (librustls.so).
 // Returns deduplicated paths accessible via /proc/<pid>/root.
 func findTLSLibraries(pid int) []string {
 	mapsPath := fmt.Sprintf("/proc/%d/maps", pid)
@@ -310,6 +336,10 @@ func isTLSLibrary(name string) bool {
 	}
 	// GnuTLS
 	if strings.HasPrefix(name, "libgnutls.so") {
+		return true
+	}
+	// rustls-ffi (Rust TLS via C FFI)
+	if strings.HasPrefix(name, "librustls.so") {
 		return true
 	}
 	return false
