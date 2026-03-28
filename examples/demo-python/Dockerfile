@@ -4,8 +4,6 @@ WORKDIR /app
 
 # Install requests
 RUN pip install --no-cache-dir requests
-RUN apt update
-RUN apt install curl -y
 
 # Copy application
 COPY app.py .
