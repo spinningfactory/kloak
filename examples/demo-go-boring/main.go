@@ -54,13 +54,6 @@ func main() {
 	fmt.Println("  - X-Secret-Blocked: Should show UUID in response (not replaced)")
 	fmt.Println(strings.Repeat("=", 60))
 
-	// TODO: Remove this delay once the controller can freeze the cgroup and attach
-	// uprobes before PID 1 makes its first TLS connection.
-	// Brief delay to allow eBPF uprobe attachment before the first TLS connection.
-	// Go starts faster than the controller can discover and instrument the process.
-	fmt.Println("Waiting 2s for Kloak controller to sync...")
-	time.Sleep(2 * time.Second)
-
 	// Force HTTP/1.1 — Go defaults to h2 via ALPN, but HTTP/2 uses binary
 	// HPACK-encoded frames that the eBPF uprobe scanner cannot parse.
 	// HTTP/1.1 sends plaintext headers through tls.Conn.Write in a single call.

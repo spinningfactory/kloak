@@ -81,6 +81,36 @@ type TLSUprobeManager struct {
 	cgroupPaths sync.Map // uint64 -> string
 }
 
+// setupCgroupAncestor finds the kubepods cgroup directory and stores its fd
+// in the BPF cgroup_ancestor map. This enables bpf_current_task_under_cgroup()
+// in the exec tracepoint to catch all container execs without per-container
+// cgroup tracking.
+func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Logger) error {
+	// Try well-known kubepods cgroup paths
+	candidates := []string{
+		filepath.Join(cgroupRoot, "kubepods.slice"),  // systemd cgroup driver
+		filepath.Join(cgroupRoot, "kubepods"),         // cgroupfs driver (k3s default)
+	}
+
+	for _, path := range candidates {
+		f, err := os.Open(path)
+		if err != nil {
+			continue
+		}
+		defer f.Close()
+
+		key := uint32(0)
+		val := uint32(f.Fd())
+		if err := objs.CgroupAncestor.Update(key, val, 0); err != nil {
+			return fmt.Errorf("updating cgroup_ancestor map: %w", err)
+		}
+		log.Info("Configured cgroup ancestor for exec tracepoint", "path", path)
+		return nil
+	}
+
+	return fmt.Errorf("kubepods cgroup not found in %s", cgroupRoot)
+}
+
 // NewTLSUprobeManager initializes a new uprobe manager.
 func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeManager, error) {
 	log := ctrl.Log.WithName("ebpf-uprobe")
@@ -96,6 +126,13 @@ func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeMa
 	if err := objs.ProgArray.Put(uint32(0), fd); err != nil {
 		_ = objs.Close()
 		return nil, fmt.Errorf("configuring tail call map: %w", err)
+	}
+
+	// Populate the cgroup ancestor map so the exec tracepoint can catch
+	// ALL container execs. Find the kubepods cgroup and store its fd.
+	if err := setupCgroupAncestor(objs, cgroupRoot, log); err != nil {
+		log.Error(err, "failed to setup cgroup ancestor — exec tracepoint will not catch initial container processes")
+		// Non-fatal: exec tracepoint falls back to tracked_cgroups
 	}
 
 	reader, err := ringbuf.NewReader(objs.TlsEvents)

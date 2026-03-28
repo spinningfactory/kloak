@@ -311,6 +311,17 @@ struct {
   __type(value, __u8); // 1 = tracked
 } tracked_cgroups SEC(".maps");
 
+// Cgroup array for bpf_current_task_under_cgroup() ancestor check.
+// Index 0 holds the fd of the kubepods ancestor cgroup. The exec
+// tracepoint uses this to catch ALL container execs without needing
+// individual container cgroup IDs to be pre-registered.
+struct {
+  __uint(type, BPF_MAP_TYPE_CGROUP_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u32);
+} cgroup_ancestor SEC(".maps");
+
 // Ring buffer for process lifecycle events (exec) to notify userspace.
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -1212,10 +1223,14 @@ int bpf_uprobe_ssl_write(void *ctx) {
 // execs a new binary. Notifies userspace via ring buffer to attach uprobes.
 SEC("tracepoint/sched/sched_process_exec")
 int tp_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
-  __u64 cgroup_id = bpf_get_current_cgroup_id();
-  __u8 *tracked = bpf_map_lookup_elem(&tracked_cgroups, &cgroup_id);
-  if (!tracked)
+  // Check if the process is under the kubepods cgroup hierarchy.
+  // This catches ALL container execs without needing per-container cgroup
+  // tracking, eliminating the timing gap where the reconciler hasn't yet
+  // registered the container's cgroup. Userspace filters by pod annotation.
+  if (bpf_current_task_under_cgroup(&cgroup_ancestor, 0) != 1)
     return 0;
+
+  __u64 cgroup_id = bpf_get_current_cgroup_id();
 
   __u32 tgid = ctx->pid; // pid field is the TGID in this context
 
