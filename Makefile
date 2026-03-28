@@ -97,9 +97,11 @@ e2e-setup:
 	@docker build -t kloak-demo-js:latest ./examples/demo-js/
 	@docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
 	@docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
+	@docker build -t kloak-demo-rust-openssl:latest ./examples/demo-rust-openssl/
+	@docker build -t kloak-demo-rust-rustls:latest ./examples/demo-rust-rustls/
 	@docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
 	@echo "==> Importing images into k3d..."
-	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest -c $(E2E_CLUSTER)
+	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest kloak-demo-rust-openssl:latest kloak-demo-rust-rustls:latest kloak-demo-python-raw-tls:latest -c $(E2E_CLUSTER)
 	@docker pull bitnami/kubectl:latest
 	@k3d image import bitnami/kubectl:latest -c $(E2E_CLUSTER)
 	@echo "==> E2E environment ready."
