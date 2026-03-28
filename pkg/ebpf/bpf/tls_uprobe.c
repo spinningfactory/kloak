@@ -991,11 +991,21 @@ static int scan_chunk(__u32 chunk_idx, void *ctx) {
     if (i + SECRET_KEY_LEN > read_len)
       break;
 
-    if (!is_kloak_prefix(&scratch_data->data[i]))
+    // Check for both plaintext "kloak:" (HTTP/1.1) and HPACK Huffman
+    // encoded "kloak:" (HTTP/2). Both use the same 8-byte key lookup
+    // into secret_map — plaintext keys start with "kloak:" ASCII,
+    // Huffman keys start with the Huffman encoding bytes.
+    int matched = 0;
+    if (is_kloak_prefix(&scratch_data->data[i]))
+      matched = 1;
+    else if (is_kloak_prefix_huffman((const unsigned char *)&scratch_data->data[i]))
+      matched = 1;
+
+    if (!matched)
       continue;
 
-    // 8-byte key lookup (kloak: + 2 UUID chars).
-    // Collision detection is done on the Go side at sync time.
+    // 8-byte key lookup. For plaintext: "kloak:" + 2 UUID chars.
+    // For Huffman: first 8 bytes of Huffman-encoded shadow value.
     struct secret_key key = {};
     __builtin_memcpy(key.prefix, &scratch_data->data[i], SECRET_KEY_LEN);
 
