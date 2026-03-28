@@ -86,10 +86,25 @@ type TLSUprobeManager struct {
 // in the exec tracepoint to catch all container execs without per-container
 // cgroup tracking.
 func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Logger) error {
-	// Try well-known kubepods cgroup paths
+	// Try well-known kubepods cgroup paths, then walk the tree as fallback.
+	// k3d/Docker nests cgroups differently than standard k8s.
 	candidates := []string{
 		filepath.Join(cgroupRoot, "kubepods.slice"), // systemd cgroup driver
 		filepath.Join(cgroupRoot, "kubepods"),       // cgroupfs driver (k3s default)
+	}
+
+	// Also walk one level deep to handle nested cgroups (e.g., k3d in Docker)
+	entries, err := os.ReadDir(cgroupRoot)
+	if err == nil {
+		for _, e := range entries {
+			if !e.IsDir() {
+				continue
+			}
+			nested := filepath.Join(cgroupRoot, e.Name(), "kubepods.slice")
+			candidates = append(candidates, nested)
+			nested = filepath.Join(cgroupRoot, e.Name(), "kubepods")
+			candidates = append(candidates, nested)
+		}
 	}
 
 	for _, path := range candidates {
