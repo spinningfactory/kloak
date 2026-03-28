@@ -321,6 +321,8 @@ struct {
 struct kloak_proc_event {
   __u32 tgid;
   __u8 type; // 1 = exec, 2 = exit
+  __u8 _pad[3];
+  __u64 cgroup_id;
 };
 
 // Check if a dns_ip_map entry has expired based on its TTL.
@@ -1069,6 +1071,12 @@ int bpf_phase2_rewrite(void *ctx) {
 
 SEC("uprobe/go_tls_write")
 int bpf_uprobe_go_tls_write(void *ctx) {
+  // Filter by cgroup: only intercept processes in tracked containers.
+  // Uprobes are attached system-wide (all CPUs) so we must filter here.
+  __u64 cgroup_id = bpf_get_current_cgroup_id();
+  if (!bpf_map_lookup_elem(&tracked_cgroups, &cgroup_id))
+    return 0;
+
   void *data_ptr;
   __u64 data_len;
 
@@ -1135,6 +1143,11 @@ int bpf_uprobe_go_tls_write(void *ctx) {
 
 SEC("uprobe/ssl_write")
 int bpf_uprobe_ssl_write(void *ctx) {
+  // Filter by cgroup: only intercept processes in tracked containers.
+  __u64 cgroup_id = bpf_get_current_cgroup_id();
+  if (!bpf_map_lookup_elem(&tracked_cgroups, &cgroup_id))
+    return 0;
+
   void *ssl_ptr;
   void *data_ptr;
   int num;
@@ -1215,6 +1228,7 @@ int tp_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
   if (evt) {
     evt->tgid = tgid;
     evt->type = 1; // exec
+    evt->cgroup_id = cgroup_id;
     bpf_ringbuf_submit(evt, 0);
   }
   return 0;

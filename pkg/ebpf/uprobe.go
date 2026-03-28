@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -16,7 +18,6 @@ import (
 	"github.com/go-logr/logr"
 	ctrl "sigs.k8s.io/controller-runtime"
 
-	"github.com/spinningfactory/kloak/pkg/cgroups"
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
@@ -29,10 +30,12 @@ type tlsEvent struct {
 	_           [3]byte // padding for alignment
 }
 
-// procEvent must match the C struct proc_event
+// procEvent must match the C struct kloak_proc_event
 type procEvent struct {
-	Tgid uint32
-	Type uint8 // 1 = exec, 2 = exit
+	Tgid     uint32
+	Type     uint8 // 1 = exec, 2 = exit
+	_        [3]byte
+	CgroupID uint64
 }
 
 // secretKey matches C struct secret_key (SECRET_KEY_LEN = 8)
@@ -73,6 +76,9 @@ type TLSUprobeManager struct {
 	store storage.Storage
 	// cgroupRoot is the path to the cgroup v2 filesystem (e.g. /sys/fs/cgroup)
 	cgroupRoot string
+	// cgroupPaths maps cgroup inode ID -> filesystem path.
+	// Populated by TrackCgroup.
+	cgroupPaths sync.Map // uint64 -> string
 }
 
 // NewTLSUprobeManager initializes a new uprobe manager.
@@ -181,102 +187,79 @@ func (m *TLSUprobeManager) UntrackTGID(tgid uint32) error {
 
 // TrackCgroup adds a container cgroup ID to the tracked_cgroups map,
 // enabling exec/exit tracepoint processing for processes in that cgroup.
-func (m *TLSUprobeManager) TrackCgroup(cgroupID uint64) error {
+func (m *TLSUprobeManager) TrackCgroup(cgroupID uint64, cgroupPath string) error {
 	val := uint8(1)
-	return m.objs.TrackedCgroups.Update(cgroupID, &val, 0)
+	if err := m.objs.TrackedCgroups.Update(cgroupID, &val, 0); err != nil {
+		return err
+	}
+	m.cgroupPaths.Store(cgroupID, cgroupPath)
+	return nil
 }
 
 // UntrackCgroup removes a container cgroup ID from the tracked_cgroups map.
 func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
+	m.cgroupPaths.Delete(cgroupID)
 	return m.objs.TrackedCgroups.Delete(cgroupID)
 }
 
-// AttachTLS attempts to automatically detect the runtime language and attach
-// the correct eBPF uprobes (Go crypto/tls, OpenSSL, or GnuTLS) to the given PID.
-// Also registers the PID's TGID in tracked_tgids for DNS/connect tracking.
+// AttachTLS attaches system-wide eBPF uprobes to all TLS libraries in a
+// container. The uprobes fire for ALL processes in the container (same overlay
+// mount = same inode). The BPF cgroup filter restricts interception to tracked
+// containers only.
 func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	exePath := fmt.Sprintf("/proc/%d/exe", pid)
 
 	// Register the process for DNS/connect tracking.
-	// On Linux, PID == TGID for the main thread.
 	if err := m.TrackTGID(uint32(pid)); err != nil {
 		m.log.Error(err, "failed to track TGID for DNS/connect", "pid", pid)
-		// Non-fatal: continue with uprobe attachment
 	} else {
 		m.log.Info("Tracking TGID for DNS/connect verification", "pid", pid)
 	}
 
-	// Open the executable to figure out if it's Go or uses OpenSSL
+	// Open the executable to check for statically linked TLS
 	ex, err := link.OpenExecutable(exePath)
 	if err != nil {
 		return fmt.Errorf("opening executable %s: %w", exePath, err)
 	}
 
-	// 1. Try Go crypto/tls first
-	// We check if the symbol exists in the binary.
+	// 1. Try Go crypto/tls (statically linked into the binary)
 	goWriteSym := "crypto/tls.(*Conn).Write"
-	upGo, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, nil)
-	if err == nil {
-		m.log.Info("Attached Go uprobe to process", "pid", pid, "symbol", goWriteSym)
-		m.links = append(m.links, upGo)
+	if up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, nil); err == nil {
+		m.log.Info("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
+		m.links = append(m.links, up)
 		return nil
-	} else if !errors.Is(err, link.ErrNoSymbol) && !strings.Contains(err.Error(), "no symbol") {
-		// Log errors that are NOT just "symbol missing"
-		m.log.Error(err, "failed to attach Go uprobe, but symbol may exist")
 	}
 
-	// 2. Try OpenSSL / BoringSSL (Node.js, Python, Rust, Envoy, gRPC)
-	// Modern OpenSSL 3.x and BoringSSL export both SSL_write and SSL_write_ex
-	// with identical C ABI calling convention.
-	sslWriteSymbols := []string{"SSL_write", "SSL_write_ex"}
+	// 2. Scan all TLS shared libraries in the container filesystem and attach
+	// system-wide uprobes. Uses /proc/<pid>/root to access the container's
+	// overlay mount — all processes in the same container share the same
+	// overlay inode, so the uprobe fires for any of them.
+	sslSymbols := []string{"SSL_write", "SSL_write_ex"}
+	gnutlsSymbols := []string{"gnutls_record_send", "gnutls_record_send2"}
 	attached := false
 
-	// Try main executable first (catches statically linked BoringSSL/OpenSSL)
-	for _, sym := range sslWriteSymbols {
-		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
-		if err == nil {
-			m.log.Info("Attached SSL write uprobe to main exe", "pid", pid, "symbol", sym)
+	// Try main executable first (statically linked OpenSSL/BoringSSL/GnuTLS)
+	for _, sym := range append(sslSymbols, gnutlsSymbols...) {
+		if up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil); err == nil {
+			m.log.Info("Attached uprobe to main exe", "pid", pid, "symbol", sym)
 			m.links = append(m.links, up)
 			attached = true
 		}
 	}
 
-	// Try all TLS shared libraries found in the process maps
-	for _, libPath := range findTLSLibraries(pid) {
-		libEx, err := link.OpenExecutable(libPath)
+	// Scan container filesystem for all TLS shared libraries
+	containerLibs := findContainerTLSLibraries(pid)
+	m.log.Info("Found container TLS libraries", "pid", pid, "count", len(containerLibs), "libs", containerLibs)
+
+	for _, containerPath := range containerLibs {
+		hostPath := fmt.Sprintf("/proc/%d/root%s", pid, containerPath)
+		libEx, err := link.OpenExecutable(hostPath)
 		if err != nil {
 			continue
 		}
-		for _, sym := range sslWriteSymbols {
-			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
-			if err == nil {
-				m.log.Info("Attached SSL write uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
-				m.links = append(m.links, up)
-				attached = true
-			}
-		}
-	}
-
-	// 3. Try GnuTLS (same C ABI as OpenSSL — reuse BpfUprobeSslWrite)
-	gnutlsSymbols := []string{"gnutls_record_send", "gnutls_record_send2"}
-	for _, sym := range gnutlsSymbols {
-		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
-		if err == nil {
-			m.log.Info("Attached GnuTLS uprobe to main exe", "pid", pid, "symbol", sym)
-			m.links = append(m.links, up)
-			attached = true
-		}
-	}
-
-	for _, libPath := range findTLSLibraries(pid) {
-		libEx, err := link.OpenExecutable(libPath)
-		if err != nil {
-			continue
-		}
-		for _, sym := range gnutlsSymbols {
-			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
-			if err == nil {
-				m.log.Info("Attached GnuTLS uprobe to shared library", "pid", pid, "symbol", sym, "lib", libPath)
+		for _, sym := range append(sslSymbols, gnutlsSymbols...) {
+			if up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil); err == nil {
+				m.log.Info("Attached uprobe (system-wide)", "pid", pid, "symbol", sym, "lib", containerPath)
 				m.links = append(m.links, up)
 				attached = true
 			}
@@ -286,42 +269,47 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	if attached {
 		return nil
 	}
-
 	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
 }
 
-// findTLSLibraries scans /proc/<pid>/maps for shared libraries that may export
-// TLS write functions: OpenSSL (libssl.so), BoringSSL (libboringssl.so or libssl.so),
-// libcrypto.so (some BoringSSL builds), and GnuTLS (libgnutls.so).
-// Returns deduplicated paths accessible via /proc/<pid>/root.
-func findTLSLibraries(pid int) []string {
-	mapsPath := fmt.Sprintf("/proc/%d/maps", pid)
-	data, err := os.ReadFile(mapsPath)
-	if err != nil {
-		return nil
-	}
+// findContainerTLSLibraries scans common library directories in the container's
+// root filesystem for all TLS libraries. Returns container-relative paths
+// (e.g., "/usr/lib/aarch64-linux-gnu/libssl.so.3").
+func findContainerTLSLibraries(pid int) []string {
+	rootPrefix := fmt.Sprintf("/proc/%d/root", pid)
+	libDirs := []string{"/usr/lib", "/lib", "/usr/local/lib"}
 
 	seen := make(map[string]bool)
 	var libs []string
 
-	for _, line := range strings.Split(string(data), "\n") {
-		parts := strings.Fields(line)
-		if len(parts) == 0 {
+	addIfTLS := func(hostPath string) {
+		if isTLSLibrary(filepath.Base(hostPath)) && !seen[hostPath] {
+			seen[hostPath] = true
+			libs = append(libs, strings.TrimPrefix(hostPath, rootPrefix))
+		}
+	}
+
+	for _, dir := range libDirs {
+		hostDir := rootPrefix + dir
+		entries, err := os.ReadDir(hostDir)
+		if err != nil {
 			continue
 		}
-		path := parts[len(parts)-1]
-		if !strings.HasPrefix(path, "/") {
-			continue
-		}
-		// Match any shared library that could export SSL_write
-		base := path[strings.LastIndex(path, "/")+1:]
-		if !isTLSLibrary(base) {
-			continue
-		}
-		fullPath := fmt.Sprintf("/proc/%d/root%s", pid, path)
-		if !seen[fullPath] {
-			seen[fullPath] = true
-			libs = append(libs, fullPath)
+		for _, e := range entries {
+			fullPath := filepath.Join(hostDir, e.Name())
+			if e.IsDir() {
+				archEntries, err := os.ReadDir(fullPath)
+				if err != nil {
+					continue
+				}
+				for _, ae := range archEntries {
+					if !ae.IsDir() {
+						addIfTLS(filepath.Join(fullPath, ae.Name()))
+					}
+				}
+			} else {
+				addIfTLS(fullPath)
+			}
 		}
 	}
 	return libs
@@ -329,23 +317,10 @@ func findTLSLibraries(pid int) []string {
 
 // isTLSLibrary returns true if the filename looks like an SSL/TLS shared library.
 func isTLSLibrary(name string) bool {
-	// OpenSSL and BoringSSL shared builds
-	if strings.HasPrefix(name, "libssl.so") {
-		return true
-	}
-	// Custom BoringSSL builds
-	if strings.HasPrefix(name, "libboringssl.so") {
-		return true
-	}
-	// Some BoringSSL builds export SSL_write from libcrypto
-	if strings.HasPrefix(name, "libcrypto.so") {
-		return true
-	}
-	// GnuTLS
-	if strings.HasPrefix(name, "libgnutls.so") {
-		return true
-	}
-	return false
+	return strings.HasPrefix(name, "libssl.so") ||
+		strings.HasPrefix(name, "libboringssl.so") ||
+		strings.HasPrefix(name, "libcrypto.so") ||
+		strings.HasPrefix(name, "libgnutls.so")
 }
 
 // Close releases all links and the eBPF manager.
@@ -410,37 +385,11 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 		}
 
 		if event.Type == 1 { // exec
-			m.log.Info("Detected exec in tracked container, attaching uprobes", "tgid", event.Tgid)
-			m.freezeAttachUnfreeze(int(event.Tgid))
-		}
-	}
-}
-
-// freezeAttachUnfreeze freezes the process's cgroup, attaches TLS uprobes,
-// then unfreezes. This eliminates the race where a process makes TLS calls
-// before uprobes are attached.
-func (m *TLSUprobeManager) freezeAttachUnfreeze(pid int) {
-	cgroupPath, err := cgroups.GetCgroupPathForPID(m.cgroupRoot, pid)
-	if err != nil {
-		m.log.V(1).Info("could not resolve cgroup for freeze, attaching without freeze", "pid", pid, "err", err)
-		if err := m.AttachTLS(pid); err != nil {
-			m.log.V(1).Info("could not attach TLS uprobes to exec'd process", "pid", pid, "err", err)
-		}
-		return
-	}
-
-	if err := cgroups.FreezeCgroup(cgroupPath); err != nil {
-		m.log.V(1).Info("could not freeze cgroup, attaching without freeze", "pid", pid, "err", err)
-	} else {
-		defer func() {
-			if err := cgroups.UnfreezeCgroup(cgroupPath); err != nil {
-				m.log.Error(err, "failed to unfreeze cgroup — processes may be stuck!", "pid", pid, "cgroup", cgroupPath)
+			m.log.Info("Detected exec in tracked container, attaching uprobes", "tgid", event.Tgid, "cgroupID", event.CgroupID)
+			if err := m.AttachTLS(int(event.Tgid)); err != nil {
+				m.log.V(1).Info("could not attach TLS uprobes to exec'd process", "tgid", event.Tgid, "err", err)
 			}
-		}()
-	}
-
-	if err := m.AttachTLS(pid); err != nil {
-		m.log.V(1).Info("could not attach TLS uprobes to exec'd process", "pid", pid, "err", err)
+		}
 	}
 }
 
@@ -473,7 +422,6 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return nil
 			}
-			// Deadline exceeded is expected — just loop back to check sync ticker
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				continue
 			}
@@ -487,7 +435,6 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 			continue
 		}
 
-		// The rewrite is handled in-kernel! We only print events for observation.
 		if event.IsRewritten == 1 {
 			m.log.Info("REWRITE SUCCESS: eBPF synchronously rewrote a secret", "pid", event.Pid)
 		} else {
@@ -498,7 +445,6 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 
 // syncSecretsToBPF updates the eBPF map with the latest shadow secret values
 // and the watched_hosts map with hostnames from secret entries.
-// Called on init and periodically. Delegates to the extracted syncSecrets function.
 func (m *TLSUprobeManager) syncSecretsToBPF() {
 	if err := syncSecrets(m.objs.SecretMap, m.objs.WatchedHosts, m.store, m.log); err != nil {
 		m.log.Error(err, "failed to sync secrets to BPF map")

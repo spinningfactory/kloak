@@ -159,7 +159,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Attach uprobes outside the lock — this involves filesystem I/O.
 	for _, cgroupID := range needsAttach {
-		if r.attachUprobesToCgroup(cgroupID, pod) {
+		if cgroupPath := r.attachUprobesToCgroup(cgroupID, pod); cgroupPath != "" {
 			r.mu.Lock()
 			if tracked := r.trackedPods[string(pod.UID)]; tracked != nil {
 				tracked[cgroupID] = true // mark as successfully attached
@@ -169,7 +169,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			// Register the cgroup for exec/exit tracepoint tracking so new
 			// processes spawned inside the container are automatically detected.
 			if r.UprobeManager != nil {
-				if err := r.UprobeManager.TrackCgroup(cgroupID); err != nil {
+				if err := r.UprobeManager.TrackCgroup(cgroupID, cgroupPath); err != nil {
 					log.Error(err, "failed to track cgroup for exec events", "cgroupID", cgroupID)
 				}
 			}
@@ -197,10 +197,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 }
 
 // attachUprobesToCgroup reads the cgroup's procs file to find a PID and calls the uprobe manager.
-// Returns true if at least one uprobe was successfully attached.
-func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) bool {
+// Returns the cgroup filesystem path on success, or empty string on failure.
+func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) string {
 	if r.UprobeManager == nil {
-		return false
+		return ""
 	}
 
 	r.Log.Info("Trying to attach uprobes to new container", "cgroup", cgroupID)
@@ -232,12 +232,12 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) boo
 		pids, err := cgroups.ReadCgroupProcs(containerCgroupPath)
 		if err != nil {
 			r.Log.Error(err, "failed to read cgroup.procs", "path", containerCgroupPath)
-			return false
+			return ""
 		}
 
 		if len(pids) == 0 {
 			r.Log.V(1).Info("no PIDs found in cgroup.procs", "path", containerCgroupPath)
-			return false
+			return ""
 		}
 
 		// Attempt to attach uprobes to every PID in the cgroup.
@@ -253,11 +253,14 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) boo
 				attached = true
 			}
 		}
-		return attached
+		if attached {
+			return containerCgroupPath
+		}
+		return ""
 	}
 
 	r.Log.V(1).Info("could not find matching container for cgroup", "cgroupID", cgroupID)
-	return false
+	return ""
 }
 
 // handleDelete removes a pod from tracking. uid is the pod UID (trackedPods key),

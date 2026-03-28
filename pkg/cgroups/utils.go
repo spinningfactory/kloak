@@ -68,38 +68,6 @@ func FindContainerCgroupPath(cgroupRoot, podUID, containerID string) (string, er
 	return "", fmt.Errorf("cgroup path not found for container %s", containerID)
 }
 
-// GetCgroupPathForPID reads /proc/<pid>/cgroup and returns the absolute cgroup
-// directory path by joining cgroupRoot with the relative cgroup path.
-// On cgroups v2, /proc/<pid>/cgroup contains a single line like "0::/kubepods/...".
-func GetCgroupPathForPID(cgroupRoot string, pid int) (string, error) {
-	if cgroupRoot == "" {
-		cgroupRoot = DefaultCgroupRoot
-	}
-	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
-	if err != nil {
-		return "", fmt.Errorf("reading /proc/%d/cgroup: %w", pid, err)
-	}
-	for _, line := range strings.Split(strings.TrimSpace(string(data)), "\n") {
-		// cgroups v2 format: "0::<relative_path>"
-		parts := strings.SplitN(line, ":", 3)
-		if len(parts) == 3 && parts[0] == "0" {
-			return filepath.Join(cgroupRoot, parts[2]), nil
-		}
-	}
-	return "", fmt.Errorf("no cgroup v2 entry found for pid %d", pid)
-}
-
-// FreezeCgroup writes "1" to the cgroup.freeze file, suspending all processes
-// in the cgroup. Returns nil if the freeze file doesn't exist (non-fatal).
-func FreezeCgroup(cgroupPath string) error {
-	return os.WriteFile(filepath.Join(cgroupPath, "cgroup.freeze"), []byte("1"), 0o644)
-}
-
-// UnfreezeCgroup writes "0" to the cgroup.freeze file, resuming all processes.
-func UnfreezeCgroup(cgroupPath string) error {
-	return os.WriteFile(filepath.Join(cgroupPath, "cgroup.freeze"), []byte("0"), 0o644)
-}
-
 // ReadCgroupProcs reads the PIDs from a cgroup's cgroup.procs file.
 func ReadCgroupProcs(cgroupPath string) ([]int, error) {
 	procsPath := filepath.Join(cgroupPath, "cgroup.procs")
