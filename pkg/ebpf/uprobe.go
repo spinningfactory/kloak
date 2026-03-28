@@ -97,11 +97,12 @@ func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Log
 		if err != nil {
 			continue
 		}
-		defer func() { _ = f.Close() }()
 
 		key := uint32(0)
 		val := uint32(f.Fd())
-		if err := objs.CgroupAncestor.Update(key, val, 0); err != nil {
+		err = objs.CgroupAncestor.Update(key, val, 0)
+		_ = f.Close()
+		if err != nil {
 			return fmt.Errorf("updating cgroup_ancestor map: %w", err)
 		}
 		log.Info("Configured cgroup ancestor for exec tracepoint", "path", path)
