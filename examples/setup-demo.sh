@@ -138,6 +138,8 @@ deploy_kloak() {
     # Install or upgrade Kloak via Helm
     helm upgrade --install kloak "$ROOT_DIR/charts/kloak" \
         -n kloak-system --create-namespace \
+        --set image.repository=kloak \
+        --set image.tag=latest \
         --set image.pullPolicy=Never \
         --wait --timeout 120s
 
