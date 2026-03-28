@@ -54,13 +54,6 @@ func main() {
 	fmt.Println("  - X-Secret-Blocked: Should show UUID in response (not replaced)")
 	fmt.Println(strings.Repeat("=", 60))
 
-	// Add startup delay to wait for Controller to program eBPF maps
-	// Go starts very fast, often before the ConfigMap/eBPF is ready.
-	// This prevents the "Persistent Connection Race" where the first connection
-	// bypasses eBPF interception and then is reused for all subsequent requests.
-	fmt.Println("Waiting 15s for Kloak controller to sync...")
-	time.Sleep(15 * time.Second)
-
 	// Force HTTP/1.1 — Go defaults to h2 via ALPN, but HTTP/2 uses binary
 	// HPACK-encoded frames that the eBPF uprobe scanner cannot parse.
 	// HTTP/1.1 sends plaintext headers through tls.Conn.Write in a single call.
@@ -70,7 +63,6 @@ func main() {
 			TLSClientConfig: &tls.Config{
 				NextProtos: []string{"http/1.1"},
 			},
-			DialTLSContext:    nil,
 			ForceAttemptHTTP2: false,
 			DialContext: (&net.Dialer{
 				Timeout: 10 * time.Second,

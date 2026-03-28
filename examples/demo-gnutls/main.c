@@ -123,9 +123,6 @@ int main(void) {
     printf("Using GnuTLS for TLS (gnutls_record_send)\n");
     printf("\n");
 
-    printf("Waiting 15 seconds for kloak controller to sync...\n");
-    sleep(15);
-
     gnutls_global_init();
 
     gnutls_certificate_credentials_t cred;
