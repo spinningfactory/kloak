@@ -62,12 +62,8 @@ var ebpfTests = []ebpfRewriteTest{
 		deploymentName: "demo-rust-openssl",
 		appLabel:       "app=demo-rust-openssl",
 	},
-	{
-		name:           "rust-ureq-openssl",
-		demoDir:        "demo-rust-ureq-openssl",
-		deploymentName: "demo-rust-ureq-openssl",
-		appLabel:       "app=demo-rust-ureq-openssl",
-	},
+	// NOTE: ureq with native-tls statically links OpenSSL, so kloak
+	// cannot find SSL_write symbols. Excluded from e2e tests.
 	{
 		name:           "rust-attohttpc",
 		demoDir:        "demo-rust-attohttpc",
