@@ -88,8 +88,8 @@ type TLSUprobeManager struct {
 func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Logger) error {
 	// Try well-known kubepods cgroup paths
 	candidates := []string{
-		filepath.Join(cgroupRoot, "kubepods.slice"),  // systemd cgroup driver
-		filepath.Join(cgroupRoot, "kubepods"),         // cgroupfs driver (k3s default)
+		filepath.Join(cgroupRoot, "kubepods.slice"), // systemd cgroup driver
+		filepath.Join(cgroupRoot, "kubepods"),       // cgroupfs driver (k3s default)
 	}
 
 	for _, path := range candidates {
@@ -97,7 +97,7 @@ func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Log
 		if err != nil {
 			continue
 		}
-		defer f.Close()
+		defer func() { _ = f.Close() }()
 
 		key := uint32(0)
 		val := uint32(f.Fd())
