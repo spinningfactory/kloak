@@ -258,8 +258,12 @@ jobs:
           docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
           docker build -t kloak-demo-rust-openssl:latest ./examples/demo-rust-openssl/
           docker build -t kloak-demo-rust-rustls:latest ./examples/demo-rust-rustls/
+          docker build -t kloak-demo-rust-ureq-rustls:latest ./examples/demo-rust-ureq-rustls/
+          docker build -t kloak-demo-rust-ureq-openssl:latest ./examples/demo-rust-ureq-openssl/
+          docker build -t kloak-demo-rust-attohttpc:latest ./examples/demo-rust-attohttpc/
+          docker build -t kloak-demo-rust-minreq:latest ./examples/demo-rust-minreq/
           docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
-          k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest kloak-demo-rust-openssl:latest kloak-demo-rust-rustls:latest kloak-demo-python-raw-tls:latest -c kloak-e2e
+          k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest kloak-demo-rust-openssl:latest kloak-demo-rust-rustls:latest kloak-demo-rust-ureq-rustls:latest kloak-demo-rust-ureq-openssl:latest kloak-demo-rust-attohttpc:latest kloak-demo-rust-minreq:latest kloak-demo-python-raw-tls:latest -c kloak-e2e
 
       - name: Install Helm
         uses: azure/setup-helm@v4

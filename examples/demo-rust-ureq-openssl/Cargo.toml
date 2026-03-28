@@ -1,0 +1,10 @@
+[package]
+name = "demo-rust-ureq-openssl"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ureq = { version = "2", default-features = false, features = ["native-tls", "tls"] }
+
+[profile.release]
+strip = false

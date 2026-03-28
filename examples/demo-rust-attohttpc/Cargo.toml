@@ -1,0 +1,10 @@
+[package]
+name = "demo-rust-attohttpc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+attohttpc = "0.28"
+
+[profile.release]
+strip = false

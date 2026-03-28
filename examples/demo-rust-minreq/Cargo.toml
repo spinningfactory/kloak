@@ -1,0 +1,10 @@
+[package]
+name = "demo-rust-minreq"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+minreq = { version = "2", features = ["https"] }
+
+[profile.release]
+strip = false

@@ -62,6 +62,18 @@ var ebpfTests = []ebpfRewriteTest{
 		deploymentName: "demo-rust-openssl",
 		appLabel:       "app=demo-rust-openssl",
 	},
+	{
+		name:           "rust-ureq-openssl",
+		demoDir:        "demo-rust-ureq-openssl",
+		deploymentName: "demo-rust-ureq-openssl",
+		appLabel:       "app=demo-rust-ureq-openssl",
+	},
+	{
+		name:           "rust-attohttpc",
+		demoDir:        "demo-rust-attohttpc",
+		deploymentName: "demo-rust-attohttpc",
+		appLabel:       "app=demo-rust-attohttpc",
+	},
 }
 
 // TestEBPFRawTLSHostFiltering tests that DNS-verified host filtering works with
