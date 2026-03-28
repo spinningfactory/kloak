@@ -98,21 +98,13 @@ e2e-setup:
 	@docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
 	@docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
 	@docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
-	@echo "==> Building Rust demo images (pruning build cache between builds)..."
+	@echo "==> Building Rust demo images (only e2e-tested ones)..."
 	@docker build -t kloak-demo-rust-openssl:latest ./examples/demo-rust-openssl/
-	@docker builder prune -f --filter type=regular 2>/dev/null || true
-	@docker build -t kloak-demo-rust-rustls:latest ./examples/demo-rust-rustls/
-	@docker builder prune -f --filter type=regular 2>/dev/null || true
-	@docker build -t kloak-demo-rust-ureq-openssl:latest ./examples/demo-rust-ureq-openssl/
-	@docker builder prune -f --filter type=regular 2>/dev/null || true
-	@docker build -t kloak-demo-rust-ureq-rustls:latest ./examples/demo-rust-ureq-rustls/
 	@docker builder prune -f --filter type=regular 2>/dev/null || true
 	@docker build -t kloak-demo-rust-attohttpc:latest ./examples/demo-rust-attohttpc/
 	@docker builder prune -f --filter type=regular 2>/dev/null || true
-	@docker build -t kloak-demo-rust-minreq:latest ./examples/demo-rust-minreq/
-	@docker builder prune -f --filter type=regular 2>/dev/null || true
 	@echo "==> Importing images into k3d..."
-	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest kloak-demo-rust-openssl:latest kloak-demo-rust-rustls:latest kloak-demo-rust-ureq-rustls:latest kloak-demo-rust-ureq-openssl:latest kloak-demo-rust-attohttpc:latest kloak-demo-rust-minreq:latest kloak-demo-python-raw-tls:latest -c $(E2E_CLUSTER)
+	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest kloak-demo-rust-openssl:latest kloak-demo-rust-attohttpc:latest kloak-demo-python-raw-tls:latest -c $(E2E_CLUSTER)
 	@docker pull bitnami/kubectl:latest
 	@k3d image import bitnami/kubectl:latest -c $(E2E_CLUSTER)
 	@echo "==> E2E environment ready."
