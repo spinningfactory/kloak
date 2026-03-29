@@ -86,31 +86,46 @@ type TLSUprobeManager struct {
 // in the exec tracepoint to catch all container execs without per-container
 // cgroup tracking.
 func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Logger) error {
-	// Walk the cgroup tree to find the kubepods directory. The depth varies
-	// by environment: standard k8s has it at the root, k3d/Docker nests it
-	// under system.slice/docker-<hash>.scope/, etc.
-	var found string
+	// Find the kubepods cgroup directory. Strategy:
+	// 1. Try well-known direct paths
+	// 2. Walk the cgroup tree
+	// 3. Derive from the controller's own cgroup path (/proc/self/cgroup)
+	//    since the controller runs under kubepods
+	candidates := []string{
+		filepath.Join(cgroupRoot, "kubepods.slice"),
+		filepath.Join(cgroupRoot, "kubepods"),
+	}
+
+	// Walk the tree to handle nested cgroups (k3d/Docker)
 	_ = filepath.WalkDir(cgroupRoot, func(path string, d os.DirEntry, err error) error {
 		if err != nil || !d.IsDir() {
 			return nil
 		}
 		name := d.Name()
 		if name == "kubepods" || name == "kubepods.slice" {
-			found = path
+			candidates = append([]string{path}, candidates...)
 			return filepath.SkipAll
 		}
 		return nil
 	})
 
-	candidates := []string{}
-	if found != "" {
-		candidates = append(candidates, found)
+	// Derive from controller's own cgroup — the controller itself runs
+	// under kubepods, so we can find it from /proc/self/cgroup
+	if selfCgroup, err := os.ReadFile("/proc/self/cgroup"); err == nil {
+		for _, line := range strings.Split(string(selfCgroup), "\n") {
+			parts := strings.SplitN(line, ":", 3)
+			if len(parts) == 3 && parts[0] == "0" {
+				// Find the kubepods ancestor in the path
+				cgPath := parts[2]
+				for _, marker := range []string{"/kubepods.slice", "/kubepods"} {
+					if idx := strings.Index(cgPath, marker); idx >= 0 {
+						ancestorPath := filepath.Join(cgroupRoot, cgPath[:idx+len(marker)])
+						candidates = append([]string{ancestorPath}, candidates...)
+					}
+				}
+			}
+		}
 	}
-	// Also try direct paths as fast path
-	candidates = append(candidates,
-		filepath.Join(cgroupRoot, "kubepods.slice"),
-		filepath.Join(cgroupRoot, "kubepods"),
-	)
 
 	for _, path := range candidates {
 		f, err := os.Open(path)
