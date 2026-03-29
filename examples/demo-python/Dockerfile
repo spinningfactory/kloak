@@ -4,6 +4,7 @@ WORKDIR /app
 
 # Install requests
 RUN pip install --no-cache-dir requests
+RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 
 # Copy application
 COPY app.py .
