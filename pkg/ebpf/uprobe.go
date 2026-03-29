@@ -86,26 +86,31 @@ type TLSUprobeManager struct {
 // in the exec tracepoint to catch all container execs without per-container
 // cgroup tracking.
 func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Logger) error {
-	// Try well-known kubepods cgroup paths, then walk the tree as fallback.
-	// k3d/Docker nests cgroups differently than standard k8s.
-	candidates := []string{
-		filepath.Join(cgroupRoot, "kubepods.slice"), // systemd cgroup driver
-		filepath.Join(cgroupRoot, "kubepods"),       // cgroupfs driver (k3s default)
-	}
-
-	// Also walk one level deep to handle nested cgroups (e.g., k3d in Docker)
-	entries, err := os.ReadDir(cgroupRoot)
-	if err == nil {
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			nested := filepath.Join(cgroupRoot, e.Name(), "kubepods.slice")
-			candidates = append(candidates, nested)
-			nested = filepath.Join(cgroupRoot, e.Name(), "kubepods")
-			candidates = append(candidates, nested)
+	// Walk the cgroup tree to find the kubepods directory. The depth varies
+	// by environment: standard k8s has it at the root, k3d/Docker nests it
+	// under system.slice/docker-<hash>.scope/, etc.
+	var found string
+	_ = filepath.WalkDir(cgroupRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
 		}
+		name := d.Name()
+		if name == "kubepods" || name == "kubepods.slice" {
+			found = path
+			return filepath.SkipAll
+		}
+		return nil
+	})
+
+	candidates := []string{}
+	if found != "" {
+		candidates = append(candidates, found)
 	}
+	// Also try direct paths as fast path
+	candidates = append(candidates,
+		filepath.Join(cgroupRoot, "kubepods.slice"),
+		filepath.Join(cgroupRoot, "kubepods"),
+	)
 
 	for _, path := range candidates {
 		f, err := os.Open(path)
