@@ -218,12 +218,17 @@ func ptr[T any](v T) *T {
 // whose HPACK Huffman encoding is at least as long as the real secret's.
 // This ensures HTTP/2 HPACK rewriting works — the shadow's Huffman length
 // determines the space available in the wire buffer for the rewritten value.
+// huffPadChars are uppercase letters with long HPACK Huffman codes (7-8 bits).
+// Used for random padding to inflate shadow Huffman length while maintaining
+// uniqueness across secrets.
+const huffPadChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
 func generateShadowValue(originalLen int, realSecret string, log logr.Logger) string {
 	realHuffLen := int(hpack.HuffmanEncodeLength(realSecret))
 
 	// Try up to 10 UUIDs. UUID hex chars compress well in Huffman (~5-6 bits),
-	// while uppercase letters compress poorly (~7 bits). If the UUID-based
-	// shadow is too short in Huffman, replace trailing chars with uppercase.
+	// while uppercase letters compress poorly (~7-8 bits). If the UUID-based
+	// shadow is too short in Huffman, pad with random uppercase letters.
 	for attempt := 0; attempt < 10; attempt++ {
 		newUUID := uuid.New().String()
 		baseVal := ValuePrefix + newUUID
@@ -233,10 +238,11 @@ func generateShadowValue(originalLen int, realSecret string, log logr.Logger) st
 			log.V(1).Info("Original secret shorter than shadow prefix, truncating UUID", "originalLen", originalLen)
 			shadow = baseVal[:originalLen]
 		} else {
-			// Pad with uppercase letters (long Huffman codes) instead of spaces
-			padding := make([]byte, originalLen-len(baseVal))
+			// Pad with random uppercase letters (long Huffman codes)
+			padLen := originalLen - len(baseVal)
+			padding := make([]byte, padLen)
 			for i := range padding {
-				padding[i] = 'X' // 'X' = 8 bits in HPACK Huffman (worst compression)
+				padding[i] = huffPadChars[uuid.New()[i%16]%byte(len(huffPadChars))]
 			}
 			shadow = baseVal + string(padding)
 		}
@@ -246,11 +252,12 @@ func generateShadowValue(originalLen int, realSecret string, log logr.Logger) st
 			return shadow
 		}
 
-		// Shadow Huffman still too short — try replacing more chars with uppercase
+		// Shadow Huffman still too short — replace trailing UUID chars with
+		// random uppercase letters which have longer Huffman codes
 		shadowBytes := []byte(shadow)
 		for j := len(shadowBytes) - 1; j >= 8 && shadowHuffLen < realHuffLen; j-- {
 			if shadowBytes[j] >= '0' && shadowBytes[j] <= '9' || shadowBytes[j] >= 'a' && shadowBytes[j] <= 'f' || shadowBytes[j] == '-' {
-				shadowBytes[j] = 'Z' // 'Z' = 8 bits in HPACK Huffman
+				shadowBytes[j] = huffPadChars[uuid.New()[0]%byte(len(huffPadChars))]
 				shadowHuffLen = int(hpack.HuffmanEncodeLength(string(shadowBytes)))
 			}
 		}
@@ -260,12 +267,16 @@ func generateShadowValue(originalLen int, realSecret string, log logr.Logger) st
 		}
 	}
 
-	// Fallback: just use the last attempt (HTTP/2 may not work but HTTP/1.1 will)
+	// Fallback: use random uppercase padding
 	newUUID := uuid.New().String()
 	baseVal := ValuePrefix + newUUID
 	if len(baseVal) > originalLen {
 		return baseVal[:originalLen]
 	}
-	padding := strings.Repeat("X", originalLen-len(baseVal))
-	return baseVal + padding
+	padLen := originalLen - len(baseVal)
+	padding := make([]byte, padLen)
+	for i := range padding {
+		padding[i] = huffPadChars[uuid.New()[i%16]%byte(len(huffPadChars))]
+	}
+	return baseVal + string(padding)
 }
