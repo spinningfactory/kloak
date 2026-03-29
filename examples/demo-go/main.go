@@ -53,8 +53,8 @@ func main() {
 	fmt.Println(strings.Repeat("=", 60))
 
 	// Brief delay for eBPF uprobe attachment before the first TLS connection.
-	fmt.Println("Waiting 2s for Kloak controller to sync...")
-	time.Sleep(2 * time.Second)
+	fmt.Println("Waiting 5s for Kloak controller to sync...")
+	time.Sleep(5 * time.Second)
 
 	// Use default HTTP/2 — the eBPF scanner supports both HTTP/1.1 plaintext
 	// and HTTP/2 HPACK Huffman-encoded headers.
