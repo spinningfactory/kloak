@@ -1092,11 +1092,8 @@ int bpf_phase2_rewrite(void *ctx) {
 
 SEC("uprobe/go_tls_write")
 int bpf_uprobe_go_tls_write(void *ctx) {
-  // Filter by cgroup: only intercept processes in tracked containers.
-  // Uprobes are attached system-wide (all CPUs) so we must filter here.
-  __u64 cgroup_id = bpf_get_current_cgroup_id();
-  if (!bpf_map_lookup_elem(&tracked_cgroups, &cgroup_id))
-    return 0;
+  // No cgroup filter — Go uprobes use PID-scoped attachment because
+  // Go binaries are statically linked (unique per container).
 
   void *data_ptr;
   __u64 data_len;

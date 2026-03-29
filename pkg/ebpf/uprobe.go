@@ -282,9 +282,11 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		return fmt.Errorf("opening executable %s: %w", exePath, err)
 	}
 
-	// 1. Try Go crypto/tls (statically linked into the binary)
+	// 1. Try Go crypto/tls (statically linked into the binary).
+	// Use PID-scoped attachment because Go binaries are unique per container
+	// and system-wide uprobes via overlay don't fire for the same binary.
 	goWriteSym := "crypto/tls.(*Conn).Write"
-	if up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, nil); err == nil {
+	if up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, &link.UprobeOptions{PID: pid}); err == nil {
 		m.log.Info("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
 		m.links = append(m.links, up)
 		return nil
@@ -298,9 +300,10 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	gnutlsSymbols := []string{"gnutls_record_send", "gnutls_record_send2"}
 	attached := false
 
-	// Try main executable first (statically linked OpenSSL/BoringSSL/GnuTLS)
+	// Try main executable first (statically linked OpenSSL/BoringSSL/GnuTLS).
+	// Use PID-scoped because the main exe is unique per container.
 	for _, sym := range append(sslSymbols, gnutlsSymbols...) {
-		if up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil); err == nil {
+		if up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid}); err == nil {
 			m.log.Info("Attached uprobe to main exe", "pid", pid, "symbol", sym)
 			m.links = append(m.links, up)
 			attached = true
