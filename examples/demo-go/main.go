@@ -52,6 +52,13 @@ func main() {
 	fmt.Println("  - X-Secret-Blocked: Should show UUID in response (not replaced)")
 	fmt.Println(strings.Repeat("=", 60))
 
+	// Wait for eBPF secret sync to populate watched_hosts before first DNS query.
+	// Without this, the DNS response for httpbin.org arrives before watched_hosts
+	// is populated and gets discarded, breaking host-based filtering.
+	// TODO: Fix by triggering syncSecretsToBPF immediately when secrets are discovered.
+	fmt.Println("Waiting 5s for Kloak controller to sync...")
+	time.Sleep(5 * time.Second)
+
 	// Use default HTTP/2 — the eBPF scanner supports both HTTP/1.1 plaintext
 	// and HTTP/2 HPACK Huffman-encoded headers.
 	client := &http.Client{
