@@ -79,6 +79,7 @@ type TLSUprobeManager struct {
 	// cgroupPaths maps cgroup inode ID -> filesystem path.
 	// Populated by TrackCgroup.
 	cgroupPaths sync.Map // uint64 -> string
+
 }
 
 // setupCgroupAncestor finds the kubepods cgroup directory and stores its fd
