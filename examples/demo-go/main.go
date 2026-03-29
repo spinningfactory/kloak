@@ -52,8 +52,13 @@ func main() {
 	fmt.Println("  - X-Secret-Blocked: Should show UUID in response (not replaced)")
 	fmt.Println(strings.Repeat("=", 60))
 
-	// Use default HTTP/2 — the eBPF scanner supports both HTTP/1.1 plaintext
-	// and HTTP/2 HPACK Huffman-encoded headers.
+	// Brief delay for eBPF uprobe attachment before the first TLS connection.
+	fmt.Println("Waiting 2s for Kloak controller to sync...")
+	time.Sleep(2 * time.Second)
+
+	// Force HTTP/1.1 — Go defaults to h2 via ALPN, but HTTP/2 uses binary
+	// HPACK-encoded frames that the eBPF uprobe scanner cannot parse.
+	// HTTP/1.1 sends plaintext headers through tls.Conn.Write in a single call.
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
