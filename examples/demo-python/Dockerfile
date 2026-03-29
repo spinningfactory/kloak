@@ -7,6 +7,9 @@ RUN pip install --no-cache-dir requests
 
 # Copy application
 COPY app.py .
+COPY entrypoint.sh .
 
-# Run the demo
-CMD ["python", "-u", "app.py"]
+# Use shell entrypoint to exercise exec tracepoint detection.
+# At container start, PID 1 is /bin/sh (no TLS symbols). Python
+# starts via exec, triggering sched_process_exec for uprobe attachment.
+ENTRYPOINT ["/bin/sh", "/app/entrypoint.sh"]

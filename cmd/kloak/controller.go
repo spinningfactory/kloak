@@ -64,7 +64,7 @@ func runController(cmd *cobra.Command, args []string) {
 	var err error
 
 	if enableEBPF {
-		uprobeMgr, err = ebpf.NewTLSUprobeManager(store)
+		uprobeMgr, err = ebpf.NewTLSUprobeManager(store, cgroupPath)
 		if err != nil {
 			setupLog.Error(err, "failed to initialize eBPF uprobe manager")
 			os.Exit(1)
@@ -132,6 +132,11 @@ func runController(cmd *cobra.Command, args []string) {
 		go func() {
 			if err := uprobeMgr.PollEvents(ctx); err != nil && ctx.Err() == nil {
 				setupLog.Error(err, "eBPF TLS event poller failed")
+			}
+		}()
+		go func() {
+			if err := uprobeMgr.PollExecEvents(ctx); err != nil && ctx.Err() == nil {
+				setupLog.Error(err, "eBPF process exec event poller failed")
 			}
 		}()
 	}
