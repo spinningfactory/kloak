@@ -129,8 +129,15 @@ func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Log
 		return nil
 	}
 
-	log.Error(nil, "kubepods cgroup not found — exec tracepoint will not detect container processes. "+
-		"Checked candidates and walked tree from cgroupRoot.", "cgroupRoot", cgroupRoot, "candidates", candidates)
+	// List top-level entries to help diagnose cgroup layout
+	var topLevel []string
+	if entries, err := os.ReadDir(cgroupRoot); err == nil {
+		for _, e := range entries {
+			topLevel = append(topLevel, e.Name())
+		}
+	}
+	log.Error(nil, "kubepods cgroup not found — exec tracepoint will not detect container processes",
+		"cgroupRoot", cgroupRoot, "candidates", candidates, "topLevelDirs", topLevel)
 	return fmt.Errorf("kubepods cgroup not found in %s", cgroupRoot)
 }
 
