@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/google/uuid"
+	"golang.org/x/net/http2/hpack"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -122,22 +123,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 		// Generate new if needed or if length mismatch
 		if shadowValue == "" {
-			newUUID := uuid.New().String()
-			baseVal := ValuePrefix + newUUID
-
-			// Handle padding or truncation to exactly match originalLen
-			if len(baseVal) > originalLen {
-				// We cannot truncate UUIDs safely and guarantee uniqueness easily.
-				// However, if the secret is shorter than our prefix + UUID (kloak: + 36 chars = 42 chars)
-				// we are in trouble anyway because ebpf probe rewrite needs space.
-				// We will log a warning, but we must truncate to avoid memory corruption on rewrite.
-				log.Info("WARNING: original secret is shorter than shadow secret UUID. Truncating UUID, collision risk.", "key", key, "originalLen", originalLen)
-				shadowValue = baseVal[:originalLen]
-			} else {
-				// Pad with spaces (or another safe character) to match the original length
-				paddingStr := strings.Repeat(" ", originalLen-len(baseVal))
-				shadowValue = baseVal + paddingStr
-			}
+			shadowValue = generateShadowValue(originalLen, originalValue, log)
 		}
 
 		newData[key] = []byte(shadowValue)
@@ -226,4 +212,60 @@ func (r *SecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 func ptr[T any](v T) *T {
 	return &v
+}
+
+// generateShadowValue creates a shadow value of exactly originalLen bytes
+// whose HPACK Huffman encoding is at least as long as the real secret's.
+// This ensures HTTP/2 HPACK rewriting works — the shadow's Huffman length
+// determines the space available in the wire buffer for the rewritten value.
+func generateShadowValue(originalLen int, realSecret string, log logr.Logger) string {
+	realHuffLen := int(hpack.HuffmanEncodeLength(realSecret))
+
+	// Try up to 10 UUIDs. UUID hex chars compress well in Huffman (~5-6 bits),
+	// while uppercase letters compress poorly (~7 bits). If the UUID-based
+	// shadow is too short in Huffman, replace trailing chars with uppercase.
+	for attempt := 0; attempt < 10; attempt++ {
+		newUUID := uuid.New().String()
+		baseVal := ValuePrefix + newUUID
+
+		var shadow string
+		if len(baseVal) > originalLen {
+			log.V(1).Info("Original secret shorter than shadow prefix, truncating UUID", "originalLen", originalLen)
+			shadow = baseVal[:originalLen]
+		} else {
+			// Pad with uppercase letters (long Huffman codes) instead of spaces
+			padding := make([]byte, originalLen-len(baseVal))
+			for i := range padding {
+				padding[i] = 'X' // 'X' = 8 bits in HPACK Huffman (worst compression)
+			}
+			shadow = baseVal + string(padding)
+		}
+
+		shadowHuffLen := int(hpack.HuffmanEncodeLength(shadow))
+		if shadowHuffLen >= realHuffLen {
+			return shadow
+		}
+
+		// Shadow Huffman still too short — try replacing more chars with uppercase
+		shadowBytes := []byte(shadow)
+		for j := len(shadowBytes) - 1; j >= 8 && shadowHuffLen < realHuffLen; j-- {
+			if shadowBytes[j] >= '0' && shadowBytes[j] <= '9' || shadowBytes[j] >= 'a' && shadowBytes[j] <= 'f' || shadowBytes[j] == '-' {
+				shadowBytes[j] = 'Z' // 'Z' = 8 bits in HPACK Huffman
+				shadowHuffLen = int(hpack.HuffmanEncodeLength(string(shadowBytes)))
+			}
+		}
+		shadow = string(shadowBytes)
+		if int(hpack.HuffmanEncodeLength(shadow)) >= realHuffLen {
+			return shadow
+		}
+	}
+
+	// Fallback: just use the last attempt (HTTP/2 may not work but HTTP/1.1 will)
+	newUUID := uuid.New().String()
+	baseVal := ValuePrefix + newUUID
+	if len(baseVal) > originalLen {
+		return baseVal[:originalLen]
+	}
+	padding := strings.Repeat("X", originalLen-len(baseVal))
+	return baseVal + padding
 }

@@ -91,20 +91,20 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 		// Also store a Huffman-encoded variant for HTTP/2 HPACK interception.
 		// HPACK uses a static Huffman table (RFC 7541) so the encoding is
 		// deterministic. The eBPF scanner checks for both plaintext "kloak:"
-		// and its Huffman encoding (0xeb 0x41 0xc7 0xd6 0xe7).
+		// and its Huffman encoding (0xeb 0x41 0xc7 0xd6).
+		//
+		// Store a Huffman-encoded variant for HTTP/2 HPACK interception.
+		// The rewritten Huffman data must be EXACTLY the same length as the
+		// shadow's Huffman encoding — the HPACK length prefix in the wire
+		// buffer is immutable. If the real's Huffman is longer, we skip
+		// (HTTP/1.1 path still works). If shorter, pad with EOS (0xFF).
 		huffShadow := hpack.AppendHuffmanString(nil, shadowPrefix)
 		huffReal := hpack.AppendHuffmanString(nil, entry.Value)
-		if len(huffShadow) >= 8 && len(huffReal) > 0 {
-			// Pad the shorter encoding to match the longer one's length.
-			// HPACK allows EOS padding (0xFF bits) after Huffman data.
-			targetLen := len(huffShadow)
-			if len(huffReal) > targetLen {
-				targetLen = len(huffReal)
-			}
-			for len(huffShadow) < targetLen {
-				huffShadow = append(huffShadow, 0xff)
-			}
-			for len(huffReal) < targetLen {
+		realHuffLen := len(huffReal)
+
+		if len(huffShadow) >= 8 && realHuffLen > 0 {
+			// Pad real with HPACK EOS bits to match shadow's Huffman length
+			for len(huffReal) < len(huffShadow) {
 				huffReal = append(huffReal, 0xff)
 			}
 
@@ -135,6 +135,11 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 					log.Info("Synced Huffman secret into eBPF map", "hash", hash, "huffLen", huffLen)
 				}
 			}
+		} else if len(huffShadow) >= 8 && realHuffLen > len(huffShadow) {
+			// This should not happen if the secret reconciler generates shadows
+			// with sufficient Huffman length, but log it just in case.
+			log.Info("Skipping HTTP/2 Huffman variant — shadow Huffman too short",
+				"hash", hash, "shadowHuffLen", len(huffShadow), "realHuffLen", realHuffLen)
 		}
 	}
 
