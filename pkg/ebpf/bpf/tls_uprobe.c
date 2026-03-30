@@ -991,11 +991,21 @@ static int scan_chunk(__u32 chunk_idx, void *ctx) {
     if (i + SECRET_KEY_LEN > read_len)
       break;
 
-    if (!is_kloak_prefix(&scratch_data->data[i]))
+    // Check for both plaintext "kloak:" (HTTP/1.1) and HPACK Huffman
+    // encoded "kloak:" (HTTP/2). Both use the same 8-byte key lookup
+    // into secret_map — plaintext keys start with "kloak:" ASCII,
+    // Huffman keys start with the Huffman encoding bytes.
+    int matched = 0;
+    if (is_kloak_prefix(&scratch_data->data[i]))
+      matched = 1;
+    else if (is_kloak_prefix_huffman((const unsigned char *)&scratch_data->data[i]))
+      matched = 1;
+
+    if (!matched)
       continue;
 
-    // 8-byte key lookup (kloak: + 2 UUID chars).
-    // Collision detection is done on the Go side at sync time.
+    // 8-byte key lookup. For plaintext: "kloak:" + 2 UUID chars.
+    // For Huffman: first 8 bytes of Huffman-encoded shadow value.
     struct secret_key key = {};
     __builtin_memcpy(key.prefix, &scratch_data->data[i], SECRET_KEY_LEN);
 
@@ -1082,11 +1092,8 @@ int bpf_phase2_rewrite(void *ctx) {
 
 SEC("uprobe/go_tls_write")
 int bpf_uprobe_go_tls_write(void *ctx) {
-  // Filter by cgroup: only intercept processes in tracked containers.
-  // Uprobes are attached system-wide (all CPUs) so we must filter here.
-  __u64 cgroup_id = bpf_get_current_cgroup_id();
-  if (!bpf_map_lookup_elem(&tracked_cgroups, &cgroup_id))
-    return 0;
+  // No cgroup filter — Go uprobes use PID-scoped attachment because
+  // Go binaries are statically linked (unique per container).
 
   void *data_ptr;
   __u64 data_len;
