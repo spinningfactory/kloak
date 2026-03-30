@@ -86,11 +86,23 @@ HELPER_INLINE __u32 clamp_write_len(__u32 val_len) {
   return ((val_len - 1) & (SECRET_MAX_LEN - 1)) + 1;
 }
 
-// Check if buffer starts with the 6-byte "kloak:" prefix.
+// Check if buffer starts with the 6-byte "kloak:" prefix (HTTP/1.1 plaintext).
 // Returns 1 if it matches, 0 otherwise. Caller must ensure buf has >= 6 bytes.
 HELPER_INLINE int is_kloak_prefix(const char *buf) {
   return (buf[0] == 'k' && buf[1] == 'l' && buf[2] == 'o' && buf[3] == 'a' &&
           buf[4] == 'k' && buf[5] == ':')
+             ? 1
+             : 0;
+}
+
+// Check if buffer starts with the HPACK Huffman encoding of "kloak:" (HTTP/2).
+// The HPACK static Huffman table (RFC 7541 Appendix B) encodes "kloak" as
+// 4 stable bytes: 0xeb 0x41 0xc7 0xd6. The 5th byte varies depending on
+// the character after ":" due to Huffman bit packing. 4 bytes is sufficient
+// to avoid false positives — the 8-byte key lookup confirms the match.
+HELPER_INLINE int is_kloak_prefix_huffman(const unsigned char *buf) {
+  return (buf[0] == 0xeb && buf[1] == 0x41 && buf[2] == 0xc7 &&
+          buf[3] == 0xd6)
              ? 1
              : 0;
 }

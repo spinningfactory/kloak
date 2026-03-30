@@ -79,6 +79,7 @@ type TLSUprobeManager struct {
 	// cgroupPaths maps cgroup inode ID -> filesystem path.
 	// Populated by TrackCgroup.
 	cgroupPaths sync.Map // uint64 -> string
+
 }
 
 // setupCgroupAncestor finds the kubepods cgroup directory and stores its fd
@@ -86,24 +87,44 @@ type TLSUprobeManager struct {
 // in the exec tracepoint to catch all container execs without per-container
 // cgroup tracking.
 func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Logger) error {
-	// Try well-known kubepods cgroup paths, then walk the tree as fallback.
-	// k3d/Docker nests cgroups differently than standard k8s.
+	// Find the kubepods cgroup directory. Strategy:
+	// 1. Try well-known direct paths
+	// 2. Walk the cgroup tree
+	// 3. Derive from the controller's own cgroup path (/proc/self/cgroup)
+	//    since the controller runs under kubepods
 	candidates := []string{
-		filepath.Join(cgroupRoot, "kubepods.slice"), // systemd cgroup driver
-		filepath.Join(cgroupRoot, "kubepods"),       // cgroupfs driver (k3s default)
+		filepath.Join(cgroupRoot, "kubepods.slice"),
+		filepath.Join(cgroupRoot, "kubepods"),
 	}
 
-	// Also walk one level deep to handle nested cgroups (e.g., k3d in Docker)
-	entries, err := os.ReadDir(cgroupRoot)
-	if err == nil {
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
+	// Walk the tree to handle nested cgroups (k3d/Docker)
+	_ = filepath.WalkDir(cgroupRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if name == "kubepods" || name == "kubepods.slice" {
+			candidates = append([]string{path}, candidates...)
+			return filepath.SkipAll
+		}
+		return nil
+	})
+
+	// Derive from controller's own cgroup — the controller itself runs
+	// under kubepods, so we can find it from /proc/self/cgroup
+	if selfCgroup, err := os.ReadFile("/proc/self/cgroup"); err == nil {
+		for _, line := range strings.Split(string(selfCgroup), "\n") {
+			parts := strings.SplitN(line, ":", 3)
+			if len(parts) == 3 && parts[0] == "0" {
+				// Find the kubepods ancestor in the path
+				cgPath := parts[2]
+				for _, marker := range []string{"/kubepods.slice", "/kubepods"} {
+					if idx := strings.Index(cgPath, marker); idx >= 0 {
+						ancestorPath := filepath.Join(cgroupRoot, cgPath[:idx+len(marker)])
+						candidates = append([]string{ancestorPath}, candidates...)
+					}
+				}
 			}
-			nested := filepath.Join(cgroupRoot, e.Name(), "kubepods.slice")
-			candidates = append(candidates, nested)
-			nested = filepath.Join(cgroupRoot, e.Name(), "kubepods")
-			candidates = append(candidates, nested)
 		}
 	}
 
@@ -124,6 +145,15 @@ func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Log
 		return nil
 	}
 
+	// List top-level entries to help diagnose cgroup layout
+	var topLevel []string
+	if entries, err := os.ReadDir(cgroupRoot); err == nil {
+		for _, e := range entries {
+			topLevel = append(topLevel, e.Name())
+		}
+	}
+	log.Error(nil, "kubepods cgroup not found — exec tracepoint will not detect container processes",
+		"cgroupRoot", cgroupRoot, "candidates", candidates, "topLevelDirs", topLevel)
 	return fmt.Errorf("kubepods cgroup not found in %s", cgroupRoot)
 }
 
@@ -275,9 +305,11 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		return fmt.Errorf("opening executable %s: %w", exePath, err)
 	}
 
-	// 1. Try Go crypto/tls (statically linked into the binary)
+	// 1. Try Go crypto/tls (statically linked into the binary).
+	// Use PID-scoped attachment because Go binaries are unique per container
+	// and system-wide uprobes via overlay don't fire for the same binary.
 	goWriteSym := "crypto/tls.(*Conn).Write"
-	if up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, nil); err == nil {
+	if up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, &link.UprobeOptions{PID: pid}); err == nil {
 		m.log.Info("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
 		m.links = append(m.links, up)
 		return nil
@@ -291,9 +323,10 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	gnutlsSymbols := []string{"gnutls_record_send", "gnutls_record_send2"}
 	attached := false
 
-	// Try main executable first (statically linked OpenSSL/BoringSSL/GnuTLS)
+	// Try main executable first (statically linked OpenSSL/BoringSSL/GnuTLS).
+	// Use PID-scoped because the main exe is unique per container.
 	for _, sym := range append(sslSymbols, gnutlsSymbols...) {
-		if up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil); err == nil {
+		if up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid}); err == nil {
 			m.log.Info("Attached uprobe to main exe", "pid", pid, "symbol", sym)
 			m.links = append(m.links, up)
 			attached = true
