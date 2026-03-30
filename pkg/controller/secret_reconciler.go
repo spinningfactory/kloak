@@ -5,8 +5,12 @@ import (
 	"fmt"
 	"strings"
 
+	"crypto/rand"
+	"math/big"
+	"time"
+
 	"github.com/go-logr/logr"
-	"github.com/google/uuid"
+	"github.com/oklog/ulid/v2"
 	"golang.org/x/net/http2/hpack"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -218,65 +222,49 @@ func ptr[T any](v T) *T {
 // whose HPACK Huffman encoding is at least as long as the real secret's.
 // This ensures HTTP/2 HPACK rewriting works — the shadow's Huffman length
 // determines the space available in the wire buffer for the rewritten value.
-// huffPadChars are uppercase letters with long HPACK Huffman codes (7-8 bits).
-// Used for random padding to inflate shadow Huffman length while maintaining
-// uniqueness across secrets.
-const huffPadChars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-
 func generateShadowValue(originalLen int, realSecret string, log logr.Logger) string {
 	realHuffLen := int(hpack.HuffmanEncodeLength(realSecret))
 
-	// Try up to 10 UUIDs. UUID hex chars compress well in Huffman (~5-6 bits),
-	// while uppercase letters compress poorly (~7-8 bits). If the UUID-based
-	// shadow is too short in Huffman, pad with random uppercase letters.
-	for attempt := 0; attempt < 10; attempt++ {
-		newUUID := uuid.New().String()
-		baseVal := ValuePrefix + newUUID
+	// ULID uses Crockford Base32 (uppercase + digits, no hyphens).
+	// These chars have long HPACK Huffman codes (7-8 bits), naturally
+	// producing longer Huffman encodings than UUID hex (5-6 bits).
+	// "kloak:" (6) + ULID (26) = 32 chars total.
+	newULID := ulid.MustNew(ulid.Timestamp(time.Now()), rand.Reader).String()
+	baseVal := ValuePrefix + newULID
 
-		var shadow string
-		if len(baseVal) > originalLen {
-			log.V(1).Info("Original secret shorter than shadow prefix, truncating UUID", "originalLen", originalLen)
-			shadow = baseVal[:originalLen]
-		} else {
-			// Pad with random uppercase letters (long Huffman codes)
-			padLen := originalLen - len(baseVal)
-			padding := make([]byte, padLen)
-			for i := range padding {
-				padding[i] = huffPadChars[uuid.New()[i%16]%byte(len(huffPadChars))]
-			}
-			shadow = baseVal + string(padding)
+	var shadow string
+	if len(baseVal) > originalLen {
+		shadow = baseVal[:originalLen]
+	} else if len(baseVal) < originalLen {
+		// Pad with random Crockford Base32 chars (same charset as ULID)
+		const base32Chars = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+		padLen := originalLen - len(baseVal)
+		padding := make([]byte, padLen)
+		for i := range padding {
+			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(base32Chars))))
+			padding[i] = base32Chars[n.Int64()]
 		}
+		shadow = baseVal + string(padding)
+	} else {
+		shadow = baseVal
+	}
 
-		shadowHuffLen := int(hpack.HuffmanEncodeLength(shadow))
-		if shadowHuffLen >= realHuffLen {
-			return shadow
-		}
-
-		// Shadow Huffman still too short — replace trailing UUID chars with
-		// random uppercase letters which have longer Huffman codes
+	// Verify Huffman length is sufficient for HTTP/2 HPACK rewriting.
+	// ULID's uppercase chars usually produce long enough Huffman, but for
+	// rare cases (short secrets with all-uppercase real values), replace
+	// trailing digits with random uppercase letters (longer Huffman codes).
+	shadowHuffLen := int(hpack.HuffmanEncodeLength(shadow))
+	if shadowHuffLen < realHuffLen {
 		shadowBytes := []byte(shadow)
 		for j := len(shadowBytes) - 1; j >= 8 && shadowHuffLen < realHuffLen; j-- {
-			if shadowBytes[j] >= '0' && shadowBytes[j] <= '9' || shadowBytes[j] >= 'a' && shadowBytes[j] <= 'f' || shadowBytes[j] == '-' {
-				shadowBytes[j] = huffPadChars[uuid.New()[0]%byte(len(huffPadChars))]
+			if shadowBytes[j] >= '0' && shadowBytes[j] <= '9' {
+				n, _ := rand.Int(rand.Reader, big.NewInt(26))
+				shadowBytes[j] = byte('A') + byte(n.Int64())
 				shadowHuffLen = int(hpack.HuffmanEncodeLength(string(shadowBytes)))
 			}
 		}
 		shadow = string(shadowBytes)
-		if int(hpack.HuffmanEncodeLength(shadow)) >= realHuffLen {
-			return shadow
-		}
 	}
 
-	// Fallback: use random uppercase padding
-	newUUID := uuid.New().String()
-	baseVal := ValuePrefix + newUUID
-	if len(baseVal) > originalLen {
-		return baseVal[:originalLen]
-	}
-	padLen := originalLen - len(baseVal)
-	padding := make([]byte, padLen)
-	for i := range padding {
-		padding[i] = huffPadChars[uuid.New()[i%16]%byte(len(huffPadChars))]
-	}
-	return baseVal + string(padding)
+	return shadow
 }
