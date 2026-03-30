@@ -16,7 +16,9 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/go-logr/logr"
+	corev1 "k8s.io/api/core/v1"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
@@ -527,6 +529,42 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 			m.log.V(2).Info("Intercepted TLS packet (no rewrite)", "pid", event.Pid, "len", event.Len)
 		}
 	}
+}
+
+// PreloadWatchedHosts reads K8s secrets with getkloak.io/hosts labels and
+// populates the watched_hosts BPF map before the manager starts. This ensures
+// DNS responses for secret hosts are captured from the very first query.
+func (m *TLSUprobeManager) PreloadWatchedHosts(reader client.Reader) error {
+	ctx := context.Background()
+	var secrets corev1.SecretList
+	if err := reader.List(ctx, &secrets, client.HasLabels{"getkloak.io/enabled"}); err != nil {
+		return fmt.Errorf("listing secrets: %w", err)
+	}
+
+	count := 0
+	val := uint8(1)
+	for i := range secrets.Items {
+		s := &secrets.Items[i]
+		hostsLabel, ok := s.Labels["getkloak.io/hosts"]
+		if !ok || hostsLabel == "" {
+			continue
+		}
+		for _, host := range strings.Split(hostsLabel, ",") {
+			host = strings.TrimSpace(host)
+			if host == "" || host == "*" {
+				continue
+			}
+			var key watchedHostKey
+			copy(key.Host[:], host)
+			if err := m.objs.WatchedHosts.Update(&key, &val, 0); err != nil {
+				m.log.Error(err, "failed to preload watched host", "host", host)
+				continue
+			}
+			count++
+		}
+	}
+	m.log.Info("Preloaded watched_hosts from K8s secrets", "count", count)
+	return nil
 }
 
 // syncSecretsToBPF updates the eBPF map with the latest shadow secret values

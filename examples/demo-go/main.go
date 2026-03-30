@@ -52,10 +52,6 @@ func main() {
 	fmt.Println("  - X-Secret-Blocked: Should show UUID in response (not replaced)")
 	fmt.Println(strings.Repeat("=", 60))
 
-	// Brief delay for watched_hosts BPF map to be populated before first DNS query.
-	fmt.Println("Waiting 10s for Kloak controller to sync...")
-	time.Sleep(10 * time.Second)
-
 	// Use default HTTP/2 — the eBPF scanner supports both HTTP/1.1 plaintext
 	// and HTTP/2 HPACK Huffman-encoded headers.
 	client := &http.Client{

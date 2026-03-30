@@ -125,6 +125,16 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	// Pre-populate watched_hosts BPF map from existing K8s secrets BEFORE
+	// starting the manager. This ensures DNS responses for secret hosts are
+	// captured from the very first query, eliminating the timing gap where
+	// processes start before the reconciler syncs secrets.
+	if uprobeMgr != nil {
+		if err := uprobeMgr.PreloadWatchedHosts(mgr.GetAPIReader()); err != nil {
+			setupLog.Error(err, "failed to preload watched_hosts (DNS filtering may be delayed)")
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Start eBPF TLS event poller (syncs secrets to BPF map and reads events)
