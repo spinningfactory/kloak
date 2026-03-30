@@ -27,6 +27,9 @@ spec:
           args:
             - --enable-ebpf={{ .Values.controller.ebpf.enabled }}
             - --cgroup-path={{ .Values.controller.cgroupPath }}
+            {{- if .Values.controller.dns.trustedServers }}
+            - --trusted-dns-servers={{ join "," .Values.controller.dns.trustedServers }}
+            {{- end }}
           env:
             - name: NODE_NAME
               valueFrom:
