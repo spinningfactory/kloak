@@ -229,8 +229,12 @@ func generateShadowValue(originalLen int, realSecret string) string {
 	// These chars have long HPACK Huffman codes (7-8 bits), naturally
 	// producing longer Huffman encodings than UUID hex (5-6 bits).
 	// "kloak:" (6) + ULID (26) = 32 chars total.
+	// ULID format: 10 chars timestamp + 16 chars random. For short secrets,
+	// truncation would keep only the timestamp (identical for secrets created
+	// at the same time). Put the random part first to maximize uniqueness.
 	newULID := ulid.MustNew(ulid.Timestamp(time.Now()), rand.Reader).String()
-	baseVal := ValuePrefix + newULID
+	ulidRandom := newULID[10:] + newULID[:10] // random first, then timestamp
+	baseVal := ValuePrefix + ulidRandom
 
 	var shadow string
 	switch {
