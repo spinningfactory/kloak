@@ -67,6 +67,8 @@ struct secret_value {
   char real_secret[SECRET_MAX_LEN];
   __u32 host_len;                      // 0 = wildcard (allow all hosts)
   char allowed_host[MAX_HOST_LEN];     // e.g. "httpbin.org"
+  __u16 port;                          // 0 = wildcard, otherwise port number (host byte order)
+  __u8 protocol;                       // IPPROTO_TCP (6) = TCP, IPPROTO_UDP (17) = UDP
   __u32 prefix_len;                    // actual prefix length (8..42)
   char full_prefix[SECRET_PREFIX_MAX]; // full kloak:UUID prefix for verification
 };
@@ -97,6 +99,7 @@ struct scratch_buf {
     struct secret_key key;        // 8-byte key prefix
   } xor_matches[XOR_MAX_MATCHES];
   char host_value[MAX_HOST_LEN]; // host from DNS chain
+  __u16 dest_port;      // destination port in host byte order
   char data[MAX_DATA_SIZE];
 };
 
@@ -232,7 +235,7 @@ struct {
   __type(value, struct dns_ip_val);
 } dns_ip_map SEC(".maps");
 
-// TCP connection fd -> peer IP per process.
+// TCP connection fd -> peer IP and port per process.
 // Populated by tp_exit_connect for every connect() call.
 struct conn_ip_key {
   __u32 tgid;
@@ -241,6 +244,7 @@ struct conn_ip_key {
 
 struct conn_ip_val {
   __u8 ip[16]; // IPv4-mapped-IPv6 or native IPv6
+  __u16 port;  // destination port (network byte order)
 };
 
 
@@ -295,10 +299,11 @@ struct {
   __type(value, struct udp_recv_pending);
 } udp_recv_scratch SEC(".maps");
 
-// Scratch for connect enter->exit correlation: save fd and sockaddr.
+// Scratch for connect enter->exit correlation: save fd, IP, and port.
 struct connect_pending_val {
   __u32 fd;
-  __u8 ip[16]; // destination IP (IPv4-mapped-IPv6)
+  __u8 ip[16];  // destination IP (IPv4-mapped-IPv6)
+  __u16 port;   // destination port (network byte order)
 };
 
 struct {
@@ -993,8 +998,16 @@ int tp_enter_connect(struct trace_event_raw_sys_enter *ctx) {
     __u8 ipv4[4] = {};
     bpf_probe_read_user(ipv4, 4, (void *)(addr_ptr + 4));
     ipv4_to_mapped(val.ip, ipv4);
+    // Port is at offset 2 in sockaddr_in (after sa_family)
+    __u16 port_be = 0;
+    bpf_probe_read_user(&port_be, sizeof(port_be), (void *)(addr_ptr + 2));
+    val.port = port_be;
   } else if (sa_family == 10) { // AF_INET6
     bpf_probe_read_user(val.ip, 16, (void *)(addr_ptr + 8));
+    // Port is at offset 2 in sockaddr_in6
+    __u16 port_be = 0;
+    bpf_probe_read_user(&port_be, sizeof(port_be), (void *)(addr_ptr + 2));
+    val.port = port_be;
   } else {
     return 0;
   }
@@ -1019,6 +1032,7 @@ int tp_exit_connect(struct trace_event_raw_sys_exit *ctx) {
   // Save before delete
   __u32 fd = pending->fd;
   __u8 ip[16];
+  __u16 port = pending->port;
   __builtin_memcpy(ip, pending->ip, 16);
 
   bpf_map_delete_elem(&connect_pending, &pid_tgid);
@@ -1028,10 +1042,11 @@ int tp_exit_connect(struct trace_event_raw_sys_exit *ctx) {
   if (ret != 0 && ret != -115)
     return 0;
 
-  // Always record fd -> IP and IP -> {tgid,fd}
+  // Always record fd -> IP, port, and IP -> {tgid,fd}
   struct conn_ip_key cik = {.tgid = tgid, .fd = fd};
   struct conn_ip_val civ;
   __builtin_memcpy(civ.ip, ip, 16);
+  civ.port = port;
   bpf_map_update_elem(&conn_ip_map, &cik, &civ, BPF_ANY);
 
   // Check if this IP was already DNS-verified
@@ -1094,7 +1109,7 @@ static __always_inline __u32 ssl_read_fd(__u64 ssl_ptr) {
 }
 
 // =============================================================================
-// Resolve host for the current SSL/TLS connection using DNS chain.
+// Resolve host and port for the current SSL/TLS connection using DNS chain.
 //
 // Chain: ssl_fd_map (cache) -> BIO fd read -> last_verified_fd -> conn_ip_map -> dns_ip_map
 // =============================================================================
@@ -1104,6 +1119,7 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
   scratch_data->host_value_len = 0;
   scratch_data->xor_fd = 0;
   __builtin_memset(scratch_data->host_value, 0, MAX_HOST_LEN);
+  scratch_data->dest_port = 0;
 
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
@@ -1169,6 +1185,8 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     struct conn_ip_key cik = {.tgid = tgid, .fd = fd};
     struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
     if (!civ) { dbg_inc(DBG_RESOLVE_NO_CONN); return; }
+    // Store destination port (network byte order from connect)
+    scratch_data->dest_port = __bpf_ntohs(civ->port);
     struct dns_ip_key dik;
     __builtin_memset(&dik, 0, sizeof(dik));
     __builtin_memcpy(dik.ip, civ->ip, 16);
@@ -1190,6 +1208,8 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
     if (!civ)
       continue;
+    // Store destination port (network byte order from connect)
+    scratch_data->dest_port = __bpf_ntohs(civ->port);
     struct dns_ip_key dik;
     __builtin_memset(&dik, 0, sizeof(dik));
     __builtin_memcpy(dik.ip, civ->ip, 16);
@@ -1386,14 +1406,27 @@ int bpf_xor_path(void *ctx) {
   // Host filtering: val is fresh, re-lookup sd for host_value.
   __u32 val_len = val->len;
   __u32 val_host_len = val->host_len;
-  if (val_host_len > 0 && val_host_len < MAX_HOST_LEN) {
-    if (sd_host_len == 0)
-      goto next;
-    // Re-lookup sd for host comparison (val stays in callee-saved reg).
+  __u16 val_port = val->port;
+  if (val_host_len > 0 || val_port > 0) {
+    // Single lookup for both host and port filtering.
     sd = bpf_map_lookup_elem(&scratch, &zero);
     if (!sd) return 0;
-    if (!hosts_match(sd->host_value, val->allowed_host))
-      goto next;
+
+    // Host filtering
+    if (val_host_len > 0 && val_host_len < MAX_HOST_LEN) {
+      if (sd_host_len == 0)
+        goto next;
+      if (!hosts_match(sd->host_value, val->allowed_host))
+        goto next;
+    }
+
+    // Port filtering: val->port == 0 means wildcard (allow all ports).
+    // val->port != 0 means only allow this specific port.
+    if (val_port != 0) {
+      // dest_port is 0 if resolution failed, which correctly fails the filter.
+      if (sd->dest_port != val_port)
+        goto next;
+    }
   }
 
   dbg_inc(DBG_XOR_SECRET_FOUND);

@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"crypto/rand"
@@ -12,6 +13,7 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/oklog/ulid/v2"
 	"golang.org/x/net/http2/hpack"
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -27,6 +29,12 @@ const (
 	// AnnotationSecretEnabled is the label/annotation to enable Kloak secret replication.
 	AnnotationSecretEnabled = "getkloak.io/enabled"
 
+	// AnnotationPort is the label/annotation to specify an allowed port for a secret.
+	AnnotationPort = "getkloak.io/port"
+
+	// AnnotationHosts is the label/annotation to specify allowed hosts for a secret.
+	AnnotationHosts = "getkloak.io/hosts"
+
 	// ShadowSecretSuffix is the suffix appended to the name of the shadow secret.
 	ShadowSecretSuffix = "-kloak"
 
@@ -34,6 +42,44 @@ const (
 	// Must match what the eBPF program expects.
 	ValuePrefix = "kloak:"
 )
+
+type PortSpec struct {
+	Port     uint16
+	Protocol uint8
+}
+
+func parsePortSpec(spec string) (PortSpec, error) {
+	spec = strings.TrimSpace(spec)
+	spec = strings.ToLower(spec)
+
+	protoStr := "tcp"
+	parts := strings.Split(spec, "/")
+	if len(parts) == 0 || len(parts) > 2 {
+		return PortSpec{}, fmt.Errorf("invalid port format: %s", spec)
+	} else if len(parts) == 2 {
+		protoStr = parts[1]
+	}
+	portStr := parts[0]
+
+	port, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return PortSpec{}, err
+	} else if port == 0 || port > 65535 {
+		return PortSpec{}, fmt.Errorf("invalid port: %d", port)
+	}
+
+	var proto uint8
+	switch protoStr {
+	case "tcp":
+		proto = uint8(unix.IPPROTO_TCP)
+	case "udp":
+		proto = uint8(unix.IPPROTO_UDP)
+	default:
+		return PortSpec{}, fmt.Errorf("invalid proto: %s", protoStr)
+	}
+
+	return PortSpec{Port: uint16(port), Protocol: proto}, nil
+}
 
 // SecretReconciler reconciles a Secret object
 type SecretReconciler struct {
@@ -143,7 +189,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	for shadowVal, originalVal := range newMappings {
 		// Parse allowed hosts
 		allowedHosts := []string{"*"}
-		if hostsLabel, ok := secret.Labels["getkloak.io/hosts"]; ok && hostsLabel != "" {
+		if hostsLabel, ok := secret.Labels[AnnotationHosts]; ok && hostsLabel != "" {
 			// Split by comma and trim spaces
 			parts := strings.Split(hostsLabel, ",")
 			allowedHosts = make([]string, 0, len(parts))
@@ -154,10 +200,25 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			}
 		}
 
-		// Store mapping (uuid -> original + hosts)
+		var portSpec PortSpec
+		var err error
+		validPort := false
+		if v, ok := secret.Labels[AnnotationPort]; ok && v != "" {
+			portSpec, err = parsePortSpec(v)
+			if err != nil {
+				log.Error(err, "Invalid port specification, treating as wildcard", "secret", req.NamespacedName, "label", v)
+			} else {
+				validPort = true
+			}
+		}
+
 		entry := storage.Entry{
 			Value:        originalVal,
 			AllowedHosts: allowedHosts,
+		}
+		if validPort {
+			entry.Port = portSpec.Port
+			entry.Protocol = portSpec.Protocol
 		}
 		if err := r.Storage.Store(ctx, secretID, shadowVal, entry); err != nil {
 			log.Error(err, "failed to store mapping", "shadow", shadowVal)
