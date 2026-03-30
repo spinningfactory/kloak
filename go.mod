@@ -5,7 +5,7 @@ go 1.25.0
 require (
 	github.com/cilium/ebpf v0.20.0
 	github.com/go-logr/logr v1.4.3
-	github.com/google/uuid v1.6.0
+	github.com/oklog/ulid/v2 v2.1.1
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/net v0.47.0
 	k8s.io/api v0.35.0
@@ -29,6 +29,7 @@ require (
 	github.com/google/btree v1.1.3 // indirect
 	github.com/google/gnostic-models v0.7.0 // indirect
 	github.com/google/go-cmp v0.7.0 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.12 // indirect

@@ -53,8 +53,8 @@ func main() {
 	fmt.Println(strings.Repeat("=", 60))
 
 	// Brief delay for watched_hosts BPF map to be populated before first DNS query.
-	fmt.Println("Waiting 5s for Kloak controller to sync...")
-	time.Sleep(5 * time.Second)
+	fmt.Println("Waiting 10s for Kloak controller to sync...")
+	time.Sleep(10 * time.Second)
 
 	// Use default HTTP/2 — the eBPF scanner supports both HTTP/1.1 plaintext
 	// and HTTP/2 HPACK Huffman-encoded headers.
