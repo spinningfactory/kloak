@@ -164,10 +164,11 @@ static __always_inline void dbg_inc(__u32 idx) {
 // =============================================================================
 
 // Per-process opt-in filter: only track DNS/connect for these TGIDs.
-// Populated from userspace when attaching uprobes to a process.
+// Populated by the exec tracepoint for all kubepods processes.
+// Sized for busy clusters with many concurrent container processes.
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 1024);
+  __uint(max_entries, 16384);
   __type(key, __u32);   // tgid
   __type(value, __u8);  // 1 = tracked
 } tracked_tgids SEC(".maps");
@@ -238,7 +239,7 @@ struct {
 // Written by tp_exit_connect when the destination IP has a dns_ip_map entry.
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 1024);
+  __uint(max_entries, 16384);
   __type(key, __u32);   // tgid
   __type(value, __u32); // fd
 } last_verified_fd SEC(".maps");
@@ -1256,13 +1257,13 @@ int tp_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
   return 0;
 }
 
-// tp/sched/sched_process_exit: clean up stale map entries when a tracked
-// process exits. Prevents map pollution from dead processes.
+// tp/sched/sched_process_exit: clean up stale map entries when any kubepods
+// process exits. Uses bpf_current_task_under_cgroup (same as exec handler)
+// to match all container processes — not just tracked_cgroups — so TGIDs
+// added by the broad exec handler are always cleaned up.
 SEC("tracepoint/sched/sched_process_exit")
 int tp_sched_process_exit(struct trace_event_raw_sched_process_template *ctx) {
-  __u64 cgroup_id = bpf_get_current_cgroup_id();
-  __u8 *tracked = bpf_map_lookup_elem(&tracked_cgroups, &cgroup_id);
-  if (!tracked)
+  if (bpf_current_task_under_cgroup(&cgroup_ancestor, 0) != 1)
     return 0;
 
   __u32 tgid = ctx->pid;
