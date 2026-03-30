@@ -127,7 +127,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 		// Generate new if needed or if length mismatch
 		if shadowValue == "" {
-			shadowValue = generateShadowValue(originalLen, originalValue, log)
+			shadowValue = generateShadowValue(originalLen, originalValue)
 		}
 
 		newData[key] = []byte(shadowValue)
@@ -222,7 +222,7 @@ func ptr[T any](v T) *T {
 // whose HPACK Huffman encoding is at least as long as the real secret's.
 // This ensures HTTP/2 HPACK rewriting works — the shadow's Huffman length
 // determines the space available in the wire buffer for the rewritten value.
-func generateShadowValue(originalLen int, realSecret string, log logr.Logger) string {
+func generateShadowValue(originalLen int, realSecret string) string {
 	realHuffLen := int(hpack.HuffmanEncodeLength(realSecret))
 
 	// ULID uses Crockford Base32 (uppercase + digits, no hyphens).
@@ -233,9 +233,10 @@ func generateShadowValue(originalLen int, realSecret string, log logr.Logger) st
 	baseVal := ValuePrefix + newULID
 
 	var shadow string
-	if len(baseVal) > originalLen {
+	switch {
+	case len(baseVal) > originalLen:
 		shadow = baseVal[:originalLen]
-	} else if len(baseVal) < originalLen {
+	case len(baseVal) < originalLen:
 		// Pad with random Crockford Base32 chars (same charset as ULID)
 		const base32Chars = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 		padLen := originalLen - len(baseVal)
@@ -245,7 +246,7 @@ func generateShadowValue(originalLen int, realSecret string, log logr.Logger) st
 			padding[i] = base32Chars[n.Int64()]
 		}
 		shadow = baseVal + string(padding)
-	} else {
+	default:
 		shadow = baseVal
 	}
 
