@@ -1,6 +1,7 @@
 .PHONY: all build build-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup \
         clean deps docker-build generate-ebpf generate-vmlinux run help \
-        lima-start lima-stop lima-delete lima-shell lima-exec lima-check
+        lima-start lima-stop lima-delete lima-shell lima-exec lima-check \
+        lima-k3d-ensure lima-k3d-shell lima-k3d-e2e-setup lima-k3d-e2e-run lima-k3d-e2e lima-k3d-stop lima-k3d-delete
 
 # Go parameters
 GOCMD=go
@@ -210,6 +211,46 @@ lima-exec: lima-ensure
 	@limactl shell $(LIMA_VM) -- bash -lc '$(CMD)'
 
 # ============================================================================
+# Lima k3d targets (for e2e testing on ARM Mac)
+# ============================================================================
+
+LIMA_K3D_VM=kloak-k3d
+LIMA_K3D_CONFIG=lima-k3d.yaml
+
+# Ensure k3d Lima VM is running
+lima-k3d-ensure: lima-check $(LIMA_K3D_CONFIG)
+	@if ! limactl list 2>/dev/null | grep -q "^$(LIMA_K3D_VM)"; then \
+		echo "Creating Lima k3d VM '$(LIMA_K3D_VM)'..."; \
+		limactl start --name=$(LIMA_K3D_VM) $(LIMA_K3D_CONFIG); \
+	elif limactl list | grep "^$(LIMA_K3D_VM)" | grep -q "Stopped"; then \
+		echo "Starting Lima k3d VM '$(LIMA_K3D_VM)'..."; \
+		limactl start $(LIMA_K3D_VM); \
+	fi
+
+# Shell into k3d Lima VM
+lima-k3d-shell: lima-k3d-ensure
+	limactl shell $(LIMA_K3D_VM)
+
+# Run e2e setup inside k3d Lima VM
+lima-k3d-e2e-setup: lima-k3d-ensure
+	limactl shell $(LIMA_K3D_VM) -- bash -lc 'cd $(LIMA_WORKDIR) && make e2e-setup'
+
+# Run e2e tests inside k3d Lima VM
+lima-k3d-e2e-run: lima-k3d-ensure
+	limactl shell $(LIMA_K3D_VM) -- bash -lc 'cd $(LIMA_WORKDIR) && make e2e-run'
+
+# Full e2e inside k3d Lima VM
+lima-k3d-e2e: lima-k3d-e2e-setup lima-k3d-e2e-run
+
+# Stop k3d Lima VM
+lima-k3d-stop:
+	@limactl stop $(LIMA_K3D_VM) 2>/dev/null || true
+
+# Delete k3d Lima VM
+lima-k3d-delete: lima-k3d-stop
+	@limactl delete $(LIMA_K3D_VM) 2>/dev/null || true
+
+# ============================================================================
 # Help
 # ============================================================================
 
@@ -240,3 +281,11 @@ help:
 	@echo "  lima-delete     - Delete the Lima VM"
 	@echo "  lima-shell      - Open shell in Lima VM"
 	@echo "  lima-ensure     - Ensure VM is running (idempotent)"
+	@echo ""
+	@echo "Lima k3d targets (for e2e on ARM Mac):"
+	@echo "  lima-k3d-shell  - Shell into k3d Lima VM"
+	@echo "  lima-k3d-e2e    - Full e2e: setup + run inside Lima k3d VM"
+	@echo "  lima-k3d-e2e-setup - Create k3d cluster inside Lima VM"
+	@echo "  lima-k3d-e2e-run   - Run e2e tests inside Lima VM"
+	@echo "  lima-k3d-stop   - Stop k3d Lima VM"
+	@echo "  lima-k3d-delete - Delete k3d Lima VM"

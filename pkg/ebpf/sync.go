@@ -6,6 +6,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/go-logr/logr"
+	"golang.org/x/net/http2/hpack"
 
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
@@ -85,6 +86,60 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 			log.Error(err, "failed to update BPF secret_map", "hash", hash)
 		} else {
 			log.Info("Synced secret into eBPF map", "hash", hash, "hostLen", val.HostLen)
+		}
+
+		// Also store a Huffman-encoded variant for HTTP/2 HPACK interception.
+		// HPACK uses a static Huffman table (RFC 7541) so the encoding is
+		// deterministic. The eBPF scanner checks for both plaintext "kloak:"
+		// and its Huffman encoding (0xeb 0x41 0xc7 0xd6).
+		//
+		// Store a Huffman-encoded variant for HTTP/2 HPACK interception.
+		// The rewritten Huffman data must be EXACTLY the same length as the
+		// shadow's Huffman encoding — the HPACK length prefix in the wire
+		// buffer is immutable. If the real's Huffman is longer, we skip
+		// (HTTP/1.1 path still works). If shorter, pad with EOS (0xFF).
+		huffShadow := hpack.AppendHuffmanString(nil, shadowPrefix)
+		huffReal := hpack.AppendHuffmanString(nil, entry.Value)
+		realHuffLen := len(huffReal)
+
+		if len(huffShadow) >= 8 && realHuffLen > 0 {
+			// Pad real with HPACK EOS bits to match shadow's Huffman length
+			for len(huffReal) < len(huffShadow) {
+				huffReal = append(huffReal, 0xff)
+			}
+
+			var huffKey secretKey
+			copy(huffKey.Prefix[:], huffShadow[:8])
+			if _, exists := newKeys[huffKey]; !exists {
+				newKeys[huffKey] = struct{}{}
+
+				var huffVal secretValue
+				huffLen := len(huffReal)
+				if huffLen > 128 {
+					huffLen = 128
+				}
+				huffVal.Len = uint32(huffLen)
+				copy(huffVal.RealSecret[:], huffReal[:huffLen])
+				huffVal.HostLen = val.HostLen
+				huffVal.AllowedHost = val.AllowedHost
+				huffPrefixLen := len(huffShadow)
+				if huffPrefixLen > 42 {
+					huffPrefixLen = 42
+				}
+				huffVal.PrefixLen = uint32(huffPrefixLen)
+				copy(huffVal.FullPrefix[:], huffShadow[:huffPrefixLen])
+
+				if err := secretMap.Update(&huffKey, &huffVal, 0); err != nil {
+					log.Error(err, "failed to update BPF secret_map (Huffman)", "hash", hash)
+				} else {
+					log.Info("Synced Huffman secret into eBPF map", "hash", hash, "huffLen", huffLen)
+				}
+			}
+		} else if len(huffShadow) >= 8 && realHuffLen > len(huffShadow) {
+			// This should not happen if the secret reconciler generates shadows
+			// with sufficient Huffman length, but log it just in case.
+			log.Info("Skipping HTTP/2 Huffman variant — shadow Huffman too short",
+				"hash", hash, "shadowHuffLen", len(huffShadow), "realHuffLen", realHuffLen)
 		}
 	}
 

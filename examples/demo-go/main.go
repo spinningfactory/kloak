@@ -1,11 +1,9 @@
 package main
 
 import (
-	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -54,24 +52,14 @@ func main() {
 	fmt.Println("  - X-Secret-Blocked: Should show UUID in response (not replaced)")
 	fmt.Println(strings.Repeat("=", 60))
 
-	// Brief delay for eBPF uprobe attachment before the first TLS connection.
-	fmt.Println("Waiting 2s for Kloak controller to sync...")
-	time.Sleep(2 * time.Second)
+	// Brief delay for watched_hosts BPF map to be populated before first DNS query.
+	fmt.Println("Waiting 10s for Kloak controller to sync...")
+	time.Sleep(10 * time.Second)
 
-	// Force HTTP/1.1 — Go defaults to h2 via ALPN, but HTTP/2 uses binary
-	// HPACK-encoded frames that the eBPF uprobe scanner cannot parse.
-	// HTTP/1.1 sends plaintext headers through tls.Conn.Write in a single call.
+	// Use default HTTP/2 — the eBPF scanner supports both HTTP/1.1 plaintext
+	// and HTTP/2 HPACK Huffman-encoded headers.
 	client := &http.Client{
 		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				NextProtos: []string{"http/1.1"},
-			},
-			ForceAttemptHTTP2: false,
-			DialContext: (&net.Dialer{
-				Timeout: 10 * time.Second,
-			}).DialContext,
-		},
 	}
 
 	requestCount := 0

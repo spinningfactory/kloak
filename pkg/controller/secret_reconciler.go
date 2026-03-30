@@ -5,8 +5,13 @@ import (
 	"fmt"
 	"strings"
 
+	"crypto/rand"
+	"math/big"
+	"time"
+
 	"github.com/go-logr/logr"
-	"github.com/google/uuid"
+	"github.com/oklog/ulid/v2"
+	"golang.org/x/net/http2/hpack"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -122,22 +127,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 		// Generate new if needed or if length mismatch
 		if shadowValue == "" {
-			newUUID := uuid.New().String()
-			baseVal := ValuePrefix + newUUID
-
-			// Handle padding or truncation to exactly match originalLen
-			if len(baseVal) > originalLen {
-				// We cannot truncate UUIDs safely and guarantee uniqueness easily.
-				// However, if the secret is shorter than our prefix + UUID (kloak: + 36 chars = 42 chars)
-				// we are in trouble anyway because ebpf probe rewrite needs space.
-				// We will log a warning, but we must truncate to avoid memory corruption on rewrite.
-				log.Info("WARNING: original secret is shorter than shadow secret UUID. Truncating UUID, collision risk.", "key", key, "originalLen", originalLen)
-				shadowValue = baseVal[:originalLen]
-			} else {
-				// Pad with spaces (or another safe character) to match the original length
-				paddingStr := strings.Repeat(" ", originalLen-len(baseVal))
-				shadowValue = baseVal + paddingStr
-			}
+			shadowValue = generateShadowValue(originalLen, originalValue)
 		}
 
 		newData[key] = []byte(shadowValue)
@@ -226,4 +216,60 @@ func (r *SecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 func ptr[T any](v T) *T {
 	return &v
+}
+
+// generateShadowValue creates a shadow value of exactly originalLen bytes
+// whose HPACK Huffman encoding is at least as long as the real secret's.
+// This ensures HTTP/2 HPACK rewriting works — the shadow's Huffman length
+// determines the space available in the wire buffer for the rewritten value.
+func generateShadowValue(originalLen int, realSecret string) string {
+	realHuffLen := int(hpack.HuffmanEncodeLength(realSecret))
+
+	// ULID uses Crockford Base32 (uppercase + digits, no hyphens).
+	// These chars have long HPACK Huffman codes (7-8 bits), naturally
+	// producing longer Huffman encodings than UUID hex (5-6 bits).
+	// "kloak:" (6) + ULID (26) = 32 chars total.
+	// ULID format: 10 chars timestamp + 16 chars random. For short secrets,
+	// truncation would keep only the timestamp (identical for secrets created
+	// at the same time). Put the random part first to maximize uniqueness.
+	newULID := ulid.MustNew(ulid.Timestamp(time.Now()), rand.Reader).String()
+	ulidRandom := newULID[10:] + newULID[:10] // random first, then timestamp
+	baseVal := ValuePrefix + ulidRandom
+
+	var shadow string
+	switch {
+	case len(baseVal) > originalLen:
+		shadow = baseVal[:originalLen]
+	case len(baseVal) < originalLen:
+		// Pad with random Crockford Base32 chars (same charset as ULID)
+		const base32Chars = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+		padLen := originalLen - len(baseVal)
+		padding := make([]byte, padLen)
+		for i := range padding {
+			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(base32Chars))))
+			padding[i] = base32Chars[n.Int64()]
+		}
+		shadow = baseVal + string(padding)
+	default:
+		shadow = baseVal
+	}
+
+	// Verify Huffman length is sufficient for HTTP/2 HPACK rewriting.
+	// ULID's uppercase chars usually produce long enough Huffman, but for
+	// rare cases (short secrets with all-uppercase real values), replace
+	// trailing digits with random uppercase letters (longer Huffman codes).
+	shadowHuffLen := int(hpack.HuffmanEncodeLength(shadow))
+	if shadowHuffLen < realHuffLen {
+		shadowBytes := []byte(shadow)
+		for j := len(shadowBytes) - 1; j >= 8 && shadowHuffLen < realHuffLen; j-- {
+			if shadowBytes[j] >= '0' && shadowBytes[j] <= '9' {
+				n, _ := rand.Int(rand.Reader, big.NewInt(26))
+				shadowBytes[j] = byte('A') + byte(n.Int64())
+				shadowHuffLen = int(hpack.HuffmanEncodeLength(string(shadowBytes)))
+			}
+		}
+		shadow = string(shadowBytes)
+	}
+
+	return shadow
 }
