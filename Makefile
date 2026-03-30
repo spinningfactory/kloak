@@ -1,6 +1,7 @@
 .PHONY: all build build-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup \
         clean deps docker-build generate-ebpf generate-vmlinux run help \
-        lima-start lima-stop lima-delete lima-shell lima-exec lima-check
+        lima-start lima-stop lima-delete lima-shell lima-exec lima-check \
+        lima-k3d-ensure lima-k3d-shell lima-k3d-e2e-setup lima-k3d-e2e-run lima-k3d-e2e lima-k3d-stop lima-k3d-delete
 
 # Go parameters
 GOCMD=go
@@ -98,10 +99,14 @@ e2e-setup:
 	@docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
 	@docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
 	@docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
-	@echo "==> Importing images into k3d..."
-	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest -c $(E2E_CLUSTER)
-	@docker pull bitnami/kubectl:latest
-	@k3d image import bitnami/kubectl:latest -c $(E2E_CLUSTER)
+	@echo "==> Importing images into k3d (one at a time)..."
+	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) -c $(E2E_CLUSTER)
+	@k3d image import kloak-demo-go:latest -c $(E2E_CLUSTER)
+	@k3d image import kloak-demo-python:latest -c $(E2E_CLUSTER)
+	@k3d image import kloak-demo-js:latest -c $(E2E_CLUSTER)
+	@k3d image import kloak-demo-go-boring:latest -c $(E2E_CLUSTER)
+	@k3d image import kloak-demo-gnutls:latest -c $(E2E_CLUSTER)
+	@k3d image import kloak-demo-python-raw-tls:latest -c $(E2E_CLUSTER)
 	@echo "==> E2E environment ready."
 
 # Run e2e tests (including eBPF) against an existing k3d cluster.
@@ -205,6 +210,46 @@ lima-exec: lima-ensure
 	@limactl shell $(LIMA_VM) -- bash -lc '$(CMD)'
 
 # ============================================================================
+# Lima k3d targets (for e2e testing on ARM Mac)
+# ============================================================================
+
+LIMA_K3D_VM=kloak-k3d
+LIMA_K3D_CONFIG=lima-k3d.yaml
+
+# Ensure k3d Lima VM is running
+lima-k3d-ensure: lima-check $(LIMA_K3D_CONFIG)
+	@if ! limactl list 2>/dev/null | grep -q "^$(LIMA_K3D_VM)"; then \
+		echo "Creating Lima k3d VM '$(LIMA_K3D_VM)'..."; \
+		limactl start --name=$(LIMA_K3D_VM) $(LIMA_K3D_CONFIG); \
+	elif limactl list | grep "^$(LIMA_K3D_VM)" | grep -q "Stopped"; then \
+		echo "Starting Lima k3d VM '$(LIMA_K3D_VM)'..."; \
+		limactl start $(LIMA_K3D_VM); \
+	fi
+
+# Shell into k3d Lima VM
+lima-k3d-shell: lima-k3d-ensure
+	limactl shell $(LIMA_K3D_VM)
+
+# Run e2e setup inside k3d Lima VM
+lima-k3d-e2e-setup: lima-k3d-ensure
+	limactl shell $(LIMA_K3D_VM) -- bash -lc 'cd $(LIMA_WORKDIR) && make e2e-setup'
+
+# Run e2e tests inside k3d Lima VM
+lima-k3d-e2e-run: lima-k3d-ensure
+	limactl shell $(LIMA_K3D_VM) -- bash -lc 'cd $(LIMA_WORKDIR) && make e2e-run'
+
+# Full e2e inside k3d Lima VM
+lima-k3d-e2e: lima-k3d-e2e-setup lima-k3d-e2e-run
+
+# Stop k3d Lima VM
+lima-k3d-stop:
+	@limactl stop $(LIMA_K3D_VM) 2>/dev/null || true
+
+# Delete k3d Lima VM
+lima-k3d-delete: lima-k3d-stop
+	@limactl delete $(LIMA_K3D_VM) 2>/dev/null || true
+
+# ============================================================================
 # Help
 # ============================================================================
 
@@ -235,3 +280,11 @@ help:
 	@echo "  lima-delete     - Delete the Lima VM"
 	@echo "  lima-shell      - Open shell in Lima VM"
 	@echo "  lima-ensure     - Ensure VM is running (idempotent)"
+	@echo ""
+	@echo "Lima k3d targets (for e2e on ARM Mac):"
+	@echo "  lima-k3d-shell  - Shell into k3d Lima VM"
+	@echo "  lima-k3d-e2e    - Full e2e: setup + run inside Lima k3d VM"
+	@echo "  lima-k3d-e2e-setup - Create k3d cluster inside Lima VM"
+	@echo "  lima-k3d-e2e-run   - Run e2e tests inside Lima VM"
+	@echo "  lima-k3d-stop   - Stop k3d Lima VM"
+	@echo "  lima-k3d-delete - Delete k3d Lima VM"
