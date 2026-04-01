@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__github__create_pull_request",
+      "Bash(git -C /Users/dhia/git/kloak/.claude/worktrees/agent-ab7973c3 status 2>&1 && git -C /Users/dhia/git/kloak/.claude/worktrees/agent-ab7973c3 diff --stat HEAD 2>&1)",
+      "Bash(gh run:*)",
+      "Bash(make generate-ebpf:*)",
+      "Bash(go vet:*)",
+      "Bash(go build:*)",
+      "Bash(grep -E \"\\\\.\\(c|h\\)$\")",
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(gh pr:*)",
+      "Bash(grep:*)",
+      "Bash(ls /Users/dhia/git/kloak/pkg/ebpf/*.go)",
+      "Bash(KUBECONFIG=/tmp/kloak-k3s.yaml kubectl logs -n kloak-system -l app.kubernetes.io/component=controller --previous)"
+    ]
+  }
+}

@@ -194,6 +194,13 @@ func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeMa
 		return nil, fmt.Errorf("configuring tail call map index 1: %w", err)
 	}
 
+	// Wire up tail call: index 2 -> bpf_h_extract (H key extraction)
+	hExtFd := uint32(objs.BpfH_extract.FD())
+	if err := objs.ProgArray.Put(uint32(2), hExtFd); err != nil {
+		_ = objs.Close()
+		return nil, fmt.Errorf("configuring tail call map index 2: %w", err)
+	}
+
 	// Wire up kprobe tail call: index 0 -> bpf_ghash_update
 	ghashFd := uint32(objs.BpfGhashUpdate.FD())
 	if err := objs.KprobeProgArray.Put(uint32(0), ghashFd); err != nil {
@@ -336,10 +343,8 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		m.log.Info("Tracking TGID for DNS/connect verification", "pid", pid)
 	}
 
-	// TODO: Replace with real H extraction from OpenSSL struct offsets.
-	// For now, populate tls_conn_state with a test H so the GHASH code
-	// path is exercised. The H value is wrong — the tag will be incorrect.
-	m.populateTestConnState(uint32(pid))
+	// H extraction now happens in the entry uprobe via 4-step pointer chain.
+	// The offsets are pushed to the BPF config map by pushTLSOffsets below.
 
 	// Open the executable to check for statically linked TLS
 	ex, err := link.OpenExecutable(exePath)

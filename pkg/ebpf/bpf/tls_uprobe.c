@@ -103,7 +103,7 @@ struct {
 //   index 1 = bpf_xor_path (TLS 1.3 AES-GCM ciphertext patching path)
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-  __uint(max_entries, 2);
+  __uint(max_entries, 3); // 0=phase2_rewrite, 1=xor_path, 2=h_extract
   __type(key, __u32);
   __type(value, __u32);
 } prog_array SEC(".maps");
@@ -463,6 +463,7 @@ struct ghash_work {
   __u64 ghash_iov_base;        // iov_base address of TLS record
   __u32 ghash_ct_len;          // ciphertext length (excluding tag)
   __u32 ghash_tgid;            // tgid for tls_conn_state lookup
+  __u64 ghash_ssl_ptr;         // ssl_ptr for tls_conn_state lookup
   __u32 ghash_secret_offset;   // byte offset of secret in plaintext
   __u32 ghash_patch_len;       // length of patched region
   __u8  ghash_xor_delta[SECRET_MAX_LEN]; // copy of xor_delta for block computation
@@ -1257,6 +1258,63 @@ int bpf_phase2_rewrite(void *ctx) {
 // and stores the XOR delta in xor_pending for the tcp_sendmsg kprobe.
 // Has its own verifier budget and 512-byte stack (separate from the entry uprobe).
 
+// =============================================================================
+// H extraction — tail-called on first SSL_write per connection.
+// Follows 4-step pointer chain: SSL* → wrl* → enc_ctx* → algctx* → H
+// Stores H in tls_conn_state. Next SSL_write uses cached state → xor_path.
+// =============================================================================
+
+SEC("uprobe/h_extract")
+int bpf_h_extract(void *ctx) {
+  __u32 zero = 0;
+  struct scratch_buf *sd = bpf_map_lookup_elem(&scratch, &zero);
+  if (!sd)
+    return 0;
+
+  __u64 ssl_ptr = sd->ssl_ptr;
+  if (!ssl_ptr)
+    return 0;
+
+  struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &zero);
+  if (!offsets || offsets->ssl_to_wrl == 0)
+    return 0;
+
+  // 4-step pointer chase: SSL* → wrl* → enc_ctx* → algctx* → H
+  __u64 ptr = 0;
+  if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
+    return 0;
+  if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
+    return 0;
+  if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr)
+    return 0;
+
+  // Read H directly into a stack-allocated tls_conn_state.
+  // Only set ghash_h + cipher_suite (rest stays zero).
+  // The struct is 276 bytes but we only write 18 bytes — the rest is zero from stack init.
+  struct tls_conn_state new_conn;
+  __builtin_memset(&new_conn, 0, sizeof(new_conn));
+  if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0)
+    return 0;
+
+  // Quick non-zero check (2 u64 comparisons instead of 16 byte loop).
+  __u64 *h64 = (__u64 *)new_conn.ghash_h;
+  if (h64[0] == 0 && h64[1] == 0)
+    return 0;
+
+  new_conn.cipher_suite = 0x1301;
+
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+  struct tls_conn_key ck;
+  __builtin_memset(&ck, 0, sizeof(ck));
+  ck.tgid = tgid;
+  ck.ssl_ptr = ssl_ptr;
+  bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_NOEXIST);
+
+  dbg_inc(DBG_XOR_CONN_HIT);
+  return 0;
+}
+
 SEC("uprobe/xor_path")
 int bpf_xor_path(void *ctx) {
   dbg_inc(DBG_XOR_PATH_ENTERED);
@@ -1491,6 +1549,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   w->ghash_iov_base = iov_base;
   w->ghash_ct_len = ct_len;
   w->ghash_tgid = (__u32)(pid_tgid >> 32);
+  w->ghash_ssl_ptr = pending->ssl_ptr;
   w->ghash_secret_offset = pending->secret_offset;
   w->ghash_patch_len = patch_len;
   __builtin_memcpy(w->ghash_xor_delta, pending->xor_delta, SECRET_MAX_LEN);
@@ -1523,20 +1582,41 @@ static int copy_h_power_step(__u32 i, void *_unused) {
   struct tls_conn_key ck;
   __builtin_memset(&ck, 0, sizeof(ck));
   ck.tgid = w->ghash_tgid;
+  ck.ssl_ptr = w->ghash_ssl_ptr;
   struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &ck);
   if (!conn)
     return 1;
 
-  // Copy h_powers[i] to stack via bpf_probe_read_kernel. The verifier accepts
-  // this because it trusts bpf_probe_read_kernel for any kernel address,
-  // and conn is a valid kernel pointer (map value).
-  __u8 tmp[16];
-  long ret = bpf_probe_read_kernel(tmp, 16, (void *)conn + 16 + (i & 0xF) * 16);
-  if (ret < 0)
-    return 1;
-
   struct h_power_entry entry;
-  __builtin_memcpy(entry.val, tmp, 16);
+
+  if (i == 0) {
+    // H^1 = H (copy directly from tls_conn_state.ghash_h)
+    __builtin_memcpy(entry.val, conn->ghash_h, 16);
+  } else {
+    // H^(2^i) = (H^(2^(i-1)))^2 — read previous entry and square it.
+    __u32 prev = i - 1;
+    struct h_power_entry *prev_entry = bpf_map_lookup_elem(&h_power_entries, &prev);
+    if (!prev_entry)
+      return 1;
+    __u8 prev_val[16];
+    __builtin_memcpy(prev_val, prev_entry->val, 16);
+
+    // Square via bpf_loop. Re-lookup w after each step.
+    w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+    if (!w)
+      return 1;
+    __builtin_memcpy(w->mul_a, prev_val, 16);
+    __builtin_memset(w->mul_z, 0, 16);
+    __builtin_memcpy(w->mul_v, prev_val, 16);
+
+    bpf_loop(128, gf128_mul_iter, NULL, 0);
+
+    w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+    if (!w)
+      return 1;
+    __builtin_memcpy(entry.val, w->mul_z, 16);
+  }
+
   bpf_map_update_elem(&h_power_entries, &i, &entry, BPF_ANY);
   return 0;
 }
@@ -1823,9 +1903,27 @@ int bpf_uprobe_ssl_write(void *ctx) {
   // Look up hostname via DNS chain: ssl_fd_map -> conn_ip_map -> dns_ip_map
   resolve_host(scratch_data, (__u64)ssl_ptr);
 
-  // XOR path: pre-scan for kloak: prefix and tail-call to xor_path.
-  // TODO: gate on tls_conn_state AES-GCM check once key extraction is implemented.
+  // XOR path: check/create tls_conn_state, pre-scan, tail-call to xor_path.
   dbg_inc(DBG_XOR_CONN_CHECK);
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+
+  struct tls_conn_key conn_key = {.tgid = tgid, .ssl_ptr = (__u64)ssl_ptr};
+  struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &conn_key);
+
+  if (!conn) {
+    // First SSL_write — tail-call to H extraction program (index 2).
+    // It will extract H and store in tls_conn_state.
+    // Next SSL_write will find the cached state and go to xor_path.
+    scratch_data->ssl_ptr = (__u64)ssl_ptr;
+    bpf_tail_call(ctx, &prog_array, 2);
+    return 0;
+  }
+
+  if (!is_aes_gcm(conn->cipher_suite))
+    return 0;
+
+  // Pre-scan for kloak: prefix and tail-call to xor_path.
   scratch_data->ssl_ptr = (__u64)ssl_ptr;
   scratch_data->xor_match_pos = 0xFFFFFFFF;
 
