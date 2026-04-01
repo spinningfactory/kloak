@@ -42,7 +42,9 @@ var opensslOffsetTable = map[string]TLSOffsets{
 	// OpenSSL 3.5.x (Debian Trixie) — aarch64
 	// Determined empirically via offsetof() with internal headers.
 	// Chain: SSL_CONNECTION.rlayer.wrl → enc_ctx → algctx → gcm.H
-	"3.5": {SSLToWRL: 3208, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 216},
+	// GCM_IV_MAX_SIZE=128 in OpenSSL 3.5 shifts gcm field by +112 vs our initial calculation.
+	// Correct: PROV_GCM_CTX.gcm at 248 (not 136), GCM128_CONTEXT.H at +80 → 248+80=328
+	"3.5": {SSLToWRL: 3208, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328},
 
 	// TODO: Add offsets for other versions/architectures.
 	// OpenSSL 3.0-3.4 had enc_write_ctx directly on SSL_CONNECTION (fewer hops).
