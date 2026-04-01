@@ -469,6 +469,11 @@ struct ghash_work {
   __u32 ghash_secret_offset;   // byte offset of secret in plaintext
   __u32 ghash_patch_len;       // length of patched region
   __u32 ghash_nonce_len;       // TLS explicit nonce length (8 for TLS 1.2, 0 for TLS 1.3)
+  // Multi-record iteration state (for tcp_sendmsg with multiple TLS records)
+  __u64 iter_iov_base;         // iov_base for current tcp_sendmsg
+  __u64 iter_iov_len;          // total iov length
+  __u64 iter_offset;           // current byte offset within the iov
+  __u32 iter_records_patched;  // number of records successfully patched
   __u8  ghash_xor_delta[SECRET_MAX_LEN]; // copy of xor_delta for block computation
   __u8  ghash_active;          // 1 = GHASH update needed
   __u8  _ghash_pad[3];
@@ -1505,52 +1510,55 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   dbg_inc(DBG_XOR_TCP_SENDMSG);
   pending->active = 0;
 
-  // All large buffers live in the per-CPU ghash_scratch map.
   __u32 zero = 0;
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w)
     return 0;
 
-  // Extract msghdr* from pt_regs (2nd arg).
-  // tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+  // Extract msghdr* from pt_regs
   struct msghdr *msg = NULL;
 #if defined(bpf_target_x86)
-  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 104); // RSI
+  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 104);
 #elif defined(bpf_target_arm64)
-  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 8);   // X1
+  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 8);
 #else
   return 0;
 #endif
   if (!msg)
     return 0;
 
-  // Read iov_base from msghdr (same CO-RE path as kprobe_udp_recvmsg).
   __u64 iov_base = 0;
   BPF_CORE_READ_INTO(&iov_base, msg, msg_iter.__ubuf_iovec.iov_base);
   if (!iov_base)
     return 0;
 
-  // Validate TLS record header: [type:1][version:2][length:2]
+  // Re-lookup w and pending after CO-RE reads
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0;
+  pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
+  if (!pending)
+    return 0;
+
+  // Validate first TLS record header
   if (bpf_probe_read_user(w->ct_buf, 5, (void *)iov_base) < 0)
     return 0;
-  if (w->ct_buf[0] != 0x17) // ContentType: application_data
+  if (w->ct_buf[0] != 0x17)
     return 0;
 
   __u16 record_len = ((__u16)w->ct_buf[3] << 8) | (__u16)w->ct_buf[4];
   if (record_len < 16 + pending->secret_len)
     return 0;
 
-  // TLS 1.2 GCM record: [header 5] [explicit_nonce 8] [ciphertext] [tag 16]
-  // TLS 1.3 GCM record: [header 5] [ciphertext] [tag 16]
-  // TODO: detect TLS version from tls_conn_state. For now assume TLS 1.2.
-  __u32 nonce_len = 8; // TLS 1.2 explicit nonce
+  __u32 nonce_len = 8; // TLS 1.2
   __u32 ct_len = record_len - 16 - nonce_len;
-
-  // 1. XOR-patch ciphertext at the secret position.
-  //    CTR mode: ciphertext byte positions align 1:1 with plaintext.
-  //    Record layout: [5-byte header] [nonce_len] [ciphertext] [16-byte tag]
   __u32 ct_offset = 5 + nonce_len + pending->secret_offset;
   __u32 patch_len = clamp_write_len(pending->secret_len);
+
+  // XOR-patch ciphertext
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0;
 
   if (bpf_probe_read_user(w->ct_buf, patch_len, (void *)(iov_base + ct_offset)) < 0)
     return 0;
@@ -1561,7 +1569,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   if (bpf_probe_write_user((void *)(iov_base + ct_offset), w->ct_buf, patch_len) < 0)
     return 0;
 
-  // 2. Store metadata for the GHASH tail-call program.
+  // Store GHASH metadata
   w->ghash_iov_base = iov_base;
   w->ghash_ct_len = ct_len;
   w->ghash_nonce_len = nonce_len;
@@ -1572,10 +1580,9 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   __builtin_memcpy(w->ghash_xor_delta, pending->xor_delta, SECRET_MAX_LEN);
   w->ghash_active = 1;
 
-  // Tail-call to GHASH update program (separate verifier budget + stack).
+  // Tail-call to GHASH
   bpf_tail_call(ctx, &kprobe_prog_array, 0);
 
-  // If tail call fails, ciphertext was patched but tag is wrong (server rejects).
   return 0;
 }
 
