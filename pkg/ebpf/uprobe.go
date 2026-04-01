@@ -194,6 +194,13 @@ func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeMa
 		return nil, fmt.Errorf("configuring tail call map index 1: %w", err)
 	}
 
+	// Wire up kprobe tail call: index 0 -> bpf_ghash_update
+	ghashFd := uint32(objs.BpfGhashUpdate.FD())
+	if err := objs.KprobeProgArray.Put(uint32(0), ghashFd); err != nil {
+		_ = objs.Close()
+		return nil, fmt.Errorf("configuring kprobe tail call map: %w", err)
+	}
+
 	// Populate the cgroup ancestor map so the exec tracepoint can catch
 	// ALL container execs. Find the kubepods cgroup and store its fd.
 	if err := setupCgroupAncestor(objs, cgroupRoot, log); err != nil {
@@ -329,6 +336,11 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		m.log.Info("Tracking TGID for DNS/connect verification", "pid", pid)
 	}
 
+	// TODO: Replace with real H extraction from OpenSSL struct offsets.
+	// For now, populate tls_conn_state with a test H so the GHASH code
+	// path is exercised. The H value is wrong — the tag will be incorrect.
+	m.populateTestConnState(uint32(pid))
+
 	// Open the executable to check for statically linked TLS
 	ex, err := link.OpenExecutable(exePath)
 	if err != nil {
@@ -422,6 +434,37 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 			"ghash_h_offset", offsets.GHashH,
 			"cipher_id_offset", offsets.CipherID)
 		return // Only need one successful push.
+	}
+}
+
+// populateTestConnState creates a tls_conn_state entry with a test GHASH key H
+// for a given PID. This is a temporary method for debugging the GHASH code path.
+// TODO: Replace with real H extraction from OpenSSL struct offsets.
+func (m *TLSUprobeManager) populateTestConnState(tgid uint32) {
+	// Use ssl_ptr=0 as a wildcard. The kprobe looks up (tgid, 0).
+	key := tlsuprobeTlsConnKey{Tgid: tgid, SslPtr: 0}
+
+	// Test H: non-zero value so GHASH produces a non-trivial delta.
+	// This is NOT a real GHASH key — the tag will be wrong.
+	var state tlsuprobeTlsConnState
+	state.CipherSuite = 0x1301 // TLS_AES_128_GCM_SHA256
+	for i := range state.GhashH {
+		state.GhashH[i] = 0x42 // Arbitrary non-zero test value
+	}
+
+	// Precompute H power table (11 entries, padded to 16 in the struct).
+	var h [16]byte
+	copy(h[:], state.GhashH[:])
+	table := ComputeHPowerTable(h)
+	for i := 0; i < 11; i++ {
+		state.H_powers[i] = table[i]
+	}
+	state.H_powersReady = 1
+
+	if err := m.objs.TlsConnState.Update(&key, &state, 0); err != nil {
+		m.log.Error(err, "failed to populate test tls_conn_state", "tgid", tgid)
+	} else {
+		m.log.Info("Populated test tls_conn_state (dummy H)", "tgid", tgid)
 	}
 }
 

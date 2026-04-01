@@ -108,6 +108,15 @@ struct {
   __type(value, __u32);
 } prog_array SEC(".maps");
 
+// Tail-call array for kprobes (separate from uprobe prog_array):
+//   index 0 = bpf_ghash_update (GHASH tag recomputation after XOR patch)
+struct {
+  __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u32);
+} kprobe_prog_array SEC(".maps");
+
 // Ringbuffer for lightweight events to userspace (metrics/logging only)
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -377,7 +386,7 @@ struct tls_conn_key {
 
 struct tls_conn_state {
   __u8  ghash_h[16];         // GHASH key H = AES(K, 0^128)
-  __u8  h_powers[11][16];    // H^(2^i) for i=0..10, precomputed by userspace
+  __u8  h_powers[16][16];    // H^(2^i) for i=0..10 (padded to 16 for bitmask bounds)
   __u16 cipher_suite;        // 0x1301 = AES_128_GCM, 0x1302 = AES_256_GCM
   __u8  h_powers_ready;      // 1 = userspace has pushed precomputed H powers
   __u8  _pad[1];
@@ -446,6 +455,19 @@ struct ghash_work {
   __u8 mul_z[16];              // gf128_mul internal: accumulator
   __u8 hp_base[16];            // gf128_h_power internal: base
   __u8 hp_tmp[16];             // gf128_h_power internal: temporary
+  // Metadata passed from kprobe to GHASH tail-call program:
+  __u64 ghash_iov_base;        // iov_base address of TLS record
+  __u32 ghash_ct_len;          // ciphertext length (excluding tag)
+  __u32 ghash_tgid;            // tgid for tls_conn_state lookup
+  __u32 ghash_secret_offset;   // byte offset of secret in plaintext
+  __u32 ghash_patch_len;       // length of patched region
+  __u8  ghash_xor_delta[SECRET_MAX_LEN]; // copy of xor_delta for block computation
+  __u8  ghash_active;          // 1 = GHASH update needed
+  __u8  _ghash_pad[3];
+  __u32 ghash_first_block;     // first changed block index
+  __u32 ghash_ct_blocks;       // total ciphertext blocks
+  // h_powers_cache moved to separate h_power_entries per-CPU array map
+  __u32 ghash_h_power_val;      // power value for h_power_step callback
 };
 
 struct {
@@ -454,6 +476,20 @@ struct {
   __type(key, __u32);
   __type(value, struct ghash_work);
 } ghash_scratch SEC(".maps");
+
+// Per-CPU array of H^(2^i) power entries (16 bytes each).
+// Separate map so callbacks can look up individual entries without
+// array indexing into ghash_work (which the verifier can't bound).
+struct h_power_entry {
+  __u8 val[16];
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 16);
+  __type(key, __u32);
+  __type(value, struct h_power_entry);
+} h_power_entries SEC(".maps");
 
 // =============================================================================
 
@@ -1316,7 +1352,9 @@ static int gf128_mul_iter(__u32 i, void *_unused) {
   if (!w)
     return 1; // stop
 
-  if (w->mul_a[i / 8] & ((__u8)0x80 >> (i % 8))) {
+  __u32 byte_idx = (i >> 3) & 0xF;  // i/8 clamped to [0,15] for verifier
+  __u32 bit_idx = i & 7;            // i%8 clamped to [0,7]
+  if (w->mul_a[byte_idx] & ((__u8)0x80 >> bit_idx)) {
     for (int j = 0; j < 16; j++)
       w->mul_z[j] ^= w->mul_v[j];
   }
@@ -1445,12 +1483,201 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   if (bpf_probe_write_user((void *)(iov_base + ct_offset), w->ct_buf, patch_len) < 0)
     return 0;
 
-  // 2. Incremental GHASH tag update.
-  //    new_tag = old_tag XOR Σ(delta_block_j * H^(ct_blocks - j + 1))
-  //    TODO: gate on tls_conn_state having a valid GHASH key H.
-  //    For now, skip GHASH (tag will be wrong — server rejects the record).
-  //    This lets us verify the ciphertext XOR works end-to-end.
+  // 2. Store metadata for the GHASH tail-call program.
+  w->ghash_iov_base = iov_base;
+  w->ghash_ct_len = ct_len;
+  w->ghash_tgid = (__u32)(pid_tgid >> 32);
+  w->ghash_secret_offset = pending->secret_offset;
+  w->ghash_patch_len = patch_len;
+  __builtin_memcpy(w->ghash_xor_delta, pending->xor_delta, SECRET_MAX_LEN);
+  w->ghash_active = 1;
 
+  // Tail-call to GHASH update program (separate verifier budget + stack).
+  bpf_tail_call(ctx, &kprobe_prog_array, 0);
+
+  // If tail call fails, ciphertext was patched but tag is wrong (server rejects).
+  return 0;
+}
+
+// =============================================================================
+// GHASH tag update — tail-called from tcp_sendmsg kprobe after XOR patching.
+// Reads metadata from ghash_scratch, computes incremental GHASH correction,
+// and writes the corrected auth tag to the TLS record.
+// =============================================================================
+
+// bpf_loop callback: copy one H^(2^i) entry from tls_conn_state to ghash_work.
+// Alternates map lookups to avoid holding both pointers simultaneously.
+static int copy_h_power_step(__u32 i, void *_unused) {
+  if (i >= 11)
+    return 1;
+
+  __u32 zero = 0;
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 1;
+
+  struct tls_conn_key ck;
+  __builtin_memset(&ck, 0, sizeof(ck));
+  ck.tgid = w->ghash_tgid;
+  struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &ck);
+  if (!conn)
+    return 1;
+
+  // Copy h_powers[i] to stack via bpf_probe_read_kernel. The verifier accepts
+  // this because it trusts bpf_probe_read_kernel for any kernel address,
+  // and conn is a valid kernel pointer (map value).
+  __u8 tmp[16];
+  long ret = bpf_probe_read_kernel(tmp, 16, (void *)conn + 16 + (i & 0xF) * 16);
+  if (ret < 0)
+    return 1;
+
+  struct h_power_entry entry;
+  __builtin_memcpy(entry.val, tmp, 16);
+  bpf_map_update_elem(&h_power_entries, &i, &entry, BPF_ANY);
+  return 0;
+}
+
+// bpf_loop callback: one step of square-and-multiply for H^power.
+// Uses nested bpf_loop(128, gf128_mul_iter) for each multiply.
+// Re-lookups w after every bpf_loop to satisfy the verifier.
+static int h_power_step(__u32 bit, void *_unused) {
+  __u32 zero = 0;
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w || bit >= 11)
+    return 1;
+
+  if (!(w->ghash_h_power_val & (1u << bit)))
+    return 0; // Bit not set — skip this multiply.
+
+  // Look up H^(2^bit) from separate map and copy to stack.
+  struct h_power_entry *hp = bpf_map_lookup_elem(&h_power_entries, &bit);
+  if (!hp)
+    return 1;
+  __u8 hp_val[16];
+  __builtin_memcpy(hp_val, hp->val, 16);
+
+  // Re-lookup w (invalidated by h_power_entries lookup).
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 1;
+
+  // h_pow = h_pow * H^(2^bit)
+  __builtin_memcpy(w->mul_a, w->h_pow, 16);
+  __builtin_memset(w->mul_z, 0, 16);
+  __builtin_memcpy(w->mul_v, hp_val, 16);
+
+  bpf_loop(128, gf128_mul_iter, NULL, 0);
+
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 1;
+  __builtin_memcpy(w->h_pow, w->mul_z, 16);
+  return 0;
+}
+
+// bpf_loop callback: process one 16-byte block for GHASH tag delta.
+static int ghash_block_iter(__u32 block_idx, void *_unused) {
+  __u32 zero = 0;
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 1;
+
+  __u32 b = w->ghash_first_block + block_idx;
+  if (b >= w->ghash_ct_blocks)
+    return 1;
+
+  // Build 16-byte block delta.
+  __builtin_memset(w->block_delta, 0, 16);
+  __u32 sec_off = w->ghash_secret_offset;
+  __u32 sec_end = sec_off + w->ghash_patch_len;
+  for (__u32 i = 0; i < 16; i++) {
+    __u32 pos = (b & 0x3FF) * 16 + i;
+    if (pos >= sec_off && pos < sec_end) {
+      __u32 si = (pos - sec_off) & (SECRET_MAX_LEN - 1);
+      w->block_delta[i] = w->ghash_xor_delta[si];
+    }
+  }
+
+  // Compute H^power via bpf_loop (no inline functions — avoids stale w).
+  __u32 power = w->ghash_ct_blocks - b + 1;
+  w->ghash_h_power_val = power;
+  __builtin_memset(w->h_pow, 0, 16);
+  w->h_pow[0] = 0x80; // GF(2^128) identity
+
+  bpf_loop(11, h_power_step, NULL, 0);
+
+  // Re-lookup w. h_pow now contains H^power.
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 1;
+
+  // contribution = block_delta * H^power (flat bpf_loop, no inline).
+  __builtin_memcpy(w->mul_a, w->block_delta, 16);
+  __builtin_memset(w->mul_z, 0, 16);
+  __builtin_memcpy(w->mul_v, w->h_pow, 16);
+
+  bpf_loop(128, gf128_mul_iter, NULL, 0);
+
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 1;
+
+  // Accumulate: tag_delta ^= contribution (mul_z)
+  for (__u32 i = 0; i < 16; i++)
+    w->tag_delta[i] ^= w->mul_z[i];
+
+  return 0;
+}
+
+SEC("kprobe/ghash_update")
+int bpf_ghash_update(void *ctx) {
+  __u32 zero = 0;
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w || !w->ghash_active)
+    return 0;
+  w->ghash_active = 0;
+
+  // Incremental test: just add tls_conn_state lookup.
+  // Copy H power table from tls_conn_state into ghash_work so the block
+  // callback only uses ONE map (avoids dual-pointer verifier issues).
+  bpf_loop(11, copy_h_power_step, NULL, 0);
+
+  // Re-lookup w after bpf_loop.
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0;
+
+  __u64 iov_base = w->ghash_iov_base;
+  __u32 ct_len = w->ghash_ct_len;
+  __u32 ct_blocks = (ct_len + 15) / 16;
+  __u32 patch_len = w->ghash_patch_len;
+
+  if (bpf_probe_read_user(w->old_tag, 16, (void *)(iov_base + 5 + ct_len)) < 0)
+    return 0;
+
+  // Re-lookup w (bpf_probe_read_user invalidates map pointers).
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0;
+
+  __builtin_memset(w->tag_delta, 0, 16);
+
+  w->ghash_first_block = w->ghash_secret_offset / 16;
+  w->ghash_ct_blocks = ct_blocks;
+  __u32 num_blocks = (w->ghash_secret_offset + patch_len - 1) / 16 - w->ghash_first_block + 1;
+  if (num_blocks > 9) num_blocks = 9;
+
+  bpf_loop(num_blocks, ghash_block_iter, NULL, 0);
+
+  // Re-lookup w after bpf_loop (verifier invalidates map pointers).
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0;
+
+  for (__u32 i = 0; i < 16; i++)
+    w->new_tag[i] = w->old_tag[i] ^ w->tag_delta[i];
+
+  bpf_probe_write_user((void *)(iov_base + 5 + ct_len), w->new_tag, 16);
   return 0;
 }
 
