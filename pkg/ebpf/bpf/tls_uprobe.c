@@ -171,6 +171,8 @@ enum {
   DBG_XOR_TCP_NO_VFD,         // last_verified_fd not found for this tgid
   DBG_XOR_TCP_NO_PENDING,     // xor_pending entry not found for (tgid,fd)
   DBG_XOR_TCP_NOT_ACTIVE,     // xor_pending entry found but active=0
+  DBG_GHASH_ENTERED,          // ghash_update program entered
+  DBG_GHASH_TAG_WRITTEN,      // ghash tag written back to TLS record
   DBG_MAX,
 };
 
@@ -466,6 +468,7 @@ struct ghash_work {
   __u64 ghash_ssl_ptr;         // ssl_ptr for tls_conn_state lookup
   __u32 ghash_secret_offset;   // byte offset of secret in plaintext
   __u32 ghash_patch_len;       // length of patched region
+  __u32 ghash_nonce_len;       // TLS explicit nonce length (8 for TLS 1.2, 0 for TLS 1.3)
   __u8  ghash_xor_delta[SECRET_MAX_LEN]; // copy of xor_delta for block computation
   __u8  ghash_active;          // 1 = GHASH update needed
   __u8  _ghash_pad[3];
@@ -1528,12 +1531,17 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   __u16 record_len = ((__u16)w->ct_buf[3] << 8) | (__u16)w->ct_buf[4];
   if (record_len < 16 + pending->secret_len)
     return 0;
-  __u32 ct_len __attribute__((unused)) = record_len - 16; // Used by GHASH (TODO)
+
+  // TLS 1.2 GCM record: [header 5] [explicit_nonce 8] [ciphertext] [tag 16]
+  // TLS 1.3 GCM record: [header 5] [ciphertext] [tag 16]
+  // TODO: detect TLS version from tls_conn_state. For now assume TLS 1.2.
+  __u32 nonce_len = 8; // TLS 1.2 explicit nonce
+  __u32 ct_len = record_len - 16 - nonce_len;
 
   // 1. XOR-patch ciphertext at the secret position.
   //    CTR mode: ciphertext byte positions align 1:1 with plaintext.
-  //    TLS record: [5-byte header] [ciphertext] [16-byte auth tag]
-  __u32 ct_offset = 5 + pending->secret_offset;
+  //    Record layout: [5-byte header] [nonce_len] [ciphertext] [16-byte tag]
+  __u32 ct_offset = 5 + nonce_len + pending->secret_offset;
   __u32 patch_len = clamp_write_len(pending->secret_len);
 
   if (bpf_probe_read_user(w->ct_buf, patch_len, (void *)(iov_base + ct_offset)) < 0)
@@ -1548,6 +1556,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   // 2. Store metadata for the GHASH tail-call program.
   w->ghash_iov_base = iov_base;
   w->ghash_ct_len = ct_len;
+  w->ghash_nonce_len = nonce_len;
   w->ghash_tgid = (__u32)(pid_tgid >> 32);
   w->ghash_ssl_ptr = pending->ssl_ptr;
   w->ghash_secret_offset = pending->secret_offset;
@@ -1715,6 +1724,7 @@ static int ghash_block_iter(__u32 block_idx, void *_unused) {
 
 SEC("kprobe/ghash_update")
 int bpf_ghash_update(void *ctx) {
+  dbg_inc(DBG_GHASH_ENTERED);
   __u32 zero = 0;
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w || !w->ghash_active)
@@ -1733,10 +1743,13 @@ int bpf_ghash_update(void *ctx) {
 
   __u64 iov_base = w->ghash_iov_base;
   __u32 ct_len = w->ghash_ct_len;
+  __u32 nonce_len = w->ghash_nonce_len;
   __u32 ct_blocks = (ct_len + 15) / 16;
   __u32 patch_len = w->ghash_patch_len;
 
-  if (bpf_probe_read_user(w->old_tag, 16, (void *)(iov_base + 5 + ct_len)) < 0)
+  // Tag is after: [header 5] [nonce nonce_len] [ciphertext ct_len] [tag 16]
+  __u32 tag_offset = 5 + nonce_len + ct_len;
+  if (bpf_probe_read_user(w->old_tag, 16, (void *)(iov_base + tag_offset)) < 0)
     return 0;
 
   // Re-lookup w (bpf_probe_read_user invalidates map pointers).
@@ -1761,7 +1774,8 @@ int bpf_ghash_update(void *ctx) {
   for (__u32 i = 0; i < 16; i++)
     w->new_tag[i] = w->old_tag[i] ^ w->tag_delta[i];
 
-  bpf_probe_write_user((void *)(iov_base + 5 + ct_len), w->new_tag, 16);
+  bpf_probe_write_user((void *)(iov_base + tag_offset), w->new_tag, 16);
+  dbg_inc(DBG_GHASH_TAG_WRITTEN);
   return 0;
 }
 
