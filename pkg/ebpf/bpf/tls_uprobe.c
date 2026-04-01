@@ -1393,6 +1393,64 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 
   dbg_inc(DBG_XOR_TCP_SENDMSG);
   pending->active = 0;
+
+  // All large buffers live in the per-CPU ghash_scratch map.
+  __u32 zero = 0;
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0;
+
+  // Extract msghdr* from pt_regs (2nd arg).
+  // tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+  struct msghdr *msg = NULL;
+#if defined(bpf_target_x86)
+  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 104); // RSI
+#elif defined(bpf_target_arm64)
+  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 8);   // X1
+#else
+  return 0;
+#endif
+  if (!msg)
+    return 0;
+
+  // Read iov_base from msghdr (same CO-RE path as kprobe_udp_recvmsg).
+  __u64 iov_base = 0;
+  BPF_CORE_READ_INTO(&iov_base, msg, msg_iter.__ubuf_iovec.iov_base);
+  if (!iov_base)
+    return 0;
+
+  // Validate TLS record header: [type:1][version:2][length:2]
+  if (bpf_probe_read_user(w->ct_buf, 5, (void *)iov_base) < 0)
+    return 0;
+  if (w->ct_buf[0] != 0x17) // ContentType: application_data
+    return 0;
+
+  __u16 record_len = ((__u16)w->ct_buf[3] << 8) | (__u16)w->ct_buf[4];
+  if (record_len < 16 + pending->secret_len)
+    return 0;
+  __u32 ct_len __attribute__((unused)) = record_len - 16; // Used by GHASH (TODO)
+
+  // 1. XOR-patch ciphertext at the secret position.
+  //    CTR mode: ciphertext byte positions align 1:1 with plaintext.
+  //    TLS record: [5-byte header] [ciphertext] [16-byte auth tag]
+  __u32 ct_offset = 5 + pending->secret_offset;
+  __u32 patch_len = clamp_write_len(pending->secret_len);
+
+  if (bpf_probe_read_user(w->ct_buf, patch_len, (void *)(iov_base + ct_offset)) < 0)
+    return 0;
+
+  for (__u32 i = 0; i < SECRET_MAX_LEN && i < patch_len; i++)
+    w->ct_buf[i] ^= pending->xor_delta[i];
+
+  if (bpf_probe_write_user((void *)(iov_base + ct_offset), w->ct_buf, patch_len) < 0)
+    return 0;
+
+  // 2. Incremental GHASH tag update.
+  //    new_tag = old_tag XOR Σ(delta_block_j * H^(ct_blocks - j + 1))
+  //    TODO: gate on tls_conn_state having a valid GHASH key H.
+  //    For now, skip GHASH (tag will be wrong — server rejects the record).
+  //    This lets us verify the ciphertext XOR works end-to-end.
+
   return 0;
 }
 
