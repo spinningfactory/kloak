@@ -1299,10 +1299,13 @@ int bpf_h_extract(void *ctx) {
   if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0)
     return 0;
 
-  // Quick non-zero check (2 u64 comparisons instead of 16 byte loop).
+  // OpenSSL stores H as two u64 in native (little-endian) byte order.
+  // GHASH expects big-endian byte order. Byte-swap each 8-byte half.
   __u64 *h64 = (__u64 *)new_conn.ghash_h;
   if (h64[0] == 0 && h64[1] == 0)
     return 0;
+  h64[0] = __builtin_bswap64(h64[0]);
+  h64[1] = __builtin_bswap64(h64[1]);
 
   new_conn.cipher_suite = 0x1301;
 

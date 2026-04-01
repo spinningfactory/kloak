@@ -143,6 +143,94 @@ func TestHPowerTableMatchesSlowPath(t *testing.T) {
 	}
 }
 
+// NIST SP 800-38D Test Case 2:
+// Key = 00000000000000000000000000000000
+// H = AES(Key, 0^128) = 66e94bd4ef8a2c3b884cfa59ca342b2e
+// Plaintext = 00000000000000000000000000000000 (16 bytes of zeros)
+// AAD = (empty)
+// IV = 000000000000000000000000
+// Expected ciphertext = 0388dace60b6a392f328c2b971b2fe78
+// Expected tag = ab6e47d42cec13bdf53a67b21257bddf
+func TestGHASHNISTTestCase2(t *testing.T) {
+	h := hexBytes(t, "66e94bd4ef8a2c3b884cfa59ca342b2e")
+
+	// GHASH input for Test Case 2: no AAD, 1 block of ciphertext, + length block
+	// Ciphertext: 0388dace60b6a392f328c2b971b2fe78
+	ct := hexBytes(t, "0388dace60b6a392f328c2b971b2fe78")
+
+	// Length block: len(AAD)=0 bits, len(C)=128 bits
+	// Format: [u64 AAD_bits_be] [u64 C_bits_be] = 0000000000000000 0000000000000080
+	var lenBlock [16]byte
+	lenBlock[15] = 0x80 // 128 in big-endian u64 at bytes 8-15
+
+	blocks := [][16]byte{ct, lenBlock}
+	ghash := GHASHCompute(h, blocks)
+
+	// The GHASH output for this test case.
+	// tag = GHASH XOR E(K, J0) where J0 = IV||00000001
+	// E(K, J0) = AES(00...0, 00...001) = 58e2fccefa7e3061367f1d57a4e7455a
+	// tag = ghash XOR 58e2fccefa7e3061367f1d57a4e7455a = ab6e47d42cec13bdf53a67b21257bddf
+	// So ghash = tag XOR E(K,J0)
+	ekj0 := hexBytes(t, "58e2fccefa7e3061367f1d57a4e7455a")
+	expectedTag := hexBytes(t, "ab6e47d42cec13bdf53a67b21257bddf")
+
+	var expectedGHASH [16]byte
+	for i := 0; i < 16; i++ {
+		expectedGHASH[i] = expectedTag[i] ^ ekj0[i]
+	}
+
+	t.Logf("Expected GHASH: %x", expectedGHASH)
+	t.Logf("Computed GHASH: %x", ghash)
+
+	if ghash != expectedGHASH {
+		t.Errorf("GHASH mismatch!\ngot:  %x\nwant: %x", ghash, expectedGHASH)
+	}
+}
+
+// Test the incremental delta computation: if we change some ciphertext bytes,
+// the tag delta should match (new_ghash - old_ghash).
+func TestGHASHIncrementalDelta(t *testing.T) {
+	h := hexBytes(t, "66e94bd4ef8a2c3b884cfa59ca342b2e")
+	ct := hexBytes(t, "0388dace60b6a392f328c2b971b2fe78")
+
+	var lenBlock [16]byte
+	lenBlock[15] = 0x80
+
+	// Original GHASH
+	blocks := [][16]byte{ct, lenBlock}
+	origGHASH := GHASHCompute(h, blocks)
+
+	// Modify ciphertext: flip some bytes
+	ctMod := ct
+	ctMod[0] ^= 0xFF
+	ctMod[1] ^= 0xAA
+
+	// New GHASH
+	blocksMod := [][16]byte{ctMod, lenBlock}
+	newGHASH := GHASHCompute(h, blocksMod)
+
+	// Expected delta = origGHASH XOR newGHASH
+	var expectedDelta [16]byte
+	for i := 0; i < 16; i++ {
+		expectedDelta[i] = origGHASH[i] ^ newGHASH[i]
+	}
+
+	// Compute via incremental method
+	var blockDelta [16]byte
+	for i := 0; i < 16; i++ {
+		blockDelta[i] = ct[i] ^ ctMod[i]
+	}
+	changedBlocks := map[int][16]byte{0: blockDelta}
+	computedDelta := GHASHIncrementalDelta(h, changedBlocks, 1) // 1 CT block
+
+	t.Logf("Expected delta: %x", expectedDelta)
+	t.Logf("Computed delta: %x", computedDelta)
+
+	if computedDelta != expectedDelta {
+		t.Errorf("Incremental delta mismatch!\ngot:  %x\nwant: %x", computedDelta, expectedDelta)
+	}
+}
+
 func BenchmarkGF128Mul(b *testing.B) {
 	a := [16]byte{0x03, 0x88, 0xda, 0xce, 0x60, 0xb6, 0xa3, 0x92,
 		0xf3, 0x28, 0xc2, 0xb9, 0x71, 0xb2, 0xfe, 0x78}

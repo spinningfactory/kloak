@@ -48,6 +48,39 @@ func ComputeHPowerTable(h [16]byte) [11][16]byte {
 	return table
 }
 
+// GHASHCompute computes GHASH(H, data) where data is the concatenation of all
+// GHASH input blocks (AAD padded + ciphertext padded + length block).
+// Returns the 16-byte GHASH output.
+func GHASHCompute(h [16]byte, blocks [][16]byte) [16]byte {
+	var x [16]byte // X_0 = 0
+	for _, block := range blocks {
+		// X_i = (X_{i-1} XOR block) * H
+		for j := 0; j < 16; j++ {
+			x[j] ^= block[j]
+		}
+		x = GF128Mul(x, h)
+	}
+	return x
+}
+
+// GHASHIncrementalDelta computes the tag delta when ciphertext blocks change.
+// changedBlocks maps block index (0-based within ciphertext) to (old XOR new) delta.
+// totalCTBlocks is the total number of ciphertext blocks.
+// Returns the 16-byte tag delta: new_tag = old_tag XOR delta.
+func GHASHIncrementalDelta(h [16]byte, changedBlocks map[int][16]byte, totalCTBlocks int) [16]byte {
+	var delta [16]byte
+	for blockIdx, blockDelta := range changedBlocks {
+		// Power = totalCTBlocks + 1 - blockIdx (accounting for length block)
+		power := uint32(totalCTBlocks + 1 - blockIdx)
+		hPow := GF128HPower(h, power)
+		contrib := GF128Mul(blockDelta, hPow)
+		for j := 0; j < 16; j++ {
+			delta[j] ^= contrib[j]
+		}
+	}
+	return delta
+}
+
 // GF128HPower computes H^power in GF(2^128) via square-and-multiply.
 func GF128HPower(h [16]byte, power uint32) [16]byte {
 	// Multiplicative identity: polynomial 1 = bit 0 set = MSB of byte 0
