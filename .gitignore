@@ -34,3 +34,9 @@ kubeconfig
 pkg/ebpf/vmlinux.h
 pkg/ebpf/bpf/vmlinux.h
 .claude/worktrees/
+kloak
+lima-k3d.yaml
+sec.yml
+test.yml
+.claude/settings.local.json
+.claude/projects/
