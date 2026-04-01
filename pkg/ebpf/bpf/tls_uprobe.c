@@ -1318,6 +1318,11 @@ int bpf_h_extract(void *ctx) {
   bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_NOEXIST);
 
   dbg_inc(DBG_XOR_CONN_HIT);
+
+  // Chain to xor_path to do the rewrite on this same SSL_write call.
+  // scratch_buf already has the pre-scanned match position from the entry uprobe.
+  bpf_tail_call(ctx, &prog_array, 1);
+
   return 0;
 }
 
@@ -1920,27 +1925,9 @@ int bpf_uprobe_ssl_write(void *ctx) {
   // Look up hostname via DNS chain: ssl_fd_map -> conn_ip_map -> dns_ip_map
   resolve_host(scratch_data, (__u64)ssl_ptr);
 
-  // XOR path: check/create tls_conn_state, pre-scan, tail-call to xor_path.
+  // Pre-scan for kloak: prefix BEFORE conn_state check, so both
+  // h_extract and xor_path have the match position in scratch_buf.
   dbg_inc(DBG_XOR_CONN_CHECK);
-  __u64 pid_tgid = bpf_get_current_pid_tgid();
-  __u32 tgid = (__u32)(pid_tgid >> 32);
-
-  struct tls_conn_key conn_key = {.tgid = tgid, .ssl_ptr = (__u64)ssl_ptr};
-  struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &conn_key);
-
-  if (!conn) {
-    // First SSL_write — tail-call to H extraction program (index 2).
-    // It will extract H and store in tls_conn_state.
-    // Next SSL_write will find the cached state and go to xor_path.
-    scratch_data->ssl_ptr = (__u64)ssl_ptr;
-    bpf_tail_call(ctx, &prog_array, 2);
-    return 0;
-  }
-
-  if (!is_aes_gcm(conn->cipher_suite))
-    return 0;
-
-  // Pre-scan for kloak: prefix and tail-call to xor_path.
   scratch_data->ssl_ptr = (__u64)ssl_ptr;
   scratch_data->xor_match_pos = 0xFFFFFFFF;
 
@@ -1956,6 +1943,24 @@ int bpf_uprobe_ssl_write(void *ctx) {
     }
   }
 
+  // Check if this connection already has H extracted.
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+
+  struct tls_conn_key conn_key = {.tgid = tgid, .ssl_ptr = (__u64)ssl_ptr};
+  struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &conn_key);
+
+  if (!conn) {
+    // First SSL_write — tail-call to H extraction (index 2).
+    // h_extract will store H then tail-call to xor_path (index 1).
+    bpf_tail_call(ctx, &prog_array, 2);
+    return 0;
+  }
+
+  if (!is_aes_gcm(conn->cipher_suite))
+    return 0;
+
+  // H already cached — go directly to xor_path.
   bpf_tail_call(ctx, &prog_array, 1);
 
   return 0;
