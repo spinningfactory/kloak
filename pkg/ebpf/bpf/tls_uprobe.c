@@ -85,6 +85,7 @@ struct scratch_buf {
   __u32 host_offset;
   __u32 host_value_len; // length of extracted host value
   __u32 xor_match_pos;  // byte offset of kloak: prefix in data[] (0xFFFFFFFF = not found)
+  __u32 xor_fd;         // socket fd resolved by resolve_host (for xor_pending key)
   struct secret_key xor_match_key; // 8-byte key prefix at match position (set by entry uprobe)
   char host_value[MAX_HOST_LEN]; // host from DNS chain
   char data[MAX_DATA_SIZE];
@@ -158,6 +159,9 @@ enum {
   DBG_XOR_DELTA_DONE,         // XOR delta computed and stored in xor_pending
   DBG_XOR_TCP_SENDMSG,        // tcp_sendmsg kprobe found active xor_pending
   DBG_XOR_TCP_ENTRY,          // tcp_sendmsg kprobe entered (any call)
+  DBG_XOR_TCP_NO_VFD,         // last_verified_fd not found for this tgid
+  DBG_XOR_TCP_NO_PENDING,     // xor_pending entry not found for (tgid,fd)
+  DBG_XOR_TCP_NOT_ACTIVE,     // xor_pending entry found but active=0
   DBG_MAX,
 };
 
@@ -398,9 +402,11 @@ struct xor_pending_val {
   __u8  _pad[3];
 };
 
+// XOR pending map keyed by pid_tgid. SSL_write → write() → tcp_sendmsg is
+// synchronous on the same thread, so pid_tgid is guaranteed to match.
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 1024);
+  __uint(max_entries, 4096);
   __type(key, __u64);  // pid_tgid
   __type(value, struct xor_pending_val);
 } xor_pending SEC(".maps");
@@ -981,6 +987,7 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
                                          __u64 ssl_ptr) {
   scratch_data->host_offset = 0;
   scratch_data->host_value_len = 0;
+  scratch_data->xor_fd = 0;
   __builtin_memset(scratch_data->host_value, 0, MAX_HOST_LEN);
 
   __u64 pid_tgid = bpf_get_current_pid_tgid();
@@ -1024,6 +1031,7 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
 
   // If we have a cached fd, try it directly
   if (found) {
+    scratch_data->xor_fd = fd;
     struct conn_ip_key cik = {.tgid = tgid, .fd = fd};
     struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
     if (!civ) { dbg_inc(DBG_RESOLVE_NO_CONN); return; }
@@ -1055,6 +1063,7 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     if (div && !dns_entry_expired(div) && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
       __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
       scratch_data->host_value_len = div->host_len;
+      scratch_data->xor_fd = try_fd;
       bpf_map_update_elem(&last_verified_fd, &tgid, &try_fd, BPF_ANY);
       dbg_inc(DBG_RESOLVE_FD_SCAN_HIT);
       return;
@@ -1268,7 +1277,7 @@ int bpf_xor_path(void *ctx) {
     w->ct_buf[j] ^= val->real_secret[j];
   }
 
-  // Step 3: Build xor_pending entry.
+  // Step 3: Build xor_pending entry keyed by (tgid, fd).
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
 
@@ -1375,6 +1384,7 @@ static __always_inline void gf128_h_power_map(struct ghash_work *w,
 SEC("kprobe/tcp_sendmsg")
 int bpf_kprobe_tcp_sendmsg(void *ctx) {
   dbg_inc(DBG_XOR_TCP_ENTRY);
+
   __u64 pid_tgid = bpf_get_current_pid_tgid();
 
   struct xor_pending_val *pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
