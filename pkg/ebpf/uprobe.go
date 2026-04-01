@@ -416,13 +416,18 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 		}
 
 		// Push offsets to the BPF config map.
+		// Must match struct tls_offsets in tls_uprobe.c.
 		type bpfTLSOffsets struct {
-			GHashHOffset   uint32
-			CipherIDOffset uint32
+			SSLToWRL       uint32
+			WRLToEncCtx    uint32
+			EncCtxToAlgctx uint32
+			AlgctxToH      uint32
 		}
 		val := bpfTLSOffsets{
-			GHashHOffset:   offsets.GHashH,
-			CipherIDOffset: offsets.CipherID,
+			SSLToWRL:       offsets.SSLToWRL,
+			WRLToEncCtx:    offsets.WRLToEncCtx,
+			EncCtxToAlgctx: offsets.EncCtxToAlgctx,
+			AlgctxToH:      offsets.AlgctxToH,
 		}
 		if err := m.objs.TlsOffsetConfig.Update(uint32(0), &val, 0); err != nil {
 			m.log.Error(err, "Failed to push TLS offsets to BPF map")
@@ -431,28 +436,24 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 
 		m.log.Info("Pushed TLS offsets for XOR-patch path",
 			"lib", libPath, "version", version,
-			"ghash_h_offset", offsets.GHashH,
-			"cipher_id_offset", offsets.CipherID)
+			"offsets", fmt.Sprintf("%+v", offsets))
 		return // Only need one successful push.
 	}
 }
 
-// populateTestConnState creates a tls_conn_state entry with a test GHASH key H
-// for a given PID. This is a temporary method for debugging the GHASH code path.
-// TODO: Replace with real H extraction from OpenSSL struct offsets.
+// populateTestConnState creates a tls_conn_state entry with a test GHASH key H.
+// TODO: Replace with real H extraction that follows the OpenSSL pointer chain
+// at runtime (requires reading /proc/<pid>/mem with the ssl_ptr from eBPF events).
+// For now, uses a dummy H for testing the GHASH code path.
 func (m *TLSUprobeManager) populateTestConnState(tgid uint32) {
-	// Use ssl_ptr=0 as a wildcard. The kprobe looks up (tgid, 0).
 	key := tlsuprobeTlsConnKey{Tgid: tgid, SslPtr: 0}
 
-	// Test H: non-zero value so GHASH produces a non-trivial delta.
-	// This is NOT a real GHASH key — the tag will be wrong.
 	var state tlsuprobeTlsConnState
-	state.CipherSuite = 0x1301 // TLS_AES_128_GCM_SHA256
+	state.CipherSuite = 0x1301
 	for i := range state.GhashH {
-		state.GhashH[i] = 0x42 // Arbitrary non-zero test value
+		state.GhashH[i] = 0x42
 	}
 
-	// Precompute H power table (11 entries, padded to 16 in the struct).
 	var h [16]byte
 	copy(h[:], state.GhashH[:])
 	table := ComputeHPowerTable(h)

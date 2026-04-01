@@ -420,12 +420,16 @@ struct {
   __type(value, struct xor_pending_val);
 } xor_pending SEC(".maps");
 
-// Userspace-configured struct offsets for reading TLS key material from the
-// SSL* object. Populated once per library at uprobe attach time after the
-// controller detects the OpenSSL version.
+// Userspace-configured struct offsets for extracting TLS key material.
+// Populated once per library at uprobe attach time after the controller
+// detects the OpenSSL version. Supports a 4-level pointer chain:
+//   SSL* + off1 → wrl* + off2 → enc_ctx* + off3 → algctx* + off4 → H (16 bytes)
+// For OpenSSL 3.2+, the record layer refactoring added an extra hop.
 struct tls_offsets {
-  __u32 ghash_h_offset;     // SSL* + offset -> H (16 bytes)
-  __u32 cipher_id_offset;   // SSL* + offset -> cipher suite ID (2 bytes)
+  __u32 ssl_to_wrl;         // SSL* + off → OSSL_RECORD_LAYER* (pointer deref)
+  __u32 wrl_to_enc_ctx;     // wrl* + off → EVP_CIPHER_CTX* (pointer deref)
+  __u32 enc_ctx_to_algctx;  // enc_ctx* + off → algctx/PROV_GCM_CTX* (pointer deref)
+  __u32 algctx_to_h;        // algctx* + off → H (16 bytes, direct read)
 };
 
 struct {

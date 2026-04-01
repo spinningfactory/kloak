@@ -7,48 +7,46 @@ import (
 	"strings"
 )
 
-// TLSOffsets contains struct offsets for reading TLS key material from an SSL*
-// object at runtime. These offsets are version-specific and must match the
-// OpenSSL build used in the container.
+// TLSOffsets contains struct offsets for extracting TLS key material from an
+// SSL* object at runtime. The offsets form a 3-level pointer chain:
+//
+//	SSL* + EncWriteCtx → EVP_CIPHER_CTX* + CipherData → data* + GHashH → H (16 bytes)
+//
+// Plus a direct offset for the cipher suite ID:
+//
+//	SSL* + CipherSuiteID → uint16 cipher suite
+//
+// These are version-specific and must match the OpenSSL build in the container.
 type TLSOffsets struct {
-	// GHashH is the offset from SSL* to the GHASH key H (16 bytes).
-	// Path: SSL* → enc_write_ctx (EVP_CIPHER_CTX*) → GCM context → Htable[0]
-	GHashH uint32
-
-	// CipherID is the offset from SSL* to the negotiated cipher suite ID.
-	// Path: SSL* → s3 → tmp.new_cipher → id (uint32, but we read 2 bytes
-	// for the TLS cipher suite value).
-	CipherID uint32
+	SSLToWRL       uint32 // SSL* + off → OSSL_RECORD_LAYER* (pointer deref)
+	WRLToEncCtx    uint32 // wrl* + off → EVP_CIPHER_CTX* (pointer deref)
+	EncCtxToAlgctx uint32 // enc_ctx* + off → algctx/PROV_GCM_CTX* (pointer deref)
+	AlgctxToH      uint32 // algctx* + off → H (16 bytes, direct read)
 }
 
 // opensslOffsetTable maps OpenSSL major.minor version strings to their TLS
-// struct offsets. These offsets are determined by compiling OpenSSL at each
-// version and inspecting the struct layouts with pahole/gdb.
+// struct offsets. Determined by compiling OpenSSL at each version and
+// inspecting struct layouts with pahole/gdb/offsetof.
 //
-// The offsets account for the chained pointer dereferences:
-//   SSL* → enc_write_ctx → cipher_data (EVP_AES_GCM_CTX) → gcm.Htable
+// To add a new version:
+//  1. Build OpenSSL with debug symbols
+//  2. Use pahole or gdb to find:
+//     - offsetof(SSL, enc_write_ctx)
+//     - offsetof(EVP_CIPHER_CTX, cipher_data)
+//     - offsetof(EVP_AES_GCM_CTX, gcm) + offsetof(GCM128_CONTEXT, Htable)
+//     - offsetof(SSL, s3) + offsetof(SSL3_STATE, tmp) + offsetof(tmp, new_cipher) + offsetof(SSL_CIPHER, id)
+//  3. Add a row to this table
 //
-// Since these are multi-level pointer dereferences, we store them as a chain
-// of offsets that the eBPF code follows step by step. However, for the initial
-// implementation, we flatten to a single "effective offset" by pre-reading
-// the intermediate pointers in userspace and pushing the final address offset.
-//
-// TODO: These offsets need validation against each OpenSSL version.
-// The current values are placeholders derived from OpenSSL 3.0 source analysis
-// and must be verified via pahole or runtime testing before production use.
+// TODO: These offsets are placeholders. Must be verified per version/arch.
 var opensslOffsetTable = map[string]TLSOffsets{
-	// OpenSSL 3.0.x (Ubuntu 22.04, Debian Bookworm)
-	"3.0": {GHashH: 0, CipherID: 0},
-	// OpenSSL 3.1.x
-	"3.1": {GHashH: 0, CipherID: 0},
-	// OpenSSL 3.2.x (Ubuntu 24.04)
-	"3.2": {GHashH: 0, CipherID: 0},
-	// OpenSSL 3.3.x
-	"3.3": {GHashH: 0, CipherID: 0},
-	// OpenSSL 3.4.x
-	"3.4": {GHashH: 0, CipherID: 0},
-	// OpenSSL 3.5.x
-	"3.5": {GHashH: 0, CipherID: 0},
+	// OpenSSL 3.5.x (Debian Trixie) — aarch64
+	// Determined empirically via offsetof() with internal headers.
+	// Chain: SSL_CONNECTION.rlayer.wrl → enc_ctx → algctx → gcm.H
+	"3.5": {SSLToWRL: 3208, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 216},
+
+	// TODO: Add offsets for other versions/architectures.
+	// OpenSSL 3.0-3.4 had enc_write_ctx directly on SSL_CONNECTION (fewer hops).
+	// x86_64 will have different offsets due to struct packing differences.
 }
 
 // DetectOpenSSLVersion reads an OpenSSL/libssl shared library from a
@@ -78,8 +76,8 @@ func DetectOpenSSLVersion(pid int, libPath string) (version string, offsets TLSO
 		return version, TLSOffsets{}, fmt.Errorf("unsupported OpenSSL version %s (major.minor=%s)", version, majorMinor)
 	}
 
-	if offsets.GHashH == 0 {
-		return version, offsets, fmt.Errorf("OpenSSL %s offsets not yet calibrated (GHashH=0)", version)
+	if offsets.SSLToWRL == 0 {
+		return version, offsets, fmt.Errorf("OpenSSL %s offsets not yet calibrated (SSLToWRL=0)", version)
 	}
 
 	return version, offsets, nil
