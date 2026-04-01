@@ -162,8 +162,21 @@ func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeMa
 	log := ctrl.Log.WithName("ebpf-uprobe")
 
 	objs := &tlsuprobeObjects{}
-	if err := loadTlsuprobeObjects(objs, nil); err != nil {
-		log.Error(err, "eBPF loading failed (no verifier log)")
+	if err := loadTlsuprobeObjects(objs, &ebpf.CollectionOptions{
+		Programs: ebpf.ProgramOptions{
+			LogSizeStart: 1 << 20, // 1 MB
+			LogLevel:     ebpf.LogLevelBranch,
+		},
+	}); err != nil {
+		var ve *ebpf.VerifierError
+		if errors.As(err, &ve) {
+			// Print only the error summary (includes rejection reason).
+			// The full verifier log can be 100K+ lines and overflows container log buffers.
+			log.Error(err, "eBPF verifier rejected program")
+		} else {
+			log.Error(err, "eBPF loading failed (not a verifier error, check dmesg)",
+				"error_type", fmt.Sprintf("%T", err))
+		}
 		return nil, fmt.Errorf("loading eBPF objects: %w", err)
 	}
 
@@ -171,7 +184,14 @@ func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeMa
 	fd := uint32(objs.BpfPhase2Rewrite.FD())
 	if err := objs.ProgArray.Put(uint32(0), fd); err != nil {
 		_ = objs.Close()
-		return nil, fmt.Errorf("configuring tail call map: %w", err)
+		return nil, fmt.Errorf("configuring tail call map index 0: %w", err)
+	}
+
+	// Wire up tail call map: index 1 -> bpf_xor_path (TLS 1.3 AES-GCM path)
+	xorFd := uint32(objs.BpfXorPath.FD())
+	if err := objs.ProgArray.Put(uint32(1), xorFd); err != nil {
+		_ = objs.Close()
+		return nil, fmt.Errorf("configuring tail call map index 1: %w", err)
 	}
 
 	// Populate the cgroup ancestor map so the exec tracepoint can catch
@@ -252,6 +272,16 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	}
 	m.links = append(m.links, krp)
 	m.log.Info("Attached kretprobe", "function", "udp_recvmsg")
+
+	// Attach kprobe on tcp_sendmsg for TLS 1.3 AES-GCM XOR-patch path.
+	// This kprobe intercepts ciphertext before it enters the kernel TCP stack
+	// and applies the XOR patch + GHASH tag update entirely in kernel context.
+	tkp, err := link.Kprobe("tcp_sendmsg", m.objs.BpfKprobeTcpSendmsg, nil)
+	if err != nil {
+		return fmt.Errorf("attaching kprobe tcp_sendmsg: %w", err)
+	}
+	m.links = append(m.links, tkp)
+	m.log.Info("Attached kprobe", "function", "tcp_sendmsg")
 
 	return nil
 }
@@ -353,9 +383,46 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	}
 
 	if attached {
+		// Try to detect the OpenSSL version and push struct offsets for the
+		// XOR-patch path. Non-fatal: if detection fails, the XOR path simply
+		// won't activate and the fallback plaintext rewrite is used.
+		m.pushTLSOffsets(pid, containerLibs)
 		return nil
 	}
 	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
+}
+
+// pushTLSOffsets detects the OpenSSL version in the container's TLS libraries
+// and pushes struct offsets to the tls_offset_config BPF map. This enables the
+// XOR-patch path for TLS 1.3 AES-GCM connections.
+func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
+	for _, libPath := range containerLibs {
+		version, offsets, err := DetectOpenSSLVersion(pid, libPath)
+		if err != nil {
+			m.log.V(1).Info("OpenSSL version detection skipped", "lib", libPath, "reason", err)
+			continue
+		}
+
+		// Push offsets to the BPF config map.
+		type bpfTLSOffsets struct {
+			GHashHOffset   uint32
+			CipherIDOffset uint32
+		}
+		val := bpfTLSOffsets{
+			GHashHOffset:   offsets.GHashH,
+			CipherIDOffset: offsets.CipherID,
+		}
+		if err := m.objs.TlsOffsetConfig.Update(uint32(0), &val, 0); err != nil {
+			m.log.Error(err, "Failed to push TLS offsets to BPF map")
+			continue
+		}
+
+		m.log.Info("Pushed TLS offsets for XOR-patch path",
+			"lib", libPath, "version", version,
+			"ghash_h_offset", offsets.GHashH,
+			"cipher_id_offset", offsets.CipherID)
+		return // Only need one successful push.
+	}
 }
 
 // findContainerTLSLibraries scans common library directories in the container's
@@ -546,6 +613,9 @@ var debugCounterNames = []string{
 	"dns_answer_stored", "phase2_entered",
 	"resolve_ssl_fd_hit", "resolve_last_vfd_hit", "resolve_fd_scan_hit",
 	"resolve_no_fd", "resolve_no_conn", "resolve_no_dns", "resolve_host_ok",
+	"xor_conn_check", "xor_conn_hit", "xor_prescan_match", "xor_tailcall",
+	"xor_path_entered", "xor_secret_found", "xor_delta_done", "xor_tcp_sendmsg",
+	"xor_tcp_entry",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

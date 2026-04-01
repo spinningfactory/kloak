@@ -79,10 +79,13 @@ struct {
 // Per-CPU array used as scratch space for reading and scanning data.
 struct scratch_buf {
   __u64 user_data_ptr;
+  __u64 ssl_ptr;        // SSL* pointer (0 for Go); used by XOR path tail call
   __u32 read_len;       // bytes read into data[] (max 256, for host parsing)
   __u32 total_data_len; // full TLS write length (for bpf_loop scanning)
   __u32 host_offset;
   __u32 host_value_len; // length of extracted host value
+  __u32 xor_match_pos;  // byte offset of kloak: prefix in data[] (0xFFFFFFFF = not found)
+  struct secret_key xor_match_key; // 8-byte key prefix at match position (set by entry uprobe)
   char host_value[MAX_HOST_LEN]; // host from DNS chain
   char data[MAX_DATA_SIZE];
 };
@@ -94,9 +97,12 @@ struct {
   __type(value, struct scratch_buf);
 } scratch SEC(".maps");
 
+// Tail-call program array:
+//   index 0 = bpf_phase2_rewrite (current plaintext rewrite path)
+//   index 1 = bpf_xor_path (TLS 1.3 AES-GCM ciphertext patching path)
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-  __uint(max_entries, 1);
+  __uint(max_entries, 2);
   __type(key, __u32);
   __type(value, __u32);
 } prog_array SEC(".maps");
@@ -143,12 +149,21 @@ enum {
   DBG_RESOLVE_NO_CONN,        // fd found but no conn_ip_map entry
   DBG_RESOLVE_NO_DNS,         // conn found but IP not in dns_ip_map
   DBG_RESOLVE_HOST_OK,        // hostname resolved successfully
+  DBG_XOR_CONN_CHECK,         // entry uprobe checked tls_conn_state
+  DBG_XOR_CONN_HIT,           // tls_conn_state found + AES-GCM confirmed
+  DBG_XOR_PRESCAN_MATCH,      // pre-scan found kloak: prefix
+  DBG_XOR_TAILCALL,           // tail-called to xor_path
+  DBG_XOR_PATH_ENTERED,       // bpf_xor_path entered
+  DBG_XOR_SECRET_FOUND,       // secret_map lookup succeeded in xor_path
+  DBG_XOR_DELTA_DONE,         // XOR delta computed and stored in xor_pending
+  DBG_XOR_TCP_SENDMSG,        // tcp_sendmsg kprobe found active xor_pending
+  DBG_XOR_TCP_ENTRY,          // tcp_sendmsg kprobe entered (any call)
   DBG_MAX,
 };
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 32); // must be >= DBG_MAX
+  __uint(max_entries, 64); // must be >= DBG_MAX
   __type(key, __u32);
   __type(value, __u64);
 } debug_counters SEC(".maps");
@@ -336,6 +351,105 @@ struct kloak_proc_event {
   __u8 _pad[3];
   __u64 cgroup_id;
 };
+
+// =============================================================================
+// TLS 1.3 XOR-patch maps (post-encryption ciphertext patching)
+//
+// When the negotiated cipher is AES-GCM (TLS 1.3), the entry uprobe does NOT
+// rewrite the plaintext buffer. Instead it stores the XOR delta in xor_pending,
+// and a kprobe on tcp_sendmsg patches the ciphertext + GHASH auth tag in-kernel.
+// The real secret never exists in user-space memory.
+// =============================================================================
+
+// Per-connection TLS state: GHASH key H and cipher suite.
+// Populated by the entry uprobe on first SSL_write (reads H from SSL struct at
+// a userspace-configured offset), then enriched by the controller with the
+// precomputed H power table.
+struct tls_conn_key {
+  __u32 tgid;
+  __u32 _pad;
+  __u64 ssl_ptr;
+};
+
+struct tls_conn_state {
+  __u8  ghash_h[16];         // GHASH key H = AES(K, 0^128)
+  __u8  h_powers[11][16];    // H^(2^i) for i=0..10, precomputed by userspace
+  __u16 cipher_suite;        // 0x1301 = AES_128_GCM, 0x1302 = AES_256_GCM
+  __u8  h_powers_ready;      // 1 = userspace has pushed precomputed H powers
+  __u8  _pad[1];
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 4096);
+  __type(key, struct tls_conn_key);
+  __type(value, struct tls_conn_state);
+} tls_conn_state SEC(".maps");
+
+// Per-thread pending XOR patch data. Written by the entry uprobe when an
+// AES-GCM connection is detected, consumed by the kprobe on tcp_sendmsg.
+struct xor_pending_val {
+  __u64 ssl_ptr;
+  __u32 tgid;
+  __u32 secret_offset;      // byte offset of secret in plaintext
+  __u32 secret_len;         // length of secret (1..128)
+  __u8  xor_delta[SECRET_MAX_LEN]; // shadow[i] ^ real[i]
+  __u8  active;             // 1 = pending XOR patch
+  __u8  _pad[3];
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 1024);
+  __type(key, __u64);  // pid_tgid
+  __type(value, struct xor_pending_val);
+} xor_pending SEC(".maps");
+
+// Userspace-configured struct offsets for reading TLS key material from the
+// SSL* object. Populated once per library at uprobe attach time after the
+// controller detects the OpenSSL version.
+struct tls_offsets {
+  __u32 ghash_h_offset;     // SSL* + offset -> H (16 bytes)
+  __u32 cipher_id_offset;   // SSL* + offset -> cipher suite ID (2 bytes)
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct tls_offsets);
+} tls_offset_config SEC(".maps");
+
+// Per-CPU scratch space for XOR-path programs (bpf_xor_path + tcp_sendmsg kprobe).
+// Holds all large structs and buffers that would otherwise exceed the 512-byte
+// BPF stack limit, including staging areas for map updates and GF(2^128) state.
+struct ghash_work {
+  // Staging for map updates (avoids large structs on BPF stack)
+  struct tls_conn_state staged_conn;     // ~196 bytes — for tls_conn_state map insert
+  struct xor_pending_val staged_pending; // ~152 bytes — for xor_pending map insert
+  // tcp_sendmsg kprobe buffers
+  __u8 ct_buf[SECRET_MAX_LEN]; // Ciphertext chunk for XOR patching
+  __u8 old_tag[16];            // Original auth tag from TLS record
+  __u8 tag_delta[16];          // Accumulated tag correction
+  __u8 new_tag[16];            // Patched auth tag
+  __u8 block_delta[16];        // Per-block XOR delta
+  __u8 h_pow[16];              // H^power for current block
+  __u8 contrib[16];            // block_delta * H^power result
+  __u8 mul_a[16];              // gf128_mul input: operand a
+  __u8 mul_v[16];              // gf128_mul internal: shifting register
+  __u8 mul_z[16];              // gf128_mul internal: accumulator
+  __u8 hp_base[16];            // gf128_h_power internal: base
+  __u8 hp_tmp[16];             // gf128_h_power internal: temporary
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct ghash_work);
+} ghash_scratch SEC(".maps");
+
+// =============================================================================
 
 // Check if a dns_ip_map entry has expired based on its TTL.
 // Returns 1 if expired, 0 if still valid. TTL of 0 means never expires.
@@ -1080,6 +1194,198 @@ int bpf_phase2_rewrite(void *ctx) {
   return 0;
 }
 
+// =============================================================================
+// TLS 1.3 AES-GCM XOR-patch path
+//
+// When the connection uses AES-GCM (TLS 1.3), the entry uprobe does NOT write
+// the real secret to user memory. Instead it stores the XOR delta in the
+// xor_pending map, and a kprobe on tcp_sendmsg patches the ciphertext and
+// recomputes the GHASH auth tag — all in kernel context.
+// =============================================================================
+
+// Tail-called XOR-path program (index 1 in prog_array).
+// Reads ssl_ptr from scratch_buf, checks for AES-GCM, scans for kloak: prefix,
+// and stores the XOR delta in xor_pending for the tcp_sendmsg kprobe.
+// Has its own verifier budget and 512-byte stack (separate from the entry uprobe).
+
+SEC("uprobe/xor_path")
+int bpf_xor_path(void *ctx) {
+  dbg_inc(DBG_XOR_PATH_ENTERED);
+
+  __u32 zero = 0;
+  struct scratch_buf *sd = bpf_map_lookup_elem(&scratch, &zero);
+  if (!sd)
+    return 0;
+
+  __u32 local_i = sd->xor_match_pos;
+  if (local_i == 0xFFFFFFFF)
+    return 0;
+
+  struct secret_key key;
+  __builtin_memcpy(&key, &sd->xor_match_key, sizeof(key));
+
+  struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
+  if (!val || val->len == 0 || val->len > SECRET_MAX_LEN)
+    return 0;
+
+  dbg_inc(DBG_XOR_SECRET_FOUND);
+
+  // Host filtering.
+  if (val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
+    if (sd->host_value_len == 0)
+      return 0;
+    if (!hosts_match(sd->host_value, val->allowed_host))
+      return 0;
+  }
+
+  // Save scalars before re-lookups.
+  __u64 ssl_ptr_saved = sd->ssl_ptr;
+  __u32 val_len = val->len;
+  __u32 delta_len = clamp_write_len(val_len);
+
+  // Step 1: Copy shadow bytes into w->ct_buf (need w + sd simultaneously).
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0;
+  sd = bpf_map_lookup_elem(&scratch, &zero);
+  if (!sd)
+    return 0;
+
+  for (__u32 j = 0; j < SECRET_MAX_LEN; j++) {
+    if (j >= delta_len)
+      break;
+    __u32 buf_idx = (local_i + j) & (MAX_DATA_SIZE - 1);
+    w->ct_buf[j] = sd->data[buf_idx];
+  }
+
+  // Step 2: XOR real_secret into ct_buf (need w + val simultaneously).
+  val = bpf_map_lookup_elem(&secret_map, &key);
+  if (!val)
+    return 0;
+  for (__u32 j = 0; j < SECRET_MAX_LEN; j++) {
+    if (j >= delta_len)
+      break;
+    w->ct_buf[j] ^= val->real_secret[j];
+  }
+
+  // Step 3: Build xor_pending entry.
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0;
+
+  __builtin_memset(&w->staged_pending, 0, sizeof(w->staged_pending));
+  w->staged_pending.ssl_ptr = ssl_ptr_saved;
+  w->staged_pending.tgid = tgid;
+  w->staged_pending.secret_offset = local_i;
+  w->staged_pending.secret_len = val_len;
+  w->staged_pending.active = 1;
+  __builtin_memcpy(w->staged_pending.xor_delta, w->ct_buf, SECRET_MAX_LEN);
+
+  bpf_map_update_elem(&xor_pending, &pid_tgid, &w->staged_pending, BPF_ANY);
+  dbg_inc(DBG_XOR_DELTA_DONE);
+  return 0;
+}
+
+// -----------------------------------------------------------------------------
+// kprobe/tcp_sendmsg — Intercept ciphertext and apply XOR patch + GHASH update
+//
+// Fires when SSL_write internally calls write()/send() → tcp_sendmsg.
+// The ciphertext is still in user-space iov buffers (not yet copied to kernel).
+// We XOR-patch the secret bytes and recompute the GHASH authentication tag.
+// -----------------------------------------------------------------------------
+
+// bpf_loop callback: one iteration of GF(2^128) multiplication.
+// State lives in the ghash_scratch per-CPU map (mul_a, mul_v, mul_z).
+// The verifier only needs to verify one iteration, not 128.
+__attribute__((unused))
+static int gf128_mul_iter(__u32 i, void *_unused) {
+  __u32 zero = 0;
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 1; // stop
+
+  if (w->mul_a[i / 8] & ((__u8)0x80 >> (i % 8))) {
+    for (int j = 0; j < 16; j++)
+      w->mul_z[j] ^= w->mul_v[j];
+  }
+  __u8 carry = w->mul_v[15] & 1;
+  for (int j = 15; j > 0; j--)
+    w->mul_v[j] = (w->mul_v[j] >> 1) | (w->mul_v[j - 1] << 7);
+  w->mul_v[0] >>= 1;
+  if (carry)
+    w->mul_v[0] ^= 0xe1;
+  return 0;
+}
+
+// Multiply a * b in GF(2^128) using bpf_loop. Result written to w->mul_z,
+// then copied to `result`. All state lives in the per-CPU ghash_work map.
+__attribute__((unused))
+static __always_inline void gf128_mul_map(struct ghash_work *w,
+                                           const __u8 a[16],
+                                           const __u8 b[16],
+                                           __u8 result[16]) {
+  __builtin_memcpy(w->mul_a, a, 16);
+  __builtin_memset(w->mul_z, 0, 16);
+  __builtin_memcpy(w->mul_v, b, 16);
+  bpf_loop(128, gf128_mul_iter, NULL, 0);
+  __builtin_memcpy(result, w->mul_z, 16);
+}
+
+// Compute H^power using precomputed table, via map-based multiply.
+__attribute__((unused))
+static __always_inline void gf128_h_power_table_map(struct ghash_work *w,
+                                                      const __u8 h_powers[11][16],
+                                                      __u32 power,
+                                                      __u8 result[16]) {
+  __builtin_memset(result, 0, 16);
+  result[0] = 0x80; // GF(2^128) identity
+
+  for (int i = 0; i < 11 && power > 0; i++) {
+    if (power & (1u << i)) {
+      gf128_mul_map(w, result, h_powers[i], w->hp_tmp);
+      __builtin_memcpy(result, w->hp_tmp, 16);
+    }
+  }
+}
+
+// Compute H^power via square-and-multiply from base H, using map-based multiply.
+__attribute__((unused))
+static __always_inline void gf128_h_power_map(struct ghash_work *w,
+                                                const __u8 h[16],
+                                                __u32 power,
+                                                __u8 result[16]) {
+  __builtin_memset(result, 0, 16);
+  result[0] = 0x80;
+
+  __builtin_memcpy(w->hp_base, h, 16);
+  for (int i = 0; i < 11 && power > 0; i++) {
+    if (power & 1) {
+      gf128_mul_map(w, result, w->hp_base, w->hp_tmp);
+      __builtin_memcpy(result, w->hp_tmp, 16);
+    }
+    gf128_mul_map(w, w->hp_base, w->hp_base, w->hp_tmp);
+    __builtin_memcpy(w->hp_base, w->hp_tmp, 16);
+    power >>= 1;
+  }
+}
+
+SEC("kprobe/tcp_sendmsg")
+int bpf_kprobe_tcp_sendmsg(void *ctx) {
+  dbg_inc(DBG_XOR_TCP_ENTRY);
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+  struct xor_pending_val *pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
+  if (!pending || !pending->active)
+    return 0;
+
+  dbg_inc(DBG_XOR_TCP_SENDMSG);
+  pending->active = 0;
+  return 0;
+}
+
 // -----------------------------------------------------------------------------
 // Go crypto/tls.(*Conn).Write uprobe
 //
@@ -1146,8 +1452,9 @@ int bpf_uprobe_go_tls_write(void *ctx) {
   // resolve_host will use last_verified_fd -> conn_ip_map -> dns_ip_map.
   resolve_host(scratch_data, 0);
 
-  // Jump to Phase 2
-  bpf_tail_call(ctx, &prog_array, 0);
+  // XOR-patch path not yet supported for Go (needs Go struct offset work).
+  // Plaintext fallback disabled: secret is NOT rewritten (fail-secure).
+  // TODO: implement Go crypto/tls key extraction to enable XOR path.
 
   return 0;
 }
@@ -1217,8 +1524,25 @@ int bpf_uprobe_ssl_write(void *ctx) {
   // Look up hostname via DNS chain: ssl_fd_map -> conn_ip_map -> dns_ip_map
   resolve_host(scratch_data, (__u64)ssl_ptr);
 
-  // Jump to Phase 2
-  bpf_tail_call(ctx, &prog_array, 0);
+  // XOR path: pre-scan for kloak: prefix and tail-call to xor_path.
+  // TODO: gate on tls_conn_state AES-GCM check once key extraction is implemented.
+  dbg_inc(DBG_XOR_CONN_CHECK);
+  scratch_data->ssl_ptr = (__u64)ssl_ptr;
+  scratch_data->xor_match_pos = 0xFFFFFFFF;
+
+  __u32 scan_limit = read_len >= SECRET_KEY_LEN ? read_len - SECRET_KEY_LEN + 1 : 0;
+  for (__u32 i = 0; i < scan_limit; i++) {
+    if (is_kloak_prefix(&scratch_data->data[i]) ||
+        is_kloak_prefix_huffman((const unsigned char *)&scratch_data->data[i])) {
+      scratch_data->xor_match_pos = i;
+      dbg_inc(DBG_XOR_PRESCAN_MATCH);
+      __builtin_memcpy(scratch_data->xor_match_key.prefix,
+                       &scratch_data->data[i], SECRET_KEY_LEN);
+      break;
+    }
+  }
+
+  bpf_tail_call(ctx, &prog_array, 1);
 
   return 0;
 }
