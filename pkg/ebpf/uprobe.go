@@ -283,6 +283,16 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	m.links = append(m.links, krp)
 	m.log.Info("Attached kretprobe", "function", "udp_recvmsg")
 
+	// Attach kprobe on tcp_sendmsg to bridge xor_pending → tc_pending.
+	// This runs after SSL_write encrypts and calls write/send, giving us
+	// access to the struct sock (source port) for per-connection keying.
+	tkp, err := link.Kprobe("tcp_sendmsg", m.objs.BpfKprobeTcpSendmsg, nil)
+	if err != nil {
+		return fmt.Errorf("attaching kprobe tcp_sendmsg: %w", err)
+	}
+	m.links = append(m.links, tkp)
+	m.log.Info("Attached kprobe", "function", "tcp_sendmsg")
+
 	return nil
 }
 

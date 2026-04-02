@@ -423,6 +423,16 @@ struct xor_pending_val {
   __u8  _pad[3];
 };
 
+// Per-thread pending XOR patches, keyed by pid_tgid.
+// Written by the uprobe (xor_path), read by the tcp_sendmsg kprobe which
+// bridges to tc_pending with the per-connection (dst_ip, src_port) key.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 4096);
+  __type(key, __u64);  // pid_tgid
+  __type(value, struct xor_pending_val);
+} xor_pending SEC(".maps");
+
 // Userspace-configured struct offsets for extracting TLS key material.
 // Populated once per library at uprobe attach time after the controller
 // detects the OpenSSL version. Supports a 4-level pointer chain:
@@ -446,8 +456,9 @@ struct {
 // tc egress struct definitions (needed by ghash_work below and tc maps further down).
 struct tc_dest_key {
   __u8  dst_ip[16]; // IPv4-mapped-IPv6 or native IPv6
-  // TODO: Add src_port for per-connection isolation to prevent overwrites
-  // when multiple connections target the same IP.
+  __u16 src_port;   // source port (network byte order) — unique per connection
+  __u16 _pad;
+  __u64 cgroup_id;  // per-container isolation
 };
 
 struct tc_pending_val {
@@ -1381,36 +1392,17 @@ next:
   }
 
 finalize:;
-  // All matches processed. Store results and populate tc_pending.
+  // All matches processed. Store patches in xor_pending keyed by pid_tgid.
+  // The tcp_sendmsg kprobe will bridge this to tc_pending with the per-connection
+  // (dst_ip, src_port) key that tc egress can look up from the packet headers.
   __u64 pid_tgid = bpf_get_current_pid_tgid();
-  __u32 tgid = (__u32)(pid_tgid >> 32);
 
   struct ghash_work *wf = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!wf || wf->staged_pending.patch_count == 0)
     return 0;
 
-  // Populate tc_pending for kernel-only ciphertext patching.
-  sd = bpf_map_lookup_elem(&scratch, &zero);
-  if (sd && sd->xor_fd > 0) {
-    struct conn_ip_key cik = {.tgid = tgid, .fd = sd->xor_fd};
-    struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
-    if (civ) {
-      struct tc_dest_key tdk = {};
-      __builtin_memcpy(tdk.dst_ip, civ->ip, 16);
-
-      wf = bpf_map_lookup_elem(&ghash_scratch, &zero);
-      if (wf) {
-        __builtin_memset(&wf->staged_tc, 0, sizeof(wf->staged_tc));
-        wf->staged_tc.tgid = tgid;
-        wf->staged_tc.ssl_ptr = wf->staged_pending.ssl_ptr;
-        wf->staged_tc.active = 1;
-        wf->staged_tc.patch_count = wf->staged_pending.patch_count;
-        for (__u32 p = 0; p < XOR_MAX_PATCHES && p < wf->staged_pending.patch_count; p++)
-          wf->staged_tc.patches[p] = wf->staged_pending.patches[p];
-        bpf_map_update_elem(&tc_pending, &tdk, &wf->staged_tc, BPF_ANY);
-      }
-    }
-  }
+  // ssl_ptr, tgid, active already set during mi=0 initialization.
+  bpf_map_update_elem(&xor_pending, &pid_tgid, &wf->staged_pending, BPF_ANY);
 
   dbg_inc(DBG_XOR_DELTA_DONE);
   return 0;
@@ -1585,6 +1577,87 @@ static int ghash_block_iter(__u32 block_idx, void *_unused) {
   // Accumulate: tag_delta ^= contribution (mul_z)
   for (__u32 i = 0; i < 16; i++)
     w->tag_delta[i] ^= w->mul_z[i];
+
+  return 0;
+}
+
+// -----------------------------------------------------------------------------
+// kprobe/tcp_sendmsg — Bridge xor_pending to tc_pending with per-connection key.
+//
+// SSL_write → encrypt → write()/send() → tcp_sendmsg (this kprobe) → kernel TCP
+//
+// The uprobe stores patches in xor_pending[pid_tgid]. This kprobe reads the
+// source port from struct sock (first arg) and copies the entry to
+// tc_pending[(dst_ip, src_port)] where tc egress can find it by packet headers.
+// This gives per-connection isolation: two connections to the same IP have
+// different source ports, so their entries don't collide.
+// -----------------------------------------------------------------------------
+
+SEC("kprobe/tcp_sendmsg")
+int bpf_kprobe_tcp_sendmsg(void *ctx) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+
+  struct xor_pending_val *pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
+  if (!pending || !pending->active)
+    return 0;
+
+  // Deactivate so only the first tcp_sendmsg after SSL_write bridges.
+  pending->active = 0;
+
+  // Read source port from struct sock (first argument of tcp_sendmsg).
+  // tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+  void *sk;
+#if defined(bpf_target_x86)
+  bpf_probe_read_kernel(&sk, sizeof(void *), (char *)ctx + 112); // RDI
+#elif defined(bpf_target_arm64)
+  bpf_probe_read_kernel(&sk, sizeof(void *), (char *)ctx + 0);   // X0
+#else
+  return 0;
+#endif
+  if (!sk) return 0;
+
+  // Read source port: struct sock → __sk_common.skc_num (host byte order).
+  __u16 src_port_h = 0;
+  bpf_probe_read_kernel(&src_port_h, sizeof(src_port_h),
+                        (void *)sk + offsetof(struct sock, __sk_common.skc_num));
+
+  // Read destination IP: struct sock → __sk_common.skc_daddr (IPv4, network order).
+  __u32 daddr = 0;
+  bpf_probe_read_kernel(&daddr, sizeof(daddr),
+                        (void *)sk + offsetof(struct sock, __sk_common.skc_daddr));
+
+  // Build tc_pending key: (dst_ip, src_port, cgroup_id).
+  // src_port is unique per connection within a container.
+  // cgroup_id isolates containers (prevents cross-container src_port collisions).
+  struct tc_dest_key tdk = {};
+  tdk.dst_ip[10] = 0xff;
+  tdk.dst_ip[11] = 0xff;
+  __builtin_memcpy(&tdk.dst_ip[12], &daddr, 4);
+  tdk.src_port = __bpf_htons(src_port_h);
+  tdk.cgroup_id = bpf_get_current_cgroup_id();
+
+  // Copy from xor_pending to tc_pending. Re-lookup pending after helper calls.
+  __u32 zero = 0;
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w) return 0;
+
+  pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
+  if (!pending) return 0;
+
+  __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
+  w->staged_tc.tgid = (__u32)(pid_tgid >> 32);
+  w->staged_tc.ssl_ptr = pending->ssl_ptr;
+  w->staged_tc.active = 1;
+  w->staged_tc.patch_count = pending->patch_count;
+  if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
+    w->staged_tc.patch_count = XOR_MAX_PATCHES;
+  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < w->staged_tc.patch_count; p++)
+    w->staged_tc.patches[p] = pending->patches[p];
+
+  bpf_map_update_elem(&tc_pending, &tdk, &w->staged_tc, BPF_ANY);
+
+  // Clean up xor_pending entry.
+  bpf_map_delete_elem(&xor_pending, &pid_tgid);
 
   return 0;
 }
@@ -1882,12 +1955,14 @@ int tc_egress_patch(struct __sk_buff *skb) {
   if (tcp_hdr_len < 20)
     return 0 /* TC_ACT_OK */;
 
-  // Build destination key from the packet's destination IP.
+  // Build key from destination IP + source port (per-connection isolation).
   // Map IPv4 to IPv4-mapped-IPv6 format (matches conn_ip_map convention).
   struct tc_dest_key key = {};
   key.dst_ip[10] = 0xff;
   key.dst_ip[11] = 0xff;
   __builtin_memcpy(&key.dst_ip[12], &ip->daddr, 4);
+  key.src_port = tcp->source; // already network byte order
+  key.cgroup_id = bpf_skb_cgroup_id(skb);
 
   struct tc_pending_val *pending = bpf_map_lookup_elem(&tc_pending, &key);
   if (!pending || !pending->active)
