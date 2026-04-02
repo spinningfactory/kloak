@@ -683,6 +683,8 @@ var debugCounterNames = []string{
 	"xor_conn_check", "xor_conn_hit", "xor_prescan_match", "xor_tailcall",
 	"xor_path_entered", "xor_secret_found", "xor_delta_done",
 	"tc_entry", "tc_match", "tc_patched",
+	"tc_skip_reclen", "tc_skip_load", "tc_skip_store", "tc_skip_nontls",
+	"tc_no_tail", "tc_empty", "tc_no_entry",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

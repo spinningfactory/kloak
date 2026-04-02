@@ -446,28 +446,17 @@ struct {
 // tc egress struct definitions (needed by ghash_work below and tc maps further down).
 struct tc_dest_key {
   __u8  dst_ip[16]; // IPv4-mapped-IPv6 or native IPv6
+  // TODO: Add src_port for per-connection isolation to prevent overwrites
+  // when multiple connections target the same IP.
 };
 
-// Per-destination queue metadata (head/tail counters).
-// The uprobe writes at tail, tc egress reads at head.
-#define TC_QUEUE_DEPTH 4 // must be power of 2
-struct tc_queue_meta {
-  __u32 head;
-  __u32 tail;
-};
-
-// Compound key: destination IP + queue slot index.
-struct tc_queue_key {
-  __u8  dst_ip[16];
-  __u32 slot;
-};
-
-// A single queue entry (one SSL_write's worth of patches).
-struct tc_queue_entry {
+struct tc_pending_val {
   __u32 tgid;
   __u64 ssl_ptr;
   __u32 patch_count;
   struct xor_patch patches[XOR_MAX_PATCHES];
+  __u8  active;
+  __u8  _pad[3];
 };
 
 // Holds all large structs and buffers that would otherwise exceed the 512-byte
@@ -476,7 +465,7 @@ struct ghash_work {
   // Staging for map updates (avoids large structs on BPF stack)
   struct tls_conn_state staged_conn;     // for tls_conn_state map insert
   struct xor_pending_val staged_pending; // staging area for patch accumulation
-  struct tc_queue_entry staged_tc;       // for tc_pending map insert
+  struct tc_pending_val staged_tc;       // for tc_pending map insert
   // Ciphertext patching buffers
   __u8 ct_buf[SECRET_MAX_LEN]; // Ciphertext chunk for XOR patching
   __u8 old_tag[16];            // Original auth tag from TLS record
@@ -535,23 +524,13 @@ struct {
 // encrypted real secret never exists in user-space memory.
 // =============================================================================
 
-// Per-destination queue state: head/tail counters for the circular buffer.
+// tc_pending map: keyed by destination IP (from conn_ip_map).
 // TODO: Use socket cookie for precise per-connection identification.
 struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
-  __uint(max_entries, 1024);
-  __type(key, struct tc_dest_key);
-  __type(value, struct tc_queue_meta);
-} tc_queue_meta SEC(".maps");
-
-// Per-slot entries: each SSL_write enqueues one entry.
-// Key is (dst_ip, slot) so each slot is a separate map entry.
-// LRU evicts stale entries from abandoned connections.
-struct {
-  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 4096);
-  __type(key, struct tc_queue_key);
-  __type(value, struct tc_queue_entry);
+  __type(key, struct tc_dest_key);
+  __type(value, struct tc_pending_val);
 } tc_pending SEC(".maps");
 
 // =============================================================================
@@ -1410,7 +1389,7 @@ finalize:;
   if (!wf || wf->staged_pending.patch_count == 0)
     return 0;
 
-  // Enqueue patches into the per-destination circular buffer.
+  // Populate tc_pending for kernel-only ciphertext patching.
   sd = bpf_map_lookup_elem(&scratch, &zero);
   if (sd && sd->xor_fd > 0) {
     struct conn_ip_key cik = {.tgid = tgid, .fd = sd->xor_fd};
@@ -1419,32 +1398,17 @@ finalize:;
       struct tc_dest_key tdk = {};
       __builtin_memcpy(tdk.dst_ip, civ->ip, 16);
 
-      // Read queue state (head/tail) — save to locals before any other lookups.
-      struct tc_queue_meta *meta = bpf_map_lookup_elem(&tc_queue_meta, &tdk);
-      __u32 qt = 0, qh = 0;
-      if (meta) { qt = meta->tail; qh = meta->head; }
-
-      // Build entry from staged_pending.
       wf = bpf_map_lookup_elem(&ghash_scratch, &zero);
       if (wf) {
         __builtin_memset(&wf->staged_tc, 0, sizeof(wf->staged_tc));
         wf->staged_tc.tgid = tgid;
         wf->staged_tc.ssl_ptr = wf->staged_pending.ssl_ptr;
+        wf->staged_tc.active = 1;
         wf->staged_tc.patch_count = wf->staged_pending.patch_count;
         for (__u32 p = 0; p < XOR_MAX_PATCHES && p < wf->staged_pending.patch_count; p++)
           wf->staged_tc.patches[p] = wf->staged_pending.patches[p];
-
-        // Write entry to queue slot.
-        struct tc_queue_key qk = {};
-        __builtin_memcpy(qk.dst_ip, tdk.dst_ip, 16);
-        qk.slot = qt & (TC_QUEUE_DEPTH - 1);
-        bpf_map_update_elem(&tc_pending, &qk, &wf->staged_tc, BPF_ANY);
+        bpf_map_update_elem(&tc_pending, &tdk, &wf->staged_tc, BPF_ANY);
       }
-
-      // Advance tail. If queue was full, advance head too (drop oldest).
-      if (qt - qh >= TC_QUEUE_DEPTH) qh = qt - TC_QUEUE_DEPTH + 1;
-      struct tc_queue_meta new_meta = {.head = qh, .tail = qt + 1};
-      bpf_map_update_elem(&tc_queue_meta, &tdk, &new_meta, BPF_ANY);
     }
   }
 
@@ -1925,29 +1889,17 @@ int tc_egress_patch(struct __sk_buff *skb) {
   key.dst_ip[11] = 0xff;
   __builtin_memcpy(&key.dst_ip[12], &ip->daddr, 4);
 
-  // Dequeue from the per-destination circular buffer.
-  struct tc_queue_meta *meta = bpf_map_lookup_elem(&tc_queue_meta, &key);
-  if (!meta || meta->head == meta->tail)
+  struct tc_pending_val *pending = bpf_map_lookup_elem(&tc_pending, &key);
+  if (!pending || !pending->active)
     return 0 /* TC_ACT_OK */;
 
-  __u32 qh = meta->head;
-  struct tc_queue_key qk = {};
-  __builtin_memcpy(qk.dst_ip, key.dst_ip, 16);
-  qk.slot = qh & (TC_QUEUE_DEPTH - 1);
-
-  struct tc_queue_entry *entry = bpf_map_lookup_elem(&tc_pending, &qk);
-  if (!entry || entry->patch_count == 0)
-    return 0 /* TC_ACT_OK */;
-
-  dbg_inc(DBG_TC_MATCH);
-
-  // TCP payload starts after IP + TCP headers
+  // Only process TLS application_data records. Non-TLS packets (ACKs,
+  // handshake) must not consume the pending entry.
   __u32 payload_off = l3_off + ip_hdr_len + tcp_hdr_len;
   __u32 payload_len = __bpf_ntohs(ip->tot_len) - ip_hdr_len - tcp_hdr_len;
   if (payload_len < 5)
     return 0 /* TC_ACT_OK */;
 
-  // Read TLS record header from the TCP payload
   __u8 tls_hdr[5];
   if (bpf_skb_load_bytes(skb, payload_off, tls_hdr, 5) < 0)
     return 0 /* TC_ACT_OK */;
@@ -1955,48 +1907,69 @@ int tc_egress_patch(struct __sk_buff *skb) {
     return 0 /* TC_ACT_OK */;
 
   __u16 record_len = ((__u16)tls_hdr[3] << 8) | (__u16)tls_hdr[4];
+
+  // Full TLS record must fit in this segment (header + body).
+  // Otherwise we can't patch ciphertext AND update the GHASH tag atomically.
+  if (payload_len < 5 + record_len)
+    return 0 /* TC_ACT_OK */;
+
+  // Copy ALL data from pending and consume ATOMICALLY — before any other map
+  // lookups or helper calls. A concurrent uprobe on another CPU can call
+  // bpf_map_update_elem at any moment, replacing the entire value.
+  // Read everything we need, THEN mark inactive.
+  __u32 pc = pending->patch_count;
+  if (pc > XOR_MAX_PATCHES) pc = XOR_MAX_PATCHES;
+  __u32 pending_tgid = pending->tgid;
+  __u64 pending_ssl_ptr = pending->ssl_ptr;
+  // Consume: mark inactive so keep-alive requests don't re-apply.
+  pending->active = 0;
+
+  dbg_inc(DBG_TC_MATCH);
+
   __u32 nonce_len = 8; // TLS 1.2
   __u32 ct_len = record_len - 16 - nonce_len;
 
-  // Copy entry data to ghash_scratch staging area.
-  // entry (tc_pending) and w (ghash_scratch) are from different maps — both valid.
+  // Now copy patches to ghash_scratch staging area (pending may be stale after
+  // the ghash_scratch lookup, but pc/tgid/ssl_ptr are already in locals).
   __u32 zero = 0;
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w)
     return 0 /* TC_ACT_OK */;
 
-  __u32 pc = entry->patch_count;
-  if (pc > XOR_MAX_PATCHES) pc = XOR_MAX_PATCHES;
+  // Re-read pending for patch data (still valid — same map, no delete).
+  pending = bpf_map_lookup_elem(&tc_pending, &key);
+  if (!pending) return 0 /* TC_ACT_OK */;
+
   w->staged_pending.patch_count = pc;
   for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++)
-    w->staged_pending.patches[p] = entry->patches[p];
+    w->staged_pending.patches[p] = pending->patches[p];
   w->ghash_ct_len = ct_len;
   w->ghash_nonce_len = nonce_len;
   w->ghash_payload_off = payload_off;
-  w->ghash_tgid = entry->tgid;
-  w->ghash_ssl_ptr = entry->ssl_ptr;
+  w->ghash_tgid = pending_tgid;
+  w->ghash_ssl_ptr = pending_ssl_ptr;
   w->ghash_active = 1;
 
-  // Advance head and clean up consumed slot.
-  bpf_map_delete_elem(&tc_pending, &qk);
-  meta = bpf_map_lookup_elem(&tc_queue_meta, &key);
-  if (meta) meta->head = qh + 1;
-
-  // Apply ALL patches from staged_pending (not from pending — it's stale now).
+  // Apply patches. Zero secret_len on failure so GHASH skips unapplied patches.
   for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++) {
     w = bpf_map_lookup_elem(&ghash_scratch, &zero);
     if (!w) return 0 /* TC_ACT_OK */;
 
     __u32 sec_off = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_offset;
     __u32 sec_len = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len;
-    if (record_len < 16 + nonce_len + sec_len)
+    if (record_len < 16 + nonce_len + sec_len) {
+      w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len = 0;
       continue;
+    }
 
     __u32 patch_off = payload_off + 5 + nonce_len + sec_off;
     __u32 patch_len = clamp_write_len(sec_len);
 
-    if (bpf_skb_load_bytes(skb, patch_off, w->ct_buf, patch_len) < 0)
+    if (bpf_skb_load_bytes(skb, patch_off, w->ct_buf, patch_len) < 0) {
+      w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+      if (w) w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len = 0;
       continue;
+    }
 
     for (__u32 i = 0; i < SECRET_MAX_LEN && i < patch_len; i++)
       w->ct_buf[i] ^= w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].xor_delta[i];
@@ -2058,9 +2031,12 @@ int tc_ghash_update(struct __sk_buff *skb) {
     w = bpf_map_lookup_elem(&ghash_scratch, &zero);
     if (!w) return 0 /* TC_ACT_OK */;
 
+    // Skip patches that tc_egress_patch failed to apply (secret_len zeroed).
+    __u32 raw_len = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len;
+    if (raw_len == 0) continue;
+
     __u32 sec_off = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_offset;
-    __u32 sec_len = clamp_write_len(
-        w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len);
+    __u32 sec_len = clamp_write_len(raw_len);
 
     w->ghash_secret_offset = sec_off;
     w->ghash_patch_len = sec_len;
