@@ -33,9 +33,12 @@
  * TLS write call and adds significant overhead. */
 
 // Buffer size for reading TLS data per chunk. Must be a power of 2 for bitmask.
-// Phase 2 uses bpf_loop() to scan the full TLS buffer in 256-byte chunks.
+// 512 bytes covers HTTP headers from libraries that add default headers
+// (e.g. Python requests adds User-Agent, Accept-Encoding, Accept, Connection
+// before custom headers, pushing secrets to byte ~260+).
+// Phase 2 uses bpf_loop() to scan the full TLS buffer in MAX_DATA_SIZE-byte chunks.
 // Requires kernel 5.17+ for bpf_loop().
-#define MAX_DATA_SIZE 256
+#define MAX_DATA_SIZE 512
 // Fixed secret rewrite size
 #define SECRET_MAX_LEN 128
 // BPF map key length — short key for lookup (kloak: + 2 UUID chars)
@@ -1451,10 +1454,11 @@ int bpf_xor_path(void *ctx) {
   sd = bpf_map_lookup_elem(&scratch, &zero);
   if (!sd) return 0;
 
-  for (__u32 j = 0; j < SECRET_MAX_LEN && j < delta_len; j++) {
-    __u32 buf_idx = (local_i + j) & (MAX_DATA_SIZE - 1);
-    w->ct_buf[j] = sd->data[buf_idx];
-  }
+  // Read shadow bytes directly from user memory. This avoids depending on
+  // the prescan buffer size — secrets that start near the end of the buffer
+  // won't wrap around and read garbage from position 0.
+  bpf_probe_read_user(w->ct_buf, SECRET_MAX_LEN,
+                      (void *)(sd->user_data_ptr + local_i));
 
   val = bpf_map_lookup_elem(&secret_map, &key);
   if (!val) goto next;
