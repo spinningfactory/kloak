@@ -99,6 +99,7 @@ e2e-setup:
 	@docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
 	@docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
 	@docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
+	@docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
 	@echo "==> Importing images into k3d (one at a time)..."
 	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) -c $(E2E_CLUSTER)
 	@k3d image import kloak-demo-go:latest -c $(E2E_CLUSTER)
@@ -107,6 +108,7 @@ e2e-setup:
 	@k3d image import kloak-demo-go-boring:latest -c $(E2E_CLUSTER)
 	@k3d image import kloak-demo-gnutls:latest -c $(E2E_CLUSTER)
 	@k3d image import kloak-demo-python-raw-tls:latest -c $(E2E_CLUSTER)
+	@k3d image import kloak-tls-echo:latest -c $(E2E_CLUSTER)
 	@echo "==> E2E environment ready."
 
 # Run e2e tests (including eBPF) against an existing k3d cluster.
