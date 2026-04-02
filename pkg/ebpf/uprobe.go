@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"syscall"
 	"runtime"
 	"strings"
 	"sync"
@@ -82,6 +83,10 @@ type TLSUprobeManager struct {
 	// cgroupPaths maps cgroup inode ID -> filesystem path.
 	// Populated by TrackCgroup.
 	cgroupPaths sync.Map // uint64 -> string
+	// tcAttached tracks network namespace inodes where tc egress is already
+	// attached, preventing duplicate attachment when new processes exec in the
+	// same container.
+	tcAttached sync.Map // uint64 (netns inode) -> bool
 
 }
 
@@ -304,8 +309,17 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 // The controller enters the container's netns via /proc/<pid>/ns/net
 // (requires hostPID: true), attaches tc, then returns to its own netns.
 func (m *TLSUprobeManager) attachTCEgress(pid int) error {
-	// Enter the container's network namespace.
+	// Check if this network namespace already has tc attached by reading
+	// the netns inode. Multiple processes in the same container share a netns.
 	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+	if fi, err := os.Stat(netnsPath); err == nil {
+		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+			if _, loaded := m.tcAttached.LoadOrStore(stat.Ino, true); loaded {
+				m.log.V(1).Info("tc egress already attached for this netns", "pid", pid, "netns_ino", stat.Ino)
+				return nil
+			}
+		}
+	}
 	containerNS, err := os.Open(netnsPath)
 	if err != nil {
 		return fmt.Errorf("opening container netns %s: %w", netnsPath, err)
