@@ -84,9 +84,16 @@ struct scratch_buf {
   __u32 total_data_len; // full TLS write length (for bpf_loop scanning)
   __u32 host_offset;
   __u32 host_value_len; // length of extracted host value
-  __u32 xor_match_pos;  // byte offset of kloak: prefix in data[] (0xFFFFFFFF = not found)
   __u32 xor_fd;         // socket fd resolved by resolve_host (for xor_pending key)
-  struct secret_key xor_match_key; // 8-byte key prefix at match position (set by entry uprobe)
+  // Multiple secret matches per SSL_write (up to 4).
+  // xor_path processes one match per invocation and tail-calls back to itself.
+  #define XOR_MAX_MATCHES 4
+  __u32 xor_match_count;   // total matches found by pre-scan
+  __u32 xor_current_match; // index of the next match to process
+  struct {
+    __u32 pos;                    // byte offset of kloak: prefix in data[]
+    struct secret_key key;        // 8-byte key prefix
+  } xor_matches[XOR_MAX_MATCHES];
   char host_value[MAX_HOST_LEN]; // host from DNS chain
   char data[MAX_DATA_SIZE];
 };
@@ -413,15 +420,21 @@ struct {
   __type(value, struct tls_conn_state);
 } tls_conn_state SEC(".maps");
 
-// Per-thread pending XOR patch data. Written by the entry uprobe when an
-// AES-GCM connection is detected, consumed by the kprobe on tcp_sendmsg.
-struct xor_pending_val {
-  __u64 ssl_ptr;
-  __u32 tgid;
+// A single XOR patch entry (one secret match within a TLS record).
+struct xor_patch {
   __u32 secret_offset;      // byte offset of secret in plaintext
   __u32 secret_len;         // length of secret (1..128)
   __u8  xor_delta[SECRET_MAX_LEN]; // shadow[i] ^ real[i]
-  __u8  active;             // 1 = pending XOR patch
+};
+
+// Per-thread pending XOR patches. Supports multiple secrets per SSL_write.
+#define XOR_MAX_PATCHES 4
+struct xor_pending_val {
+  __u64 ssl_ptr;
+  __u32 tgid;
+  __u32 patch_count;        // number of valid patches (0..XOR_MAX_PATCHES)
+  struct xor_patch patches[XOR_MAX_PATCHES];
+  __u8  active;
   __u8  _pad[3];
 };
 
@@ -454,12 +467,27 @@ struct {
 } tls_offset_config SEC(".maps");
 
 // Per-CPU scratch space for XOR-path programs (bpf_xor_path + tcp_sendmsg kprobe).
+// tc egress struct definitions (needed by ghash_work below and tc maps further down).
+struct tc_dest_key {
+  __u8  dst_ip[16]; // IPv4-mapped-IPv6 or native IPv6
+};
+
+struct tc_pending_val {
+  __u32 tgid;
+  __u64 ssl_ptr;
+  __u32 patch_count;
+  struct xor_patch patches[XOR_MAX_PATCHES];
+  __u8  active;
+  __u8  _pad[3];
+};
+
 // Holds all large structs and buffers that would otherwise exceed the 512-byte
 // BPF stack limit, including staging areas for map updates and GF(2^128) state.
 struct ghash_work {
   // Staging for map updates (avoids large structs on BPF stack)
-  struct tls_conn_state staged_conn;     // ~196 bytes — for tls_conn_state map insert
-  struct xor_pending_val staged_pending; // ~152 bytes — for xor_pending map insert
+  struct tls_conn_state staged_conn;     // for tls_conn_state map insert
+  struct xor_pending_val staged_pending; // for xor_pending map insert
+  struct tc_pending_val staged_tc;       // for tc_pending map insert
   // tcp_sendmsg kprobe buffers
   __u8 ct_buf[SECRET_MAX_LEN]; // Ciphertext chunk for XOR patching
   __u8 old_tag[16];            // Original auth tag from TLS record
@@ -524,26 +552,8 @@ struct {
 // encrypted real secret never exists in user-space memory.
 // =============================================================================
 
-// tc_pending key: destination IP (from conn_ip_map, already tracked).
-// TODO: Use socket cookie (bpf_get_socket_cookie) for precise per-connection
-// identification. Requires storing the cookie in the connect tracepoint and
-// passing it through to the uprobe via a (tgid, fd) → cookie map.
-// For now, keyed by destination IP which works when each destination has
-// one secret pattern (the common case for API endpoints).
-struct tc_dest_key {
-  __u8  dst_ip[16]; // IPv4-mapped-IPv6 or native IPv6
-};
-
-struct tc_pending_val {
-  __u32 secret_offset;        // byte offset of secret within TLS record plaintext
-  __u32 secret_len;
-  __u32 tgid;                 // for tls_conn_state lookup
-  __u64 ssl_ptr;              // for tls_conn_state lookup
-  __u8  xor_delta[SECRET_MAX_LEN];
-  __u8  active;
-  __u8  _pad[3];
-};
-
+// tc_pending map: keyed by destination IP (from conn_ip_map).
+// TODO: Use socket cookie for precise per-connection identification.
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 4096);
@@ -1383,84 +1393,108 @@ int bpf_h_extract(void *ctx) {
 
 SEC("uprobe/xor_path")
 int bpf_xor_path(void *ctx) {
-  dbg_inc(DBG_XOR_PATH_ENTERED);
-
   __u32 zero = 0;
   struct scratch_buf *sd = bpf_map_lookup_elem(&scratch, &zero);
   if (!sd)
     return 0;
 
-  __u32 local_i = sd->xor_match_pos;
-  if (local_i == 0xFFFFFFFF)
-    return 0;
+  __u32 mi = sd->xor_current_match;
+  if (mi >= sd->xor_match_count || mi >= XOR_MAX_MATCHES)
+    goto finalize;
 
+  // Initialize staged_pending on first invocation.
+  if (mi == 0) {
+    struct ghash_work *wi = bpf_map_lookup_elem(&ghash_scratch, &zero);
+    if (!wi) return 0;
+    __builtin_memset(&wi->staged_pending, 0, sizeof(wi->staged_pending));
+    wi->staged_pending.ssl_ptr = sd->ssl_ptr;
+    wi->staged_pending.tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    wi->staged_pending.active = 1;
+  }
+
+  dbg_inc(DBG_XOR_PATH_ENTERED);
+
+  // Read the current match position + key. Use fixed index via bitmask for verifier.
+  __u32 local_i = sd->xor_matches[mi & (XOR_MAX_MATCHES - 1)].pos;
   struct secret_key key;
-  __builtin_memcpy(&key, &sd->xor_match_key, sizeof(key));
+  __builtin_memcpy(&key,
+    &sd->xor_matches[mi & (XOR_MAX_MATCHES - 1)].key, sizeof(key));
+
+  // Save host_value from sd before secret_map lookup invalidates it.
+  __u32 sd_host_len = sd->host_value_len;
+  // Host comparison will use sd->host_value via re-lookup later.
 
   struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
   if (!val || val->len == 0 || val->len > SECRET_MAX_LEN)
-    return 0;
+    goto next; // Skip this match.
+
+  // Host filtering: val is fresh, re-lookup sd for host_value.
+  __u32 val_len = val->len;
+  __u32 val_host_len = val->host_len;
+  if (val_host_len > 0 && val_host_len < MAX_HOST_LEN) {
+    if (sd_host_len == 0)
+      goto next;
+    // Re-lookup sd for host comparison (val stays in callee-saved reg).
+    sd = bpf_map_lookup_elem(&scratch, &zero);
+    if (!sd) return 0;
+    if (!hosts_match(sd->host_value, val->allowed_host))
+      goto next;
+  }
 
   dbg_inc(DBG_XOR_SECRET_FOUND);
 
-  // Host filtering.
-  if (val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
-    if (sd->host_value_len == 0)
-      return 0;
-    if (!hosts_match(sd->host_value, val->allowed_host))
-      return 0;
-  }
-
-  // Save scalars before re-lookups.
-  __u64 ssl_ptr_saved = sd->ssl_ptr;
-  __u32 val_len = val->len;
+  // Compute XOR delta: shadow bytes ^ real bytes.
   __u32 delta_len = clamp_write_len(val_len);
 
-  // Step 1: Copy shadow bytes into w->ct_buf (need w + sd simultaneously).
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 0;
+  if (!w) return 0;
   sd = bpf_map_lookup_elem(&scratch, &zero);
-  if (!sd)
-    return 0;
+  if (!sd) return 0;
 
-  for (__u32 j = 0; j < SECRET_MAX_LEN; j++) {
-    if (j >= delta_len)
-      break;
+  for (__u32 j = 0; j < SECRET_MAX_LEN && j < delta_len; j++) {
     __u32 buf_idx = (local_i + j) & (MAX_DATA_SIZE - 1);
     w->ct_buf[j] = sd->data[buf_idx];
   }
 
-  // Step 2: XOR real_secret into ct_buf (need w + val simultaneously).
   val = bpf_map_lookup_elem(&secret_map, &key);
-  if (!val)
-    return 0;
-  for (__u32 j = 0; j < SECRET_MAX_LEN; j++) {
-    if (j >= delta_len)
-      break;
+  if (!val) goto next;
+  for (__u32 j = 0; j < SECRET_MAX_LEN && j < delta_len; j++)
     w->ct_buf[j] ^= val->real_secret[j];
+
+  // Store patch in staged_pending.
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w) return 0;
+
+  __u32 pi = w->staged_pending.patch_count;
+  if (pi < XOR_MAX_PATCHES) {
+    w->staged_pending.patches[pi & (XOR_MAX_PATCHES - 1)].secret_offset = local_i;
+    w->staged_pending.patches[pi & (XOR_MAX_PATCHES - 1)].secret_len = val_len;
+    __builtin_memcpy(w->staged_pending.patches[pi & (XOR_MAX_PATCHES - 1)].xor_delta,
+                     w->ct_buf, SECRET_MAX_LEN);
+    w->staged_pending.patch_count = pi + 1;
   }
 
-  // Step 3: Build xor_pending entry keyed by (tgid, fd).
+next:
+  // Increment current match and tail-call back to process the next one.
+  sd = bpf_map_lookup_elem(&scratch, &zero);
+  if (!sd) return 0;
+  sd->xor_current_match = mi + 1;
+  if (mi + 1 < sd->xor_match_count && mi + 1 < XOR_MAX_MATCHES) {
+    bpf_tail_call(ctx, &prog_array, 1); // Tail-call back to xor_path.
+  }
+
+finalize:;
+  // All matches processed. Store results and populate tc_pending.
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
 
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
+  struct ghash_work *wf = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!wf || wf->staged_pending.patch_count == 0)
     return 0;
 
-  __builtin_memset(&w->staged_pending, 0, sizeof(w->staged_pending));
-  w->staged_pending.ssl_ptr = ssl_ptr_saved;
-  w->staged_pending.tgid = tgid;
-  w->staged_pending.secret_offset = local_i;
-  w->staged_pending.secret_len = val_len;
-  w->staged_pending.active = 1;
-  __builtin_memcpy(w->staged_pending.xor_delta, w->ct_buf, SECRET_MAX_LEN);
+  bpf_map_update_elem(&xor_pending, &pid_tgid, &wf->staged_pending, BPF_ANY);
 
-  bpf_map_update_elem(&xor_pending, &pid_tgid, &w->staged_pending, BPF_ANY);
-
-  // Populate tc_pending for the tc egress path (kernel-only patching).
-  // Get destination IP from conn_ip_map using the fd saved by resolve_host.
+  // Populate tc_pending.
   sd = bpf_map_lookup_elem(&scratch, &zero);
   if (sd && sd->xor_fd > 0) {
     struct conn_ip_key cik = {.tgid = tgid, .fd = sd->xor_fd};
@@ -1469,18 +1503,17 @@ int bpf_xor_path(void *ctx) {
       struct tc_dest_key tdk = {};
       __builtin_memcpy(tdk.dst_ip, civ->ip, 16);
 
-      struct tc_pending_val tpv = {};
-      tpv.secret_offset = local_i;
-      tpv.secret_len = val_len;
-      tpv.tgid = tgid;
-      tpv.ssl_ptr = ssl_ptr_saved;
-      tpv.active = 1;
-
-      w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-      if (w)
-        __builtin_memcpy(tpv.xor_delta, w->ct_buf, SECRET_MAX_LEN);
-
-      bpf_map_update_elem(&tc_pending, &tdk, &tpv, BPF_ANY);
+      wf = bpf_map_lookup_elem(&ghash_scratch, &zero);
+      if (wf) {
+        __builtin_memset(&wf->staged_tc, 0, sizeof(wf->staged_tc));
+        wf->staged_tc.tgid = tgid;
+        wf->staged_tc.ssl_ptr = wf->staged_pending.ssl_ptr;
+        wf->staged_tc.active = 1;
+        wf->staged_tc.patch_count = wf->staged_pending.patch_count;
+        for (__u32 p = 0; p < XOR_MAX_PATCHES && p < wf->staged_pending.patch_count; p++)
+          wf->staged_tc.patches[p] = wf->staged_pending.patches[p];
+        bpf_map_update_elem(&tc_pending, &tdk, &wf->staged_tc, BPF_ANY);
+      }
     }
   }
 
@@ -1941,17 +1974,22 @@ int bpf_uprobe_ssl_write(void *ctx) {
   // h_extract and xor_path have the match position in scratch_buf.
   dbg_inc(DBG_XOR_CONN_CHECK);
   scratch_data->ssl_ptr = (__u64)ssl_ptr;
-  scratch_data->xor_match_pos = 0xFFFFFFFF;
+  scratch_data->xor_match_count = 0;
+  scratch_data->xor_current_match = 0;
 
+  // Scan for ALL kloak: prefixes (up to XOR_MAX_MATCHES).
   __u32 scan_limit = read_len >= SECRET_KEY_LEN ? read_len - SECRET_KEY_LEN + 1 : 0;
   for (__u32 i = 0; i < scan_limit; i++) {
     if (is_kloak_prefix(&scratch_data->data[i]) ||
         is_kloak_prefix_huffman((const unsigned char *)&scratch_data->data[i])) {
-      scratch_data->xor_match_pos = i;
-      dbg_inc(DBG_XOR_PRESCAN_MATCH);
-      __builtin_memcpy(scratch_data->xor_match_key.prefix,
+      __u32 idx = scratch_data->xor_match_count;
+      if (idx >= XOR_MAX_MATCHES)
+        break;
+      scratch_data->xor_matches[idx].pos = i;
+      __builtin_memcpy(scratch_data->xor_matches[idx].key.prefix,
                        &scratch_data->data[i], SECRET_KEY_LEN);
-      break;
+      scratch_data->xor_match_count++;
+      dbg_inc(DBG_XOR_PRESCAN_MATCH);
     }
   }
 
@@ -1972,7 +2010,7 @@ int bpf_uprobe_ssl_write(void *ctx) {
   if (!is_aes_gcm(conn->cipher_type))
     return 0;
 
-  // H already cached — go directly to xor_path.
+  // H already cached — go to xor_path (processes one match per invocation).
   bpf_tail_call(ctx, &prog_array, 1);
 
   return 0;
@@ -2118,44 +2156,54 @@ int tc_egress_patch(struct __sk_buff *skb) {
 
   __u16 record_len = ((__u16)tls_hdr[3] << 8) | (__u16)tls_hdr[4];
   __u32 nonce_len = 8; // TLS 1.2
-  if (record_len < 16 + nonce_len + pending->secret_len)
-    return 0 /* TC_ACT_OK */;
+  __u32 ct_len = record_len - 16 - nonce_len;
 
-  __u32 ct_len __attribute__((unused)) = record_len - 16 - nonce_len; // Used by GHASH (TODO)
-  __u32 patch_off = payload_off + 5 + nonce_len + pending->secret_offset;
-  __u32 patch_len = clamp_write_len(pending->secret_len); // [1, 128] — non-zero for verifier
-
-  // Read ciphertext from skb
+  // Apply ALL patches from the pending entry.
   __u32 zero = 0;
+  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pending->patch_count; p++) {
+    __u32 sec_off = pending->patches[p].secret_offset;
+    __u32 sec_len = pending->patches[p].secret_len;
+
+    if (record_len < 16 + nonce_len + sec_len)
+      continue;
+
+    __u32 patch_off = payload_off + 5 + nonce_len + sec_off;
+    __u32 patch_len = clamp_write_len(sec_len);
+
+    struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+    if (!w)
+      return 0 /* TC_ACT_OK */;
+
+    if (bpf_skb_load_bytes(skb, patch_off, w->ct_buf, patch_len) < 0)
+      continue;
+
+    for (__u32 i = 0; i < SECRET_MAX_LEN && i < patch_len; i++)
+      w->ct_buf[i] ^= pending->patches[p].xor_delta[i];
+
+    bpf_skb_store_bytes(skb, patch_off, w->ct_buf, patch_len, 0);
+    dbg_inc(DBG_TC_PATCHED);
+  }
+
+  // Store ALL patches in ghash_work for the GHASH tail-call.
+  // The GHASH formula is additive: tag_delta = Σ(delta_i * H^power_i).
+  // The GHASH program iterates all patches and accumulates the delta.
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
+  if (!w || pending->patch_count == 0)
     return 0 /* TC_ACT_OK */;
 
-  if (bpf_skb_load_bytes(skb, patch_off, w->ct_buf, patch_len) < 0)
-    return 0 /* TC_ACT_OK */;
-
-  // XOR-patch
-  for (__u32 i = 0; i < SECRET_MAX_LEN && i < patch_len; i++)
-    w->ct_buf[i] ^= pending->xor_delta[i];
-
-  // Write patched ciphertext back to skb (kernel memory only!)
-  if (bpf_skb_store_bytes(skb, patch_off, w->ct_buf, patch_len, 0) < 0)
-    return 0 /* TC_ACT_OK */;
-
-  dbg_inc(DBG_TC_PATCHED);
-
-  // Store GHASH metadata for the tc GHASH tail-call.
   w->ghash_ct_len = ct_len;
   w->ghash_nonce_len = nonce_len;
   w->ghash_payload_off = payload_off;
   w->ghash_tgid = pending->tgid;
   w->ghash_ssl_ptr = pending->ssl_ptr;
-  w->ghash_secret_offset = pending->secret_offset;
-  w->ghash_patch_len = patch_len;
-  __builtin_memcpy(w->ghash_xor_delta, pending->xor_delta, SECRET_MAX_LEN);
   w->ghash_active = 1;
 
-  // Tail-call to tc GHASH program (same callbacks, skb-based tag read/write).
+  // Copy all patches to staged_pending for GHASH iteration.
+  w->staged_pending.patch_count = pending->patch_count;
+  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pending->patch_count; p++)
+    w->staged_pending.patches[p] = pending->patches[p];
+
+  // Tail-call to tc GHASH program.
   bpf_tail_call(skb, &tc_prog_array, 0);
 
   return 0 /* TC_ACT_OK */;
@@ -2187,7 +2235,6 @@ int tc_ghash_update(struct __sk_buff *skb) {
   __u32 nonce_len = w->ghash_nonce_len;
   __u32 payload_off = w->ghash_payload_off;
   __u32 ct_blocks = (ct_len + 15) / 16;
-  __u32 patch_len = w->ghash_patch_len;
 
   // Read old tag from skb (kernel memory).
   __u32 tag_offset = payload_off + 5 + nonce_len + ct_len;
@@ -2200,12 +2247,33 @@ int tc_ghash_update(struct __sk_buff *skb) {
 
   __builtin_memset(w->tag_delta, 0, 16);
 
-  w->ghash_first_block = w->ghash_secret_offset / 16;
-  w->ghash_ct_blocks = ct_blocks;
-  __u32 num_blocks = (w->ghash_secret_offset + patch_len - 1) / 16 - w->ghash_first_block + 1;
-  if (num_blocks > 9) num_blocks = 9;
+  // Iterate ALL patches — the GHASH formula is additive:
+  // tag_delta = Σ Σ (delta_block * H^power) for each patch, each block.
+  // tag_delta accumulates across all ghash_block_iter calls.
+  __u32 pc = w->staged_pending.patch_count;
+  if (pc > XOR_MAX_PATCHES) pc = XOR_MAX_PATCHES;
 
-  bpf_loop(num_blocks, ghash_block_iter, NULL, 0);
+  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++) {
+    w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+    if (!w) return 0 /* TC_ACT_OK */;
+
+    __u32 sec_off = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_offset;
+    __u32 sec_len = clamp_write_len(
+        w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len);
+
+    w->ghash_secret_offset = sec_off;
+    w->ghash_patch_len = sec_len;
+    __builtin_memcpy(w->ghash_xor_delta,
+        w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].xor_delta,
+        SECRET_MAX_LEN);
+    w->ghash_first_block = sec_off / 16;
+    w->ghash_ct_blocks = ct_blocks;
+
+    __u32 num_blocks = (sec_off + sec_len - 1) / 16 - w->ghash_first_block + 1;
+    if (num_blocks > 9) num_blocks = 9;
+
+    bpf_loop(num_blocks, ghash_block_iter, NULL, 0);
+  }
 
   w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w)
@@ -2214,7 +2282,6 @@ int tc_ghash_update(struct __sk_buff *skb) {
   for (__u32 i = 0; i < 16; i++)
     w->new_tag[i] = w->old_tag[i] ^ w->tag_delta[i];
 
-  // Write corrected tag to skb (kernel memory only!).
   bpf_skb_store_bytes(skb, tag_offset, w->new_tag, 16, 0);
 
   return 0 /* TC_ACT_OK */;
