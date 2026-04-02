@@ -204,11 +204,18 @@ func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeMa
 		return nil, fmt.Errorf("configuring tail call map index 2: %w", err)
 	}
 
-	// Wire up kprobe tail call: index 0 -> bpf_ghash_update
+	// Wire up kprobe tail call: index 0 -> bpf_ghash_update (legacy path)
 	ghashFd := uint32(objs.BpfGhashUpdate.FD())
 	if err := objs.KprobeProgArray.Put(uint32(0), ghashFd); err != nil {
 		_ = objs.Close()
 		return nil, fmt.Errorf("configuring kprobe tail call map: %w", err)
+	}
+
+	// Wire up tc tail call: index 0 -> tc_ghash_update
+	tcGhashFd := uint32(objs.TcGhashUpdate.FD())
+	if err := objs.TcProgArray.Put(uint32(0), tcGhashFd); err != nil {
+		_ = objs.Close()
+		return nil, fmt.Errorf("configuring tc tail call map: %w", err)
 	}
 
 	// Populate the cgroup ancestor map so the exec tracepoint can catch

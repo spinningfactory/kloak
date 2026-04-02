@@ -109,13 +109,22 @@ struct {
 } prog_array SEC(".maps");
 
 // Tail-call array for kprobes (separate from uprobe prog_array):
-//   index 0 = bpf_ghash_update (GHASH tag recomputation after XOR patch)
+//   index 0 = bpf_ghash_update (GHASH tag recomputation — legacy kprobe path)
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
   __uint(max_entries, 1);
   __type(key, __u32);
   __type(value, __u32);
 } kprobe_prog_array SEC(".maps");
+
+// Tail-call array for tc programs:
+//   index 0 = tc_ghash_update (GHASH tag recomputation in kernel skb)
+struct {
+  __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u32);
+} tc_prog_array SEC(".maps");
 
 // Ringbuffer for lightweight events to userspace (metrics/logging only)
 struct {
@@ -472,6 +481,7 @@ struct ghash_work {
   __u32 ghash_secret_offset;   // byte offset of secret in plaintext
   __u32 ghash_patch_len;       // length of patched region
   __u32 ghash_nonce_len;       // TLS explicit nonce length (8 for TLS 1.2, 0 for TLS 1.3)
+  __u32 ghash_payload_off;     // TCP payload offset within skb (for tc path)
   // Multi-record iteration state (for tcp_sendmsg with multiple TLS records)
   __u64 iter_iov_base;         // iov_base for current tcp_sendmsg
   __u64 iter_iov_len;          // total iov length
@@ -1446,7 +1456,7 @@ int bpf_xor_path(void *ctx) {
 
   bpf_map_update_elem(&xor_pending, &pid_tgid, &w->staged_pending, BPF_ANY);
 
-  // Also populate tc_pending for the tc egress path (kernel-only patching).
+  // Populate tc_pending for the tc egress path (kernel-only patching).
   // Get destination IP from conn_ip_map using the fd saved by resolve_host.
   sd = bpf_map_lookup_elem(&scratch, &zero);
   if (sd && sd->xor_fd > 0) {
@@ -1463,7 +1473,6 @@ int bpf_xor_path(void *ctx) {
       tpv.ssl_ptr = ssl_ptr_saved;
       tpv.active = 1;
 
-      // Re-lookup w for xor_delta (may have been invalidated by sd/civ lookups)
       w = bpf_map_lookup_elem(&ghash_scratch, &zero);
       if (w)
         __builtin_memcpy(tpv.xor_delta, w->ct_buf, SECRET_MAX_LEN);
@@ -1574,76 +1583,8 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   dbg_inc(DBG_XOR_TCP_SENDMSG);
   pending->active = 0;
 
-  __u32 zero = 0;
-  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 0;
-
-  // Extract msghdr* from pt_regs
-  struct msghdr *msg = NULL;
-#if defined(bpf_target_x86)
-  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 104);
-#elif defined(bpf_target_arm64)
-  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 8);
-#else
-  return 0;
-#endif
-  if (!msg)
-    return 0;
-
-  __u64 iov_base = 0;
-  BPF_CORE_READ_INTO(&iov_base, msg, msg_iter.__ubuf_iovec.iov_base);
-  if (!iov_base)
-    return 0;
-
-  // Re-lookup w and pending after CO-RE reads
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 0;
-  pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
-  if (!pending)
-    return 0;
-
-  // Validate first TLS record header
-  if (bpf_probe_read_user(w->ct_buf, 5, (void *)iov_base) < 0)
-    return 0;
-  if (w->ct_buf[0] != 0x17)
-    return 0;
-
-  __u16 record_len = ((__u16)w->ct_buf[3] << 8) | (__u16)w->ct_buf[4];
-  if (record_len < 16 + pending->secret_len)
-    return 0;
-
-  __u32 nonce_len = 8; // TLS 1.2
-  __u32 ct_len = record_len - 16 - nonce_len;
-  __u32 patch_len = clamp_write_len(pending->secret_len);
-
-  // XOR patching moved to tc egress (kernel-only, no user-space exposure).
-  // The kprobe now only handles GHASH tag correction in the user-space iov.
-  // After tcp_sendmsg copies the iov to kernel skb:
-  //   - The skb has shadow ciphertext + corrected tag (from GHASH below)
-  //   - The tc program XOR-patches the ciphertext in the skb
-  //   - Result: patched ct + correct tag in kernel memory only
-
-  // Re-lookup w for GHASH metadata storage.
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 0;
-
-  // Store GHASH metadata
-  w->ghash_iov_base = iov_base;
-  w->ghash_ct_len = ct_len;
-  w->ghash_nonce_len = nonce_len;
-  w->ghash_tgid = (__u32)(pid_tgid >> 32);
-  w->ghash_ssl_ptr = pending->ssl_ptr;
-  w->ghash_secret_offset = pending->secret_offset;
-  w->ghash_patch_len = patch_len;
-  __builtin_memcpy(w->ghash_xor_delta, pending->xor_delta, SECRET_MAX_LEN);
-  w->ghash_active = 1;
-
-  // Tail-call to GHASH
-  bpf_tail_call(ctx, &kprobe_prog_array, 0);
-
+  // No user-space writes — all patching (XOR + GHASH) happens in tc egress
+  // using kernel skb memory only. The kprobe just deactivates xor_pending.
   return 0;
 }
 
@@ -2200,10 +2141,78 @@ int tc_egress_patch(struct __sk_buff *skb) {
 
   dbg_inc(DBG_TC_PATCHED);
 
-  // TODO: GHASH tag correction in the skb.
-  // For now, the tag is wrong — server will reject. This proves the tc path works.
-  // The GHASH computation needs to be adapted from bpf_probe_read/write_user to
-  // bpf_skb_load/store_bytes. Reuse the existing bpf_loop callbacks.
+  // Store GHASH metadata for the tc GHASH tail-call.
+  w->ghash_ct_len = ct_len;
+  w->ghash_nonce_len = nonce_len;
+  w->ghash_payload_off = payload_off;
+  w->ghash_tgid = pending->tgid;
+  w->ghash_ssl_ptr = pending->ssl_ptr;
+  w->ghash_secret_offset = pending->secret_offset;
+  w->ghash_patch_len = patch_len;
+  __builtin_memcpy(w->ghash_xor_delta, pending->xor_delta, SECRET_MAX_LEN);
+  w->ghash_active = 1;
+
+  // Tail-call to tc GHASH program (same callbacks, skb-based tag read/write).
+  bpf_tail_call(skb, &tc_prog_array, 0);
+
+  return 0 /* TC_ACT_OK */;
+}
+
+// =============================================================================
+// tc GHASH: tag recomputation in kernel skb memory.
+// Same GHASH logic as bpf_ghash_update but reads/writes via skb helpers.
+// The GF multiply callbacks (gf128_mul_iter, h_power_step, ghash_block_iter,
+// copy_h_power_step) work on BPF maps and are shared with the kprobe path.
+// =============================================================================
+
+SEC("tc")
+int tc_ghash_update(struct __sk_buff *skb) {
+  __u32 zero = 0;
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w || !w->ghash_active)
+    return 0 /* TC_ACT_OK */;
+  w->ghash_active = 0;
+
+  // Copy H power table from tls_conn_state.
+  bpf_loop(11, copy_h_power_step, NULL, 0);
+
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0 /* TC_ACT_OK */;
+
+  __u32 ct_len = w->ghash_ct_len;
+  __u32 nonce_len = w->ghash_nonce_len;
+  __u32 payload_off = w->ghash_payload_off;
+  __u32 ct_blocks = (ct_len + 15) / 16;
+  __u32 patch_len = w->ghash_patch_len;
+
+  // Read old tag from skb (kernel memory).
+  __u32 tag_offset = payload_off + 5 + nonce_len + ct_len;
+  if (bpf_skb_load_bytes(skb, tag_offset, w->old_tag, 16) < 0)
+    return 0 /* TC_ACT_OK */;
+
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0 /* TC_ACT_OK */;
+
+  __builtin_memset(w->tag_delta, 0, 16);
+
+  w->ghash_first_block = w->ghash_secret_offset / 16;
+  w->ghash_ct_blocks = ct_blocks;
+  __u32 num_blocks = (w->ghash_secret_offset + patch_len - 1) / 16 - w->ghash_first_block + 1;
+  if (num_blocks > 9) num_blocks = 9;
+
+  bpf_loop(num_blocks, ghash_block_iter, NULL, 0);
+
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0 /* TC_ACT_OK */;
+
+  for (__u32 i = 0; i < 16; i++)
+    w->new_tag[i] = w->old_tag[i] ^ w->tag_delta[i];
+
+  // Write corrected tag to skb (kernel memory only!).
+  bpf_skb_store_bytes(skb, tag_offset, w->new_tag, 16, 0);
 
   return 0 /* TC_ACT_OK */;
 }
