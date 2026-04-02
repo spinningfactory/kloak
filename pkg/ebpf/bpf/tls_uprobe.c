@@ -33,12 +33,11 @@
  * TLS write call and adds significant overhead. */
 
 // Buffer size for reading TLS data per chunk. Must be a power of 2 for bitmask.
-// 512 bytes covers HTTP headers from libraries that add default headers
-// (e.g. Python requests adds User-Agent, Accept-Encoding, Accept, Connection
-// before custom headers, pushing secrets to byte ~260+).
-// Phase 2 uses bpf_loop() to scan the full TLS buffer in MAX_DATA_SIZE-byte chunks.
+// The prescan and phase2 paths use bpf_loop() to scan the full SSL_write buffer
+// in MAX_DATA_SIZE-byte chunks with SECRET_KEY_LEN-1 overlap, so there is no
+// upper limit on the buffer size that can be scanned.
 // Requires kernel 5.17+ for bpf_loop().
-#define MAX_DATA_SIZE 512
+#define MAX_DATA_SIZE 256
 // Fixed secret rewrite size
 #define SECRET_MAX_LEN 128
 // BPF map key length — short key for lookup (kloak: + 2 UUID chars)
@@ -1312,6 +1311,61 @@ int bpf_phase2_rewrite(void *ctx) {
   return 0;
 }
 
+// -----------------------------------------------------------------------------
+// Prescan: bpf_loop callback to find all kloak: prefixes in the SSL_write buffer.
+// Scans in MAX_DATA_SIZE chunks with SECRET_KEY_LEN-1 overlap so that tokens
+// straddling chunk boundaries are always detected. Match positions are stored as
+// global byte offsets (relative to the start of the SSL_write buffer).
+// -----------------------------------------------------------------------------
+
+struct prescan_ctx {
+  __u64 user_data_ptr;
+  __u32 total_len;
+};
+
+static int prescan_chunk(__u32 chunk_idx, void *ctx) {
+  struct prescan_ctx *pctx = (struct prescan_ctx *)ctx;
+
+  __u32 offset = chunk_idx * CHUNK_STRIDE;
+  if (offset >= pctx->total_len)
+    return 1; // stop
+
+  __u32 zero = 0;
+  struct scratch_buf *sd = bpf_map_lookup_elem(&scratch, &zero);
+  if (!sd)
+    return 1;
+
+  if (sd->xor_match_count >= XOR_MAX_MATCHES)
+    return 1; // already found max matches
+
+  __u32 read_len = pctx->total_len - offset;
+  if (read_len > MAX_DATA_SIZE)
+    read_len = MAX_DATA_SIZE;
+
+  bpf_probe_read_user(sd->data, read_len,
+                      (void *)(pctx->user_data_ptr + offset));
+
+  __u32 scan_limit = read_len >= SECRET_KEY_LEN ? read_len - SECRET_KEY_LEN + 1 : 0;
+  for (__u32 i = 0; i < MAX_DATA_SIZE && i < scan_limit; i++) {
+    if (sd->xor_match_count >= XOR_MAX_MATCHES)
+      break;
+
+    __u32 si = i & (MAX_DATA_SIZE - 1); // verifier-friendly bitmask
+    if (is_kloak_prefix(&sd->data[si]) ||
+        is_kloak_prefix_huffman((const unsigned char *)&sd->data[si])) {
+      __u32 idx = sd->xor_match_count;
+      if (idx >= XOR_MAX_MATCHES) break;
+      sd->xor_matches[idx & (XOR_MAX_MATCHES - 1)].pos = offset + i;
+      __builtin_memcpy(sd->xor_matches[idx & (XOR_MAX_MATCHES - 1)].key.prefix,
+                       &sd->data[si], SECRET_KEY_LEN);
+      sd->xor_match_count = idx + 1;
+      dbg_inc(DBG_XOR_PRESCAN_MATCH);
+    }
+  }
+
+  return 0;
+}
+
 // =============================================================================
 // TLS 1.3 AES-GCM XOR-patch path
 //
@@ -1981,20 +2035,17 @@ int bpf_uprobe_ssl_write(void *ctx) {
   scratch_data->xor_match_count = 0;
   scratch_data->xor_current_match = 0;
 
-  // Scan for ALL kloak: prefixes (up to XOR_MAX_MATCHES).
-  __u32 scan_limit = read_len >= SECRET_KEY_LEN ? read_len - SECRET_KEY_LEN + 1 : 0;
-  for (__u32 i = 0; i < scan_limit; i++) {
-    if (is_kloak_prefix(&scratch_data->data[i]) ||
-        is_kloak_prefix_huffman((const unsigned char *)&scratch_data->data[i])) {
-      __u32 idx = scratch_data->xor_match_count;
-      if (idx >= XOR_MAX_MATCHES)
-        break;
-      scratch_data->xor_matches[idx].pos = i;
-      __builtin_memcpy(scratch_data->xor_matches[idx].key.prefix,
-                       &scratch_data->data[i], SECRET_KEY_LEN);
-      scratch_data->xor_match_count++;
-      dbg_inc(DBG_XOR_PRESCAN_MATCH);
-    }
+  // Scan the FULL SSL_write buffer for kloak: prefixes using bpf_loop.
+  // Each chunk reads MAX_DATA_SIZE bytes with SECRET_KEY_LEN-1 overlap,
+  // so tokens spanning chunk boundaries are always detected. Match positions
+  // are stored as global offsets relative to the SSL_write buffer start.
+  {
+    struct prescan_ctx pctx = {
+      .user_data_ptr = scratch_data->user_data_ptr,
+      .total_len = scratch_data->total_data_len,
+    };
+    __u32 num_chunks = (pctx.total_len + CHUNK_STRIDE - 1) / CHUNK_STRIDE;
+    bpf_loop(num_chunks, prescan_chunk, &pctx, 0);
   }
 
   // Check if this connection already has H extracted.
