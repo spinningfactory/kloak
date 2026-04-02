@@ -183,32 +183,18 @@ func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeMa
 		return nil, fmt.Errorf("loading eBPF objects: %w", err)
 	}
 
-	// Wire up tail call map: index 0 -> bpf_phase2_rewrite
-	fd := uint32(objs.BpfPhase2Rewrite.FD())
-	if err := objs.ProgArray.Put(uint32(0), fd); err != nil {
-		_ = objs.Close()
-		return nil, fmt.Errorf("configuring tail call map index 0: %w", err)
-	}
-
-	// Wire up tail call map: index 1 -> bpf_xor_path (TLS 1.3 AES-GCM path)
+	// Wire up tail call map: index 1 -> bpf_xor_path (AES-GCM ciphertext patching)
 	xorFd := uint32(objs.BpfXorPath.FD())
 	if err := objs.ProgArray.Put(uint32(1), xorFd); err != nil {
 		_ = objs.Close()
 		return nil, fmt.Errorf("configuring tail call map index 1: %w", err)
 	}
 
-	// Wire up tail call: index 2 -> bpf_h_extract (H key extraction)
+	// Wire up tail call: index 2 -> bpf_h_extract (GHASH key H extraction)
 	hExtFd := uint32(objs.BpfH_extract.FD())
 	if err := objs.ProgArray.Put(uint32(2), hExtFd); err != nil {
 		_ = objs.Close()
 		return nil, fmt.Errorf("configuring tail call map index 2: %w", err)
-	}
-
-	// Wire up kprobe tail call: index 0 -> bpf_ghash_update (legacy path)
-	ghashFd := uint32(objs.BpfGhashUpdate.FD())
-	if err := objs.KprobeProgArray.Put(uint32(0), ghashFd); err != nil {
-		_ = objs.Close()
-		return nil, fmt.Errorf("configuring kprobe tail call map: %w", err)
 	}
 
 	// Wire up tc tail call: index 0 -> tc_ghash_update
@@ -296,16 +282,6 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	}
 	m.links = append(m.links, krp)
 	m.log.Info("Attached kretprobe", "function", "udp_recvmsg")
-
-	// Attach kprobe on tcp_sendmsg for TLS 1.3 AES-GCM XOR-patch path.
-	// This kprobe intercepts ciphertext before it enters the kernel TCP stack
-	// and applies the XOR patch + GHASH tag update entirely in kernel context.
-	tkp, err := link.Kprobe("tcp_sendmsg", m.objs.BpfKprobeTcpSendmsg, nil)
-	if err != nil {
-		return fmt.Errorf("attaching kprobe tcp_sendmsg: %w", err)
-	}
-	m.links = append(m.links, tkp)
-	m.log.Info("Attached kprobe", "function", "tcp_sendmsg")
 
 	return nil
 }
@@ -470,13 +446,13 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	if attached {
 		// Try to detect the OpenSSL version and push struct offsets for the
 		// XOR-patch path. Non-fatal: if detection fails, the XOR path simply
-		// won't activate and the fallback plaintext rewrite is used.
+		// won't activate and the shadow secret is sent as-is (fail-secure).
 		m.pushTLSOffsets(pid, containerLibs)
 
 		// Attach tc egress to the container's eth0 for kernel-only ciphertext
-		// patching. Non-fatal: falls back to kprobe iov patching if tc fails.
+		// patching. Required for secret rewriting.
 		if err := m.attachTCEgress(pid); err != nil {
-			m.log.Error(err, "Failed to attach tc egress to container — using kprobe fallback", "pid", pid)
+			m.log.Error(err, "Failed to attach tc egress to container — secrets will not be rewritten", "pid", pid)
 		}
 
 		return nil
@@ -701,13 +677,11 @@ var debugCounterNames = []string{
 	"kprobe_dport_other", "kprobe_iov_ok", "kretprobe_entry", "kretprobe_ret_small",
 	"kretprobe_read_fail", "kretprobe_read_ok", "dns_parse_entry", "dns_not_response",
 	"dns_no_answers", "dns_qname_fail", "dns_not_watched", "dns_watched_hit",
-	"dns_answer_stored", "phase2_entered",
+	"dns_answer_stored",
 	"resolve_ssl_fd_hit", "resolve_last_vfd_hit", "resolve_fd_scan_hit",
 	"resolve_no_fd", "resolve_no_conn", "resolve_no_dns", "resolve_host_ok",
 	"xor_conn_check", "xor_conn_hit", "xor_prescan_match", "xor_tailcall",
-	"xor_path_entered", "xor_secret_found", "xor_delta_done", "xor_tcp_sendmsg",
-	"xor_tcp_entry", "xor_tcp_no_vfd", "xor_tcp_no_pending", "xor_tcp_not_active",
-	"ghash_entered", "ghash_tag_written",
+	"xor_path_entered", "xor_secret_found", "xor_delta_done",
 	"tc_entry", "tc_match", "tc_patched",
 }
 

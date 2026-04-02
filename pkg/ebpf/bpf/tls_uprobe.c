@@ -33,8 +33,8 @@
  * TLS write call and adds significant overhead. */
 
 // Buffer size for reading TLS data per chunk. Must be a power of 2 for bitmask.
-// The prescan and phase2 paths use bpf_loop() to scan the full SSL_write buffer
-// in MAX_DATA_SIZE-byte chunks with SECRET_KEY_LEN-1 overlap, so there is no
+// The prescan uses bpf_loop() to scan the full SSL_write buffer in
+// MAX_DATA_SIZE-byte chunks with SECRET_KEY_LEN-1 overlap, so there is no
 // upper limit on the buffer size that can be scanned.
 // Requires kernel 5.17+ for bpf_loop().
 #define MAX_DATA_SIZE 256
@@ -86,7 +86,7 @@ struct scratch_buf {
   __u32 total_data_len; // full TLS write length (for bpf_loop scanning)
   __u32 host_offset;
   __u32 host_value_len; // length of extracted host value
-  __u32 xor_fd;         // socket fd resolved by resolve_host (for xor_pending key)
+  __u32 xor_fd;         // socket fd resolved by resolve_host (for tc_pending key)
   // Multiple secret matches per SSL_write (up to 4).
   // xor_path processes one match per invocation and tail-calls back to itself.
   #define XOR_MAX_MATCHES 4
@@ -108,23 +108,14 @@ struct {
 } scratch SEC(".maps");
 
 // Tail-call program array:
-//   index 0 = bpf_phase2_rewrite (current plaintext rewrite path)
-//   index 1 = bpf_xor_path (TLS 1.3 AES-GCM ciphertext patching path)
+//   index 1 = bpf_xor_path (AES-GCM ciphertext patching path)
+//   index 2 = bpf_h_extract (GHASH key H extraction on first SSL_write)
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-  __uint(max_entries, 3); // 0=phase2_rewrite, 1=xor_path, 2=h_extract
+  __uint(max_entries, 3); // indices 1 and 2 used
   __type(key, __u32);
   __type(value, __u32);
 } prog_array SEC(".maps");
-
-// Tail-call array for kprobes (separate from uprobe prog_array):
-//   index 0 = bpf_ghash_update (GHASH tag recomputation — legacy kprobe path)
-struct {
-  __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-  __uint(max_entries, 1);
-  __type(key, __u32);
-  __type(value, __u32);
-} kprobe_prog_array SEC(".maps");
 
 // Tail-call array for tc programs:
 //   index 0 = tc_ghash_update (GHASH tag recomputation in kernel skb)
@@ -169,7 +160,6 @@ enum {
   DBG_DNS_NOT_WATCHED,        // hostname not in watched_hosts
   DBG_DNS_WATCHED_HIT,        // hostname IS in watched_hosts
   DBG_DNS_ANSWER_STORED,      // A/AAAA record stored in dns_ip_map
-  DBG_PHASE2_ENTERED,         // phase2_rewrite entered
   DBG_RESOLVE_SSL_FD_HIT,     // ssl_fd_map cache hit
   DBG_RESOLVE_LAST_VFD_HIT,   // last_verified_fd hit
   DBG_RESOLVE_FD_SCAN_HIT,    // fd scan found DNS-verified connection
@@ -183,14 +173,7 @@ enum {
   DBG_XOR_TAILCALL,           // tail-called to xor_path
   DBG_XOR_PATH_ENTERED,       // bpf_xor_path entered
   DBG_XOR_SECRET_FOUND,       // secret_map lookup succeeded in xor_path
-  DBG_XOR_DELTA_DONE,         // XOR delta computed and stored in xor_pending
-  DBG_XOR_TCP_SENDMSG,        // tcp_sendmsg kprobe found active xor_pending
-  DBG_XOR_TCP_ENTRY,          // tcp_sendmsg kprobe entered (any call)
-  DBG_XOR_TCP_NO_VFD,         // last_verified_fd not found for this tgid
-  DBG_XOR_TCP_NO_PENDING,     // xor_pending entry not found for (tgid,fd)
-  DBG_XOR_TCP_NOT_ACTIVE,     // xor_pending entry found but active=0
-  DBG_GHASH_ENTERED,          // ghash_update program entered
-  DBG_GHASH_TAG_WRITTEN,      // ghash tag written back to TLS record
+  DBG_XOR_DELTA_DONE,         // XOR delta computed and stored in tc_pending
   DBG_TC_ENTRY,               // tc egress program entered (any packet)
   DBG_TC_MATCH,               // tc_pending lookup matched
   DBG_TC_PATCHED,             // tc XOR patch applied to skb
@@ -389,12 +372,12 @@ struct kloak_proc_event {
 };
 
 // =============================================================================
-// TLS 1.3 XOR-patch maps (post-encryption ciphertext patching)
+// TLS AES-GCM XOR-patch maps (post-encryption ciphertext patching)
 //
-// When the negotiated cipher is AES-GCM (TLS 1.3), the entry uprobe does NOT
-// rewrite the plaintext buffer. Instead it stores the XOR delta in xor_pending,
-// and a kprobe on tcp_sendmsg patches the ciphertext + GHASH auth tag in-kernel.
-// The real secret never exists in user-space memory.
+// When the negotiated cipher is AES-GCM, the entry uprobe does NOT rewrite the
+// plaintext buffer. Instead it computes XOR deltas and stores them in tc_pending.
+// A tc egress program patches the ciphertext + GHASH auth tag entirely in kernel
+// skb memory. The real secret never exists in user-space memory.
 // =============================================================================
 
 // Per-connection TLS state: GHASH key H and cipher suite.
@@ -440,15 +423,6 @@ struct xor_pending_val {
   __u8  _pad[3];
 };
 
-// XOR pending map keyed by pid_tgid. SSL_write → write() → tcp_sendmsg is
-// synchronous on the same thread, so pid_tgid is guaranteed to match.
-struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 4096);
-  __type(key, __u64);  // pid_tgid
-  __type(value, struct xor_pending_val);
-} xor_pending SEC(".maps");
-
 // Userspace-configured struct offsets for extracting TLS key material.
 // Populated once per library at uprobe attach time after the controller
 // detects the OpenSSL version. Supports a 4-level pointer chain:
@@ -488,9 +462,9 @@ struct tc_pending_val {
 struct ghash_work {
   // Staging for map updates (avoids large structs on BPF stack)
   struct tls_conn_state staged_conn;     // for tls_conn_state map insert
-  struct xor_pending_val staged_pending; // for xor_pending map insert
+  struct xor_pending_val staged_pending; // staging area for patch accumulation
   struct tc_pending_val staged_tc;       // for tc_pending map insert
-  // tcp_sendmsg kprobe buffers
+  // Ciphertext patching buffers
   __u8 ct_buf[SECRET_MAX_LEN]; // Ciphertext chunk for XOR patching
   __u8 old_tag[16];            // Original auth tag from TLS record
   __u8 tag_delta[16];          // Accumulated tag correction
@@ -503,20 +477,14 @@ struct ghash_work {
   __u8 mul_z[16];              // gf128_mul internal: accumulator
   __u8 hp_base[16];            // gf128_h_power internal: base
   __u8 hp_tmp[16];             // gf128_h_power internal: temporary
-  // Metadata passed from kprobe to GHASH tail-call program:
-  __u64 ghash_iov_base;        // iov_base address of TLS record
+  // Metadata for GHASH tag recomputation (tc egress path):
   __u32 ghash_ct_len;          // ciphertext length (excluding tag)
   __u32 ghash_tgid;            // tgid for tls_conn_state lookup
   __u64 ghash_ssl_ptr;         // ssl_ptr for tls_conn_state lookup
   __u32 ghash_secret_offset;   // byte offset of secret in plaintext
   __u32 ghash_patch_len;       // length of patched region
   __u32 ghash_nonce_len;       // TLS explicit nonce length (8 for TLS 1.2, 0 for TLS 1.3)
-  __u32 ghash_payload_off;     // TCP payload offset within skb (for tc path)
-  // Multi-record iteration state (for tcp_sendmsg with multiple TLS records)
-  __u64 iter_iov_base;         // iov_base for current tcp_sendmsg
-  __u64 iter_iov_len;          // total iov length
-  __u64 iter_offset;           // current byte offset within the iov
-  __u32 iter_records_patched;  // number of records successfully patched
+  __u32 ghash_payload_off;     // TCP payload offset within skb
   __u8  ghash_xor_delta[SECRET_MAX_LEN]; // copy of xor_delta for block computation
   __u8  ghash_active;          // 1 = GHASH update needed
   __u8  _ghash_pad[3];
@@ -1181,137 +1149,6 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
 }
 
 // -----------------------------------------------------------------------------
-// Phase 2: Scan full TLS buffer for "kloak:" secrets and rewrite.
-// Uses bpf_loop() to iterate over 256-byte chunks with 41-byte overlap,
-// covering up to 16KB per TLS record (max ~77 chunks).
-// Host comparison uses fixed-size uint64 comparisons (no loops).
-// -----------------------------------------------------------------------------
-
-// Context passed to each bpf_loop callback invocation.
-struct scan_ctx {
-  __u64 user_data_ptr;
-  __u32 total_len;
-  __u32 host_value_len;
-  char host_value[MAX_HOST_LEN];
-  int rewritten;
-};
-
-// bpf_loop callback: read one 256-byte chunk into the per-CPU scratch buffer
-// and scan for kloak: tokens. Uses scratch->data instead of a stack-allocated
-// buffer to stay well within the 512-byte BPF stack limit.
-static int scan_chunk(__u32 chunk_idx, void *ctx) {
-  struct scan_ctx *sctx = (struct scan_ctx *)ctx;
-
-  __u32 offset = chunk_idx * CHUNK_STRIDE;
-  if (offset >= sctx->total_len)
-    return 1; // stop iteration
-
-  // Re-lookup per-CPU scratch buffer (verifier requires map lookup per frame)
-  __u32 zero = 0;
-  struct scratch_buf *scratch_data = bpf_map_lookup_elem(&scratch, &zero);
-  if (!scratch_data)
-    return 1;
-
-  __u32 read_len = sctx->total_len - offset;
-  if (read_len > MAX_DATA_SIZE)
-    read_len = MAX_DATA_SIZE;
-
-  bpf_probe_read_user(scratch_data->data, read_len,
-                      (void *)(sctx->user_data_ptr + offset));
-
-  for (__u32 i = 0; i < MAX_DATA_SIZE; i++) {
-    if (i + SECRET_KEY_LEN > read_len)
-      break;
-
-    // Check for both plaintext "kloak:" (HTTP/1.1) and HPACK Huffman
-    // encoded "kloak:" (HTTP/2). Both use the same 8-byte key lookup
-    // into secret_map — plaintext keys start with "kloak:" ASCII,
-    // Huffman keys start with the Huffman encoding bytes.
-    int matched = 0;
-    if (is_kloak_prefix(&scratch_data->data[i]))
-      matched = 1;
-    else if (is_kloak_prefix_huffman((const unsigned char *)&scratch_data->data[i]))
-      matched = 1;
-
-    if (!matched)
-      continue;
-
-    // 8-byte key lookup. For plaintext: "kloak:" + 2 UUID chars.
-    // For Huffman: first 8 bytes of Huffman-encoded shadow value.
-    struct secret_key key = {};
-    __builtin_memcpy(key.prefix, &scratch_data->data[i], SECRET_KEY_LEN);
-
-    struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
-    if (!val || val->len == 0 || val->len > SECRET_MAX_LEN)
-      continue;
-
-    // Host-based filtering: compare resolved host against allowed_host
-    if (val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
-      if (sctx->host_value_len == 0)
-        continue;
-
-      if (!hosts_match(sctx->host_value, val->allowed_host))
-        continue;
-    }
-
-    // Rewrite directly to user memory
-    __u32 safe_i = i & (MAX_DATA_SIZE - 1);
-    char *target = (char *)(sctx->user_data_ptr + offset + safe_i);
-
-    // Bound write_len to [1, 128] using pure arithmetic so the verifier
-    // can prove the range without relying on tracked register state
-    // (which gets lost across the host comparison in bpf_loop callbacks).
-    // val->len is already checked > 0 and <= SECRET_MAX_LEN above.
-    __u32 write_len = clamp_write_len(val->len);
-
-    bpf_probe_write_user(target, val->real_secret, write_len);
-    sctx->rewritten = 1;
-  }
-  return 0;
-}
-
-SEC("uprobe/phase2_rewrite")
-int bpf_phase2_rewrite(void *ctx) {
-  dbg_inc(DBG_PHASE2_ENTERED);
-  __u32 zero = 0;
-  struct scratch_buf *scratch_data = bpf_map_lookup_elem(&scratch, &zero);
-  if (!scratch_data)
-    return 0;
-
-  struct scan_ctx sctx = {
-    .user_data_ptr = scratch_data->user_data_ptr,
-    .total_len = scratch_data->total_data_len,
-    .host_value_len = scratch_data->host_value_len,
-    .rewritten = 0,
-  };
-  __builtin_memcpy(sctx.host_value, scratch_data->host_value, MAX_HOST_LEN);
-
-  __u32 num_chunks = (sctx.total_len + CHUNK_STRIDE - 1) / CHUNK_STRIDE;
-
-  bpf_loop(num_chunks, scan_chunk, &sctx, 0);
-
-#ifdef KLOAK_DEBUG
-  bpf_printk("kloak phase2: rewritten=%d total_len=%u chunks=%u",
-             sctx.rewritten, sctx.total_len, num_chunks);
-#endif
-
-  if (sctx.rewritten) {
-    struct tls_event *event =
-        bpf_ringbuf_reserve(&tls_events, sizeof(struct tls_event), 0);
-    if (event) {
-      __u64 pid_tgid = bpf_get_current_pid_tgid();
-      event->pid  = (__u32)(pid_tgid & 0xFFFFFFFF);
-      event->tgid = (__u32)(pid_tgid >> 32);
-      event->len = sctx.total_len;
-      event->is_rewritten = 1;
-      bpf_ringbuf_submit(event, 0);
-    }
-  }
-
-  return 0;
-}
-
-// -----------------------------------------------------------------------------
 // Prescan: bpf_loop callback to find all kloak: prefixes in the SSL_write buffer.
 // Scans in MAX_DATA_SIZE chunks with SECRET_KEY_LEN-1 overlap so that tokens
 // straddling chunk boundaries are always detected. Match positions are stored as
@@ -1369,15 +1206,15 @@ static int prescan_chunk(__u32 chunk_idx, void *ctx) {
 // =============================================================================
 // TLS 1.3 AES-GCM XOR-patch path
 //
-// When the connection uses AES-GCM (TLS 1.3), the entry uprobe does NOT write
-// the real secret to user memory. Instead it stores the XOR delta in the
-// xor_pending map, and a kprobe on tcp_sendmsg patches the ciphertext and
-// recomputes the GHASH auth tag — all in kernel context.
+// When the connection uses AES-GCM, the entry uprobe does NOT write the real
+// secret to user memory. Instead it computes XOR deltas and stores them in
+// tc_pending. A tc egress program patches the ciphertext and recomputes the
+// GHASH auth tag entirely in kernel skb memory.
 // =============================================================================
 
 // Tail-called XOR-path program (index 1 in prog_array).
-// Reads ssl_ptr from scratch_buf, checks for AES-GCM, scans for kloak: prefix,
-// and stores the XOR delta in xor_pending for the tcp_sendmsg kprobe.
+// Reads ssl_ptr from scratch_buf, checks for AES-GCM, computes the XOR delta,
+// and stores patches in tc_pending for the tc egress program.
 // Has its own verifier budget and 512-byte stack (separate from the entry uprobe).
 
 // =============================================================================
@@ -1550,9 +1387,7 @@ finalize:;
   if (!wf || wf->staged_pending.patch_count == 0)
     return 0;
 
-  bpf_map_update_elem(&xor_pending, &pid_tgid, &wf->staged_pending, BPF_ANY);
-
-  // Populate tc_pending.
+  // Populate tc_pending for kernel-only ciphertext patching.
   sd = bpf_map_lookup_elem(&scratch, &zero);
   if (sd && sd->xor_fd > 0) {
     struct conn_ip_key cik = {.tgid = tgid, .fd = sd->xor_fd};
@@ -1579,18 +1414,13 @@ finalize:;
   return 0;
 }
 
-// -----------------------------------------------------------------------------
-// kprobe/tcp_sendmsg — Intercept ciphertext and apply XOR patch + GHASH update
-//
-// Fires when SSL_write internally calls write()/send() → tcp_sendmsg.
-// The ciphertext is still in user-space iov buffers (not yet copied to kernel).
-// We XOR-patch the secret bytes and recompute the GHASH authentication tag.
-// -----------------------------------------------------------------------------
+// =============================================================================
+// GHASH shared callbacks — used by tc_ghash_update for tag recomputation.
+// =============================================================================
 
 // bpf_loop callback: one iteration of GF(2^128) multiplication.
 // State lives in the ghash_scratch per-CPU map (mul_a, mul_v, mul_z).
 // The verifier only needs to verify one iteration, not 128.
-__attribute__((unused))
 static int gf128_mul_iter(__u32 i, void *_unused) {
   __u32 zero = 0;
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
@@ -1611,82 +1441,6 @@ static int gf128_mul_iter(__u32 i, void *_unused) {
     w->mul_v[0] ^= 0xe1;
   return 0;
 }
-
-// Multiply a * b in GF(2^128) using bpf_loop. Result written to w->mul_z,
-// then copied to `result`. All state lives in the per-CPU ghash_work map.
-__attribute__((unused))
-static __always_inline void gf128_mul_map(struct ghash_work *w,
-                                           const __u8 a[16],
-                                           const __u8 b[16],
-                                           __u8 result[16]) {
-  __builtin_memcpy(w->mul_a, a, 16);
-  __builtin_memset(w->mul_z, 0, 16);
-  __builtin_memcpy(w->mul_v, b, 16);
-  bpf_loop(128, gf128_mul_iter, NULL, 0);
-  __builtin_memcpy(result, w->mul_z, 16);
-}
-
-// Compute H^power using precomputed table, via map-based multiply.
-__attribute__((unused))
-static __always_inline void gf128_h_power_table_map(struct ghash_work *w,
-                                                      const __u8 h_powers[11][16],
-                                                      __u32 power,
-                                                      __u8 result[16]) {
-  __builtin_memset(result, 0, 16);
-  result[0] = 0x80; // GF(2^128) identity
-
-  for (int i = 0; i < 11 && power > 0; i++) {
-    if (power & (1u << i)) {
-      gf128_mul_map(w, result, h_powers[i], w->hp_tmp);
-      __builtin_memcpy(result, w->hp_tmp, 16);
-    }
-  }
-}
-
-// Compute H^power via square-and-multiply from base H, using map-based multiply.
-__attribute__((unused))
-static __always_inline void gf128_h_power_map(struct ghash_work *w,
-                                                const __u8 h[16],
-                                                __u32 power,
-                                                __u8 result[16]) {
-  __builtin_memset(result, 0, 16);
-  result[0] = 0x80;
-
-  __builtin_memcpy(w->hp_base, h, 16);
-  for (int i = 0; i < 11 && power > 0; i++) {
-    if (power & 1) {
-      gf128_mul_map(w, result, w->hp_base, w->hp_tmp);
-      __builtin_memcpy(result, w->hp_tmp, 16);
-    }
-    gf128_mul_map(w, w->hp_base, w->hp_base, w->hp_tmp);
-    __builtin_memcpy(w->hp_base, w->hp_tmp, 16);
-    power >>= 1;
-  }
-}
-
-SEC("kprobe/tcp_sendmsg")
-int bpf_kprobe_tcp_sendmsg(void *ctx) {
-  dbg_inc(DBG_XOR_TCP_ENTRY);
-
-  __u64 pid_tgid = bpf_get_current_pid_tgid();
-
-  struct xor_pending_val *pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
-  if (!pending || !pending->active)
-    return 0;
-
-  dbg_inc(DBG_XOR_TCP_SENDMSG);
-  pending->active = 0;
-
-  // No user-space writes — all patching (XOR + GHASH) happens in tc egress
-  // using kernel skb memory only. The kprobe just deactivates xor_pending.
-  return 0;
-}
-
-// =============================================================================
-// GHASH tag update — tail-called from tcp_sendmsg kprobe after XOR patching.
-// Reads metadata from ghash_scratch, computes incremental GHASH correction,
-// and writes the corrected auth tag to the TLS record.
-// =============================================================================
 
 // bpf_loop callback: copy one H^(2^i) entry from tls_conn_state to ghash_work.
 // Alternates map lookups to avoid holding both pointers simultaneously.
@@ -1833,63 +1587,6 @@ static int ghash_block_iter(__u32 block_idx, void *_unused) {
   return 0;
 }
 
-SEC("kprobe/ghash_update")
-int bpf_ghash_update(void *ctx) {
-  dbg_inc(DBG_GHASH_ENTERED);
-  __u32 zero = 0;
-  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w || !w->ghash_active)
-    return 0;
-  w->ghash_active = 0;
-
-  // Incremental test: just add tls_conn_state lookup.
-  // Copy H power table from tls_conn_state into ghash_work so the block
-  // callback only uses ONE map (avoids dual-pointer verifier issues).
-  bpf_loop(11, copy_h_power_step, NULL, 0);
-
-  // Re-lookup w after bpf_loop.
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 0;
-
-  __u64 iov_base = w->ghash_iov_base;
-  __u32 ct_len = w->ghash_ct_len;
-  __u32 nonce_len = w->ghash_nonce_len;
-  __u32 ct_blocks = (ct_len + 15) / 16;
-  __u32 patch_len = w->ghash_patch_len;
-
-  // Tag is after: [header 5] [nonce nonce_len] [ciphertext ct_len] [tag 16]
-  __u32 tag_offset = 5 + nonce_len + ct_len;
-  if (bpf_probe_read_user(w->old_tag, 16, (void *)(iov_base + tag_offset)) < 0)
-    return 0;
-
-  // Re-lookup w (bpf_probe_read_user invalidates map pointers).
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 0;
-
-  __builtin_memset(w->tag_delta, 0, 16);
-
-  w->ghash_first_block = w->ghash_secret_offset / 16;
-  w->ghash_ct_blocks = ct_blocks;
-  __u32 num_blocks = (w->ghash_secret_offset + patch_len - 1) / 16 - w->ghash_first_block + 1;
-  if (num_blocks > 9) num_blocks = 9;
-
-  bpf_loop(num_blocks, ghash_block_iter, NULL, 0);
-
-  // Re-lookup w after bpf_loop (verifier invalidates map pointers).
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 0;
-
-  for (__u32 i = 0; i < 16; i++)
-    w->new_tag[i] = w->old_tag[i] ^ w->tag_delta[i];
-
-  bpf_probe_write_user((void *)(iov_base + tag_offset), w->new_tag, 16);
-  dbg_inc(DBG_GHASH_TAG_WRITTEN);
-  return 0;
-}
-
 // -----------------------------------------------------------------------------
 // Go crypto/tls.(*Conn).Write uprobe
 //
@@ -1957,7 +1654,7 @@ int bpf_uprobe_go_tls_write(void *ctx) {
   resolve_host(scratch_data, 0);
 
   // XOR-patch path not yet supported for Go (needs Go struct offset work).
-  // Plaintext fallback disabled: secret is NOT rewritten (fail-secure).
+  // Secret is NOT rewritten (fail-secure).
   // TODO: implement Go crypto/tls key extraction to enable XOR path.
 
   return 0;
@@ -2264,9 +1961,8 @@ int tc_egress_patch(struct __sk_buff *skb) {
 
 // =============================================================================
 // tc GHASH: tag recomputation in kernel skb memory.
-// Same GHASH logic as bpf_ghash_update but reads/writes via skb helpers.
-// The GF multiply callbacks (gf128_mul_iter, h_power_step, ghash_block_iter,
-// copy_h_power_step) work on BPF maps and are shared with the kprobe path.
+// Uses shared GF multiply callbacks (gf128_mul_iter, h_power_step,
+// ghash_block_iter, copy_h_power_step) that operate on BPF maps.
 // =============================================================================
 
 SEC("tc")
