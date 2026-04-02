@@ -2158,39 +2158,19 @@ int tc_egress_patch(struct __sk_buff *skb) {
   __u32 nonce_len = 8; // TLS 1.2
   __u32 ct_len = record_len - 16 - nonce_len;
 
-  // Apply ALL patches from the pending entry.
+  // Copy ALL patches from pending → ghash_scratch FIRST, before any map lookups
+  // invalidate the pending pointer. Then iterate from staged data.
   __u32 zero = 0;
-  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pending->patch_count; p++) {
-    __u32 sec_off = pending->patches[p].secret_offset;
-    __u32 sec_len = pending->patches[p].secret_len;
-
-    if (record_len < 16 + nonce_len + sec_len)
-      continue;
-
-    __u32 patch_off = payload_off + 5 + nonce_len + sec_off;
-    __u32 patch_len = clamp_write_len(sec_len);
-
-    struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-    if (!w)
-      return 0 /* TC_ACT_OK */;
-
-    if (bpf_skb_load_bytes(skb, patch_off, w->ct_buf, patch_len) < 0)
-      continue;
-
-    for (__u32 i = 0; i < SECRET_MAX_LEN && i < patch_len; i++)
-      w->ct_buf[i] ^= pending->patches[p].xor_delta[i];
-
-    bpf_skb_store_bytes(skb, patch_off, w->ct_buf, patch_len, 0);
-    dbg_inc(DBG_TC_PATCHED);
-  }
-
-  // Store ALL patches in ghash_work for the GHASH tail-call.
-  // The GHASH formula is additive: tag_delta = Σ(delta_i * H^power_i).
-  // The GHASH program iterates all patches and accumulates the delta.
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w || pending->patch_count == 0)
+  if (!w)
     return 0 /* TC_ACT_OK */;
 
+  // Save all pending data (pending might be invalidated by later map lookups).
+  __u32 pc = pending->patch_count;
+  if (pc > XOR_MAX_PATCHES) pc = XOR_MAX_PATCHES;
+  w->staged_pending.patch_count = pc;
+  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++)
+    w->staged_pending.patches[p] = pending->patches[p];
   w->ghash_ct_len = ct_len;
   w->ghash_nonce_len = nonce_len;
   w->ghash_payload_off = payload_off;
@@ -2198,10 +2178,28 @@ int tc_egress_patch(struct __sk_buff *skb) {
   w->ghash_ssl_ptr = pending->ssl_ptr;
   w->ghash_active = 1;
 
-  // Copy all patches to staged_pending for GHASH iteration.
-  w->staged_pending.patch_count = pending->patch_count;
-  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pending->patch_count; p++)
-    w->staged_pending.patches[p] = pending->patches[p];
+  // Apply ALL patches from staged_pending (not from pending — it's stale now).
+  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++) {
+    w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+    if (!w) return 0 /* TC_ACT_OK */;
+
+    __u32 sec_off = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_offset;
+    __u32 sec_len = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len;
+    if (record_len < 16 + nonce_len + sec_len)
+      continue;
+
+    __u32 patch_off = payload_off + 5 + nonce_len + sec_off;
+    __u32 patch_len = clamp_write_len(sec_len);
+
+    if (bpf_skb_load_bytes(skb, patch_off, w->ct_buf, patch_len) < 0)
+      continue;
+
+    for (__u32 i = 0; i < SECRET_MAX_LEN && i < patch_len; i++)
+      w->ct_buf[i] ^= w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].xor_delta[i];
+
+    bpf_skb_store_bytes(skb, patch_off, w->ct_buf, patch_len, 0);
+    dbg_inc(DBG_TC_PATCHED);
+  }
 
   // Tail-call to tc GHASH program.
   bpf_tail_call(skb, &tc_prog_array, 0);
