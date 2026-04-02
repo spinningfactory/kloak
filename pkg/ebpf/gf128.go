@@ -43,7 +43,7 @@ func ComputeHPowerTable(h [16]byte) [11][16]byte {
 	var table [11][16]byte
 	table[0] = h // H^1
 	for i := 1; i < 11; i++ {
-		table[i] = GF128Mul(table[i-1], table[i-1]) // H^(2^i) = (H^(2^(i-1)))^2
+		table[i] = GF128Mul(table[i-1], table[i-1])
 	}
 	return table
 }

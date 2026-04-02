@@ -64,7 +64,7 @@ func DetectOpenSSLVersion(pid int, libPath string) (version string, offsets TLSO
 	if err != nil {
 		return "", TLSOffsets{}, fmt.Errorf("opening ELF %s: %w", hostPath, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	version, err = readOpenSSLVersion(f)
 	if err != nil {
@@ -108,7 +108,7 @@ func readOpenSSLVersion(f *elf.File) (string, error) {
 	if err == nil {
 		for _, sym := range syms {
 			if sym.Name == "OpenSSL_version_num" && sym.Value != 0 {
-				return readVersionFromSymbol(f, sym)
+				return readVersionFromSymbol(f, &sym)
 			}
 		}
 	}
@@ -156,28 +156,29 @@ func startsWith(data, prefix []byte) bool {
 // readVersionFromSymbol reads the version number from the OpenSSL_version_num
 // symbol value. The version number is encoded as 0xMNN00PP0 where M=major,
 // NN=minor, PP=patch (OpenSSL 3.x encoding).
-func readVersionFromSymbol(f *elf.File, sym elf.Symbol) (string, error) {
+func readVersionFromSymbol(f *elf.File, sym *elf.Symbol) (string, error) {
 	// For OpenSSL 3.x, the version_num function returns a value, not a constant.
 	// We can try to read from the .data section at the symbol's address.
 	for _, sec := range f.Sections {
-		if sec.Addr <= sym.Value && sym.Value < sec.Addr+sec.Size {
-			offset := sym.Value - sec.Addr
-			data, err := sec.Data()
-			if err != nil || offset+4 > uint64(len(data)) {
-				continue
-			}
-			var num uint32
-			if f.ByteOrder == binary.LittleEndian {
-				num = binary.LittleEndian.Uint32(data[offset:])
-			} else {
-				num = binary.BigEndian.Uint32(data[offset:])
-			}
-			if num > 0 {
-				major := (num >> 28) & 0xF
-				minor := (num >> 20) & 0xFF
-				patch := (num >> 4) & 0xFF
-				return fmt.Sprintf("%d.%d.%d", major, minor, patch), nil
-			}
+		if sec.Addr > sym.Value || sym.Value >= sec.Addr+sec.Size {
+			continue
+		}
+		offset := sym.Value - sec.Addr
+		data, err := sec.Data()
+		if err != nil || offset+4 > uint64(len(data)) {
+			continue
+		}
+		var num uint32
+		if f.ByteOrder == binary.LittleEndian {
+			num = binary.LittleEndian.Uint32(data[offset:])
+		} else {
+			num = binary.BigEndian.Uint32(data[offset:])
+		}
+		if num > 0 {
+			major := (num >> 28) & 0xF
+			minor := (num >> 20) & 0xFF
+			patch := (num >> 4) & 0xFF
+			return fmt.Sprintf("%d.%d.%d", major, minor, patch), nil
 		}
 	}
 	return "", fmt.Errorf("could not read version from symbol")

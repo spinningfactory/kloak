@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"net"
 	"os"
-	"runtime"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -324,14 +324,14 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	if err != nil {
 		return fmt.Errorf("opening container netns %s: %w", netnsPath, err)
 	}
-	defer containerNS.Close()
+	defer func() { _ = containerNS.Close() }()
 
 	// Save our current network namespace.
 	selfNS, err := os.Open("/proc/self/ns/net")
 	if err != nil {
 		return fmt.Errorf("opening self netns: %w", err)
 	}
-	defer selfNS.Close()
+	defer func() { _ = selfNS.Close() }()
 
 	// Lock OS thread — setns is per-thread.
 	runtime.LockOSThread()
@@ -503,12 +503,7 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 			EncCtxToAlgctx uint32
 			AlgctxToH      uint32
 		}
-		val := bpfTLSOffsets{
-			SSLToWRL:       offsets.SSLToWRL,
-			WRLToEncCtx:    offsets.WRLToEncCtx,
-			EncCtxToAlgctx: offsets.EncCtxToAlgctx,
-			AlgctxToH:      offsets.AlgctxToH,
-		}
+		val := bpfTLSOffsets(offsets)
 		if err := m.objs.TlsOffsetConfig.Update(uint32(0), &val, 0); err != nil {
 			m.log.Error(err, "Failed to push TLS offsets to BPF map")
 			continue
@@ -518,34 +513,6 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 			"lib", libPath, "version", version,
 			"offsets", fmt.Sprintf("%+v", offsets))
 		return // Only need one successful push.
-	}
-}
-
-// populateTestConnState creates a tls_conn_state entry with a test GHASH key H.
-// TODO: Replace with real H extraction that follows the OpenSSL pointer chain
-// at runtime (requires reading /proc/<pid>/mem with the ssl_ptr from eBPF events).
-// For now, uses a dummy H for testing the GHASH code path.
-func (m *TLSUprobeManager) populateTestConnState(tgid uint32) {
-	key := tlsuprobeTlsConnKey{Tgid: tgid, SslPtr: 0}
-
-	var state tlsuprobeTlsConnState
-	state.CipherType = 1 // KLOAK_CIPHER_AES_GCM
-	for i := range state.GhashH {
-		state.GhashH[i] = 0x42
-	}
-
-	var h [16]byte
-	copy(h[:], state.GhashH[:])
-	table := ComputeHPowerTable(h)
-	for i := 0; i < 11; i++ {
-		state.H_powers[i] = table[i]
-	}
-	state.H_powersReady = 1
-
-	if err := m.objs.TlsConnState.Update(&key, &state, 0); err != nil {
-		m.log.Error(err, "failed to populate test tls_conn_state", "tgid", tgid)
-	} else {
-		m.log.Info("Populated test tls_conn_state (dummy H)", "tgid", tgid)
 	}
 }
 
