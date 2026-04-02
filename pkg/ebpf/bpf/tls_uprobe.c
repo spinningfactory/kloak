@@ -448,13 +448,26 @@ struct tc_dest_key {
   __u8  dst_ip[16]; // IPv4-mapped-IPv6 or native IPv6
 };
 
-struct tc_pending_val {
+// Per-destination queue metadata (head/tail counters).
+// The uprobe writes at tail, tc egress reads at head.
+#define TC_QUEUE_DEPTH 4 // must be power of 2
+struct tc_queue_meta {
+  __u32 head;
+  __u32 tail;
+};
+
+// Compound key: destination IP + queue slot index.
+struct tc_queue_key {
+  __u8  dst_ip[16];
+  __u32 slot;
+};
+
+// A single queue entry (one SSL_write's worth of patches).
+struct tc_queue_entry {
   __u32 tgid;
   __u64 ssl_ptr;
   __u32 patch_count;
   struct xor_patch patches[XOR_MAX_PATCHES];
-  __u8  active;
-  __u8  _pad[3];
 };
 
 // Holds all large structs and buffers that would otherwise exceed the 512-byte
@@ -463,7 +476,7 @@ struct ghash_work {
   // Staging for map updates (avoids large structs on BPF stack)
   struct tls_conn_state staged_conn;     // for tls_conn_state map insert
   struct xor_pending_val staged_pending; // staging area for patch accumulation
-  struct tc_pending_val staged_tc;       // for tc_pending map insert
+  struct tc_queue_entry staged_tc;       // for tc_pending map insert
   // Ciphertext patching buffers
   __u8 ct_buf[SECRET_MAX_LEN]; // Ciphertext chunk for XOR patching
   __u8 old_tag[16];            // Original auth tag from TLS record
@@ -522,13 +535,23 @@ struct {
 // encrypted real secret never exists in user-space memory.
 // =============================================================================
 
-// tc_pending map: keyed by destination IP (from conn_ip_map).
+// Per-destination queue state: head/tail counters for the circular buffer.
 // TODO: Use socket cookie for precise per-connection identification.
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 4096);
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 1024);
   __type(key, struct tc_dest_key);
-  __type(value, struct tc_pending_val);
+  __type(value, struct tc_queue_meta);
+} tc_queue_meta SEC(".maps");
+
+// Per-slot entries: each SSL_write enqueues one entry.
+// Key is (dst_ip, slot) so each slot is a separate map entry.
+// LRU evicts stale entries from abandoned connections.
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 4096);
+  __type(key, struct tc_queue_key);
+  __type(value, struct tc_queue_entry);
 } tc_pending SEC(".maps");
 
 // =============================================================================
@@ -1387,7 +1410,7 @@ finalize:;
   if (!wf || wf->staged_pending.patch_count == 0)
     return 0;
 
-  // Populate tc_pending for kernel-only ciphertext patching.
+  // Enqueue patches into the per-destination circular buffer.
   sd = bpf_map_lookup_elem(&scratch, &zero);
   if (sd && sd->xor_fd > 0) {
     struct conn_ip_key cik = {.tgid = tgid, .fd = sd->xor_fd};
@@ -1396,17 +1419,32 @@ finalize:;
       struct tc_dest_key tdk = {};
       __builtin_memcpy(tdk.dst_ip, civ->ip, 16);
 
+      // Read queue state (head/tail) — save to locals before any other lookups.
+      struct tc_queue_meta *meta = bpf_map_lookup_elem(&tc_queue_meta, &tdk);
+      __u32 qt = 0, qh = 0;
+      if (meta) { qt = meta->tail; qh = meta->head; }
+
+      // Build entry from staged_pending.
       wf = bpf_map_lookup_elem(&ghash_scratch, &zero);
       if (wf) {
         __builtin_memset(&wf->staged_tc, 0, sizeof(wf->staged_tc));
         wf->staged_tc.tgid = tgid;
         wf->staged_tc.ssl_ptr = wf->staged_pending.ssl_ptr;
-        wf->staged_tc.active = 1;
         wf->staged_tc.patch_count = wf->staged_pending.patch_count;
         for (__u32 p = 0; p < XOR_MAX_PATCHES && p < wf->staged_pending.patch_count; p++)
           wf->staged_tc.patches[p] = wf->staged_pending.patches[p];
-        bpf_map_update_elem(&tc_pending, &tdk, &wf->staged_tc, BPF_ANY);
+
+        // Write entry to queue slot.
+        struct tc_queue_key qk = {};
+        __builtin_memcpy(qk.dst_ip, tdk.dst_ip, 16);
+        qk.slot = qt & (TC_QUEUE_DEPTH - 1);
+        bpf_map_update_elem(&tc_pending, &qk, &wf->staged_tc, BPF_ANY);
       }
+
+      // Advance tail. If queue was full, advance head too (drop oldest).
+      if (qt - qh >= TC_QUEUE_DEPTH) qh = qt - TC_QUEUE_DEPTH + 1;
+      struct tc_queue_meta new_meta = {.head = qh, .tail = qt + 1};
+      bpf_map_update_elem(&tc_queue_meta, &tdk, &new_meta, BPF_ANY);
     }
   }
 
@@ -1887,8 +1925,18 @@ int tc_egress_patch(struct __sk_buff *skb) {
   key.dst_ip[11] = 0xff;
   __builtin_memcpy(&key.dst_ip[12], &ip->daddr, 4);
 
-  struct tc_pending_val *pending = bpf_map_lookup_elem(&tc_pending, &key);
-  if (!pending || !pending->active)
+  // Dequeue from the per-destination circular buffer.
+  struct tc_queue_meta *meta = bpf_map_lookup_elem(&tc_queue_meta, &key);
+  if (!meta || meta->head == meta->tail)
+    return 0 /* TC_ACT_OK */;
+
+  __u32 qh = meta->head;
+  struct tc_queue_key qk = {};
+  __builtin_memcpy(qk.dst_ip, key.dst_ip, 16);
+  qk.slot = qh & (TC_QUEUE_DEPTH - 1);
+
+  struct tc_queue_entry *entry = bpf_map_lookup_elem(&tc_pending, &qk);
+  if (!entry || entry->patch_count == 0)
     return 0 /* TC_ACT_OK */;
 
   dbg_inc(DBG_TC_MATCH);
@@ -1910,25 +1958,29 @@ int tc_egress_patch(struct __sk_buff *skb) {
   __u32 nonce_len = 8; // TLS 1.2
   __u32 ct_len = record_len - 16 - nonce_len;
 
-  // Copy ALL patches from pending → ghash_scratch FIRST, before any map lookups
-  // invalidate the pending pointer. Then iterate from staged data.
+  // Copy entry data to ghash_scratch staging area.
+  // entry (tc_pending) and w (ghash_scratch) are from different maps — both valid.
   __u32 zero = 0;
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w)
     return 0 /* TC_ACT_OK */;
 
-  // Save all pending data (pending might be invalidated by later map lookups).
-  __u32 pc = pending->patch_count;
+  __u32 pc = entry->patch_count;
   if (pc > XOR_MAX_PATCHES) pc = XOR_MAX_PATCHES;
   w->staged_pending.patch_count = pc;
   for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++)
-    w->staged_pending.patches[p] = pending->patches[p];
+    w->staged_pending.patches[p] = entry->patches[p];
   w->ghash_ct_len = ct_len;
   w->ghash_nonce_len = nonce_len;
   w->ghash_payload_off = payload_off;
-  w->ghash_tgid = pending->tgid;
-  w->ghash_ssl_ptr = pending->ssl_ptr;
+  w->ghash_tgid = entry->tgid;
+  w->ghash_ssl_ptr = entry->ssl_ptr;
   w->ghash_active = 1;
+
+  // Advance head and clean up consumed slot.
+  bpf_map_delete_elem(&tc_pending, &qk);
+  meta = bpf_map_lookup_elem(&tc_queue_meta, &key);
+  if (meta) meta->head = qh + 1;
 
   // Apply ALL patches from staged_pending (not from pending — it's stale now).
   for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++) {
