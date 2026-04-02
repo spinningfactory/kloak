@@ -535,10 +535,11 @@ struct {
 // encrypted real secret never exists in user-space memory.
 // =============================================================================
 
-// tc_pending map: keyed by destination IP (from conn_ip_map).
-// TODO: Use socket cookie for precise per-connection identification.
+// tc_pending map: keyed by (dst_ip, src_port, cgroup_id, tcp_seq).
+// Each TLS record gets a unique entry (tcp_seq prevents keep-alive overwrites).
+// LRU evicts stale entries from connections that closed without consuming.
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, 4096);
   __type(key, struct tc_dest_key);
   __type(value, struct tc_pending_val);
@@ -1598,11 +1599,8 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   __u64 pid_tgid = bpf_get_current_pid_tgid();
 
   struct xor_pending_val *pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
-  if (!pending || !pending->active)
+  if (!pending || pending->patch_count == 0)
     return 0;
-
-  // Deactivate so only the first tcp_sendmsg after SSL_write bridges.
-  pending->active = 0;
 
   // Read source port from struct sock (first argument of tcp_sendmsg).
   // tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
@@ -1628,7 +1626,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 
   // Build tc_pending key: (dst_ip, src_port, cgroup_id).
   // src_port is unique per connection within a container.
-  // cgroup_id isolates containers (prevents cross-container src_port collisions).
+  // cgroup_id isolates containers.
   struct tc_dest_key tdk = {};
   tdk.dst_ip[10] = 0xff;
   tdk.dst_ip[11] = 0xff;
@@ -1656,7 +1654,11 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 
   bpf_map_update_elem(&tc_pending, &tdk, &w->staged_tc, BPF_ANY);
 
-  // Clean up xor_pending entry.
+  // Delete xor_pending — the entry has been bridged to tc_pending.
+  // If SSL_write triggers multiple tcp_sendmsg calls (handshake + data),
+  // only the first bridges. The tc_pending entry uses (dst_ip, src_port,
+  // cgroup_id) without tcp_seq, so subsequent overwrites are harmless
+  // (same patches). tc only patches application_data (0x17) records.
   bpf_map_delete_elem(&xor_pending, &pid_tgid);
 
   return 0;
@@ -2007,42 +2009,33 @@ int tc_egress_patch(struct __sk_buff *skb) {
       return 0 /* TC_ACT_OK */;
   }
 
-  // Copy ALL data from pending and consume ATOMICALLY — before any other map
-  // lookups or helper calls. A concurrent uprobe on another CPU can call
-  // bpf_map_update_elem at any moment, replacing the entire value.
-  // Read everything we need, THEN mark inactive.
-  __u32 pc = pending->patch_count;
-  if (pc > XOR_MAX_PATCHES) pc = XOR_MAX_PATCHES;
-  __u32 pending_tgid = pending->tgid;
-  __u64 pending_ssl_ptr = pending->ssl_ptr;
-  // Consume: mark inactive so keep-alive requests don't re-apply.
-  pending->active = 0;
-
   dbg_inc(DBG_TC_MATCH);
 
   __u32 nonce_len = 8; // TLS 1.2
   __u32 ct_len = record_len - 16 - nonce_len;
 
-  // Now copy patches to ghash_scratch staging area (pending may be stale after
-  // the ghash_scratch lookup, but pc/tgid/ssl_ptr are already in locals).
+  // Copy ALL data from pending to ghash_scratch staging area.
+  // pending (tc_pending) and w (ghash_scratch) are from different maps — both
+  // pointers remain valid after the second lookup.
   __u32 zero = 0;
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w)
     return 0 /* TC_ACT_OK */;
 
-  // Re-read pending for patch data (still valid — same map, no delete).
-  pending = bpf_map_lookup_elem(&tc_pending, &key);
-  if (!pending) return 0 /* TC_ACT_OK */;
-
+  __u32 pc = pending->patch_count;
+  if (pc > XOR_MAX_PATCHES) pc = XOR_MAX_PATCHES;
   w->staged_pending.patch_count = pc;
   for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++)
     w->staged_pending.patches[p] = pending->patches[p];
   w->ghash_ct_len = ct_len;
   w->ghash_nonce_len = nonce_len;
   w->ghash_payload_off = payload_off;
-  w->ghash_tgid = pending_tgid;
-  w->ghash_ssl_ptr = pending_ssl_ptr;
+  w->ghash_tgid = pending->tgid;
+  w->ghash_ssl_ptr = pending->ssl_ptr;
   w->ghash_active = 1;
+
+  // Delete entry after copying all data.
+  bpf_map_delete_elem(&tc_pending, &key);
 
   // Apply patches. Zero secret_len on failure so GHASH skips unapplied patches.
   for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++) {
