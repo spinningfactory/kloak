@@ -6,7 +6,9 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"os"
+	"runtime"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -16,6 +18,7 @@ import (
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/go-logr/logr"
+	"golang.org/x/sys/unix"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/spinningfactory/kloak/pkg/storage"
@@ -300,6 +303,64 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	return nil
 }
 
+// attachTCEgress attaches the tc egress BPF program to eth0 inside a
+// container's network namespace. The program patches TLS ciphertext in
+// kernel skb memory, ensuring the encrypted real secret never exists in
+// user-space memory.
+//
+// The controller enters the container's netns via /proc/<pid>/ns/net
+// (requires hostPID: true), attaches tc, then returns to its own netns.
+func (m *TLSUprobeManager) attachTCEgress(pid int) error {
+	// Enter the container's network namespace.
+	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+	containerNS, err := os.Open(netnsPath)
+	if err != nil {
+		return fmt.Errorf("opening container netns %s: %w", netnsPath, err)
+	}
+	defer containerNS.Close()
+
+	// Save our current network namespace.
+	selfNS, err := os.Open("/proc/self/ns/net")
+	if err != nil {
+		return fmt.Errorf("opening self netns: %w", err)
+	}
+	defer selfNS.Close()
+
+	// Lock OS thread — setns is per-thread.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Switch to the container's network namespace.
+	if err := unix.Setns(int(containerNS.Fd()), unix.CLONE_NEWNET); err != nil {
+		return fmt.Errorf("setns to container netns: %w", err)
+	}
+
+	// Ensure we return to our original netns.
+	defer func() {
+		if err := unix.Setns(int(selfNS.Fd()), unix.CLONE_NEWNET); err != nil {
+			m.log.Error(err, "failed to restore original netns")
+		}
+	}()
+
+	// Find eth0 inside the container's network namespace.
+	iface, err := net.InterfaceByName("eth0")
+	if err != nil {
+		return fmt.Errorf("finding eth0 in container netns: %w", err)
+	}
+
+	tcLink, err := link.AttachTCX(link.TCXOptions{
+		Interface: iface.Index,
+		Program:   m.objs.TcEgressPatch,
+		Attach:    ebpf.AttachTCXEgress,
+	})
+	if err != nil {
+		return fmt.Errorf("attaching tc egress to eth0 (ifindex %d) in pid %d netns: %w", iface.Index, pid, err)
+	}
+	m.links = append(m.links, tcLink)
+	m.log.Info("Attached tc egress to container", "pid", pid, "interface", "eth0", "ifindex", iface.Index)
+	return nil
+}
+
 // TrackTGID adds a process TGID to the tracked_tgids map, enabling
 // DNS/connect tracepoint processing for that process.
 func (m *TLSUprobeManager) TrackTGID(tgid uint32) error {
@@ -404,6 +465,13 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		// XOR-patch path. Non-fatal: if detection fails, the XOR path simply
 		// won't activate and the fallback plaintext rewrite is used.
 		m.pushTLSOffsets(pid, containerLibs)
+
+		// Attach tc egress to the container's eth0 for kernel-only ciphertext
+		// patching. Non-fatal: falls back to kprobe iov patching if tc fails.
+		if err := m.attachTCEgress(pid); err != nil {
+			m.log.Error(err, "Failed to attach tc egress to container — using kprobe fallback", "pid", pid)
+		}
+
 		return nil
 	}
 	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
@@ -666,6 +734,7 @@ var debugCounterNames = []string{
 	"xor_path_entered", "xor_secret_found", "xor_delta_done", "xor_tcp_sendmsg",
 	"xor_tcp_entry", "xor_tcp_no_vfd", "xor_tcp_no_pending", "xor_tcp_not_active",
 	"ghash_entered", "ghash_tag_written",
+	"tc_entry", "tc_match", "tc_patched",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

@@ -173,6 +173,9 @@ enum {
   DBG_XOR_TCP_NOT_ACTIVE,     // xor_pending entry found but active=0
   DBG_GHASH_ENTERED,          // ghash_update program entered
   DBG_GHASH_TAG_WRITTEN,      // ghash tag written back to TLS record
+  DBG_TC_ENTRY,               // tc egress program entered (any packet)
+  DBG_TC_MATCH,               // tc_pending lookup matched
+  DBG_TC_PATCHED,             // tc XOR patch applied to skb
   DBG_MAX,
 };
 
@@ -503,6 +506,40 @@ struct {
   __type(key, __u32);
   __type(value, struct h_power_entry);
 } h_power_entries SEC(".maps");
+
+// =============================================================================
+// tc egress: pending XOR patch map keyed by TCP 4-tuple.
+// Populated by the entry uprobe, consumed by the tc egress BPF program.
+// The tc program modifies kernel skb data (not user-space memory), so the
+// encrypted real secret never exists in user-space memory.
+// =============================================================================
+
+// tc_pending key: destination IP (from conn_ip_map, already tracked).
+// TODO: Use socket cookie (bpf_get_socket_cookie) for precise per-connection
+// identification. Requires storing the cookie in the connect tracepoint and
+// passing it through to the uprobe via a (tgid, fd) → cookie map.
+// For now, keyed by destination IP which works when each destination has
+// one secret pattern (the common case for API endpoints).
+struct tc_dest_key {
+  __u8  dst_ip[16]; // IPv4-mapped-IPv6 or native IPv6
+};
+
+struct tc_pending_val {
+  __u32 secret_offset;        // byte offset of secret within TLS record plaintext
+  __u32 secret_len;
+  __u32 tgid;                 // for tls_conn_state lookup
+  __u64 ssl_ptr;              // for tls_conn_state lookup
+  __u8  xor_delta[SECRET_MAX_LEN];
+  __u8  active;
+  __u8  _pad[3];
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 4096);
+  __type(key, struct tc_dest_key);
+  __type(value, struct tc_pending_val);
+} tc_pending SEC(".maps");
 
 // =============================================================================
 
@@ -1408,6 +1445,33 @@ int bpf_xor_path(void *ctx) {
   __builtin_memcpy(w->staged_pending.xor_delta, w->ct_buf, SECRET_MAX_LEN);
 
   bpf_map_update_elem(&xor_pending, &pid_tgid, &w->staged_pending, BPF_ANY);
+
+  // Also populate tc_pending for the tc egress path (kernel-only patching).
+  // Get destination IP from conn_ip_map using the fd saved by resolve_host.
+  sd = bpf_map_lookup_elem(&scratch, &zero);
+  if (sd && sd->xor_fd > 0) {
+    struct conn_ip_key cik = {.tgid = tgid, .fd = sd->xor_fd};
+    struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
+    if (civ) {
+      struct tc_dest_key tdk = {};
+      __builtin_memcpy(tdk.dst_ip, civ->ip, 16);
+
+      struct tc_pending_val tpv = {};
+      tpv.secret_offset = local_i;
+      tpv.secret_len = val_len;
+      tpv.tgid = tgid;
+      tpv.ssl_ptr = ssl_ptr_saved;
+      tpv.active = 1;
+
+      // Re-lookup w for xor_delta (may have been invalidated by sd/civ lookups)
+      w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+      if (w)
+        __builtin_memcpy(tpv.xor_delta, w->ct_buf, SECRET_MAX_LEN);
+
+      bpf_map_update_elem(&tc_pending, &tdk, &tpv, BPF_ANY);
+    }
+  }
+
   dbg_inc(DBG_XOR_DELTA_DONE);
   return 0;
 }
@@ -1552,21 +1616,18 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 
   __u32 nonce_len = 8; // TLS 1.2
   __u32 ct_len = record_len - 16 - nonce_len;
-  __u32 ct_offset = 5 + nonce_len + pending->secret_offset;
   __u32 patch_len = clamp_write_len(pending->secret_len);
 
-  // XOR-patch ciphertext
+  // XOR patching moved to tc egress (kernel-only, no user-space exposure).
+  // The kprobe now only handles GHASH tag correction in the user-space iov.
+  // After tcp_sendmsg copies the iov to kernel skb:
+  //   - The skb has shadow ciphertext + corrected tag (from GHASH below)
+  //   - The tc program XOR-patches the ciphertext in the skb
+  //   - Result: patched ct + correct tag in kernel memory only
+
+  // Re-lookup w for GHASH metadata storage.
   w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w)
-    return 0;
-
-  if (bpf_probe_read_user(w->ct_buf, patch_len, (void *)(iov_base + ct_offset)) < 0)
-    return 0;
-
-  for (__u32 i = 0; i < SECRET_MAX_LEN && i < patch_len; i++)
-    w->ct_buf[i] ^= pending->xor_delta[i];
-
-  if (bpf_probe_write_user((void *)(iov_base + ct_offset), w->ct_buf, patch_len) < 0)
     return 0;
 
   // Store GHASH metadata
@@ -2030,6 +2091,121 @@ int tp_sched_process_exit(struct trace_event_raw_sched_process_template *ctx) {
   // The LRU will naturally evict stale entries over time.
 
   return 0;
+}
+
+// =============================================================================
+// tc egress: XOR-patch ciphertext + GHASH tag in kernel skb data.
+//
+// This runs AFTER tcp_sendmsg copies user-space data to kernel skbs.
+// Modifications happen in kernel memory only — the user-space iov is untouched.
+// The encrypted real secret NEVER exists in user-space memory.
+// =============================================================================
+
+SEC("tc")
+int tc_egress_patch(struct __sk_buff *skb) {
+  dbg_inc(DBG_TC_ENTRY);
+
+  // Parse Ethernet header (if present)
+  void *data = (void *)(long)skb->data;
+  void *data_end = (void *)(long)skb->data_end;
+
+  // Determine L3 offset. For tc, skb->protocol tells us the L3 protocol.
+  // In container environments (veth), there's usually no Ethernet header
+  // at the tc level — the packet starts at IP. Check skb->protocol.
+  __u32 l3_off = 0;
+
+  // Check if there's an Ethernet header
+  if (skb->protocol == __bpf_htons(0x0800)) {
+    // Could be raw IP or after Ethernet. Check data length.
+    // For tc on veth pairs, skb typically includes Ethernet header.
+    struct ethhdr *eth = data;
+    if ((void *)(eth + 1) > data_end)
+      return 0 /* TC_ACT_OK */;
+    if (eth->h_proto == __bpf_htons(0x0800))
+      l3_off = sizeof(struct ethhdr);
+    // else: raw IP, l3_off stays 0
+  }
+
+  // Parse IPv4 header
+  struct iphdr *ip = data + l3_off;
+  if ((void *)(ip + 1) > data_end)
+    return 0 /* TC_ACT_OK */;
+  if (ip->protocol != 6) // Not TCP
+    return 0 /* TC_ACT_OK */;
+
+  __u32 ip_hdr_len = ip->ihl * 4;
+  if (ip_hdr_len < 20)
+    return 0 /* TC_ACT_OK */;
+
+  // Parse TCP header
+  struct tcphdr *tcp = data + l3_off + ip_hdr_len;
+  if ((void *)(tcp + 1) > data_end)
+    return 0 /* TC_ACT_OK */;
+
+  __u32 tcp_hdr_len = tcp->doff * 4;
+  if (tcp_hdr_len < 20)
+    return 0 /* TC_ACT_OK */;
+
+  // Build destination key from the packet's destination IP.
+  // Map IPv4 to IPv4-mapped-IPv6 format (matches conn_ip_map convention).
+  struct tc_dest_key key = {};
+  key.dst_ip[10] = 0xff;
+  key.dst_ip[11] = 0xff;
+  __builtin_memcpy(&key.dst_ip[12], &ip->daddr, 4);
+
+  struct tc_pending_val *pending = bpf_map_lookup_elem(&tc_pending, &key);
+  if (!pending || !pending->active)
+    return 0 /* TC_ACT_OK */;
+
+  dbg_inc(DBG_TC_MATCH);
+
+  // TCP payload starts after IP + TCP headers
+  __u32 payload_off = l3_off + ip_hdr_len + tcp_hdr_len;
+  __u32 payload_len = __bpf_ntohs(ip->tot_len) - ip_hdr_len - tcp_hdr_len;
+  if (payload_len < 5)
+    return 0 /* TC_ACT_OK */;
+
+  // Read TLS record header from the TCP payload
+  __u8 tls_hdr[5];
+  if (bpf_skb_load_bytes(skb, payload_off, tls_hdr, 5) < 0)
+    return 0 /* TC_ACT_OK */;
+  if (tls_hdr[0] != 0x17) // Not application_data
+    return 0 /* TC_ACT_OK */;
+
+  __u16 record_len = ((__u16)tls_hdr[3] << 8) | (__u16)tls_hdr[4];
+  __u32 nonce_len = 8; // TLS 1.2
+  if (record_len < 16 + nonce_len + pending->secret_len)
+    return 0 /* TC_ACT_OK */;
+
+  __u32 ct_len __attribute__((unused)) = record_len - 16 - nonce_len; // Used by GHASH (TODO)
+  __u32 patch_off = payload_off + 5 + nonce_len + pending->secret_offset;
+  __u32 patch_len = clamp_write_len(pending->secret_len); // [1, 128] — non-zero for verifier
+
+  // Read ciphertext from skb
+  __u32 zero = 0;
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0 /* TC_ACT_OK */;
+
+  if (bpf_skb_load_bytes(skb, patch_off, w->ct_buf, patch_len) < 0)
+    return 0 /* TC_ACT_OK */;
+
+  // XOR-patch
+  for (__u32 i = 0; i < SECRET_MAX_LEN && i < patch_len; i++)
+    w->ct_buf[i] ^= pending->xor_delta[i];
+
+  // Write patched ciphertext back to skb (kernel memory only!)
+  if (bpf_skb_store_bytes(skb, patch_off, w->ct_buf, patch_len, 0) < 0)
+    return 0 /* TC_ACT_OK */;
+
+  dbg_inc(DBG_TC_PATCHED);
+
+  // TODO: GHASH tag correction in the skb.
+  // For now, the tag is wrong — server will reject. This proves the tc path works.
+  // The GHASH computation needs to be adapted from bpf_probe_read/write_user to
+  // bpf_skb_load/store_bytes. Reuse the existing bpf_loop callbacks.
+
+  return 0 /* TC_ACT_OK */;
 }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
