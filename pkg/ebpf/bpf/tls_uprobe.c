@@ -1978,15 +1978,34 @@ int tc_egress_patch(struct __sk_buff *skb) {
   __u8 tls_hdr[5];
   if (bpf_skb_load_bytes(skb, payload_off, tls_hdr, 5) < 0)
     return 0 /* TC_ACT_OK */;
-  if (tls_hdr[0] != 0x17) // Not application_data
+  // Validate TLS application_data record:
+  //   byte 0: content type must be 0x17
+  //   bytes 1-2: version must be 0x0301..0x0303 (TLS 1.0-1.3)
+  //   bytes 3-4: record_len must be sane (> 24 for TLS 1.2 AES-GCM minimum)
+  // This rejects TCP continuation segments where random ciphertext bytes
+  // coincidentally start with 0x17 (1/256 without version check → ~1/5.6M with).
+  if (tls_hdr[0] != 0x17 || tls_hdr[1] != 0x03 || tls_hdr[2] > 0x03)
     return 0 /* TC_ACT_OK */;
 
   __u16 record_len = ((__u16)tls_hdr[3] << 8) | (__u16)tls_hdr[4];
-
-  // Full TLS record must fit in this segment (header + body).
-  // Otherwise we can't patch ciphertext AND update the GHASH tag atomically.
-  if (payload_len < 5 + record_len)
+  if (record_len < 24) // minimum: 8 nonce + 0 payload + 16 tag
     return 0 /* TC_ACT_OK */;
+  __u32 tls_total = 5 + record_len; // header + body
+
+  // Linearize the skb so the full TLS record is in contiguous memory.
+  // With GSO, the kernel may pass a large packet with non-linear fragments;
+  // bpf_skb_pull_data makes it accessible to bpf_skb_load/store_bytes.
+  // If the record truly spans TCP segments (separate skbs), this can't help
+  // and we fail-secure (shadow goes through).
+  if (payload_len < tls_total) {
+    if (bpf_skb_pull_data(skb, payload_off + tls_total) < 0)
+      return 0 /* TC_ACT_OK */;
+    // After pull, skb->len reflects the linearized data. Re-derive payload_len.
+    // skb->len is the total L3 length. Direct access pointers are invalid after
+    // pull, but bpf_skb_load/store_bytes still work.
+    if (skb->len < payload_off + tls_total)
+      return 0 /* TC_ACT_OK */;
+  }
 
   // Copy ALL data from pending and consume ATOMICALLY — before any other map
   // lookups or helper calls. A concurrent uprobe on another CPU can call
