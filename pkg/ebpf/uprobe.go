@@ -529,7 +529,7 @@ func (m *TLSUprobeManager) populateTestConnState(tgid uint32) {
 	key := tlsuprobeTlsConnKey{Tgid: tgid, SslPtr: 0}
 
 	var state tlsuprobeTlsConnState
-	state.CipherSuite = 0x1301
+	state.CipherType = 1 // KLOAK_CIPHER_AES_GCM
 	for i := range state.GhashH {
 		state.GhashH[i] = 0x42
 	}

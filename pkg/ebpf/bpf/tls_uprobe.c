@@ -401,7 +401,7 @@ struct tls_conn_key {
 struct tls_conn_state {
   __u8  ghash_h[16];         // GHASH key H = AES(K, 0^128)
   __u8  h_powers[16][16];    // H^(2^i) for i=0..10 (padded to 16 for bitmask bounds)
-  __u16 cipher_suite;        // 0x1301 = AES_128_GCM, 0x1302 = AES_256_GCM
+  __u16 cipher_type;        // KLOAK_CIPHER_AES_GCM or KLOAK_CIPHER_UNKNOWN
   __u8  h_powers_ready;      // 1 = userspace has pushed precomputed H powers
   __u8  _pad[1];
 };
@@ -1344,7 +1344,7 @@ int bpf_h_extract(void *ctx) {
     return 0;
 
   // Read H directly into a stack-allocated tls_conn_state.
-  // Only set ghash_h + cipher_suite (rest stays zero).
+  // Only set ghash_h + cipher_type (rest stays zero).
   // The struct is 276 bytes but we only write 18 bytes — the rest is zero from stack init.
   struct tls_conn_state new_conn;
   __builtin_memset(&new_conn, 0, sizeof(new_conn));
@@ -1359,7 +1359,10 @@ int bpf_h_extract(void *ctx) {
   h64[0] = __builtin_bswap64(h64[0]);
   h64[1] = __builtin_bswap64(h64[1]);
 
-  new_conn.cipher_suite = 0x1301;
+  // Successful H extraction implies AES-GCM (only GCM contexts have a valid H key).
+  // Non-GCM ciphers (CBC, ChaCha20) don't have a GCM128_CONTEXT, so the pointer
+  // chain fails or H is all-zeros — both caught above.
+  new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
 
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
@@ -1966,7 +1969,7 @@ int bpf_uprobe_ssl_write(void *ctx) {
     return 0;
   }
 
-  if (!is_aes_gcm(conn->cipher_suite))
+  if (!is_aes_gcm(conn->cipher_type))
     return 0;
 
   // H already cached — go directly to xor_path.

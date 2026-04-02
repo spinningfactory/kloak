@@ -250,9 +250,14 @@ HELPER_INLINE void gf128_h_power_table_ws(const __u8 h_powers[11][16],
   }
 }
 
-// Check if a TLS 1.3 cipher suite is AES-GCM (compatible with XOR patching).
-HELPER_INLINE int is_aes_gcm(__u32 cipher_suite) {
-  return (cipher_suite == 0x1301 || cipher_suite == 0x1302) ? 1 : 0;
+// Kloak internal cipher type enum (not TLS cipher suite IDs).
+// The cipher type is determined implicitly: successful H extraction = AES-GCM.
+#define KLOAK_CIPHER_UNKNOWN 0
+#define KLOAK_CIPHER_AES_GCM 1  // AES-128-GCM or AES-256-GCM (TLS 1.2 or 1.3)
+
+// Check if the connection uses AES-GCM (compatible with XOR patching + GHASH).
+HELPER_INLINE int is_aes_gcm(__u32 cipher_type) {
+  return cipher_type == KLOAK_CIPHER_AES_GCM;
 }
 
 #endif // KLOAK_HELPERS_H

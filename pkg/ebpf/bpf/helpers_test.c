@@ -332,11 +332,10 @@ static void test_gf128_h_power_table(void) {
 }
 
 static void test_is_aes_gcm(void) {
-  assert(is_aes_gcm(0x1301) == 1); // TLS_AES_128_GCM_SHA256
-  assert(is_aes_gcm(0x1302) == 1); // TLS_AES_256_GCM_SHA384
-  assert(is_aes_gcm(0x1303) == 0); // TLS_CHACHA20_POLY1305_SHA256
-  assert(is_aes_gcm(0x1304) == 0); // TLS_AES_128_CCM_SHA256
-  assert(is_aes_gcm(0x0000) == 0);
+  assert(is_aes_gcm(KLOAK_CIPHER_AES_GCM) == 1);
+  assert(is_aes_gcm(KLOAK_CIPHER_UNKNOWN) == 0);
+  assert(is_aes_gcm(0) == 0);
+  assert(is_aes_gcm(99) == 0);
 }
 
 // ============================================================================
