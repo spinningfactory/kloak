@@ -31,13 +31,21 @@ PROV_OBJ=$(find . -name '*ciphercommon_gcm.o' -o -name '*cipher_aes_gcm.o' -o -n
 # OSSL_RECORD_LAYER is in the record layer source files
 REC_OBJ=$(find . -name '*tls_common.o' -o -name '*tlsrecord.o' | head -1)
 
-# SSL_CONNECTION offsets
-SSL_TO_VERSION=$(get_offset "$SSL_OBJ" "ssl_connection_st" "version")
-# rlayer is a nested struct — get its offset, then wrl within it
-RLAYER_OFFSET=$(get_offset "$SSL_OBJ" "ssl_connection_st" "rlayer")
+# SSL_CONNECTION offsets (3.2+) or ssl_st (3.0-3.1)
+# Try ssl_connection_st first, fall back to ssl_st
+SSL_STRUCT="ssl_connection_st"
+SSL_TO_VERSION=$(get_offset "$SSL_OBJ" "$SSL_STRUCT" "version")
+if [ -z "$SSL_TO_VERSION" ]; then
+    SSL_STRUCT="ssl_st"
+    SSL_TO_VERSION=$(get_offset "$SSL_OBJ" "$SSL_STRUCT" "version")
+fi
+SIZEOF_SSL_CONNECTION=$(get_sizeof "$SSL_OBJ" "$SSL_STRUCT")
+
+# rlayer.wrl (3.2+ only — nested struct)
+RLAYER_OFFSET=$(get_offset "$SSL_OBJ" "$SSL_STRUCT" "rlayer")
 WRL_IN_RLAYER=$(get_offset "$SSL_OBJ" "record_layer_st" "wrl")
-# For 3.0-3.1: enc_write_ctx directly on ssl_connection_st
-SSL_TO_ENC_WRITE_CTX=$(get_offset "$SSL_OBJ" "ssl_connection_st" "enc_write_ctx")
+# For 3.0-3.1: enc_write_ctx directly on the SSL struct
+SSL_TO_ENC_WRITE_CTX=$(get_offset "$SSL_OBJ" "$SSL_STRUCT" "enc_write_ctx")
 
 SSL_TO_WRL=""
 if [ -n "$RLAYER_OFFSET" ] && [ -n "$WRL_IN_RLAYER" ]; then

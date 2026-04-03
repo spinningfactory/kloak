@@ -14,12 +14,12 @@ RUN curl -fsSL "https://github.com/openssl/openssl/releases/download/openssl-${O
 
 WORKDIR /tmp/openssl
 
+# Configure flags vary by version. no-docs was added in 3.2.
 RUN ./Configure \
     --prefix=/usr/local \
     --openssldir=/usr/local/ssl \
     no-shared \
     no-tests \
-    no-docs \
     -g -O0 \
     && make -j$(nproc) build_sw
 
