@@ -1708,8 +1708,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   bpf_map_delete_elem(&xor_pending, &pid_tgid);
 
   // Extract H from the SSL struct. At tcp_sendmsg time, the TLS handshake
-  // has completed and the encryption context (with H) is available — unlike
-  // at SSL_write entry where the handshake may not have happened yet.
+  // has completed and the encryption context (with H) is available.
   struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &zero);
   if (!offsets || offsets->ssl_to_wrl == 0)
     return 0;

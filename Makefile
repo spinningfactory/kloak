@@ -234,11 +234,11 @@ lima-k3d-shell: lima-k3d-ensure
 
 # Run e2e setup inside k3d Lima VM
 lima-k3d-e2e-setup: lima-k3d-ensure
-	limactl shell $(LIMA_K3D_VM) -- bash -lc 'cd $(LIMA_WORKDIR) && make e2e-setup'
+	limactl shell $(LIMA_K3D_VM) -- bash -lc 'sg docker -c "cd $(LIMA_WORKDIR) && make e2e-setup"'
 
 # Run e2e tests inside k3d Lima VM
 lima-k3d-e2e-run: lima-k3d-ensure
-	limactl shell $(LIMA_K3D_VM) -- bash -lc 'cd $(LIMA_WORKDIR) && make e2e-run'
+	limactl shell $(LIMA_K3D_VM) -- bash -lc 'sg docker -c "cd $(LIMA_WORKDIR) && make e2e-run"'
 
 # Full e2e inside k3d Lima VM
 lima-k3d-e2e: lima-k3d-e2e-setup lima-k3d-e2e-run
