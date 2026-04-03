@@ -105,6 +105,9 @@ build_images() {
     # Build demo JS app
     docker build -t kloak-demo-js:latest "$SCRIPT_DIR/demo-js"
 
+    # Build demo Python raw TLS app
+    docker build -t kloak-demo-python-raw-tls:latest "$SCRIPT_DIR/demo-python-raw-tls"
+
     # Build Kloak controller
     docker build -t kloak:latest "$ROOT_DIR"
 
@@ -119,6 +122,9 @@ build_images() {
 
     echo "Importing kloak-demo-js..."
     docker save kloak-demo-js:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
+
+    echo "Importing kloak-demo-python-raw-tls..."
+    docker save kloak-demo-python-raw-tls:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
 
     echo "Importing kloak..."
     docker save kloak:latest | limactl shell "${LIMA_INSTANCE}" -- sudo k3s ctr images import -
@@ -195,6 +201,8 @@ deploy_demo() {
     kubectl delete pod demo-go -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
     kubectl delete deployment demo-js -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
     kubectl delete pod demo-js -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
+    kubectl delete deployment demo-python-raw-tls -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
+    kubectl delete service tls -n "$DEMO_NAMESPACE" --ignore-not-found 2>/dev/null || true
     
     # Create SECRET 1: Allowed for httpbin.org
     echo "Creating secret-allowed (hosts=httpbin.org)..."
@@ -204,6 +212,22 @@ deploy_demo() {
         kubectl label -f - getkloak.io/enabled="true" getkloak.io/hosts="httpbin.org" --local -o yaml | \
         kubectl apply -f -
     
+    # Create SECRET for raw TLS demo: Allowed for tls.kloak-demo (short FQDN fits MAX_HOST_LEN=32)
+    echo "Creating secret-rawtls-allowed (hosts=tls.kloak-demo.svc.cluster.local)..."
+    kubectl create secret generic secret-rawtls-allowed \
+        --from-literal=api-key="REAL-ALLOWED-KEY-12345" \
+        -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | \
+        kubectl label -f - getkloak.io/enabled="true" getkloak.io/hosts="tls.kloak-demo.svc.cluster.local" --local -o yaml | \
+        kubectl apply -f -
+
+    # Create SECRET for raw TLS demo: Blocked (only allowed for example.com)
+    echo "Creating secret-rawtls-blocked (hosts=example.com)..."
+    kubectl create secret generic secret-rawtls-blocked \
+        --from-literal=api-key="REAL-BLOCKED-KEY-67890" \
+        -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | \
+        kubectl label -f - getkloak.io/enabled="true" getkloak.io/hosts="example.com" --local -o yaml | \
+        kubectl apply -f -
+
     # Create SECRET 2: Blocked for httpbin.org (only allowed for example.com)
     echo "Creating secret-blocked (hosts=example.com)..."
     kubectl create secret generic secret-blocked \
@@ -219,6 +243,7 @@ deploy_demo() {
     kubectl apply -f "$SCRIPT_DIR/demo-python/deployment.yaml" -n "$DEMO_NAMESPACE"
     kubectl apply -f "$SCRIPT_DIR/demo-go/deployment.yaml" -n "$DEMO_NAMESPACE"
     kubectl apply -f "$SCRIPT_DIR/demo-js/deployment.yaml" -n "$DEMO_NAMESPACE"
+    kubectl apply -f "$SCRIPT_DIR/demo-python-raw-tls/deployment.yaml" -n "$DEMO_NAMESPACE"
 
     echo "✓ Demo applications deployed (Python + Go + JS)"
 }
@@ -303,6 +328,7 @@ show_summary() {
     echo "  View Python logs:    kubectl logs -f -l app=demo-python -n $DEMO_NAMESPACE -c demo-app"
     echo "  View Go logs:        kubectl logs -f -l app=demo-go -n $DEMO_NAMESPACE -c demo-app"
     echo "  View JS logs:        kubectl logs -f -l app=demo-js -n $DEMO_NAMESPACE -c demo-app"
+    echo "  View Raw TLS logs:   kubectl logs -f -l app=demo-python-raw-tls -n $DEMO_NAMESPACE -c demo-app"
     echo "  View webhook logs:   kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook"
     echo "  View controller logs: kubectl logs -n kloak-system -l app.kubernetes.io/component=controller"
     echo ""

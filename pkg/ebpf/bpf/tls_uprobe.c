@@ -1071,10 +1071,29 @@ int tp_enter_close(struct trace_event_raw_sys_enter *ctx) {
   return 0;
 }
 
+// Offsets for reading fd from SSL struct's BIO (stable across OpenSSL 3.x).
+// SSL_CONNECTION.wbio → BIO*, BIO.num → int fd
+// Verified via pahole: identical on aarch64 and x86_64, OpenSSL 3.0-3.5.
+#define SSL_WBIO_OFFSET 88  // offsetof(ssl_connection_st, wbio) for 3.2+
+#define BIO_NUM_OFFSET  56  // offsetof(bio_st, num)
+
+// Read the socket fd directly from the SSL struct's write BIO.
+// Returns the fd, or 0 if the read fails.
+static __always_inline __u32 ssl_read_fd(__u64 ssl_ptr) {
+  if (!ssl_ptr) return 0;
+  __u64 wbio = 0;
+  if (bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + SSL_WBIO_OFFSET)) < 0 || !wbio)
+    return 0;
+  __u32 fd = 0;
+  if (bpf_probe_read_user(&fd, 4, (void *)(wbio + BIO_NUM_OFFSET)) < 0)
+    return 0;
+  return fd;
+}
+
 // =============================================================================
 // Resolve host for the current SSL/TLS connection using DNS chain.
 //
-// Chain: ssl_fd_map (cache) -> last_verified_fd -> conn_ip_map -> dns_ip_map
+// Chain: ssl_fd_map (cache) -> BIO fd read -> last_verified_fd -> conn_ip_map -> dns_ip_map
 // =============================================================================
 static __always_inline void resolve_host(struct scratch_buf *scratch_data,
                                          __u64 ssl_ptr) {
@@ -1103,7 +1122,26 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     }
   }
 
-  // Path 2: last_verified_fd (fast path if connect happened after DNS)
+  // Path 2: Read fd directly from the SSL struct's BIO.
+  // This covers new connections where ssl_fd_map hasn't been populated yet
+  // (e.g., raw TLS sockets, first SSL_write on a fresh connection).
+  if (!found && ssl_ptr != 0) {
+    __u32 bio_fd = ssl_read_fd(ssl_ptr);
+    if (bio_fd > 0) {
+      fd = bio_fd;
+      found = 1;
+      // Cache it in ssl_fd_map for subsequent SSL_writes on same connection.
+      struct ssl_fd_key sfk;
+      __builtin_memset(&sfk, 0, sizeof(sfk));
+      sfk.tgid = tgid;
+      sfk.ssl_ptr = ssl_ptr;
+      struct ssl_fd_val new_sfv = {.fd = fd};
+      bpf_map_update_elem(&ssl_fd_map, &sfk, &new_sfv, BPF_ANY);
+      dbg_inc(DBG_RESOLVE_SSL_FD_HIT);
+    }
+  }
+
+  // Path 3: last_verified_fd (fast path if connect happened after DNS)
   if (!found) {
     __u32 *vfd = bpf_map_lookup_elem(&last_verified_fd, &tgid);
     if (vfd) {
