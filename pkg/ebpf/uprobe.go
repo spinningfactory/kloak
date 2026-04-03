@@ -11,8 +11,8 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"syscall"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
