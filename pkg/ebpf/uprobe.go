@@ -9,9 +9,9 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"syscall"
 	"runtime"
 	"strings"
+	"syscall"
 	"sync"
 	"time"
 
