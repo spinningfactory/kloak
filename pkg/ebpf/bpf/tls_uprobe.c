@@ -422,6 +422,7 @@ struct xor_pending_val {
   struct xor_patch patches[XOR_MAX_PATCHES];
   __u8  active;
   __u8  _pad[3];
+  __u32 plaintext_len;      // SSL_write data length (for TLS version detection in tc)
 };
 
 // Per-thread pending XOR patches, keyed by pid_tgid.
@@ -469,6 +470,7 @@ struct tc_pending_val {
   struct xor_patch patches[XOR_MAX_PATCHES];
   __u8  active;
   __u8  _pad[3];
+  __u32 plaintext_len;      // SSL_write data length (for TLS version detection)
 };
 
 // Holds all large structs and buffers that would otherwise exceed the 512-byte
@@ -1321,6 +1323,7 @@ int bpf_xor_path(void *ctx) {
     wi->staged_pending.ssl_ptr = sd->ssl_ptr;
     wi->staged_pending.tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
     wi->staged_pending.active = 1;
+    wi->staged_pending.plaintext_len = sd->total_data_len;
   }
 
   dbg_inc(DBG_XOR_PATH_ENTERED);
@@ -1650,6 +1653,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   w->staged_tc.tgid = (__u32)(pid_tgid >> 32);
   w->staged_tc.ssl_ptr = pending->ssl_ptr;
   w->staged_tc.active = 1;
+  w->staged_tc.plaintext_len = pending->plaintext_len;
   w->staged_tc.patch_count = pending->patch_count;
   if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
     w->staged_tc.patch_count = XOR_MAX_PATCHES;
@@ -2042,7 +2046,15 @@ int tc_egress_patch(struct __sk_buff *skb) {
 
   dbg_inc(DBG_TC_MATCH);
 
-  __u32 nonce_len = 8; // TLS 1.2
+  // Detect TLS version from record_len vs plaintext_len:
+  //   TLS 1.2: record_len = plaintext_len + 8 (nonce) + 16 (tag) = pt + 24
+  //   TLS 1.3: record_len = plaintext_len + 1 (content_type) + 16 (tag) = pt + 17
+  __u32 pt_len = pending->plaintext_len;
+  __u32 nonce_len;
+  if (pt_len > 0 && record_len == pt_len + 17)
+    nonce_len = 0;  // TLS 1.3
+  else
+    nonce_len = 8;  // TLS 1.2 (default)
   __u32 ct_len = record_len - 16 - nonce_len;
 
   // Copy ALL data from pending to ghash_scratch staging area.
