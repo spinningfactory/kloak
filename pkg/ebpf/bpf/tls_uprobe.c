@@ -47,8 +47,8 @@
 // Chunk stride for bpf_loop scanning: overlap of SECRET_KEY_LEN-1 bytes
 // ensures tokens straddling chunk boundaries are always detected.
 #define CHUNK_STRIDE (MAX_DATA_SIZE - (SECRET_KEY_LEN - 1)) // 249
-// Max host length for matching (compared as 4 x uint64, no loop needed)
-#define MAX_HOST_LEN 32
+// Max host length for matching
+#define MAX_HOST_LEN 64
 // Maximum DNS packet size we can parse in BPF
 #define MAX_DNS_PKT 512
 // Maximum number of DNS answer records to process

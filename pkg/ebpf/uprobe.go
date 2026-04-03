@@ -52,7 +52,7 @@ type secretValue struct {
 	Len         uint32
 	RealSecret  [128]byte
 	HostLen     uint32
-	AllowedHost [32]byte
+	AllowedHost [64]byte
 	PrefixLen   uint32
 	FullPrefix  [42]byte // SECRET_PREFIX_MAX
 	_           [2]byte  // padding to match C struct alignment
@@ -60,7 +60,7 @@ type secretValue struct {
 
 // watchedHostKey matches C struct watched_host_key
 type watchedHostKey struct {
-	Host [32]byte
+	Host [64]byte
 }
 
 // Generate eBPF bindings. The KLOAK_TARGET_ARCH env var (set by Dockerfile or
