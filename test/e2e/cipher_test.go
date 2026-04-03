@@ -93,9 +93,10 @@ func deployTLSEchoServer(t *testing.T) string {
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{
-				Name:  "echo",
-				Image: echoServerImage,
-				Ports: []corev1.ContainerPort{{ContainerPort: 8443}},
+				Name:            "echo",
+				Image:           echoServerImage,
+				ImagePullPolicy: corev1.PullNever,
+				Ports:           []corev1.ContainerPort{{ContainerPort: 8443}},
 			}},
 		},
 	}
