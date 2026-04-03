@@ -396,6 +396,7 @@ struct tls_conn_state {
   __u16 cipher_type;        // KLOAK_CIPHER_AES_GCM or KLOAK_CIPHER_UNKNOWN
   __u8  h_powers_ready;      // 1 = userspace has pushed precomputed H powers
   __u8  _pad[1];
+  __u64 wrl_ptr;             // cached first pointer in chain — changes on session recycle
 };
 
 struct {
@@ -1253,9 +1254,10 @@ int bpf_h_extract(void *ctx) {
     return 0;
 
   // 4-step pointer chase: SSL* → wrl* → enc_ctx* → algctx* → H
-  __u64 ptr = 0;
-  if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
+  __u64 wrl_ptr = 0;
+  if (bpf_probe_read_user(&wrl_ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !wrl_ptr)
     return 0;
+  __u64 ptr = wrl_ptr;
   if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
     return 0;
   if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr)
@@ -1281,6 +1283,7 @@ int bpf_h_extract(void *ctx) {
   // Non-GCM ciphers (CBC, ChaCha20) don't have a GCM128_CONTEXT, so the pointer
   // chain fails or H is all-zeros — both caught above.
   new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
+  new_conn.wrl_ptr = wrl_ptr;
 
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
@@ -1288,7 +1291,7 @@ int bpf_h_extract(void *ctx) {
   __builtin_memset(&ck, 0, sizeof(ck));
   ck.tgid = tgid;
   ck.ssl_ptr = ssl_ptr;
-  bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_NOEXIST);
+  bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_ANY);
 
   dbg_inc(DBG_XOR_CONN_HIT);
 
@@ -1404,6 +1407,7 @@ finalize:;
 
   // ssl_ptr, tgid, active already set during mi=0 initialization.
   bpf_map_update_elem(&xor_pending, &pid_tgid, &wf->staged_pending, BPF_ANY);
+  bpf_printk("kloak [1-UPROBE] pid=%u patches=%u", (__u32)pid_tgid, wf->staged_pending.patch_count);
 
   dbg_inc(DBG_XOR_DELTA_DONE);
   return 0;
@@ -1652,14 +1656,49 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   for (__u32 p = 0; p < XOR_MAX_PATCHES && p < w->staged_tc.patch_count; p++)
     w->staged_tc.patches[p] = pending->patches[p];
 
+  __u64 ssl_ptr = pending->ssl_ptr;
+  __u32 tgid = w->staged_tc.tgid;
+
   bpf_map_update_elem(&tc_pending, &tdk, &w->staged_tc, BPF_ANY);
+  bpf_printk("kloak [2-KPROBE] sport=%u cg=%x", src_port_h, (__u32)tdk.cgroup_id);
 
   // Delete xor_pending — the entry has been bridged to tc_pending.
-  // If SSL_write triggers multiple tcp_sendmsg calls (handshake + data),
-  // only the first bridges. The tc_pending entry uses (dst_ip, src_port,
-  // cgroup_id) without tcp_seq, so subsequent overwrites are harmless
-  // (same patches). tc only patches application_data (0x17) records.
   bpf_map_delete_elem(&xor_pending, &pid_tgid);
+
+  // Extract H from the SSL struct. At tcp_sendmsg time, the TLS handshake
+  // has completed and the encryption context (with H) is available — unlike
+  // at SSL_write entry where the handshake may not have happened yet.
+  struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &zero);
+  if (!offsets || offsets->ssl_to_wrl == 0)
+    return 0;
+
+  __u64 ptr = 0;
+  if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
+    return 0;
+  __u64 wrl_val = ptr;
+  if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
+    return 0;
+  if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr)
+    return 0;
+
+  struct tls_conn_state new_conn;
+  __builtin_memset(&new_conn, 0, sizeof(new_conn));
+  if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0)
+    return 0;
+
+  __u64 *h64 = (__u64 *)new_conn.ghash_h;
+  if (h64[0] == 0 && h64[1] == 0)
+    return 0;
+  h64[0] = __builtin_bswap64(h64[0]);
+  h64[1] = __builtin_bswap64(h64[1]);
+
+  new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
+  new_conn.wrl_ptr = wrl_val;
+
+  struct tls_conn_key ck = {};
+  ck.tgid = tgid;
+  ck.ssl_ptr = ssl_ptr;
+  bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_ANY);
 
   return 0;
 }
@@ -1822,24 +1861,8 @@ int bpf_uprobe_ssl_write(void *ctx) {
     bpf_loop(num_chunks, prescan_chunk, &pctx, 0);
   }
 
-  // Check if this connection already has H extracted.
-  __u64 pid_tgid = bpf_get_current_pid_tgid();
-  __u32 tgid = (__u32)(pid_tgid >> 32);
-
-  struct tls_conn_key conn_key = {.tgid = tgid, .ssl_ptr = (__u64)ssl_ptr};
-  struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &conn_key);
-
-  if (!conn) {
-    // First SSL_write — tail-call to H extraction (index 2).
-    // h_extract will store H then tail-call to xor_path (index 1).
-    bpf_tail_call(ctx, &prog_array, 2);
-    return 0;
-  }
-
-  if (!is_aes_gcm(conn->cipher_type))
-    return 0;
-
-  // H already cached — go to xor_path (processes one match per invocation).
+  // Go directly to xor_path. H extraction is deferred to the tcp_sendmsg
+  // kprobe where the TLS handshake has completed and H is available.
   bpf_tail_call(ctx, &prog_array, 1);
 
   return 0;
@@ -1957,21 +1980,19 @@ int tc_egress_patch(struct __sk_buff *skb) {
   if (tcp_hdr_len < 20)
     return 0 /* TC_ACT_OK */;
 
+  // Save header fields to locals before helper calls invalidate direct pointers.
+  __u32 daddr = ip->daddr;
+  __u16 sport = tcp->source;
+
   // Build key from destination IP + source port (per-connection isolation).
-  // Map IPv4 to IPv4-mapped-IPv6 format (matches conn_ip_map convention).
   struct tc_dest_key key = {};
   key.dst_ip[10] = 0xff;
   key.dst_ip[11] = 0xff;
-  __builtin_memcpy(&key.dst_ip[12], &ip->daddr, 4);
-  key.src_port = tcp->source; // already network byte order
+  __builtin_memcpy(&key.dst_ip[12], &daddr, 4);
+  key.src_port = sport;
   key.cgroup_id = bpf_skb_cgroup_id(skb);
 
-  struct tc_pending_val *pending = bpf_map_lookup_elem(&tc_pending, &key);
-  if (!pending || !pending->active)
-    return 0 /* TC_ACT_OK */;
-
-  // Only process TLS application_data records. Non-TLS packets (ACKs,
-  // handshake) must not consume the pending entry.
+  // Check TLS application_data FIRST (cheap, no map lookup).
   __u32 payload_off = l3_off + ip_hdr_len + tcp_hdr_len;
   __u32 payload_len = __bpf_ntohs(ip->tot_len) - ip_hdr_len - tcp_hdr_len;
   if (payload_len < 5)
@@ -1992,6 +2013,16 @@ int tc_egress_patch(struct __sk_buff *skb) {
   __u16 record_len = ((__u16)tls_hdr[3] << 8) | (__u16)tls_hdr[4];
   if (record_len < 24) // minimum: 8 nonce + 0 payload + 16 tag
     return 0 /* TC_ACT_OK */;
+
+  // Now that we know this is a valid TLS application_data record, look up
+  // the pending entry. This avoids map lookups on non-TLS packets.
+  struct tc_pending_val *pending = bpf_map_lookup_elem(&tc_pending, &key);
+  if (!pending || !pending->active) {
+    bpf_printk("kloak [3-TC] MISS sport=%u cg=%x", __bpf_ntohs(sport), (__u32)key.cgroup_id);
+    return 0 /* TC_ACT_OK */;
+  }
+  bpf_printk("kloak [3-TC] HIT sport=%u cg=%x", __bpf_ntohs(sport), (__u32)key.cgroup_id);
+
   __u32 tls_total = 5 + record_len; // header + body
 
   // Linearize the skb so the full TLS record is in contiguous memory.
@@ -2034,8 +2065,12 @@ int tc_egress_patch(struct __sk_buff *skb) {
   w->ghash_ssl_ptr = pending->ssl_ptr;
   w->ghash_active = 1;
 
-  // Delete entry after copying all data.
-  bpf_map_delete_elem(&tc_pending, &key);
+  // Mark inactive instead of deleting. Retransmits on the same connection
+  // would steal a freshly-created entry if we deleted. With active=0, the
+  // retransmit finds the entry but skips it. The kprobe overwrites with
+  // active=1 on the next SSL_write.
+  pending = bpf_map_lookup_elem(&tc_pending, &key);
+  if (pending) pending->active = 0;
 
   // Apply patches. Zero secret_len on failure so GHASH skips unapplied patches.
   for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++) {
@@ -2065,9 +2100,11 @@ int tc_egress_patch(struct __sk_buff *skb) {
     dbg_inc(DBG_TC_PATCHED);
   }
 
+  bpf_printk("kloak [4-PATCH] sport=%u pc=%u ct=%u", __bpf_ntohs(sport), pc, ct_len);
+
   // Tail-call to tc GHASH program.
   bpf_tail_call(skb, &tc_prog_array, 0);
-
+  bpf_printk("kloak [4-PATCH] TAILCALL_FAILED");
   return 0 /* TC_ACT_OK */;
 }
 
@@ -2147,6 +2184,10 @@ int tc_ghash_update(struct __sk_buff *skb) {
     w->new_tag[i] = w->old_tag[i] ^ w->tag_delta[i];
 
   bpf_skb_store_bytes(skb, tag_offset, w->new_tag, 16, 0);
+
+  __u32 dsum = 0;
+  for (__u32 di = 0; di < 16; di++) dsum += w->tag_delta[di];
+  bpf_printk("kloak [5-GHASH] tag_off=%u dsum=%u", tag_offset, dsum);
 
   return 0 /* TC_ACT_OK */;
 }
