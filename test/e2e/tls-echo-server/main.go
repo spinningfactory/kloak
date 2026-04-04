@@ -8,6 +8,7 @@ package main
 import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
+	"crypto/rsa"
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
@@ -23,15 +24,21 @@ import (
 )
 
 func main() {
-	// Generate self-signed certificate.
-	cert, err := generateSelfSignedCert()
+	// Generate both ECDSA and RSA certificates so the server can negotiate
+	// any cipher suite (ECDHE-ECDSA-* and ECDHE-RSA-*).
+	ecdsaCert, err := generateECDSACert()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "failed to generate cert: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to generate ECDSA cert: %v\n", err)
+		os.Exit(1)
+	}
+	rsaCert, err := generateRSACert()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to generate RSA cert: %v\n", err)
 		os.Exit(1)
 	}
 
 	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{cert},
+		Certificates: []tls.Certificate{ecdsaCert, rsaCert},
 	}
 
 	// Configure TLS version from env.
@@ -108,13 +115,8 @@ func main() {
 	}
 }
 
-func generateSelfSignedCert() (tls.Certificate, error) {
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	template := &x509.Certificate{
+func certTemplate() *x509.Certificate {
+	return &x509.Certificate{
 		SerialNumber: big.NewInt(1),
 		Subject:      pkix.Name{CommonName: "tls-echo-server"},
 		NotBefore:    time.Now(),
@@ -124,16 +126,33 @@ func generateSelfSignedCert() (tls.Certificate, error) {
 		DNSNames:     []string{"tls-echo-server", "localhost"},
 		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
 	}
+}
 
-	certDER, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+func generateECDSACert() (tls.Certificate, error) {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
+	tmpl := certTemplate()
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{Certificate: [][]byte{certDER}, PrivateKey: key}, nil
+}
 
-	return tls.Certificate{
-		Certificate: [][]byte{certDER},
-		PrivateKey:  key,
-	}, nil
+func generateRSACert() (tls.Certificate, error) {
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	tmpl := certTemplate()
+	tmpl.SerialNumber = big.NewInt(2)
+	certDER, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		return tls.Certificate{}, err
+	}
+	return tls.Certificate{Certificate: [][]byte{certDER}, PrivateKey: key}, nil
 }
 
 func tlsVersionName(v uint16) string {
