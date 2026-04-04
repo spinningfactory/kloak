@@ -101,12 +101,8 @@ jobs:
       - name: Run tests
         run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/pkg/ebpf|/pkg/cgroups')
 
-      - name: Upload coverage
-        uses: actions/upload-artifact@v5
-        with:
-          name: coverage
-          path: coverage.out
-          retention-days: 1
+      # Coverage artifact skipped to save storage quota.
+      # The e2e job merges coverage separately.
 
   coverage:
     name: Coverage Report
