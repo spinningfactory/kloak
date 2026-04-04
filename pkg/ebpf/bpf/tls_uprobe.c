@@ -1451,7 +1451,7 @@ finalize:;
 
   // ssl_ptr, tgid, active already set during mi=0 initialization.
   bpf_map_update_elem(&xor_pending, &pid_tgid, &wf->staged_pending, BPF_ANY);
-  bpf_printk("kloak [1-UPROBE] pid=%u patches=%u", (__u32)pid_tgid, wf->staged_pending.patch_count);
+  // bpf_printk("kloak [1-UPROBE] pid=%u patches=%u", (__u32)pid_tgid, wf->staged_pending.patch_count);
 
   dbg_inc(DBG_XOR_DELTA_DONE);
   return 0;
@@ -1931,9 +1931,10 @@ int tp_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 
   __u32 tgid = ctx->pid; // pid field is the TGID in this context
 
-  // Ensure the new process is in tracked_tgids for DNS/connect tracking
+  // Ensure the new process is tracked for DNS/connect and SSL_write filtering.
   __u8 val = 1;
   bpf_map_update_elem(&tracked_tgids, &tgid, &val, BPF_ANY);
+  bpf_map_update_elem(&tracked_cgroups, &cgroup_id, &val, BPF_ANY);
 
   // Notify userspace to attach uprobes to the new binary
   struct kloak_proc_event *evt = bpf_ringbuf_reserve(&proc_events, sizeof(*evt), 0);
@@ -2058,6 +2059,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
   __u8 tls_hdr[5];
   if (bpf_skb_load_bytes(skb, payload_off, tls_hdr, 5) < 0)
     return 0 /* TC_ACT_OK */;
+  bpf_printk("kloak tc tls_hdr=%x ver=%x%x plen=%u", tls_hdr[0], tls_hdr[1], tls_hdr[2], payload_len);
   // Validate TLS application_data record:
   //   byte 0: content type must be 0x17
   //   bytes 1-2: version must be 0x0301..0x0303 (TLS 1.0-1.3)

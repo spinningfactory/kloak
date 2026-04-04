@@ -159,7 +159,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Attach uprobes outside the lock — this involves filesystem I/O.
 	for _, cgroupID := range needsAttach {
-		if cgroupPath := r.attachUprobesToCgroup(cgroupID, pod); cgroupPath != "" {
+		cgroupPath, pid := r.attachUprobesToCgroup(cgroupID, pod)
+		if cgroupPath != "" {
 			r.mu.Lock()
 			if tracked := r.trackedPods[string(pod.UID)]; tracked != nil {
 				tracked[cgroupID] = true // mark as successfully attached
@@ -171,6 +172,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			if r.UprobeManager != nil {
 				if err := r.UprobeManager.TrackCgroup(cgroupID, cgroupPath); err != nil {
 					log.Error(err, "failed to track cgroup for exec events", "cgroupID", cgroupID)
+				}
+				// Record which netns this cgroup belongs to, so UntrackCgroup
+				// can clean up the pinned netns fd and allow inode reuse.
+				if pid > 0 {
+					r.UprobeManager.RecordCgroupNetns(cgroupID, pid)
 				}
 			}
 		}
@@ -197,10 +203,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 }
 
 // attachUprobesToCgroup reads the cgroup's procs file to find a PID and calls the uprobe manager.
-// Returns the cgroup filesystem path on success, or empty string on failure.
-func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) string {
+// Returns the cgroup filesystem path and one of the container's PIDs on success, or empty string and 0 on failure.
+func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (string, int) {
 	if r.UprobeManager == nil {
-		return ""
+		return "", 0
 	}
 
 	r.Log.Info("Trying to attach uprobes to new container", "cgroup", cgroupID)
@@ -232,12 +238,12 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) str
 		pids, err := cgroups.ReadCgroupProcs(containerCgroupPath)
 		if err != nil {
 			r.Log.Error(err, "failed to read cgroup.procs", "path", containerCgroupPath)
-			return ""
+			return "", 0
 		}
 
 		if len(pids) == 0 {
 			r.Log.V(1).Info("no PIDs found in cgroup.procs", "path", containerCgroupPath)
-			return ""
+			return "", 0
 		}
 
 		// Attempt to attach uprobes to every PID in the cgroup.
@@ -245,22 +251,26 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) str
 		// whichever process makes TLS calls is instrumented. AttachTLS skips
 		// PIDs that have no compatible TLS symbols.
 		attached := false
+		attachedPid := 0
 		for _, pid := range pids {
 			if err := r.UprobeManager.AttachTLS(pid); err != nil {
 				r.Log.V(1).Info("could not attach TLS uprobes to pid (no compatible symbols or already attached)", "pid", pid, "container", status.Name, "err", err)
 			} else {
 				r.Log.Info("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
 				attached = true
+				if attachedPid == 0 {
+					attachedPid = pid
+				}
 			}
 		}
 		if attached {
-			return containerCgroupPath
+			return containerCgroupPath, attachedPid
 		}
-		return ""
+		return "", 0
 	}
 
 	r.Log.V(1).Info("could not find matching container for cgroup", "cgroupID", cgroupID)
-	return ""
+	return "", 0
 }
 
 // handleDelete removes a pod from tracking. uid is the pod UID (trackedPods key),
