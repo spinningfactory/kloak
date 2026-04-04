@@ -26,7 +26,7 @@ func e2eImage(name, tag string) string {
 // e2ePullPolicy returns Never for local images, IfNotPresent for registry images.
 func e2ePullPolicy() corev1.PullPolicy {
 	if imageRegistry != "" {
-		return corev1.PullIfNotPresent
+		return corev1.PullAlways
 	}
 	return corev1.PullNever
 }
@@ -43,7 +43,7 @@ func applyManifest(t *testing.T, path string) error {
 
 	if imageRegistry != "" {
 		manifest = strings.ReplaceAll(manifest, "image: kloak-", "image: "+imageRegistry+"/kloak-")
-		manifest = strings.ReplaceAll(manifest, "imagePullPolicy: Never", "imagePullPolicy: IfNotPresent")
+		manifest = strings.ReplaceAll(manifest, "imagePullPolicy: Never", "imagePullPolicy: Always")
 	}
 
 	cmd := exec.Command("kubectl", "apply", "-f", "-", "-n", testNamespace)

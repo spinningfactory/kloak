@@ -76,7 +76,7 @@ func TestMain(m *testing.M) {
 	if imageRegistry != "" {
 		helmArgs = append(helmArgs,
 			"--set", "image.repository="+imageRegistry+"/kloak",
-			"--set", "image.pullPolicy=IfNotPresent",
+			"--set", "image.pullPolicy=Always",
 		)
 	}
 	if _, err := helm(helmArgs...); err != nil {
