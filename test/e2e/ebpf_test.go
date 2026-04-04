@@ -23,10 +23,15 @@ type ebpfRewriteTest struct {
 	demoDir        string
 	deploymentName string
 	appLabel       string
-	skip           string // if non-empty, test is skipped with this reason
 }
 
 var ebpfTests = []ebpfRewriteTest{
+	{
+		name:           "go",
+		demoDir:        "demo-go",
+		deploymentName: "demo-go",
+		appLabel:       "app=demo-go",
+	},
 	{
 		name:           "python",
 		demoDir:        "demo-python",
@@ -40,25 +45,16 @@ var ebpfTests = []ebpfRewriteTest{
 		appLabel:       "app=demo-js",
 	},
 	{
-		name:           "go",
-		demoDir:        "demo-go",
-		deploymentName: "demo-go",
-		appLabel:       "app=demo-go",
-		skip:           "Go crypto/tls H extraction not yet implemented",
-	},
-	{
 		name:           "go-boringssl",
 		demoDir:        "demo-go-boring",
 		deploymentName: "demo-go-boring",
 		appLabel:       "app=demo-go-boring",
-		skip:           "BoringSSL H extraction not yet implemented",
 	},
 	{
 		name:           "gnutls",
 		demoDir:        "demo-gnutls",
 		deploymentName: "demo-gnutls",
 		appLabel:       "app=demo-gnutls",
-		skip:           "GnuTLS H extraction not yet implemented",
 	},
 }
 
@@ -151,9 +147,6 @@ func TestEBPFSecretRewrite(t *testing.T) {
 }
 
 func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
-	if tc.skip != "" {
-		t.Skip(tc.skip)
-	}
 	demoManifest := filepath.Join(repoRoot, "examples", tc.demoDir, "deployment.yaml")
 	_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
 	if err != nil {
@@ -217,7 +210,7 @@ func TestEBPFSecretLengths(t *testing.T) {
 		{"16bytes", "SECRET-16B-ABCDE", "BLOCKE-16B-FGHIJ"},
 		{"21bytes", "SECRET-21B-ABCDEFGHIJ", "BLOCKE-21B-KLMNOPQRST"},
 		{"42bytes", "SECRET-42B-ABCDEFGHIJKLMNOPQRSTUVWXYZABCDE", "BLOCKE-42B-FGHIJKLMNOPQRSTUVWXYZABCDEFGHIJ"},
-		//{"100bytes", "SECRET-100B-ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJ", "BLOCKE-100B-KLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRST"},
+		{"100bytes", "SECRET-100B-ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJ", "BLOCKE-100B-KLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRST"},
 	}
 
 	for _, tc := range cases {

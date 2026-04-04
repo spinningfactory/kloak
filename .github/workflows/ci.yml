@@ -251,22 +251,14 @@ jobs:
       - name: Build and import images into k3d
         run: |
           docker build --build-arg TARGETARCH=amd64 --build-arg COVER=1 -t kloak:e2e .
+          k3d image import kloak:e2e -c kloak-e2e
           docker build -t kloak-demo-go:latest ./examples/demo-go/
           docker build -t kloak-demo-python:latest ./examples/demo-python/
           docker build -t kloak-demo-js:latest ./examples/demo-js/
           docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
           docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
           docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
-          docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
-          # Import images one at a time with retry for kloak:e2e
-          for i in 1 2 3; do k3d image import kloak:e2e -c kloak-e2e && break || sleep 5; done
-          k3d image import kloak-demo-go:latest -c kloak-e2e
-          k3d image import kloak-demo-python:latest -c kloak-e2e
-          k3d image import kloak-demo-js:latest -c kloak-e2e
-          k3d image import kloak-demo-go-boring:latest -c kloak-e2e
-          k3d image import kloak-demo-gnutls:latest -c kloak-e2e
-          k3d image import kloak-demo-python-raw-tls:latest -c kloak-e2e
-          k3d image import kloak-tls-echo:latest -c kloak-e2e
+          k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest -c kloak-e2e
 
       - name: Install Helm
         uses: azure/setup-helm@v4
