@@ -631,7 +631,15 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 		if event.Type == 1 { // exec
 			m.log.Info("Detected exec in tracked container, attaching uprobes", "tgid", event.Tgid, "cgroupID", event.CgroupID)
 			if err := m.AttachTLS(int(event.Tgid)); err != nil {
-				m.log.V(1).Info("could not attach TLS uprobes to exec'd process", "tgid", event.Tgid, "err", err)
+				// libssl may not be loaded yet (e.g. Python hasn't imported ssl).
+				// Retry after a delay to catch lazy-loaded libraries.
+				m.log.V(1).Info("first attach attempt failed, scheduling retry", "tgid", event.Tgid, "err", err)
+				go func(tgid uint32) {
+					time.Sleep(2 * time.Second)
+					if err := m.AttachTLS(int(tgid)); err != nil {
+						m.log.V(1).Info("retry attach also failed", "tgid", tgid, "err", err)
+					}
+				}(event.Tgid)
 			}
 		}
 	}

@@ -147,7 +147,7 @@ e2e-local-push:
 E2E_RUN ?=
 
 e2e-local-run:
-	E2E_REGISTRY=$(E2E_REGISTRY) \
+	E2E_REGISTRY=$(E2E_REGISTRY) E2E_SKIP_INSTALL=$(E2E_SKIP_INSTALL) \
 	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 $(if $(E2E_RUN),-run $(E2E_RUN)) ./test/e2e/
 
 # Tear down e2e k3d cluster.
