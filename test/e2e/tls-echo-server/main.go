@@ -38,7 +38,14 @@ func main() {
 	}
 
 	tlsCfg := &tls.Config{
-		Certificates: []tls.Certificate{ecdsaCert, rsaCert},
+		// Both certs are listed; Go's TLS stack auto-selects based on the
+		// client's cipher suite (ECDSA ciphers → ecdsaCert, RSA → rsaCert).
+		// RSA cert first — Go's TLS auto-selects based on cipher suite.
+		// With RSA first, ECDHE-RSA-* ciphers find the RSA cert immediately.
+		// ECDHE-ECDSA-* ciphers skip it and use the ECDSA cert.
+		Certificates: []tls.Certificate{rsaCert, ecdsaCert},
+		// Explicitly allow all cipher suites including RSA key exchange.
+		CipherSuites: allGCMCiphers(),
 	}
 
 	// Configure TLS version from env.
@@ -153,6 +160,19 @@ func generateRSACert() (tls.Certificate, error) {
 		return tls.Certificate{}, err
 	}
 	return tls.Certificate{Certificate: [][]byte{certDER}, PrivateKey: key}, nil
+}
+
+func allGCMCiphers() []uint16 {
+	return []uint16{
+		tls.TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+		tls.TLS_RSA_WITH_AES_128_GCM_SHA256,
+		tls.TLS_RSA_WITH_AES_256_GCM_SHA384,
+		// Include CBC for testing non-GCM rejection
+		tls.TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA256,
+	}
 }
 
 func tlsVersionName(v uint16) string {

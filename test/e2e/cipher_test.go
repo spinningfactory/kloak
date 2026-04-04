@@ -160,7 +160,7 @@ func runCipherClient(t *testing.T, serverHost, secretName, cipher, tlsMin, tlsMa
 
 	// Build curl command with cipher/version flags.
 	curlCmd := fmt.Sprintf(
-		`sleep 5 && `+ // Wait for controller to attach uprobe after exec detection
+		`sleep 10 && `+ // Wait for controller to attach uprobe after exec detection
 			`SECRET=$(cat /etc/secrets/api-key) && `+
 			`curl --insecure --connect-timeout 10 -s `+
 			`%s %s `+
