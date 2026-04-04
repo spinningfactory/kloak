@@ -24,9 +24,10 @@ const (
 )
 
 var (
-	clientset *kubernetes.Clientset
-	repoRoot  string
-	chartDir  string // path to the Helm chart directory
+	clientset    *kubernetes.Clientset
+	repoRoot     string
+	chartDir     string // path to the Helm chart directory
+	imageRegistry string // E2E_REGISTRY env var: if set, images are prefixed (e.g. "ttl.sh/kloak-abc123")
 )
 
 // findRepoRoot returns the absolute path to the repository root
@@ -39,7 +40,26 @@ func findRepoRoot() (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// e2eImage returns the full image reference, prefixed by E2E_REGISTRY if set.
+// e.g. e2eImage("kloak", "e2e") → "kloak:e2e" or "ttl.sh/kloak-abc123/kloak:e2e"
+func e2eImage(name, tag string) string {
+	if imageRegistry != "" {
+		return imageRegistry + "/" + name + ":" + tag
+	}
+	return name + ":" + tag
+}
+
+// e2ePullPolicy returns Never for local images, IfNotPresent for registry images.
+func e2ePullPolicy() corev1.PullPolicy {
+	if imageRegistry != "" {
+		return corev1.PullIfNotPresent
+	}
+	return corev1.PullNever
+}
+
 func TestMain(m *testing.M) {
+	imageRegistry = os.Getenv("E2E_REGISTRY")
+
 	var err error
 	repoRoot, err = findRepoRoot()
 	if err != nil {
@@ -69,7 +89,14 @@ func TestMain(m *testing.M) {
 	// Deploy Kloak using Helm chart
 	chartDir = filepath.Join(repoRoot, "charts", "kloak")
 	valuesFile := filepath.Join(repoRoot, "test", "e2e", "values-e2e.yaml")
-	if _, err := helm("install", "kloak", chartDir, "-n", kloakNamespace, "--create-namespace", "-f", valuesFile, "--wait", "--timeout", "120s"); err != nil {
+	helmArgs := []string{"install", "kloak", chartDir, "-n", kloakNamespace, "--create-namespace", "-f", valuesFile, "--wait", "--timeout", "120s"}
+	if imageRegistry != "" {
+		helmArgs = append(helmArgs,
+			"--set", "image.repository="+imageRegistry+"/kloak",
+			"--set", "image.pullPolicy=IfNotPresent",
+		)
+	}
+	if _, err := helm(helmArgs...); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to deploy kloak: %v\n", err)
 		os.Exit(1)
 	}

@@ -118,11 +118,32 @@ e2e-run:
 	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
 
 # Run e2e tests against the current kube context.
+# Builds images, pushes to ttl.sh (anonymous ephemeral registry, 2h TTL),
+# and runs tests with E2E_REGISTRY so images are pulled from there.
+# Set E2E_REGISTRY to use a different registry (e.g. localhost:5000).
 # WARNING: This will helm install/uninstall kloak in kloak-system and
-# create/delete a kloak-e2e namespace. All test resources are contained
-# in kloak-e2e and cleaned up after the run.
+# create/delete a kloak-e2e namespace.
 # Usage: make e2e-local
-e2e-local:
+E2E_TTL_TAG ?= kloak-$(shell date +%s)
+E2E_REGISTRY ?= ttl.sh/$(E2E_TTL_TAG)
+
+e2e-local: e2e-local-push e2e-local-run
+
+e2e-local-push:
+	@echo "==> Building and pushing images to $(E2E_REGISTRY) ..."
+	@docker build -t $(E2E_REGISTRY)/kloak:e2e .
+	@docker push $(E2E_REGISTRY)/kloak:e2e
+	@for demo in demo-go demo-python demo-js demo-go-boring demo-gnutls demo-python-raw-tls; do \
+		echo "  Pushing kloak-$$demo..."; \
+		docker build -t $(E2E_REGISTRY)/kloak-$$demo:latest ./examples/$$demo/ && \
+		docker push $(E2E_REGISTRY)/kloak-$$demo:latest; \
+	done
+	@docker build -t $(E2E_REGISTRY)/kloak-tls-echo:latest ./test/e2e/tls-echo-server/
+	@docker push $(E2E_REGISTRY)/kloak-tls-echo:latest
+	@echo "==> All images pushed."
+
+e2e-local-run:
+	E2E_REGISTRY=$(E2E_REGISTRY) \
 	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
 
 # Tear down e2e k3d cluster.

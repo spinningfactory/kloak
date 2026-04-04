@@ -15,8 +15,7 @@ import (
 )
 
 const (
-	echoServerImage = "kloak-tls-echo:latest"
-	echoServerName  = "tls-echo"
+	echoServerName = "tls-echo"
 )
 
 // TestCipherSuites verifies that kloak correctly rewrites secrets for AES-GCM
@@ -94,8 +93,8 @@ func deployTLSEchoServer(t *testing.T) string {
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{
 				Name:            "echo",
-				Image:           echoServerImage,
-				ImagePullPolicy: corev1.PullNever,
+				Image:           e2eImage("kloak-tls-echo", "latest"),
+				ImagePullPolicy: e2ePullPolicy(),
 				Ports:           []corev1.ContainerPort{{ContainerPort: 8443}},
 			}},
 		},

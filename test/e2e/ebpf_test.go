@@ -84,8 +84,7 @@ func TestEBPFRawTLSHostFiltering(t *testing.T) {
 	assertShadowSecret(t, "secret-blocked", blockedData)
 
 	demoManifest := filepath.Join(repoRoot, "examples", "demo-python-raw-tls", "deployment.yaml")
-	_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
-	if err != nil {
+	if err := applyManifest(t, demoManifest); err != nil {
 		t.Fatalf("failed to deploy demo-python-raw-tls: %v", err)
 	}
 	t.Cleanup(func() {
@@ -155,8 +154,7 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 		t.Skip(tc.skip)
 	}
 	demoManifest := filepath.Join(repoRoot, "examples", tc.demoDir, "deployment.yaml")
-	_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
-	if err != nil {
+	if err := applyManifest(t, demoManifest); err != nil {
 		t.Fatalf("failed to deploy %s: %v", tc.demoDir, err)
 	}
 	t.Cleanup(func() {
@@ -244,8 +242,7 @@ func TestEBPFSecretLengths(t *testing.T) {
 			assertShadowSecret(t, "secret-blocked", blockedData)
 
 			demoManifest := filepath.Join(repoRoot, "examples", "demo-python-raw-tls", "deployment.yaml")
-			_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
-			if err != nil {
+			if err := applyManifest(t, demoManifest); err != nil {
 				t.Fatalf("failed to deploy: %v", err)
 			}
 			t.Cleanup(func() {
