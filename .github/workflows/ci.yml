@@ -104,69 +104,14 @@ jobs:
       # Coverage artifact skipped to save storage quota.
       # The e2e job merges coverage separately.
 
-  coverage:
-    name: Coverage Report
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    needs: [e2e]
-    permissions:
-      contents: read
-      actions: read
-      pull-requests: write
-    steps:
-      - uses: fgrosse/go-coverage-report@v1.3.0
-        with:
-          coverage-artifact-name: combined-coverage
-          coverage-file-name: combined-coverage.out
-
-  coverage-badge:
-    name: Coverage Badge
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    needs: [e2e]
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-
-      - name: Download combined coverage
-        uses: actions/download-artifact@v5
-        with:
-          name: combined-coverage
-          path: /tmp/combined-coverage
-
-      - name: Prepare coverage for badge
-        run: |
-          go tool cover -func=/tmp/combined-coverage/combined-coverage.out -o=coverage.out
-
-      - name: Update coverage badge
-        uses: tj-actions/coverage-badge-go@v3
-        with:
-          filename: coverage.out
-
-      - name: Verify changed files
-        uses: tj-actions/verify-changed-files@v16
-        id: verify-changed-files
-        with:
-          files: README.md
-
-      - name: Commit coverage badge
-        if: steps.verify-changed-files.outputs.files_changed == 'true'
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add README.md
-          git commit -m "chore: update coverage badge"
-          git push
+  # Coverage report and badge jobs disabled — artifact uploads removed to save
+  # storage quota. Re-enable when storage is available.
+  # coverage:
+  #   name: Coverage Report
+  #   ...
+  # coverage-badge:
+  #   name: Coverage Badge
+  #   ...
 
   docker:
     name: Docker Build & Push
@@ -277,12 +222,7 @@ jobs:
           echo "E2E coverage files:"
           ls -la /tmp/e2e-covdata/ 2>/dev/null || echo "No coverage files collected"
 
-      - name: Download unit test coverage
-        if: always()
-        uses: actions/download-artifact@v5
-        with:
-          name: coverage
-          path: /tmp/unit-coverage
+      # Unit coverage download disabled (artifact upload removed to save storage).
 
       - name: Merge unit and e2e coverage
         if: always()
@@ -309,14 +249,7 @@ jobs:
           echo "=== Combined coverage summary ==="
           go tool cover -func=/tmp/combined-coverage.out | tail -1
 
-      - name: Upload combined coverage
-        if: always()
-        uses: actions/upload-artifact@v5
-        with:
-          name: combined-coverage
-          path: /tmp/combined-coverage.out
-          retention-days: 1
-          if-no-files-found: ignore
+      # Combined coverage artifact upload disabled to save storage quota.
 
       # E2E coverage artifact skipped to save storage quota.
 
