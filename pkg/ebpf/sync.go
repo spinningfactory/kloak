@@ -69,8 +69,8 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 		// Set allowed host for host-based filtering
 		if len(entry.AllowedHosts) > 0 && entry.AllowedHosts[0] != "*" {
 			host := entry.AllowedHosts[0]
-			if len(host) > 32 {
-				host = host[:32]
+			if len(host) > len(val.AllowedHost) {
+				host = host[:len(val.AllowedHost)]
 			}
 			val.HostLen = uint32(len(host))
 			copy(val.AllowedHost[:], host)
