@@ -204,7 +204,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 // attachUprobesToCgroup reads the cgroup's procs file to find a PID and calls the uprobe manager.
 // Returns the cgroup filesystem path and one of the container's PIDs on success, or empty string and 0 on failure.
-func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (string, int) {
+func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (cgroupPath string, attachedPID int) {
 	if r.UprobeManager == nil {
 		return "", 0
 	}

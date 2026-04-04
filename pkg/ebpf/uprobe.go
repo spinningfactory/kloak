@@ -344,7 +344,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	// Save our current network namespace.
 	selfNS, err := os.Open("/proc/self/ns/net")
 	if err != nil {
-		containerNS.Close()
+		_ = containerNS.Close()
 		return fmt.Errorf("opening self netns: %w", err)
 	}
 	defer func() { _ = selfNS.Close() }()
@@ -355,7 +355,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 
 	// Switch to the container's network namespace.
 	if err := unix.Setns(int(containerNS.Fd()), unix.CLONE_NEWNET); err != nil {
-		containerNS.Close()
+		_ = containerNS.Close()
 		return fmt.Errorf("setns to container netns: %w", err)
 	}
 
@@ -372,7 +372,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 		if err != nil {
 			// lo should always exist; eth0 might not in some setups.
 			if ifName == "lo" {
-				containerNS.Close()
+				_ = containerNS.Close()
 				return fmt.Errorf("finding %s in container netns: %w", ifName, err)
 			}
 			m.log.V(1).Info("interface not found, skipping", "pid", pid, "interface", ifName)
@@ -385,7 +385,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 			Attach:    ebpf.AttachTCXEgress,
 		})
 		if err != nil {
-			containerNS.Close()
+			_ = containerNS.Close()
 			return fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", ifName, iface.Index, pid, err)
 		}
 		m.links = append(m.links, tcLink)
