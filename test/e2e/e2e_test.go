@@ -24,9 +24,9 @@ const (
 )
 
 var (
-	clientset    *kubernetes.Clientset
-	repoRoot     string
-	chartDir     string // path to the Helm chart directory
+	clientset     *kubernetes.Clientset
+	repoRoot      string
+	chartDir      string // path to the Helm chart directory
 	imageRegistry string // E2E_REGISTRY env var: if set, images are prefixed (e.g. "ttl.sh/kloak-abc123")
 )
 
@@ -38,23 +38,6 @@ func findRepoRoot() (string, error) {
 		return "", fmt.Errorf("failed to find module root: %w\n%s", err, out)
 	}
 	return strings.TrimSpace(string(out)), nil
-}
-
-// e2eImage returns the full image reference, prefixed by E2E_REGISTRY if set.
-// e.g. e2eImage("kloak", "e2e") → "kloak:e2e" or "ttl.sh/kloak-abc123/kloak:e2e"
-func e2eImage(name, tag string) string {
-	if imageRegistry != "" {
-		return imageRegistry + "/" + name + ":" + tag
-	}
-	return name + ":" + tag
-}
-
-// e2ePullPolicy returns Never for local images, IfNotPresent for registry images.
-func e2ePullPolicy() corev1.PullPolicy {
-	if imageRegistry != "" {
-		return corev1.PullIfNotPresent
-	}
-	return corev1.PullNever
 }
 
 func TestMain(m *testing.M) {

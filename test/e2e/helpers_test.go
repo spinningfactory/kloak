@@ -3,7 +3,6 @@ package e2e
 import (
 	"context"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 	"testing"
@@ -13,33 +12,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
-
-// applyManifest applies a k8s manifest YAML, rewriting image references
-// if E2E_REGISTRY is set. When set, "image: kloak-*" becomes
-// "image: $E2E_REGISTRY/kloak-*" and imagePullPolicy changes from Never
-// to IfNotPresent.
-func applyManifest(t *testing.T, path string) error {
-	t.Helper()
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("reading manifest %s: %w", path, err)
-	}
-	manifest := string(data)
-
-	if imageRegistry != "" {
-		// Rewrite image references: kloak-demo-foo:latest → registry/kloak-demo-foo:latest
-		manifest = strings.ReplaceAll(manifest, "image: kloak-", "image: "+imageRegistry+"/kloak-")
-		manifest = strings.ReplaceAll(manifest, "imagePullPolicy: Never", "imagePullPolicy: IfNotPresent")
-	}
-
-	cmd := exec.Command("kubectl", "apply", "-f", "-", "-n", testNamespace)
-	cmd.Stdin = strings.NewReader(manifest)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("kubectl apply: %s: %w", string(out), err)
-	}
-	return nil
-}
 
 // kubectl runs a kubectl command and returns its combined output.
 func kubectl(args ...string) (string, error) {

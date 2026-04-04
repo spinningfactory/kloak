@@ -4,11 +4,56 @@ package e2e
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
 )
+
+// e2eImage returns the full image reference, prefixed by E2E_REGISTRY if set.
+func e2eImage(name, tag string) string {
+	if imageRegistry != "" {
+		return imageRegistry + "/" + name + ":" + tag
+	}
+	return name + ":" + tag
+}
+
+// e2ePullPolicy returns Never for local images, IfNotPresent for registry images.
+func e2ePullPolicy() corev1.PullPolicy {
+	if imageRegistry != "" {
+		return corev1.PullIfNotPresent
+	}
+	return corev1.PullNever
+}
+
+// applyManifest applies a k8s manifest YAML, rewriting image references
+// if E2E_REGISTRY is set.
+func applyManifest(t *testing.T, path string) error {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading manifest %s: %w", path, err)
+	}
+	manifest := string(data)
+
+	if imageRegistry != "" {
+		manifest = strings.ReplaceAll(manifest, "image: kloak-", "image: "+imageRegistry+"/kloak-")
+		manifest = strings.ReplaceAll(manifest, "imagePullPolicy: Never", "imagePullPolicy: IfNotPresent")
+	}
+
+	cmd := exec.Command("kubectl", "apply", "-f", "-", "-n", testNamespace)
+	cmd.Stdin = strings.NewReader(manifest)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("kubectl apply: %s: %w", string(out), err)
+	}
+	return nil
+}
 
 // controllerLogs fetches the latest controller log output.
 func controllerLogs() string {
