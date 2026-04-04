@@ -204,54 +204,8 @@ jobs:
         env:
           KUBECONFIG: /tmp/kubeconfig-e2e.yaml
 
-      - name: Collect e2e coverage
-        if: always()
-        env:
-          KUBECONFIG: /tmp/kubeconfig-e2e.yaml
-        run: |
-          mkdir -p /tmp/e2e-covdata
-          # Wait for the controller pod to fully terminate after helm uninstall
-          # (triggered by test teardown). The Go coverage runtime writes
-          # covcounters on clean exit, which needs time to flush to the
-          # hostPath volume.
-          echo "Waiting for controller pod to terminate..."
-          kubectl wait --for=delete pod -l app.kubernetes.io/component=controller \
-            -n kloak-system --timeout=30s 2>/dev/null || true
-          # Copy coverage files from the k3d node's hostPath
-          docker cp k3d-kloak-e2e-server-0:/tmp/kloak-coverage/. /tmp/e2e-covdata/ 2>/dev/null || true
-          echo "E2E coverage files:"
-          ls -la /tmp/e2e-covdata/ 2>/dev/null || echo "No coverage files collected"
-
-      # Unit coverage download disabled (artifact upload removed to save storage).
-
-      - name: Merge unit and e2e coverage
-        if: always()
-        run: |
-          # Convert e2e covdata (binary) to text format
-          if ls /tmp/e2e-covdata/covcounters.* 1>/dev/null 2>&1; then
-            go tool covdata textfmt -i=/tmp/e2e-covdata -o=/tmp/e2e-coverage.out
-            echo "E2E coverage converted to text format"
-          else
-            echo "No e2e coverage data found, using unit coverage only"
-          fi
-
-          # Merge: start with unit coverage, append all e2e coverage lines.
-          # Exclude generated eBPF bindings (tlsuprobe_bpf*.go) which aren't
-          # on the runner, but include all other packages (cmd/, pkg/ebpf/, etc.).
-          cp /tmp/unit-coverage/coverage.out /tmp/combined-coverage.out
-
-          if [ -f /tmp/e2e-coverage.out ]; then
-            # Append all e2e lines except the mode line and generated eBPF files
-            tail -n +2 /tmp/e2e-coverage.out | grep -v 'tlsuprobe_bpf' >> /tmp/combined-coverage.out
-            echo "Combined unit + e2e coverage (all packages)"
-          fi
-
-          echo "=== Combined coverage summary ==="
-          go tool cover -func=/tmp/combined-coverage.out | tail -1
-
-      # Combined coverage artifact upload disabled to save storage quota.
-
-      # E2E coverage artifact skipped to save storage quota.
+      # E2e coverage collection and merge disabled — unit coverage artifact
+      # upload was removed to save storage quota, so merge has nothing to work with.
 
       - name: Collect logs on failure
         if: failure()
