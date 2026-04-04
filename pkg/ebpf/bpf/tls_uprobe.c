@@ -177,6 +177,9 @@ enum {
   DBG_TC_ENTRY,               // tc egress program entered (any packet)
   DBG_TC_MATCH,               // tc_pending lookup matched
   DBG_TC_PATCHED,             // tc XOR patch applied to skb
+  DBG_KPROBE_BRIDGE,          // kprobe successfully bridged xor_pending → tc_pending
+  DBG_KPROBE_BRIDGE_NO_ENTRY, // kprobe found no xor_pending entry
+  DBG_KPROBE_BRIDGE_H_FAIL,   // kprobe H extraction failed (no tc_pending written)
   DBG_MAX,
 };
 
@@ -2022,8 +2025,21 @@ int tc_egress_patch(struct __sk_buff *skb) {
     return 0 /* TC_ACT_OK */;
 
   // Save header fields to locals before helper calls invalidate direct pointers.
-  __u32 daddr = ip->daddr;
   __u16 sport = tcp->source;
+
+  // Read the original (pre-DNAT) destination IP from the socket, not the packet.
+  // For cluster services, iptables/kube-proxy DNATs the packet's dst_ip to the
+  // pod IP, but the socket's skc_daddr still holds the service ClusterIP —
+  // matching what the kprobe stored in tc_pending.
+  __u32 daddr = ip->daddr; // fallback: packet dst_ip
+  struct bpf_sock *bsk = skb->sk;
+  if (bsk) {
+    bsk = bpf_sk_fullsock(bsk);
+    if (bsk) {
+      // bpf_sock.dst_ip4 is the original connect() destination
+      daddr = bsk->dst_ip4;
+    }
+  }
 
   // Build key from destination IP + source port (per-connection isolation).
   struct tc_dest_key key = {};

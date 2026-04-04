@@ -40,7 +40,7 @@ spec:
             - name: SECRET_BLOCKED_FILE
               value: "/etc/secrets/blocked/api-key"
             - name: TARGET_HOST
-              value: "tls.kloak-demo"
+              value: "tls"
             - name: REQUEST_INTERVAL
               value: "5"
           volumeMounts:
@@ -59,7 +59,7 @@ spec:
       volumes:
         - name: secret-allowed-vol
           secret:
-            secretName: secret-rawtls-allowed
+            secretName: secret-allowed
         - name: secret-blocked-vol
           secret:
-            secretName: secret-rawtls-blocked
+            secretName: secret-blocked
