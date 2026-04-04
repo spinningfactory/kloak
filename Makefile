@@ -143,9 +143,12 @@ e2e-local-push:
 	@docker push $(E2E_REGISTRY)/kloak-tls-echo:latest
 	@echo "==> All images pushed."
 
+# E2E_RUN: optional -run filter (e.g. E2E_RUN=TestCipherSuites make e2e-local)
+E2E_RUN ?=
+
 e2e-local-run:
 	E2E_REGISTRY=$(E2E_REGISTRY) \
-	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
+	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 $(if $(E2E_RUN),-run $(E2E_RUN)) ./test/e2e/
 
 # Tear down e2e k3d cluster.
 e2e-cleanup:
