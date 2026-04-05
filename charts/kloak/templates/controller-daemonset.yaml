@@ -19,6 +19,17 @@ spec:
     spec:
       serviceAccountName: kloak-controller
       hostPID: true
+      initContainers:
+        - name: mount-tracefs
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["sh", "-c", "mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true"]
+          securityContext:
+            privileged: true
+          volumeMounts:
+            - name: tracefs
+              mountPath: /sys/kernel/tracing
+              mountPropagation: Bidirectional
       containers:
         - name: controller
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -58,7 +69,7 @@ spec:
               readOnly: true
             - name: tracefs
               mountPath: /sys/kernel/tracing
-              readOnly: true
+              mountPropagation: Bidirectional
             {{- if .Values.coverage.enabled }}
             - name: coverage
               mountPath: /coverage

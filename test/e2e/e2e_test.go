@@ -24,9 +24,10 @@ const (
 )
 
 var (
-	clientset *kubernetes.Clientset
-	repoRoot  string
-	chartDir  string // path to the Helm chart directory
+	clientset     *kubernetes.Clientset
+	repoRoot      string
+	chartDir      string // path to the Helm chart directory
+	imageRegistry string // E2E_REGISTRY env var: if set, images are prefixed (e.g. "ttl.sh/kloak-abc123")
 )
 
 // findRepoRoot returns the absolute path to the repository root
@@ -40,6 +41,8 @@ func findRepoRoot() (string, error) {
 }
 
 func TestMain(m *testing.M) {
+	imageRegistry = os.Getenv("E2E_REGISTRY")
+
 	var err error
 	repoRoot, err = findRepoRoot()
 	if err != nil {
@@ -66,12 +69,24 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	// Deploy Kloak using Helm chart
-	chartDir = filepath.Join(repoRoot, "charts", "kloak")
-	valuesFile := filepath.Join(repoRoot, "test", "e2e", "values-e2e.yaml")
-	if _, err := helm("install", "kloak", chartDir, "-n", kloakNamespace, "--create-namespace", "-f", valuesFile, "--wait", "--timeout", "120s"); err != nil {
-		fmt.Fprintf(os.Stderr, "failed to deploy kloak: %v\n", err)
-		os.Exit(1)
+	// Deploy Kloak using Helm chart (skip if E2E_SKIP_INSTALL is set)
+	skipInstall := os.Getenv("E2E_SKIP_INSTALL") != ""
+	if skipInstall {
+		fmt.Println("Skipping Helm install (E2E_SKIP_INSTALL set, assuming kloak is already deployed)")
+	} else {
+		chartDir = filepath.Join(repoRoot, "charts", "kloak")
+		valuesFile := filepath.Join(repoRoot, "test", "e2e", "values-e2e.yaml")
+		helmArgs := []string{"install", "kloak", chartDir, "-n", kloakNamespace, "--create-namespace", "-f", valuesFile, "--wait", "--timeout", "120s"}
+		if imageRegistry != "" {
+			helmArgs = append(helmArgs,
+				"--set", "image.repository="+imageRegistry+"/kloak",
+				"--set", "image.pullPolicy=Always",
+			)
+		}
+		if _, err := helm(helmArgs...); err != nil {
+			fmt.Fprintf(os.Stderr, "failed to deploy kloak: %v\n", err)
+			os.Exit(1)
+		}
 	}
 
 	// Wait for controller and webhook to be ready
@@ -119,10 +134,10 @@ func TestMain(m *testing.M) {
 func teardown() {
 	// Delete test namespace (cascade deletes all resources in it)
 	_ = clientset.CoreV1().Namespaces().Delete(context.Background(), testNamespace, metav1.DeleteOptions{})
-	// Remove kloak deployment. The controller exits cleanly, flushing
-	// coverage data to the hostPath volume (/tmp/kloak-coverage on the
-	// k3d node) which CI copies after teardown.
-	_, _ = helm("uninstall", "kloak", "-n", kloakNamespace)
+	// Remove kloak deployment unless we skipped install.
+	if os.Getenv("E2E_SKIP_INSTALL") == "" {
+		_, _ = helm("uninstall", "kloak", "-n", kloakNamespace)
+	}
 }
 
 func dumpLogs() {

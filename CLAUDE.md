@@ -76,3 +76,6 @@ The binary (`cmd/kloak/main.go`) has two subcommands via cobra:
 - `pkg/cgroups/` — cgroup path resolution and inode lookup (Linux-only impl + stub)
 - `charts/kloak/` — Helm chart for deploying Kloak (controller DaemonSet, webhook Deployment, RBAC, values.yaml)
 - `examples/` — demo applications (Go, Node.js, Python)
+
+/memory I want a production ready code and not things that are specific to the demo, while we can sometime prioritize making the demo work we need
+always to add a todo to make things more generic and fix them

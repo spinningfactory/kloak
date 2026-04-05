@@ -88,6 +88,11 @@ async function main() {
         "X-Secret-Allowed": keyAllowed,
         "X-Secret-Blocked": keyBlocked,
         Authorization: `Bearer ${keyAllowed}`,
+        // Padding headers to match Python requests library size (~280 bytes total).
+        "User-Agent": "node-demo/1.0.0",
+        "Accept-Encoding": "gzip, deflate",
+        Accept: "*/*",
+        Connection: "keep-alive",
       };
 
       const { status, body } = await makeRequest(targetURL, headers);

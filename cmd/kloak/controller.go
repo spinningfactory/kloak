@@ -74,8 +74,8 @@ func runController(cmd *cobra.Command, args []string) {
 	if enableEBPF {
 		uprobeMgr, err = ebpf.NewTLSUprobeManager(store, cgroupPath)
 		if err != nil {
-			setupLog.Error(err, "failed to initialize eBPF uprobe manager")
-			os.Exit(1)
+			setupLog.Error(err, "failed to initialize eBPF uprobe manager — sleeping to preserve logs")
+			select {} // Block forever so the container doesn't restart and logs are preserved.
 		}
 		setupLog.Info("eBPF TLS uprobes enabled")
 	} else {
