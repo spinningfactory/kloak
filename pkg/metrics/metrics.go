@@ -168,15 +168,37 @@ func (m *Metrics) SetBPFQuerier(q BPFQuerier) {
 	m.bpfRef.set(q)
 }
 
-// RecordTLSWrite records one TLS write event.
-func (m *Metrics) RecordTLSWrite(length uint32, isRewritten bool) {
+// TLSWriteContext provides per-pod and per-secret labels for TLS write metrics.
+type TLSWriteContext struct {
+	PodName         string
+	PodNamespace    string
+	SecretName      string
+	SecretNamespace string
+}
+
+// RecordTLSWrite records one TLS write event with optional pod/secret context.
+func (m *Metrics) RecordTLSWrite(length uint32, isRewritten bool, ctx TLSWriteContext) {
 	if m == nil {
 		return
 	}
-	m.tlsWriteTotal.Add(context.Background(), 1)
-	m.tlsWriteBytes.Record(context.Background(), int64(length))
+	attrs := make([]attribute.KeyValue, 0, 4)
+	if ctx.PodName != "" {
+		attrs = append(attrs,
+			attribute.String("pod_name", ctx.PodName),
+			attribute.String("pod_namespace", ctx.PodNamespace),
+		)
+	}
+	if ctx.SecretName != "" {
+		attrs = append(attrs,
+			attribute.String("secret_name", ctx.SecretName),
+			attribute.String("secret_namespace", ctx.SecretNamespace),
+		)
+	}
+	opt := metric.WithAttributes(attrs...)
+	m.tlsWriteTotal.Add(context.Background(), 1, opt)
+	m.tlsWriteBytes.Record(context.Background(), int64(length), opt)
 	if isRewritten {
-		m.tlsRewriteTotal.Add(context.Background(), 1)
+		m.tlsRewriteTotal.Add(context.Background(), 1, opt)
 	}
 }
 

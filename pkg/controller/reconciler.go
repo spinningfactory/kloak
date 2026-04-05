@@ -255,6 +255,7 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) str
 				r.Log.V(1).Info("could not attach TLS uprobes to pid (no compatible symbols or already attached)", "pid", pid, "container", status.Name, "err", err)
 			} else {
 				r.Log.Info("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
+				r.UprobeManager.TrackPod(uint32(pid), pod.Name, pod.Namespace)
 				attached = true
 			}
 		}

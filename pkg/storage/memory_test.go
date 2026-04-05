@@ -87,6 +87,43 @@ func TestMemory_DeleteNonExistent(t *testing.T) {
 	}
 }
 
+func TestMemory_LookupByPrefix(t *testing.T) {
+	ctx := context.Background()
+	store := NewMemory()
+
+	// Store a hash with a known prefix (>= 8 chars)
+	hash := "kloak:AB1234567890"
+	_ = store.Store(ctx, "default/my-secret", hash, Entry{Value: "real-value"})
+
+	// Lookup by first 8 bytes
+	podID, found, err := store.LookupByPrefix(ctx, hash[:8])
+	if err != nil {
+		t.Fatalf("LookupByPrefix failed: %v", err)
+	}
+	if !found {
+		t.Fatal("expected to find podID by prefix")
+	}
+	if podID != "default/my-secret" {
+		t.Errorf("expected podID 'default/my-secret', got %q", podID)
+	}
+
+	// Lookup non-existent prefix
+	_, found, err = store.LookupByPrefix(ctx, "ZZZZZZZZ")
+	if err != nil {
+		t.Fatalf("LookupByPrefix failed: %v", err)
+	}
+	if found {
+		t.Fatal("expected not to find non-existent prefix")
+	}
+
+	// Delete the pod and verify prefix is cleaned up
+	_ = store.Delete(ctx, "default/my-secret")
+	_, found, _ = store.LookupByPrefix(ctx, hash[:8])
+	if found {
+		t.Fatal("prefix should be removed after Delete")
+	}
+}
+
 func TestMemory_List(t *testing.T) {
 	ctx := context.Background()
 	store := NewMemory()

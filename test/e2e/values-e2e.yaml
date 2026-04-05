@@ -2,6 +2,9 @@ image:
   repository: kloak
   tag: e2e
   pullPolicy: Never
+controller:
+  metrics:
+    otlpEndpoint: "http://otel-collector.kloak-system.svc:4318"
 coverage:
   enabled: true
   hostPath: /tmp/kloak-coverage

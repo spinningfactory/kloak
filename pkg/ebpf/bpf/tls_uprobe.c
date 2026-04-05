@@ -113,6 +113,8 @@ struct tls_event {
   __u32 tgid;
   __u32 len;
   __u8 is_rewritten; // 1 = secret was rewritten in-kernel
+  __u8 _pad[3];
+  __u8 matched_key[8]; // first 8 bytes of matched secret prefix
 };
 
 // Debug counters for diagnosing DNS interception issues.
@@ -962,6 +964,7 @@ struct scan_ctx {
   __u32 host_value_len;
   char host_value[MAX_HOST_LEN];
   int rewritten;
+  __u8 matched_key[8]; // last matched secret key prefix
 };
 
 // bpf_loop callback: read one 256-byte chunk into the per-CPU scratch buffer
@@ -1034,6 +1037,7 @@ static int scan_chunk(__u32 chunk_idx, void *ctx) {
 
     bpf_probe_write_user(target, val->real_secret, write_len);
     sctx->rewritten = 1;
+    __builtin_memcpy(sctx->matched_key, key.prefix, 8);
   }
   return 0;
 }
@@ -1072,6 +1076,7 @@ int bpf_phase2_rewrite(void *ctx) {
       event->tgid = (__u32)(pid_tgid >> 32);
       event->len = sctx.total_len;
       event->is_rewritten = 1;
+      __builtin_memcpy(event->matched_key, sctx.matched_key, 8);
       bpf_ringbuf_submit(event, 0);
     }
   }

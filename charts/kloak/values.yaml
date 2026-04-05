@@ -7,6 +7,8 @@ controller:
   ebpf:
     enabled: true
   cgroupPath: /host/sys/fs/cgroup
+  metrics:
+    otlpEndpoint: ""  # Set to push metrics via OTLP HTTP (e.g. "http://otel-collector:4318")
   resources:
     requests:
       cpu: 10m

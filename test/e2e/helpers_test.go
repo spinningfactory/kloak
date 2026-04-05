@@ -3,6 +3,8 @@ package e2e
 import (
 	"context"
 	"fmt"
+	"io"
+	"net/http"
 	"os/exec"
 	"strings"
 	"testing"
@@ -304,4 +306,54 @@ func assertShadowSecret(t *testing.T, originalName string, originalData map[stri
 	}
 
 	return shadow.Data
+}
+
+// portForwardPod starts a kubectl port-forward to a pod matching the given label selector.
+// Returns the local URL and a cleanup function.
+func portForwardPod(t *testing.T, namespace, labelSelector string, localPort, remotePort int) (string, func()) {
+	t.Helper()
+
+	// Find a pod matching the label selector
+	pods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: labelSelector,
+	})
+	if err != nil || len(pods.Items) == 0 {
+		t.Fatalf("no pods found for selector %q in %s: %v", labelSelector, namespace, err)
+	}
+	podName := pods.Items[0].Name
+
+	cmd := exec.Command("kubectl", "port-forward", "-n", namespace,
+		fmt.Sprintf("pod/%s", podName),
+		fmt.Sprintf("%d:%d", localPort, remotePort))
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("failed to start port-forward: %v", err)
+	}
+
+	// Give it a moment to establish
+	time.Sleep(2 * time.Second)
+
+	url := fmt.Sprintf("http://localhost:%d", localPort)
+	cleanup := func() {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}
+	return url, cleanup
+}
+
+// scrapeMetrics fetches the /metrics endpoint and returns the body.
+func scrapeMetrics(t *testing.T, baseURL string) string {
+	t.Helper()
+	resp, err := http.Get(baseURL + "/metrics")
+	if err != nil {
+		t.Fatalf("failed to scrape metrics: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read metrics body: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("metrics endpoint returned %d: %s", resp.StatusCode, string(body))
+	}
+	return string(body)
 }

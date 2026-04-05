@@ -15,6 +15,8 @@ type Memory struct {
 	podToHashes map[string]map[string]struct{}
 	// hashToPod maps hash → podID (for reverse lookup)
 	hashToPod map[string]string
+	// prefixToPod maps first-8-bytes-of-hash → podID (for eBPF matched_key lookup)
+	prefixToPod map[string]string
 }
 
 // NewMemory creates a new in-memory storage.
@@ -23,6 +25,7 @@ func NewMemory() *Memory {
 		hashToEntry: make(map[string]Entry),
 		podToHashes: make(map[string]map[string]struct{}),
 		hashToPod:   make(map[string]string),
+		prefixToPod: make(map[string]string),
 	}
 }
 
@@ -42,6 +45,11 @@ func (m *Memory) Store(ctx context.Context, podID, hash string, entry Entry) err
 		m.podToHashes[podID] = make(map[string]struct{})
 	}
 	m.podToHashes[podID][hash] = struct{}{}
+
+	// Maintain prefix index (first 8 bytes of hash → podID)
+	if len(hash) >= 8 {
+		m.prefixToPod[hash[:8]] = podID
+	}
 
 	return nil
 }
@@ -70,6 +78,9 @@ func (m *Memory) Delete(ctx context.Context, podID string) error {
 	for hash := range hashes {
 		delete(m.hashToEntry, hash)
 		delete(m.hashToPod, hash)
+		if len(hash) >= 8 {
+			delete(m.prefixToPod, hash[:8])
+		}
 	}
 
 	// Remove pod tracking
@@ -89,6 +100,16 @@ func (m *Memory) List(ctx context.Context) (map[string]Entry, error) {
 		result[k] = v
 	}
 	return result, nil
+}
+
+// LookupByPrefix finds the podID (namespace/secretName) that owns a
+// shadow hash whose first 8 bytes match the given prefix.
+func (m *Memory) LookupByPrefix(ctx context.Context, prefix string) (string, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	podID, found := m.prefixToPod[prefix]
+	return podID, found, nil
 }
 
 // Compile-time check that Memory implements Storage

@@ -28,7 +28,14 @@ type tlsEvent struct {
 	Tgid        uint32
 	Len         uint32
 	IsRewritten uint8
-	_           [3]byte // padding for alignment
+	_           [3]byte  // explicit padding
+	MatchedKey  [8]byte  // first 8 bytes of matched secret prefix
+}
+
+// PodRef identifies a pod for metrics labeling.
+type PodRef struct {
+	Name      string
+	Namespace string
 }
 
 // procEvent must match the C struct kloak_proc_event
@@ -81,6 +88,8 @@ type TLSUprobeManager struct {
 	// cgroupPaths maps cgroup inode ID -> filesystem path.
 	// Populated by TrackCgroup.
 	cgroupPaths sync.Map // uint64 -> string
+	// tgidToPod maps kernel TGID -> PodRef for per-pod metrics labeling.
+	tgidToPod sync.Map // uint32 -> PodRef
 }
 
 // setupCgroupAncestor finds the kubepods cgroup directory and stores its fd
@@ -285,6 +294,16 @@ func (m *TLSUprobeManager) TrackCgroup(cgroupID uint64, cgroupPath string) error
 func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 	m.cgroupPaths.Delete(cgroupID)
 	return m.objs.TrackedCgroups.Delete(cgroupID)
+}
+
+// TrackPod associates a kernel TGID with a pod for per-pod metrics labeling.
+func (m *TLSUprobeManager) TrackPod(tgid uint32, name, namespace string) {
+	m.tgidToPod.Store(tgid, PodRef{Name: name, Namespace: namespace})
+}
+
+// UntrackPod removes the TGID→pod association.
+func (m *TLSUprobeManager) UntrackPod(tgid uint32) {
+	m.tgidToPod.Delete(tgid)
 }
 
 // AttachTLS attaches system-wide eBPF uprobes to all TLS libraries in a
@@ -526,7 +545,26 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 			continue
 		}
 
-		m.metrics.RecordTLSWrite(event.Len, event.IsRewritten == 1)
+		// Build per-pod/secret context for labeled metrics.
+		var tlsCtx metrics.TLSWriteContext
+		if v, ok := m.tgidToPod.Load(event.Tgid); ok {
+			pod := v.(PodRef)
+			tlsCtx.PodName = pod.Name
+			tlsCtx.PodNamespace = pod.Namespace
+		}
+		if event.IsRewritten == 1 {
+			// Look up which secret was matched via the 8-byte key prefix.
+			prefix := string(event.MatchedKey[:])
+			if podID, found, _ := m.store.LookupByPrefix(context.Background(), prefix); found {
+				// podID is "namespace/secretName"
+				if parts := strings.SplitN(podID, "/", 2); len(parts) == 2 {
+					tlsCtx.SecretNamespace = parts[0]
+					tlsCtx.SecretName = parts[1]
+				}
+			}
+		}
+
+		m.metrics.RecordTLSWrite(event.Len, event.IsRewritten == 1, tlsCtx)
 		if event.IsRewritten == 1 {
 			m.log.Info("REWRITE SUCCESS: eBPF synchronously rewrote a secret", "pid", event.Pid)
 		} else {

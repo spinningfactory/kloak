@@ -139,9 +139,9 @@ func findGaugeValue(t *testing.T, rm metricdata.ResourceMetrics, name string, at
 func TestMetrics_TLSWrite_NoRewrite(t *testing.T) {
 	m, reader := newTestMetrics(t, nil)
 
-	m.RecordTLSWrite(100, false)
-	m.RecordTLSWrite(200, false)
-	m.RecordTLSWrite(50, false)
+	m.RecordTLSWrite(100, false, kloakmetrics.TLSWriteContext{})
+	m.RecordTLSWrite(200, false, kloakmetrics.TLSWriteContext{})
+	m.RecordTLSWrite(50, false, kloakmetrics.TLSWriteContext{})
 
 	rm := collect(t, reader)
 
@@ -162,9 +162,9 @@ func TestMetrics_TLSWrite_NoRewrite(t *testing.T) {
 func TestMetrics_TLSWrite_WithRewrite(t *testing.T) {
 	m, reader := newTestMetrics(t, nil)
 
-	m.RecordTLSWrite(50, true)
-	m.RecordTLSWrite(50, true)
-	m.RecordTLSWrite(50, false)
+	m.RecordTLSWrite(50, true, kloakmetrics.TLSWriteContext{})
+	m.RecordTLSWrite(50, true, kloakmetrics.TLSWriteContext{})
+	m.RecordTLSWrite(50, false, kloakmetrics.TLSWriteContext{})
 
 	rm := collect(t, reader)
 
@@ -257,7 +257,7 @@ func TestMetrics_SecretReconcile_Outcomes(t *testing.T) {
 func TestMetrics_NilSafe(t *testing.T) {
 	var m *kloakmetrics.Metrics
 	// None of these should panic.
-	m.RecordTLSWrite(100, true)
+	m.RecordTLSWrite(100, true, kloakmetrics.TLSWriteContext{})
 	m.RecordUprobeAttach(true)
 	m.RecordSecretSync()
 	m.RecordPodReconcile("ok")

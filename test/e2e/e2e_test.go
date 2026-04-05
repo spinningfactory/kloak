@@ -66,6 +66,16 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
+	// Create namespace and deploy OTel Collector for metrics e2e testing
+	if _, err := kubectl("create", "namespace", kloakNamespace, "--dry-run=client", "-o", "yaml"); err == nil {
+		_, _ = kubectl("create", "namespace", kloakNamespace)
+	}
+	collectorManifest := filepath.Join(repoRoot, "test", "e2e", "otel-collector.yaml")
+	if _, err := kubectl("apply", "-f", collectorManifest, "-n", kloakNamespace); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to deploy otel-collector: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Deploy Kloak using Helm chart
 	chartDir = filepath.Join(repoRoot, "charts", "kloak")
 	valuesFile := filepath.Join(repoRoot, "test", "e2e", "values-e2e.yaml")
@@ -89,6 +99,14 @@ func TestMain(m *testing.M) {
 	fmt.Println("Waiting for kloak-webhook Deployment...")
 	if err := waitForDeploymentReady(ctx, kloakNamespace, "kloak-webhook"); err != nil {
 		fmt.Fprintf(os.Stderr, "webhook not ready: %v\n", err)
+		dumpLogs()
+		teardown()
+		os.Exit(1)
+	}
+
+	fmt.Println("Waiting for otel-collector Deployment...")
+	if err := waitForDeploymentReady(ctx, kloakNamespace, "otel-collector"); err != nil {
+		fmt.Fprintf(os.Stderr, "otel-collector not ready: %v\n", err)
 		dumpLogs()
 		teardown()
 		os.Exit(1)
@@ -134,6 +152,9 @@ func dumpLogs() {
 	fmt.Println(out)
 	fmt.Println("=== Kloak Webhook Logs ===")
 	out, _ = kubectl("logs", "-n", kloakNamespace, "-l", "app.kubernetes.io/component=webhook", "--tail=50")
+	fmt.Println(out)
+	fmt.Println("=== OTel Collector Logs ===")
+	out, _ = kubectl("logs", "-n", kloakNamespace, "-l", "app=otel-collector", "--tail=50")
 	fmt.Println(out)
 	fmt.Println("=== All Pods ===")
 	out, _ = kubectl("get", "pods", "-A")

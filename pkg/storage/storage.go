@@ -29,4 +29,8 @@ type Storage interface {
 	// List returns all hash→Entry mappings.
 	// Used for syncing to eBPF maps.
 	List(ctx context.Context) (map[string]Entry, error)
+
+	// LookupByPrefix finds the podID (namespace/secretName) that owns a
+	// shadow hash starting with the given prefix.
+	LookupByPrefix(ctx context.Context, prefix string) (podID string, found bool, err error)
 }
