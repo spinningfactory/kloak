@@ -1,7 +1,8 @@
 .PHONY: all build build-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup \
         clean deps docker-build generate-ebpf generate-vmlinux run help \
         lima-start lima-stop lima-delete lima-shell lima-exec lima-check \
-        lima-k3d-ensure lima-k3d-shell lima-k3d-e2e-setup lima-k3d-e2e-run lima-k3d-e2e lima-k3d-stop lima-k3d-delete
+        lima-k3d-ensure lima-k3d-shell lima-k3d-e2e-setup lima-k3d-e2e-run lima-k3d-e2e lima-k3d-stop lima-k3d-delete \
+        local-env local-env-teardown local-env-status local-env-load dashboard
 
 # Go parameters
 GOCMD=go
@@ -251,6 +252,28 @@ lima-k3d-delete: lima-k3d-stop
 	@limactl delete $(LIMA_K3D_VM) 2>/dev/null || true
 
 # ============================================================================
+# Local observability environment
+# ============================================================================
+
+local-env:
+	@bash scripts/local-env.sh
+
+local-env-teardown:
+	@bash scripts/local-env-teardown.sh
+
+local-env-status: lima-ensure
+	@limactl shell $(LIMA_VM) -- bash -lc 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml; echo "=== kloak-system ==="; kubectl get pods -n kloak-system; echo "=== kloak-local ==="; kubectl get pods -n kloak-local'
+
+local-env-load:
+	@bash scripts/local-env-load.sh --scale $(or $(SCALE),5) --interval $(or $(INTERVAL),1)
+
+dashboard: lima-ensure
+	@limactl shell $(LIMA_VM) -- bash -lc 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml; kubectl port-forward -n kloak-system svc/clickhouse 8123:8123 --address 0.0.0.0' &
+	@sleep 2
+	@echo "Dashboard at http://localhost:8088"
+	@go run ./cmd/dashboard --clickhouse-url http://localhost:8123 --port 8088
+
+# ============================================================================
 # Help
 # ============================================================================
 
@@ -281,6 +304,13 @@ help:
 	@echo "  lima-delete     - Delete the Lima VM"
 	@echo "  lima-shell      - Open shell in Lima VM"
 	@echo "  lima-ensure     - Ensure VM is running (idempotent)"
+	@echo ""
+	@echo "Local observability environment:"
+	@echo "  local-env       - Deploy full local env (kloak + apps + ClickHouse + collector)"
+	@echo "  local-env-teardown - Tear down local environment"
+	@echo "  local-env-status - Show pod status in local env"
+	@echo "  local-env-load  - Load test (SCALE=N INTERVAL=S)"
+	@echo "  dashboard       - Start D3 node graph dashboard at http://localhost:8088"
 	@echo ""
 	@echo "Lima k3d targets (for e2e on ARM Mac):"
 	@echo "  lima-k3d-shell  - Shell into k3d Lima VM"

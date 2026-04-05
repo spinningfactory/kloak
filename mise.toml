@@ -209,6 +209,43 @@ rm -f $EBPF_PKG/tlsuprobe_bpfel.o $EBPF_PKG/tlsuprobe_bpfeb.o
 # Lima VM (for eBPF development on macOS)
 # ============================================================================
 
+# ============================================================================
+# Local observability environment
+# ============================================================================
+
+[tasks."local-env"]
+description = "Deploy full local env (kloak + apps + ClickHouse + collector)"
+run = "bash scripts/local-env.sh"
+
+[tasks."local-env:teardown"]
+description = "Tear down local environment"
+run = "bash scripts/local-env-teardown.sh"
+
+[tasks."local-env:status"]
+description = "Show pod status in local env"
+depends = ["lima:ensure"]
+run = """
+limactl shell $LIMA_VM -- bash -lc 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml; echo "=== kloak-system ==="; kubectl get pods -n kloak-system; echo "=== kloak-local ==="; kubectl get pods -n kloak-local'
+"""
+
+[tasks."local-env:load"]
+description = "Load test the local env (SCALE=N INTERVAL=S)"
+run = "bash scripts/local-env-load.sh --scale ${SCALE:-5} --interval ${INTERVAL:-1}"
+
+[tasks.dashboard]
+description = "Start D3 node graph dashboard at http://localhost:8088"
+depends = ["lima:ensure"]
+run = """
+limactl shell $LIMA_VM -- bash -lc 'export KUBECONFIG=/etc/rancher/k3s/k3s.yaml; kubectl port-forward -n kloak-system svc/clickhouse 8123:8123 --address 0.0.0.0' &
+sleep 2
+echo "Dashboard at http://localhost:8088"
+go run ./cmd/dashboard --clickhouse-url http://localhost:8123 --port 8088
+"""
+
+# ============================================================================
+# Lima VM (for eBPF development on macOS)
+# ============================================================================
+
 [tasks."lima:check"]
 description = "Verify limactl is installed"
 run = """

@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Kloak - Secret Flow Graph</title>
+  <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #1a1a2e;
+      color: #e0e0e0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    header {
+      padding: 12px 24px;
+      background: #0f0f23;
+      border-bottom: 1px solid #2a2a4e;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-shrink: 0;
+    }
+
+    header h1 {
+      font-size: 18px;
+      font-weight: 600;
+      color: #a0c4ff;
+      letter-spacing: 0.04em;
+    }
+
+    header .subtitle {
+      font-size: 13px;
+      color: #667;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #3CB371;
+      margin-left: auto;
+      box-shadow: 0 0 6px #3CB371;
+      animation: pulse 2s ease-in-out infinite;
+    }
+
+    @keyframes pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.4; }
+    }
+
+    .main-content {
+      display: flex;
+      flex: 1;
+      overflow: hidden;
+    }
+
+    #graph-container {
+      flex: 1;
+      position: relative;
+      overflow: hidden;
+    }
+
+    #graph {
+      width: 100%;
+      height: 100%;
+    }
+
+    .empty-state {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      text-align: center;
+      color: #445;
+      pointer-events: none;
+    }
+
+    .empty-state h2 {
+      font-size: 22px;
+      margin-bottom: 8px;
+      color: #556;
+    }
+
+    .empty-state p {
+      font-size: 14px;
+    }
+
+    #sidebar {
+      width: 25%;
+      min-width: 220px;
+      max-width: 320px;
+      background: #16213e;
+      border-left: 1px solid #2a2a4e;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .sidebar-header {
+      padding: 16px 20px 12px;
+      border-bottom: 1px solid #2a2a4e;
+    }
+
+    .sidebar-header h2 {
+      font-size: 14px;
+      font-weight: 600;
+      color: #a0c4ff;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    #top-secrets {
+      list-style: none;
+      overflow-y: auto;
+      flex: 1;
+      padding: 8px 0;
+    }
+
+    #top-secrets::-webkit-scrollbar { width: 4px; }
+    #top-secrets::-webkit-scrollbar-track { background: transparent; }
+    #top-secrets::-webkit-scrollbar-thumb { background: #2a2a4e; border-radius: 2px; }
+
+    .secret-item {
+      padding: 10px 20px;
+      border-bottom: 1px solid #1e2d50;
+      transition: background 0.15s;
+    }
+
+    .secret-item:hover { background: #1e2d50; }
+
+    .secret-item:last-child { border-bottom: none; }
+
+    .secret-rank {
+      font-size: 11px;
+      color: #667;
+      margin-bottom: 3px;
+    }
+
+    .secret-name {
+      font-weight: 600;
+      font-size: 13px;
+      color: #FFD700;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .secret-ns {
+      font-size: 11px;
+      color: #778;
+      margin-bottom: 5px;
+    }
+
+    .secret-count {
+      font-size: 12px;
+      color: #a0c4ff;
+      margin-bottom: 4px;
+    }
+
+    .bar-track {
+      height: 3px;
+      background: #2a2a4e;
+      border-radius: 2px;
+      overflow: hidden;
+    }
+
+    .bar-fill {
+      height: 100%;
+      background: linear-gradient(90deg, #4A90D9, #a0c4ff);
+      border-radius: 2px;
+      transition: width 0.4s ease;
+    }
+
+    .legend {
+      padding: 12px 20px;
+      border-top: 1px solid #2a2a4e;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+      font-size: 11px;
+      color: #889;
+    }
+
+    .legend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+
+    .legend-diamond {
+      width: 10px;
+      height: 10px;
+      background: #FFD700;
+      transform: rotate(45deg);
+    }
+
+    /* D3 graph elements */
+    .node-label {
+      font-size: 11px;
+      fill: #ccc;
+      text-anchor: middle;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    .link {
+      stroke: #556677;
+      stroke-opacity: 0.7;
+    }
+
+    .node-pod {
+      stroke: white;
+      stroke-width: 2;
+      cursor: grab;
+    }
+
+    .node-pod:active { cursor: grabbing; }
+
+    .node-secret {
+      stroke: white;
+      stroke-width: 2;
+      cursor: grab;
+      fill: #FFD700;
+    }
+
+    .node-secret:active { cursor: grabbing; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Kloak</h1>
+    <span class="subtitle">Secret Flow Graph</span>
+    <span class="status-dot" id="status-dot" title="Live"></span>
+  </header>
+
+  <div class="main-content">
+    <div id="graph-container">
+      <svg id="graph"></svg>
+      <div class="empty-state" id="empty-state">
+        <h2>Waiting for data...</h2>
+        <p>No rewrite events received yet.</p>
+      </div>
+    </div>
+
+    <div id="sidebar">
+      <div class="sidebar-header">
+        <h2>Top Secrets</h2>
+      </div>
+      <ol id="top-secrets"></ol>
+      <div class="legend">
+        <div class="legend-item">
+          <div class="legend-dot" style="background:#4A90D9"></div> Go
+        </div>
+        <div class="legend-item">
+          <div class="legend-dot" style="background:#3CB371"></div> Python
+        </div>
+        <div class="legend-item">
+          <div class="legend-dot" style="background:#E8793A"></div> Rust
+        </div>
+        <div class="legend-item">
+          <div class="legend-dot" style="background:#888"></div> Unknown
+        </div>
+        <div class="legend-item">
+          <div class="legend-diamond"></div> Secret
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const RUNTIME_COLORS = {
+      go: '#4A90D9',
+      python: '#3CB371',
+      rust: '#E8793A',
+      unknown: '#888',
+    };
+
+    const svg = d3.select('#graph');
+    const container = document.getElementById('graph-container');
+
+    let width = container.clientWidth;
+    let height = container.clientHeight;
+
+    svg.attr('width', width).attr('height', height);
+
+    const g = svg.append('g');
+
+    // Zoom + pan
+    svg.call(d3.zoom()
+      .scaleExtent([0.3, 4])
+      .on('zoom', (event) => g.attr('transform', event.transform))
+    );
+
+    let simulation = d3.forceSimulation([])
+      .force('link', d3.forceLink([]).id(d => d.id).distance(150))
+      .force('charge', d3.forceManyBody().strength(-300))
+      .force('center', d3.forceCenter(width / 2, height / 2))
+      .force('collision', d3.forceCollide(30));
+
+    let linkSel = g.append('g').attr('class', 'links').selectAll('.link');
+    let nodeSel = g.append('g').attr('class', 'nodes').selectAll('.node-group');
+
+    let currentNodes = [];
+    let currentEdges = [];
+
+    function drag(sim) {
+      return d3.drag()
+        .on('start', (event, d) => {
+          if (!event.active) sim.alphaTarget(0.3).restart();
+          d.fx = d.x;
+          d.fy = d.y;
+        })
+        .on('drag', (event, d) => {
+          d.fx = event.x;
+          d.fy = event.y;
+        })
+        .on('end', (event, d) => {
+          if (!event.active) sim.alphaTarget(0);
+          d.fx = null;
+          d.fy = null;
+        });
+    }
+
+    function updateGraph(data) {
+      const { nodes: newNodes, edges: newEdges } = data;
+
+      const emptyState = document.getElementById('empty-state');
+      if (!newNodes || newNodes.length === 0) {
+        emptyState.style.display = 'block';
+        return;
+      }
+      emptyState.style.display = 'none';
+
+      // Merge: preserve existing node positions
+      const existingById = new Map(currentNodes.map(n => [n.id, n]));
+      const mergedNodes = newNodes.map(n => {
+        const existing = existingById.get(n.id);
+        return existing
+          ? Object.assign(existing, { label: n.label, type: n.type, runtime: n.runtime })
+          : n;
+      });
+
+      currentNodes = mergedNodes;
+      currentEdges = newEdges || [];
+
+      simulation.nodes(currentNodes);
+      simulation.force('link').links(currentEdges);
+      simulation.alpha(0.3).restart();
+
+      // Edges
+      linkSel = g.select('.links').selectAll('.link').data(currentEdges, d => d.source.id + '-' + d.target.id);
+      linkSel.exit().remove();
+      linkSel = linkSel.enter()
+        .append('line')
+        .attr('class', 'link')
+        .merge(linkSel);
+
+      linkSel.attr('stroke-width', d => Math.max(1.5, Math.min(8, Math.log2((d.weight || 1) + 1))));
+
+      // Nodes
+      nodeSel = g.select('.nodes').selectAll('.node-group').data(currentNodes, d => d.id);
+      nodeSel.exit().remove();
+
+      const nodeEnter = nodeSel.enter()
+        .append('g')
+        .attr('class', 'node-group')
+        .call(drag(simulation));
+
+      // Pod: circle
+      nodeEnter.filter(d => d.type === 'pod')
+        .append('circle')
+        .attr('class', 'node-pod')
+        .attr('r', 22)
+        .attr('fill', d => RUNTIME_COLORS[d.runtime] || RUNTIME_COLORS.unknown);
+
+      // Secret: diamond (rect rotated 45deg)
+      nodeEnter.filter(d => d.type === 'secret')
+        .append('rect')
+        .attr('class', 'node-secret')
+        .attr('width', 28)
+        .attr('height', 28)
+        .attr('x', -14)
+        .attr('y', -14)
+        .attr('transform', 'rotate(45)');
+
+      nodeEnter.append('text')
+        .attr('class', 'node-label')
+        .attr('dy', d => d.type === 'pod' ? 36 : 30)
+        .text(d => d.label);
+
+      nodeSel = nodeEnter.merge(nodeSel);
+
+      // Update colors on existing pod nodes
+      nodeSel.select('circle.node-pod')
+        .attr('fill', d => RUNTIME_COLORS[d.runtime] || RUNTIME_COLORS.unknown);
+
+      simulation.on('tick', () => {
+        linkSel
+          .attr('x1', d => d.source.x)
+          .attr('y1', d => d.source.y)
+          .attr('x2', d => d.target.x)
+          .attr('y2', d => d.target.y);
+
+        nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
+      });
+    }
+
+    function updateTopSecrets(data) {
+      const list = document.getElementById('top-secrets');
+      const secrets = (data && data.secrets) ? data.secrets : [];
+      list.innerHTML = '';
+
+      if (secrets.length === 0) {
+        const li = document.createElement('li');
+        li.style.cssText = 'padding:20px;color:#445;font-size:13px;text-align:center;';
+        li.textContent = 'No data yet';
+        list.appendChild(li);
+        return;
+      }
+
+      const maxRewrites = Math.max(...secrets.map(s => s.total_rewrites), 1);
+
+      secrets.forEach((s, i) => {
+        const pct = Math.round((s.total_rewrites / maxRewrites) * 100);
+        const li = document.createElement('li');
+        li.className = 'secret-item';
+        li.innerHTML = `
+          <div class="secret-rank">#${i + 1}</div>
+          <div class="secret-name">${escHtml(s.name)}</div>
+          <div class="secret-ns">${escHtml(s.namespace)}</div>
+          <div class="secret-count">${s.total_rewrites.toLocaleString()} rewrites</div>
+          <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>
+        `;
+        list.appendChild(li);
+      });
+    }
+
+    function escHtml(s) {
+      return String(s)
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;');
+    }
+
+    async function fetchAndUpdate() {
+      try {
+        const [graphData, topData] = await Promise.all([
+          fetch('/api/graph').then(r => r.json()),
+          fetch('/api/top-secrets').then(r => r.json()),
+        ]);
+        updateGraph(graphData);
+        updateTopSecrets(topData);
+        document.getElementById('status-dot').style.background = '#3CB371';
+      } catch (err) {
+        console.error('fetch error:', err);
+        document.getElementById('status-dot').style.background = '#cc4444';
+      }
+    }
+
+    // Handle resize
+    window.addEventListener('resize', () => {
+      width = container.clientWidth;
+      height = container.clientHeight;
+      svg.attr('width', width).attr('height', height);
+      simulation.force('center', d3.forceCenter(width / 2, height / 2));
+      simulation.alpha(0.1).restart();
+    });
+
+    // Initial fetch + poll
+    fetchAndUpdate();
+    setInterval(fetchAndUpdate, 5000);
+  </script>
+</body>
+</html>

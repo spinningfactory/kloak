@@ -1,0 +1,7 @@
+image:
+  repository: kloak
+  tag: latest
+  pullPolicy: Never
+controller:
+  metrics:
+    otlpEndpoint: "http://otel-collector.kloak-system.svc:4318"
