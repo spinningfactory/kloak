@@ -307,6 +307,7 @@ struct udp_recv_pending {
   __u64 iov_base;     // user buffer (first iovec base)
   __u8 peer_ip[16];   // DNS server IP (IPv4-mapped-IPv6)
   __u8 has_peer_ip;   // 1 if peer_ip is valid (connected socket)
+  __u64 msg_name_ptr; // kernel ptr to sockaddr filled by recvmsg (unconnected)
 };
 
 struct {
@@ -912,9 +913,9 @@ int kprobe_udp_recvmsg(void *ctx) {
     return 0;
 
   // Filter for DNS traffic. For connected UDP sockets (Go, Python), skc_dport
-  // is set to 53. For unconnected sockets (Node.js c-ares uses sendto), skc_dport
-  // is 0 — we allow those through since tracked_tgids already limits scope, and
-  // process_dns_packet validates the DNS response format.
+  // is set to 53. For unconnected sockets (Node.js c-ares, musl libc use sendto),
+  // skc_dport is 0 — we allow those through and read the peer IP from msg_name
+  // in the kretprobe after the kernel fills it.
   __be16 dport = 0;
   BPF_CORE_READ_INTO(&dport, sk, __sk_common.skc_dport);
   if (dport == __bpf_htons(53))
@@ -937,14 +938,14 @@ int kprobe_udp_recvmsg(void *ctx) {
 
   // Read peer IP for DNS server validation.
   // Connected sockets (dport=53) have the DNS server address in skc_daddr.
-  // Unconnected sockets (dport=0) don't — mark as no peer IP.
+  // Unconnected sockets (dport=0) get the peer IP from msg->msg_name after
+  // recvmsg completes (the kernel fills it with the source address).
   if (dport == __bpf_htons(53)) {
     __u16 family = 0;
     BPF_CORE_READ_INTO(&family, sk, __sk_common.skc_family);
     if (family == 2) { // AF_INET
       __u32 ipv4 = 0;
       BPF_CORE_READ_INTO(&ipv4, sk, __sk_common.skc_daddr);
-      // Convert to IPv4-mapped-IPv6
       val.peer_ip[10] = 0xff;
       val.peer_ip[11] = 0xff;
       __builtin_memcpy(&val.peer_ip[12], &ipv4, 4);
@@ -953,6 +954,12 @@ int kprobe_udp_recvmsg(void *ctx) {
       BPF_CORE_READ_INTO(val.peer_ip, sk, __sk_common.skc_v6_daddr);
       val.has_peer_ip = 1;
     }
+  } else {
+    // Unconnected socket (dport=0): save msg_name pointer so the kretprobe
+    // can read the peer address after the kernel fills it.
+    void *mn = NULL;
+    BPF_CORE_READ_INTO(&mn, msg, msg_name);
+    val.msg_name_ptr = (__u64)mn;
   }
 
   bpf_map_update_elem(&udp_recv_scratch, &pid_tgid, &val, BPF_ANY);
@@ -973,8 +980,29 @@ int kretprobe_udp_recvmsg(void *ctx) {
   __u64 iov_base = pending->iov_base;
   __u8 peer_ip[16];
   __u8 has_peer_ip = pending->has_peer_ip;
+  __u64 msg_name_ptr = pending->msg_name_ptr;
   __builtin_memcpy(peer_ip, pending->peer_ip, 16);
   bpf_map_delete_elem(&udp_recv_scratch, &pid_tgid);
+
+  // For unconnected sockets (dport=0), read the peer address from msg_name
+  // which the kernel filled during recvmsg with the source sockaddr.
+  if (!has_peer_ip && msg_name_ptr) {
+    __u16 sa_family = 0;
+    bpf_probe_read_kernel(&sa_family, sizeof(sa_family), (void *)msg_name_ptr);
+    if (sa_family == 2) { // AF_INET — struct sockaddr_in
+      __u32 ipv4 = 0;
+      // sin_addr is at offset 4 (after sa_family(2) + sin_port(2))
+      bpf_probe_read_kernel(&ipv4, sizeof(ipv4), (void *)(msg_name_ptr + 4));
+      peer_ip[10] = 0xff;
+      peer_ip[11] = 0xff;
+      __builtin_memcpy(&peer_ip[12], &ipv4, 4);
+      has_peer_ip = 1;
+    } else if (sa_family == 10) { // AF_INET6 — struct sockaddr_in6
+      // sin6_addr is at offset 8 (after sa_family(2) + sin6_port(2) + sin6_flowinfo(4))
+      bpf_probe_read_kernel(peer_ip, 16, (void *)(msg_name_ptr + 8));
+      has_peer_ip = 1;
+    }
+  }
 
   // Validate DNS server source IP against trusted_dns_servers whitelist.
   // If dns_whitelist_enabled is 1 and the peer IP is not in the map, drop.

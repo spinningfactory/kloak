@@ -16,6 +16,7 @@ import (
 
 const (
 	dnsWLClientName = "dns-wl-client"
+	dnsWLEchoName   = "dns-wl-echo"
 	customDNSName   = "custom-dns"
 )
 
@@ -32,8 +33,9 @@ func TestDNSWhitelist(t *testing.T) {
 	secretValue := "REAL-DNS-WHITELIST-12345"
 	secretName := "dns-whitelist-secret"
 
-	// Deploy the TLS echo server (Python/OpenSSL) + service.
-	echoSvcHost := deployTLSEchoServer(t)
+	// Deploy a dedicated TLS echo server with a unique name to avoid
+	// collisions with TestCipherSuites.
+	echoSvcHost, echoSvcIP := deployDNSWLEchoServer(t)
 
 	// Create kloak-enabled secret with host filter targeting the echo server.
 	createEnabledSecret(t, secretName, map[string][]byte{
@@ -45,9 +47,13 @@ func TestDNSWhitelist(t *testing.T) {
 		"api-key": []byte(secretValue),
 	})
 
-	// Deploy custom CoreDNS resolver that forwards to kube-dns.
-	// Its ClusterIP differs from kube-dns, so it's NOT in trusted_dns_servers.
-	customDNSIP := deployCustomDNS(t)
+	// Deploy custom CoreDNS that answers authoritatively for the echo hostname.
+	// It does NOT forward to kube-dns, so the ONLY DNS response in the system
+	// for this hostname comes from the custom DNS IP (untrusted).
+	// This is critical because the DNS kprobe is system-wide — if CoreDNS
+	// forwarded to kube-dns, kube-dns's response would populate dns_ip_map
+	// via CoreDNS's own udp_recvmsg (peer=kube-dns=trusted).
+	customDNSIP := deployCustomDNS(t, echoSvcHost, echoSvcIP)
 	t.Logf("custom DNS service IP: %s (not in trusted_dns_servers)", customDNSIP)
 
 	// Deploy curl client configured to use the custom (untrusted) DNS server.
@@ -59,23 +65,119 @@ func TestDNSWhitelist(t *testing.T) {
 	verifyRewriteBlocked(t, clientPod, echoSvcHost, secretValue)
 }
 
-// deployCustomDNS creates a CoreDNS pod + ClusterIP service that forwards all
-// queries to the cluster's upstream DNS (kube-dns). The service gets a unique
-// ClusterIP that is NOT in the trusted_dns_servers BPF map.
-func deployCustomDNS(t *testing.T) string {
+// deployDNSWLEchoServer creates a TLS echo server with a unique name for the
+// DNS whitelist test, avoiding name collisions with TestCipherSuites.
+// Returns (FQDN, ClusterIP).
+func deployDNSWLEchoServer(t *testing.T) (string, string) {
+	t.Helper()
+
+	labels := map[string]string{"app": dnsWLEchoName}
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      dnsWLEchoName,
+			Namespace: testNamespace,
+			Labels:    labels,
+			Annotations: map[string]string{
+				"getkloak.io/enabled": "false",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:            "echo",
+				Image:           e2eImage("kloak-tls-echo", "latest"),
+				ImagePullPolicy: e2ePullPolicy(),
+				Ports:           []corev1.ContainerPort{{ContainerPort: 8443}},
+				ReadinessProbe: &corev1.Probe{
+					ProbeHandler: corev1.ProbeHandler{
+						HTTPGet: &corev1.HTTPGetAction{
+							Path:   "/health",
+							Port:   intstr.FromInt32(8443),
+							Scheme: corev1.URISchemeHTTPS,
+						},
+					},
+					InitialDelaySeconds: 2,
+					PeriodSeconds:       2,
+				},
+			}},
+		},
+	}
+	_, err := clientset.CoreV1().Pods(testNamespace).Create(
+		context.Background(), pod, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create echo server pod: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = clientset.CoreV1().Pods(testNamespace).Delete(
+			context.Background(), dnsWLEchoName, metav1.DeleteOptions{})
+	})
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      dnsWLEchoName,
+			Namespace: testNamespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: labels,
+			Ports: []corev1.ServicePort{{
+				Port:       8443,
+				TargetPort: intstr.FromInt32(8443),
+			}},
+		},
+	}
+	_, err = clientset.CoreV1().Services(testNamespace).Create(
+		context.Background(), svc, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("failed to create echo server service: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = clientset.CoreV1().Services(testNamespace).Delete(
+			context.Background(), dnsWLEchoName, metav1.DeleteOptions{})
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := waitForPodReady(ctx, testNamespace, dnsWLEchoName); err != nil {
+		t.Fatalf("echo server not ready: %v", err)
+	}
+
+	// Fetch the assigned ClusterIP for the authoritative DNS zone.
+	created, err := clientset.CoreV1().Services(testNamespace).Get(
+		context.Background(), dnsWLEchoName, metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get echo server service: %v", err)
+	}
+	fqdn := fmt.Sprintf("%s.%s.svc.cluster.local", dnsWLEchoName, testNamespace)
+	return fqdn, created.Spec.ClusterIP
+}
+
+// deployCustomDNS creates an authoritative CoreDNS pod + ClusterIP service
+// that answers queries for echoHost with echoIP. It does NOT forward to
+// kube-dns, ensuring the ONLY DNS response for this hostname comes from the
+// custom DNS IP (which is NOT in trusted_dns_servers).
+func deployCustomDNS(t *testing.T, echoHost, echoIP string) string {
 	t.Helper()
 
 	labels := map[string]string{"app": customDNSName}
 
-	// ConfigMap with CoreDNS Corefile — forward everything to /etc/resolv.conf
-	// (which points to kube-dns in the pod's default config).
+	// Authoritative Corefile: respond to the echo hostname with its ClusterIP.
+	// No forward directive — never contacts kube-dns.
+	corefile := fmt.Sprintf(`.:53 {
+    hosts {
+        %s %s
+        fallthrough
+    }
+    log
+}
+`, echoIP, echoHost)
+
 	cm := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      customDNSName,
 			Namespace: testNamespace,
 		},
 		Data: map[string]string{
-			"Corefile": ".:53 {\n    forward . /etc/resolv.conf\n    cache 30\n    log\n}\n",
+			"Corefile": corefile,
 		},
 	}
 	_, err := clientset.CoreV1().ConfigMaps(testNamespace).Create(
@@ -93,7 +195,6 @@ func deployCustomDNS(t *testing.T) string {
 			Name:      customDNSName,
 			Namespace: testNamespace,
 			Labels:    labels,
-			// Opt out of kloak interception — this is test infrastructure.
 			Annotations: map[string]string{
 				"getkloak.io/enabled": "false",
 			},
@@ -177,14 +278,12 @@ func deployCustomDNS(t *testing.T) string {
 			context.Background(), customDNSName, metav1.DeleteOptions{})
 	})
 
-	// Wait for CoreDNS to be ready.
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	if err := waitForPodReady(ctx, testNamespace, customDNSName); err != nil {
 		t.Fatalf("CoreDNS pod not ready: %v", err)
 	}
 
-	// Fetch the assigned ClusterIP.
 	created, err := clientset.CoreV1().Services(testNamespace).Get(
 		context.Background(), customDNSName, metav1.GetOptions{})
 	if err != nil {
@@ -212,8 +311,7 @@ func deployCipherClientWithDNS(t *testing.T, secretName, dnsIP string) string {
 		},
 		Spec: corev1.PodSpec{
 			RestartPolicy: corev1.RestartPolicyNever,
-			// Route DNS to the custom (untrusted) resolver.
-			DNSPolicy: corev1.DNSNone,
+			DNSPolicy:     corev1.DNSNone,
 			DNSConfig: &corev1.PodDNSConfig{
 				Nameservers: []string{dnsIP},
 				Searches: []string{
@@ -297,7 +395,6 @@ func verifyRewriteBlocked(t *testing.T, clientPod, serverHost, secretValue strin
 		out, _ := kubectl("exec", "-n", testNamespace, clientPod,
 			"--", "sh", "-c", curlCmd)
 
-		// Only evaluate responses where the echo server actually responded.
 		if !strings.Contains(out, `"headers"`) {
 			t.Logf("waiting for echo server response: %q", out)
 			time.Sleep(pollInterval)
