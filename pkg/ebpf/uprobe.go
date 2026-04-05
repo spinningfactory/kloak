@@ -706,6 +706,15 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 		}
 
 		if event.Type == 1 { // exec
+			// Only attach to processes whose cgroup was explicitly registered by
+			// the controller via TrackCgroup (i.e. kloak-enabled pods).
+			// sched_process_exec fires for ALL kubepods containers; without this
+			// guard, AttachTLS would attach tc egress to non-kloak pods and
+			// corrupt their outbound TLS (wrong H key → bad GHASH tag).
+			if _, ok := m.cgroupPaths.Load(event.CgroupID); !ok {
+				m.log.V(1).Info("exec in untracked cgroup, skipping", "tgid", event.Tgid, "cgroupID", event.CgroupID)
+				continue
+			}
 			m.log.Info("Detected exec in tracked container, attaching uprobes", "tgid", event.Tgid, "cgroupID", event.CgroupID)
 			if err := m.AttachTLS(int(event.Tgid)); err != nil {
 				// libssl may not be loaded yet (e.g. Python hasn't imported ssl).
