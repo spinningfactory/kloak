@@ -251,9 +251,15 @@ func waitForUprobeReady(t *testing.T, clientPod, serverHost, secretValue string)
 
 		out, err := kubectl("exec", "-n", testNamespace, clientPod,
 			"--", "sh", "-c", curlCmd)
-		if err == nil && strings.Contains(out, secretValue) {
+		// Accept the response even when curl exits non-zero: Python's BaseHTTPServer
+		// closes the TLS connection without a clean close_notify, causing curl to
+		// exit with 56 (CURLE_RECV_ERROR) even though the full response was received.
+		if strings.Contains(out, secretValue) {
 			t.Logf("uprobe ready — rewrite verified")
 			return
+		}
+		if err != nil {
+			t.Logf("error waiting for uprobe to become ready: %v\n  out=%q", err, out)
 		}
 		time.Sleep(pollInterval)
 	}
@@ -280,7 +286,10 @@ func execCurl(t *testing.T, clientPod, serverHost, cipher, tlsMin, tlsMax string
 	for attempt := 1; attempt <= 3; attempt++ {
 		out, err = kubectl("exec", "-n", testNamespace, clientPod,
 			"--", "sh", "-c", curlCmd)
-		if err == nil && strings.TrimSpace(out) != "" {
+		// Accept when we received a JSON response body, even if curl exits non-zero.
+		// Python's BaseHTTPServer may close the TLS connection without clean shutdown,
+		// causing curl exit 56 (CURLE_RECV_ERROR) even when the full body was received.
+		if strings.Contains(out, `"headers"`) {
 			return out
 		}
 		t.Logf("curl attempt %d: err=%v out=%q", attempt, err, out)
