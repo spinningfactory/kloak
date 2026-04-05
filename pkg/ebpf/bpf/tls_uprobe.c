@@ -1858,16 +1858,20 @@ int bpf_uprobe_ssl_write(void *ctx) {
   // Without this check, the H extraction path runs against server-mode SSL*
   // objects whose internal layout differs from client-mode, producing garbage
   // GHASH keys that corrupt outbound TLS authentication tags ("bad record MAC").
+  //
+  // If ssl_read_fd fails (returns 0), we cannot determine client vs server mode,
+  // so we fall through and let the existing logic handle it. We only bail when
+  // we have a valid fd that is positively NOT in conn_ip_map (server-mode).
   {
     __u32 bio_fd = ssl_read_fd((__u64)ssl_ptr);
-    if (bio_fd == 0)
-      return 0;
-    __u32 cur_tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-    struct conn_ip_key cik = {};
-    cik.tgid = cur_tgid;
-    cik.fd = bio_fd;
-    if (!bpf_map_lookup_elem(&conn_ip_map, &cik))
-      return 0;
+    if (bio_fd != 0) {
+      __u32 cur_tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+      struct conn_ip_key cik = {};
+      cik.tgid = cur_tgid;
+      cik.fd = bio_fd;
+      if (!bpf_map_lookup_elem(&conn_ip_map, &cik))
+        return 0;  // server-mode: fd exists but not from connect()
+    }
   }
 
 #ifdef KLOAK_DEBUG
