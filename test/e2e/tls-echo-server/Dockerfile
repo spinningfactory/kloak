@@ -1,10 +1,5 @@
-FROM golang:1.25-alpine AS builder
-WORKDIR /app
-COPY go.mod .
-COPY main.go .
-RUN CGO_ENABLED=0 go build -o /tls-echo-server main.go
-
-FROM alpine:3.21
-COPY --from=builder /tls-echo-server /tls-echo-server
+FROM python:3.13-alpine
+RUN apk add --no-cache openssl
+COPY server.py /server.py
 EXPOSE 8443
-ENTRYPOINT ["/tls-echo-server"]
+ENTRYPOINT ["python3", "-u", "/server.py"]
