@@ -168,13 +168,17 @@ func runCipherClient(t *testing.T, serverHost, secretName, cipher, tlsMin, tlsMa
 	shadowName := secretName + "-kloak"
 
 	// Build curl command with cipher/version flags.
+	// Retry up to 3 times with 5s sleep between attempts to handle
+	// transient DNS/connectivity issues in CI.
 	curlCmd := fmt.Sprintf(
 		`sleep 10 && `+ // Wait for controller to attach uprobe after exec detection
 			`SECRET=$(cat /etc/secrets/api-key) && `+
-			`curl --insecure --connect-timeout 10 -s `+
+			`for i in 1 2 3; do `+
+			`RESULT=$(curl --insecure --connect-timeout 10 -s `+
 			`%s %s `+
 			`-H "X-Secret: $SECRET" `+
-			`https://%s:8443/echo || echo CURL_FAILED`,
+			`https://%s:8443/echo) && echo "$RESULT" && exit 0; `+
+			`sleep 5; done; echo CURL_FAILED`,
 		buildTLSVersionFlags(tlsMin, tlsMax),
 		buildCipherFlag(cipher, tlsMin),
 		serverHost,
