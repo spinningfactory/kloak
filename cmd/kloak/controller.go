@@ -5,7 +5,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -13,6 +12,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	crmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/ebpf"
@@ -66,7 +66,7 @@ func runController(cmd *cobra.Command, args []string) {
 	metricsProvider, metricsShutdown, err := kloakmetrics.NewMeterProvider(
 		context.Background(),
 		kloakmetrics.ProviderConfig{
-			PrometheusRegisterer: prometheus.DefaultRegisterer,
+			PrometheusRegisterer: crmetrics.Registry,
 		},
 	)
 	if err != nil {
