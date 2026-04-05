@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	promexporter "go.opentelemetry.io/otel/exporters/prometheus"
@@ -44,7 +45,9 @@ func NewMeterProvider(ctx context.Context, cfg ProviderConfig) (*sdkmetric.Meter
 		if err != nil {
 			return nil, nil, fmt.Errorf("creating otlp metric exporter: %w", err)
 		}
-		opts = append(opts, sdkmetric.WithReader(sdkmetric.NewPeriodicReader(otlpExp)))
+		opts = append(opts, sdkmetric.WithReader(
+			sdkmetric.NewPeriodicReader(otlpExp, sdkmetric.WithInterval(10*time.Second)),
+		))
 	}
 
 	provider := sdkmetric.NewMeterProvider(opts...)
