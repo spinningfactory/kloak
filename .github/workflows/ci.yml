@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -161,8 +162,7 @@ jobs:
   e2e:
     name: E2E Tests
     runs-on: ubuntu-latest
-    needs: [build, test]
-    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'e2e')
+    if: contains(github.event.pull_request.labels.*.name, 'e2e')
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -172,6 +172,12 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      - name: Install clang for eBPF generation
+        run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev
+
+      - name: Generate eBPF bindings
+        run: KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/
 
       - name: Install k3d
         run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
