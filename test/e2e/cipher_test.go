@@ -105,6 +105,12 @@ func deployTLSEchoServer(t *testing.T) string {
 			Name:      echoServerName,
 			Namespace: testNamespace,
 			Labels:    labels,
+			// Explicitly opt out of kloak interception. The echo server is test
+			// infrastructure — attaching tc egress to it corrupts its outbound
+			// TLS records (bad record MAC on readiness probes).
+			Annotations: map[string]string{
+				"getkloak.io/enabled": "false",
+			},
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{
