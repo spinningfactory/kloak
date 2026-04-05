@@ -20,6 +20,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/spinningfactory/kloak/pkg/metrics"
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
@@ -41,6 +42,7 @@ type SecretReconciler struct {
 	Log     logr.Logger
 	Scheme  *runtime.Scheme
 	Storage storage.Storage
+	Metrics *metrics.Metrics
 }
 
 // Reconcile handles Secret events.
@@ -49,6 +51,9 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	var secret corev1.Secret
 	if err := r.Get(ctx, req.NamespacedName, &secret); err != nil {
+		if client.IgnoreNotFound(err) != nil {
+			r.Metrics.RecordSecretReconcile("error")
+		}
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -195,16 +200,19 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		existingShadow.OwnerReferences = shadowSecret.OwnerReferences
 		existingShadow.Labels = shadowSecret.Labels
 		if err := r.Update(ctx, &existingShadow); err != nil {
+			r.Metrics.RecordSecretReconcile("error")
 			return ctrl.Result{}, fmt.Errorf("failed to update shadow secret: %w", err)
 		}
 		log.Info("Updated shadow secret", "name", shadowName)
 	} else {
 		if err := r.Create(ctx, shadowSecret); err != nil {
+			r.Metrics.RecordSecretReconcile("error")
 			return ctrl.Result{}, fmt.Errorf("failed to create shadow secret: %w", err)
 		}
 		log.Info("Created shadow secret", "name", shadowName)
 	}
 
+	r.Metrics.RecordSecretReconcile("ok")
 	return ctrl.Result{}, nil
 }
 

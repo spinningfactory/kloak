@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"os"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
@@ -14,6 +16,7 @@ import (
 
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/ebpf"
+	kloakmetrics "github.com/spinningfactory/kloak/pkg/metrics"
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
@@ -59,16 +62,40 @@ func runController(cmd *cobra.Command, args []string) {
 	// Create shared storage
 	store := storage.NewMemory()
 
+	// Set up OTel metrics provider (Prometheus bridge + optional OTLP push)
+	metricsProvider, metricsShutdown, err := kloakmetrics.NewMeterProvider(
+		context.Background(),
+		kloakmetrics.ProviderConfig{
+			PrometheusRegisterer: prometheus.DefaultRegisterer,
+		},
+	)
+	if err != nil {
+		setupLog.Error(err, "failed to set up metrics provider")
+		os.Exit(1)
+	}
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = metricsShutdown(ctx)
+	}()
+
+	meter := metricsProvider.Meter("kloak")
+	m, err := kloakmetrics.New(meter, nil)
+	if err != nil {
+		setupLog.Error(err, "failed to create metrics instruments")
+		os.Exit(1)
+	}
+
 	// Create uprobe manager instances
 	var uprobeMgr *ebpf.TLSUprobeManager
-	var err error
 
 	if enableEBPF {
-		uprobeMgr, err = ebpf.NewTLSUprobeManager(store, cgroupPath)
+		uprobeMgr, err = ebpf.NewTLSUprobeManager(store, cgroupPath, m)
 		if err != nil {
 			setupLog.Error(err, "failed to initialize eBPF uprobe manager")
 			os.Exit(1)
 		}
+		m.SetBPFQuerier(uprobeMgr)
 		setupLog.Info("eBPF TLS uprobes enabled")
 	} else {
 		setupLog.Info("eBPF disabled")
@@ -96,6 +123,7 @@ func runController(cmd *cobra.Command, args []string) {
 		uprobeMgr,
 		cgroupPath,
 		nodeName,
+		m,
 	)
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
@@ -109,6 +137,7 @@ func runController(cmd *cobra.Command, args []string) {
 		Log:     ctrl.Log.WithName("controller").WithName("Secret"),
 		Scheme:  mgr.GetScheme(),
 		Storage: store,
+		Metrics: m,
 	}
 
 	if err := secretReconciler.SetupWithManager(mgr); err != nil {

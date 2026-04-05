@@ -18,6 +18,7 @@ import (
 	"github.com/go-logr/logr"
 	ctrl "sigs.k8s.io/controller-runtime"
 
+	"github.com/spinningfactory/kloak/pkg/metrics"
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
@@ -71,6 +72,7 @@ type TLSUprobeManager struct {
 	procReader *ringbuf.Reader
 	log        logr.Logger
 	links      []link.Link
+	metrics    *metrics.Metrics
 
 	// store provides access to secrets
 	store storage.Storage
@@ -79,7 +81,6 @@ type TLSUprobeManager struct {
 	// cgroupPaths maps cgroup inode ID -> filesystem path.
 	// Populated by TrackCgroup.
 	cgroupPaths sync.Map // uint64 -> string
-
 }
 
 // setupCgroupAncestor finds the kubepods cgroup directory and stores its fd
@@ -158,7 +159,7 @@ func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Log
 }
 
 // NewTLSUprobeManager initializes a new uprobe manager.
-func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeManager, error) {
+func NewTLSUprobeManager(store storage.Storage, cgroupRoot string, m *metrics.Metrics) (*TLSUprobeManager, error) {
 	log := ctrl.Log.WithName("ebpf-uprobe")
 
 	objs := &tlsuprobeObjects{}
@@ -199,6 +200,7 @@ func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeMa
 		reader:     reader,
 		procReader: procReader,
 		log:        log,
+		metrics:    m,
 		store:      store,
 		cgroupRoot: cgroupRoot,
 	}
@@ -312,6 +314,7 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	if up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, &link.UprobeOptions{PID: pid}); err == nil {
 		m.log.Info("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
 		m.links = append(m.links, up)
+		m.metrics.RecordUprobeAttach(true)
 		return nil
 	}
 
@@ -353,8 +356,10 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	}
 
 	if attached {
+		m.metrics.RecordUprobeAttach(true)
 		return nil
 	}
+	m.metrics.RecordUprobeAttach(false)
 	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
 }
 
@@ -521,6 +526,7 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 			continue
 		}
 
+		m.metrics.RecordTLSWrite(event.Len, event.IsRewritten == 1)
 		if event.IsRewritten == 1 {
 			m.log.Info("REWRITE SUCCESS: eBPF synchronously rewrote a secret", "pid", event.Pid)
 		} else {
@@ -532,9 +538,65 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 // syncSecretsToBPF updates the eBPF map with the latest shadow secret values
 // and the watched_hosts map with hostnames from secret entries.
 func (m *TLSUprobeManager) syncSecretsToBPF() {
+	m.metrics.RecordSecretSync()
 	if err := syncSecrets(m.objs.SecretMap, m.objs.WatchedHosts, m.store, m.log); err != nil {
 		m.log.Error(err, "failed to sync secrets to BPF map")
 	}
+}
+
+// DebugCounterSum returns the per-CPU summed value for the named debug counter.
+// Implements metrics.BPFQuerier.
+func (m *TLSUprobeManager) DebugCounterSum(name string) uint64 {
+	if m.objs == nil || m.objs.DebugCounters == nil {
+		return 0
+	}
+	for i, n := range debugCounterNames {
+		if n != name {
+			continue
+		}
+		var vals []uint64
+		key := uint32(i)
+		if err := m.objs.DebugCounters.Lookup(key, &vals); err != nil {
+			return 0
+		}
+		var total uint64
+		for _, v := range vals {
+			total += v
+		}
+		return total
+	}
+	return 0
+}
+
+// MapSize returns the number of entries in the named BPF map.
+// Implements metrics.BPFQuerier.
+func (m *TLSUprobeManager) MapSize(name string) int {
+	if m.objs == nil {
+		return 0
+	}
+	var bpfMap *ebpf.Map
+	switch name {
+	case "secret_map":
+		bpfMap = m.objs.SecretMap
+	case "tracked_tgids":
+		bpfMap = m.objs.TrackedTgids
+	case "tracked_cgroups":
+		bpfMap = m.objs.TrackedCgroups
+	case "dns_ip_map":
+		bpfMap = m.objs.DnsIpMap
+	default:
+		return 0
+	}
+	if bpfMap == nil {
+		return 0
+	}
+	var count int
+	var key, val []byte
+	iter := bpfMap.Iterate()
+	for iter.Next(&key, &val) {
+		count++
+	}
+	return count
 }
 
 // debugCounterNames maps index to human-readable name (must match C enum).

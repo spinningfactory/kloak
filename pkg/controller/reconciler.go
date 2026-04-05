@@ -17,6 +17,7 @@ import (
 
 	"github.com/spinningfactory/kloak/pkg/cgroups"
 	"github.com/spinningfactory/kloak/pkg/ebpf"
+	"github.com/spinningfactory/kloak/pkg/metrics"
 )
 
 const (
@@ -36,6 +37,7 @@ type Reconciler struct {
 	CgroupRoot    string
 	// NodeName filters pods to only those on this node (empty = all nodes)
 	NodeName string
+	Metrics  *metrics.Metrics
 
 	mu sync.RWMutex
 	// trackedPods maps pod UID -> set of cgroup IDs (one per container).
@@ -50,7 +52,7 @@ type Reconciler struct {
 }
 
 // NewReconciler creates a new pod reconciler.
-func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, uprobeMgr *ebpf.TLSUprobeManager, cgroupRoot, nodeName string) *Reconciler {
+func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, uprobeMgr *ebpf.TLSUprobeManager, cgroupRoot, nodeName string, m *metrics.Metrics) *Reconciler {
 	if cgroupRoot == "" {
 		cgroupRoot = CgroupBasePath
 	}
@@ -61,6 +63,7 @@ func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, upr
 		UprobeManager: uprobeMgr,
 		CgroupRoot:    cgroupRoot,
 		NodeName:      nodeName,
+		Metrics:       m,
 		trackedPods:   make(map[string]map[uint64]bool),
 		podKeyToUID:   make(map[string]string),
 	}
@@ -191,8 +194,10 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	r.mu.RUnlock()
 
 	if needsRetry {
+		r.Metrics.RecordPodReconcile("requeue")
 		return ctrl.Result{RequeueAfter: 500 * time.Millisecond}, nil
 	}
+	r.Metrics.RecordPodReconcile("ok")
 	return ctrl.Result{}, nil
 }
 
