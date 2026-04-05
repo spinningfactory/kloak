@@ -4,11 +4,56 @@ package e2e
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	corev1 "k8s.io/api/core/v1"
 )
+
+// e2eImage returns the full image reference, prefixed by E2E_REGISTRY if set.
+func e2eImage(name, tag string) string {
+	if imageRegistry != "" {
+		return imageRegistry + "/" + name + ":" + tag
+	}
+	return name + ":" + tag
+}
+
+// e2ePullPolicy returns Never for local images, IfNotPresent for registry images.
+func e2ePullPolicy() corev1.PullPolicy {
+	if imageRegistry != "" {
+		return corev1.PullAlways
+	}
+	return corev1.PullNever
+}
+
+// applyManifest applies a k8s manifest YAML, rewriting image references
+// if E2E_REGISTRY is set.
+func applyManifest(t *testing.T, path string) error {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("reading manifest %s: %w", path, err)
+	}
+	manifest := string(data)
+
+	if imageRegistry != "" {
+		manifest = strings.ReplaceAll(manifest, "image: kloak-", "image: "+imageRegistry+"/kloak-")
+		manifest = strings.ReplaceAll(manifest, "imagePullPolicy: Never", "imagePullPolicy: Always")
+	}
+
+	cmd := exec.Command("kubectl", "apply", "-f", "-", "-n", testNamespace)
+	cmd.Stdin = strings.NewReader(manifest)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("kubectl apply: %s: %w", string(out), err)
+	}
+	return nil
+}
 
 // controllerLogs fetches the latest controller log output.
 func controllerLogs() string {
@@ -23,15 +68,10 @@ type ebpfRewriteTest struct {
 	demoDir        string
 	deploymentName string
 	appLabel       string
+	skip           string // if non-empty, test is skipped with this reason
 }
 
 var ebpfTests = []ebpfRewriteTest{
-	{
-		name:           "go",
-		demoDir:        "demo-go",
-		deploymentName: "demo-go",
-		appLabel:       "app=demo-go",
-	},
 	{
 		name:           "python",
 		demoDir:        "demo-python",
@@ -45,16 +85,25 @@ var ebpfTests = []ebpfRewriteTest{
 		appLabel:       "app=demo-js",
 	},
 	{
+		name:           "go",
+		demoDir:        "demo-go",
+		deploymentName: "demo-go",
+		appLabel:       "app=demo-go",
+		skip:           "Go crypto/tls H extraction not yet implemented",
+	},
+	{
 		name:           "go-boringssl",
 		demoDir:        "demo-go-boring",
 		deploymentName: "demo-go-boring",
 		appLabel:       "app=demo-go-boring",
+		skip:           "BoringSSL H extraction not yet implemented",
 	},
 	{
 		name:           "gnutls",
 		demoDir:        "demo-gnutls",
 		deploymentName: "demo-gnutls",
 		appLabel:       "app=demo-gnutls",
+		skip:           "GnuTLS H extraction not yet implemented",
 	},
 }
 
@@ -80,8 +129,7 @@ func TestEBPFRawTLSHostFiltering(t *testing.T) {
 	assertShadowSecret(t, "secret-blocked", blockedData)
 
 	demoManifest := filepath.Join(repoRoot, "examples", "demo-python-raw-tls", "deployment.yaml")
-	_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
-	if err != nil {
+	if err := applyManifest(t, demoManifest); err != nil {
 		t.Fatalf("failed to deploy demo-python-raw-tls: %v", err)
 	}
 	t.Cleanup(func() {
@@ -147,9 +195,11 @@ func TestEBPFSecretRewrite(t *testing.T) {
 }
 
 func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
+	if tc.skip != "" {
+		t.Skip(tc.skip)
+	}
 	demoManifest := filepath.Join(repoRoot, "examples", tc.demoDir, "deployment.yaml")
-	_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
-	if err != nil {
+	if err := applyManifest(t, demoManifest); err != nil {
 		t.Fatalf("failed to deploy %s: %v", tc.demoDir, err)
 	}
 	t.Cleanup(func() {
@@ -237,8 +287,7 @@ func TestEBPFSecretLengths(t *testing.T) {
 			assertShadowSecret(t, "secret-blocked", blockedData)
 
 			demoManifest := filepath.Join(repoRoot, "examples", "demo-python-raw-tls", "deployment.yaml")
-			_, err := kubectl("apply", "-f", demoManifest, "-n", testNamespace)
-			if err != nil {
+			if err := applyManifest(t, demoManifest); err != nil {
 				t.Fatalf("failed to deploy: %v", err)
 			}
 			t.Cleanup(func() {

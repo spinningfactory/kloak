@@ -33,3 +33,10 @@ kubeconfig
 # Generated kernel headers (the arch-specific vmlinux_*.h files ARE committed)
 pkg/ebpf/vmlinux.h
 pkg/ebpf/bpf/vmlinux.h
+.claude/worktrees/
+kloak
+lima-k3d.yaml
+sec.yml
+test.yml
+.claude/settings.local.json
+.claude/projects/

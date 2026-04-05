@@ -84,11 +84,12 @@ e2e: e2e-setup e2e-run e2e-cleanup
 # Create k3d cluster with BPF mounts, build and import all images.
 e2e-setup:
 	@which k3d > /dev/null || (echo "Error: k3d not found. Install with: brew install k3d" && exit 1)
+	@mountpoint -q /sys/kernel/tracing 2>/dev/null || sudo mount -t tracefs tracefs /sys/kernel/tracing 2>/dev/null || true
 	@echo "==> Creating k3d cluster '$(E2E_CLUSTER)' with BPF mounts..."
 	@k3d cluster create $(E2E_CLUSTER) --wait --timeout 120s \
 		--volume /sys/kernel/btf:/sys/kernel/btf:ro@server:0 \
 		--volume /sys/fs/bpf:/sys/fs/bpf:rw@server:0 \
-		--volume /sys/kernel/tracing:/sys/kernel/tracing:ro@server:0 \
+		--volume /sys/kernel/tracing:/sys/kernel/tracing:rw@server:0 \
 		2>/dev/null || true
 	@echo "==> Building kloak image..."
 	@docker build -t $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) .
@@ -99,20 +100,55 @@ e2e-setup:
 	@docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
 	@docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
 	@docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
-	@echo "==> Importing images into k3d (one at a time)..."
-	@k3d image import $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) -c $(E2E_CLUSTER)
-	@k3d image import kloak-demo-go:latest -c $(E2E_CLUSTER)
-	@k3d image import kloak-demo-python:latest -c $(E2E_CLUSTER)
-	@k3d image import kloak-demo-js:latest -c $(E2E_CLUSTER)
-	@k3d image import kloak-demo-go-boring:latest -c $(E2E_CLUSTER)
-	@k3d image import kloak-demo-gnutls:latest -c $(E2E_CLUSTER)
-	@k3d image import kloak-demo-python-raw-tls:latest -c $(E2E_CLUSTER)
+	@docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
+	@echo "==> Importing images into k3d (via tar to avoid pipe EOF)..."
+	@mkdir -p /tmp/k3d-images
+	@for img in $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest \
+		kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest \
+		kloak-demo-python-raw-tls:latest kloak-tls-echo:latest; do \
+		echo "  Importing $$img..."; \
+		docker save $$img -o /tmp/k3d-images/$$(echo $$img | tr ':/' '__').tar && \
+		k3d image import /tmp/k3d-images/$$(echo $$img | tr ':/' '__').tar -c $(E2E_CLUSTER); \
+	done
+	@rm -rf /tmp/k3d-images
 	@echo "==> E2E environment ready."
 
 # Run e2e tests (including eBPF) against an existing k3d cluster.
 e2e-run:
 	KUBECONFIG=$$(k3d kubeconfig write $(E2E_CLUSTER)) \
 	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
+
+# Run e2e tests against the current kube context.
+# Builds images, pushes to ttl.sh (anonymous ephemeral registry, 2h TTL),
+# and runs tests with E2E_REGISTRY so images are pulled from there.
+# Set E2E_REGISTRY to use a different registry (e.g. localhost:5000).
+# WARNING: This will helm install/uninstall kloak in kloak-system and
+# create/delete a kloak-e2e namespace.
+# Usage: make e2e-local
+E2E_TTL_TAG ?= kloak-$(shell date +%s)
+E2E_REGISTRY ?= ttl.sh/$(E2E_TTL_TAG)
+
+e2e-local: e2e-local-push e2e-local-run
+
+e2e-local-push:
+	@echo "==> Building and pushing images to $(E2E_REGISTRY) ..."
+	@docker build -t $(E2E_REGISTRY)/kloak:e2e .
+	@docker push $(E2E_REGISTRY)/kloak:e2e
+	@for demo in demo-go demo-python demo-js demo-go-boring demo-gnutls demo-python-raw-tls; do \
+		echo "  Pushing kloak-$$demo..."; \
+		docker build -t $(E2E_REGISTRY)/kloak-$$demo:latest ./examples/$$demo/ && \
+		docker push $(E2E_REGISTRY)/kloak-$$demo:latest; \
+	done
+	@docker build -t $(E2E_REGISTRY)/kloak-tls-echo:latest ./test/e2e/tls-echo-server/
+	@docker push $(E2E_REGISTRY)/kloak-tls-echo:latest
+	@echo "==> All images pushed."
+
+# E2E_RUN: optional -run filter (e.g. E2E_RUN=TestCipherSuites make e2e-local)
+E2E_RUN ?=
+
+e2e-local-run:
+	E2E_REGISTRY=$(E2E_REGISTRY) E2E_SKIP_INSTALL=$(E2E_SKIP_INSTALL) \
+	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 $(if $(E2E_RUN),-run $(E2E_RUN)) ./test/e2e/
 
 # Tear down e2e k3d cluster.
 e2e-cleanup:
@@ -232,11 +268,11 @@ lima-k3d-shell: lima-k3d-ensure
 
 # Run e2e setup inside k3d Lima VM
 lima-k3d-e2e-setup: lima-k3d-ensure
-	limactl shell $(LIMA_K3D_VM) -- bash -lc 'cd $(LIMA_WORKDIR) && make e2e-setup'
+	limactl shell $(LIMA_K3D_VM) -- bash -lc 'sg docker -c "cd $(LIMA_WORKDIR) && make e2e-setup"'
 
 # Run e2e tests inside k3d Lima VM
 lima-k3d-e2e-run: lima-k3d-ensure
-	limactl shell $(LIMA_K3D_VM) -- bash -lc 'cd $(LIMA_WORKDIR) && make e2e-run'
+	limactl shell $(LIMA_K3D_VM) -- bash -lc 'sg docker -c "cd $(LIMA_WORKDIR) && make e2e-run"'
 
 # Full e2e inside k3d Lima VM
 lima-k3d-e2e: lima-k3d-e2e-setup lima-k3d-e2e-run
