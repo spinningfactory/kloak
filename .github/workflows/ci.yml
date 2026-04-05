@@ -71,12 +71,7 @@ jobs:
       - name: Build binary
         run: go build -v -o bin/kloak ./cmd/kloak
 
-      - name: Upload binary
-        uses: actions/upload-artifact@v5
-        with:
-          name: kloak-binary
-          path: bin/kloak
-          retention-days: 7
+      # Binary artifact skipped to save storage quota.
 
   test:
     name: Test
@@ -106,76 +101,17 @@ jobs:
       - name: Run tests
         run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/pkg/ebpf|/pkg/cgroups')
 
-      - name: Upload coverage
-        uses: actions/upload-artifact@v5
-        with:
-          name: coverage
-          path: coverage.out
-          retention-days: 7
+      # Coverage artifact skipped to save storage quota.
+      # The e2e job merges coverage separately.
 
-  coverage:
-    name: Coverage Report
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    needs: [e2e]
-    permissions:
-      contents: read
-      actions: read
-      pull-requests: write
-    steps:
-      - uses: fgrosse/go-coverage-report@v1.3.0
-        with:
-          coverage-artifact-name: combined-coverage
-          coverage-file-name: combined-coverage.out
-
-  coverage-badge:
-    name: Coverage Badge
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    needs: [e2e]
-    permissions:
-      contents: write
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
-
-      - name: Download combined coverage
-        uses: actions/download-artifact@v5
-        with:
-          name: combined-coverage
-          path: /tmp/combined-coverage
-
-      - name: Prepare coverage for badge
-        run: |
-          go tool cover -func=/tmp/combined-coverage/combined-coverage.out -o=coverage.out
-
-      - name: Update coverage badge
-        uses: tj-actions/coverage-badge-go@v3
-        with:
-          filename: coverage.out
-
-      - name: Verify changed files
-        uses: tj-actions/verify-changed-files@v16
-        id: verify-changed-files
-        with:
-          files: README.md
-
-      - name: Commit coverage badge
-        if: steps.verify-changed-files.outputs.files_changed == 'true'
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add README.md
-          git commit -m "chore: update coverage badge"
-          git push
+  # Coverage report and badge jobs disabled — artifact uploads removed to save
+  # storage quota. Re-enable when storage is available.
+  # coverage:
+  #   name: Coverage Report
+  #   ...
+  # coverage-badge:
+  #   name: Coverage Badge
+  #   ...
 
   docker:
     name: Docker Build & Push
@@ -258,7 +194,9 @@ jobs:
           docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
           docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
           docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
+          docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
           k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest -c kloak-e2e
+          k3d image import kloak-tls-echo:latest -c kloak-e2e
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -268,73 +206,8 @@ jobs:
         env:
           KUBECONFIG: /tmp/kubeconfig-e2e.yaml
 
-      - name: Collect e2e coverage
-        if: always()
-        env:
-          KUBECONFIG: /tmp/kubeconfig-e2e.yaml
-        run: |
-          mkdir -p /tmp/e2e-covdata
-          # Wait for the controller pod to fully terminate after helm uninstall
-          # (triggered by test teardown). The Go coverage runtime writes
-          # covcounters on clean exit, which needs time to flush to the
-          # hostPath volume.
-          echo "Waiting for controller pod to terminate..."
-          kubectl wait --for=delete pod -l app.kubernetes.io/component=controller \
-            -n kloak-system --timeout=30s 2>/dev/null || true
-          # Copy coverage files from the k3d node's hostPath
-          docker cp k3d-kloak-e2e-server-0:/tmp/kloak-coverage/. /tmp/e2e-covdata/ 2>/dev/null || true
-          echo "E2E coverage files:"
-          ls -la /tmp/e2e-covdata/ 2>/dev/null || echo "No coverage files collected"
-
-      - name: Download unit test coverage
-        if: always()
-        uses: actions/download-artifact@v5
-        with:
-          name: coverage
-          path: /tmp/unit-coverage
-
-      - name: Merge unit and e2e coverage
-        if: always()
-        run: |
-          # Convert e2e covdata (binary) to text format
-          if ls /tmp/e2e-covdata/covcounters.* 1>/dev/null 2>&1; then
-            go tool covdata textfmt -i=/tmp/e2e-covdata -o=/tmp/e2e-coverage.out
-            echo "E2E coverage converted to text format"
-          else
-            echo "No e2e coverage data found, using unit coverage only"
-          fi
-
-          # Merge: start with unit coverage, append all e2e coverage lines.
-          # Exclude generated eBPF bindings (tlsuprobe_bpf*.go) which aren't
-          # on the runner, but include all other packages (cmd/, pkg/ebpf/, etc.).
-          cp /tmp/unit-coverage/coverage.out /tmp/combined-coverage.out
-
-          if [ -f /tmp/e2e-coverage.out ]; then
-            # Append all e2e lines except the mode line and generated eBPF files
-            tail -n +2 /tmp/e2e-coverage.out | grep -v 'tlsuprobe_bpf' >> /tmp/combined-coverage.out
-            echo "Combined unit + e2e coverage (all packages)"
-          fi
-
-          echo "=== Combined coverage summary ==="
-          go tool cover -func=/tmp/combined-coverage.out | tail -1
-
-      - name: Upload combined coverage
-        if: always()
-        uses: actions/upload-artifact@v5
-        with:
-          name: combined-coverage
-          path: /tmp/combined-coverage.out
-          retention-days: 7
-          if-no-files-found: ignore
-
-      - name: Upload e2e coverage
-        if: always()
-        uses: actions/upload-artifact@v5
-        with:
-          name: e2e-coverage
-          path: /tmp/e2e-coverage.out
-          retention-days: 7
-          if-no-files-found: ignore
+      # E2e coverage collection and merge disabled — unit coverage artifact
+      # upload was removed to save storage quota, so merge has nothing to work with.
 
       - name: Collect logs on failure
         if: failure()

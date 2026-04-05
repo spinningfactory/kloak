@@ -6,16 +6,20 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/go-logr/logr"
+	"golang.org/x/sys/unix"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/spinningfactory/kloak/pkg/storage"
@@ -48,7 +52,7 @@ type secretValue struct {
 	Len         uint32
 	RealSecret  [128]byte
 	HostLen     uint32
-	AllowedHost [32]byte
+	AllowedHost [64]byte
 	PrefixLen   uint32
 	FullPrefix  [42]byte // SECRET_PREFIX_MAX
 	_           [2]byte  // padding to match C struct alignment
@@ -56,7 +60,7 @@ type secretValue struct {
 
 // watchedHostKey matches C struct watched_host_key
 type watchedHostKey struct {
-	Host [32]byte
+	Host [64]byte
 }
 
 // Generate eBPF bindings. The KLOAK_TARGET_ARCH env var (set by Dockerfile or
@@ -79,7 +83,19 @@ type TLSUprobeManager struct {
 	// cgroupPaths maps cgroup inode ID -> filesystem path.
 	// Populated by TrackCgroup.
 	cgroupPaths sync.Map // uint64 -> string
+	// tcAttached tracks network namespace inodes where tc egress is already
+	// attached. Stores an open fd to the netns — keeping it open prevents the
+	// kernel from freeing the inode, so a new pod's netns always gets a
+	// different inode. This avoids false "already attached" dedup hits from
+	// inode reuse after pod deletion. The fd is closed in UntrackCgroup.
+	tcAttached sync.Map // uint64 (netns inode) -> *tcAttachEntry
+	// cgroupToNetns maps cgroup ID → netns inode for cleanup on UntrackCgroup.
+	cgroupToNetns sync.Map // uint64 (cgroup ID) -> uint64 (netns inode)
+}
 
+// tcAttachEntry holds an open fd to a network namespace to prevent inode reuse.
+type tcAttachEntry struct {
+	netnsFd *os.File // kept open to pin the inode
 }
 
 // setupCgroupAncestor finds the kubepods cgroup directory and stores its fd
@@ -162,16 +178,43 @@ func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeMa
 	log := ctrl.Log.WithName("ebpf-uprobe")
 
 	objs := &tlsuprobeObjects{}
-	if err := loadTlsuprobeObjects(objs, nil); err != nil {
-		log.Error(err, "eBPF loading failed (no verifier log)")
+	if err := loadTlsuprobeObjects(objs, &ebpf.CollectionOptions{
+		Programs: ebpf.ProgramOptions{
+			LogSizeStart: 1 << 20, // 1 MB
+			LogLevel:     ebpf.LogLevelBranch,
+		},
+	}); err != nil {
+		var ve *ebpf.VerifierError
+		if errors.As(err, &ve) {
+			// Print only the error summary (includes rejection reason).
+			// The full verifier log can be 100K+ lines and overflows container log buffers.
+			log.Error(err, "eBPF verifier rejected program")
+		} else {
+			log.Error(err, "eBPF loading failed (not a verifier error, check dmesg)",
+				"error_type", fmt.Sprintf("%T", err))
+		}
 		return nil, fmt.Errorf("loading eBPF objects: %w", err)
 	}
 
-	// Wire up tail call map: index 0 -> bpf_phase2_rewrite
-	fd := uint32(objs.BpfPhase2Rewrite.FD())
-	if err := objs.ProgArray.Put(uint32(0), fd); err != nil {
+	// Wire up tail call map: index 1 -> bpf_xor_path (AES-GCM ciphertext patching)
+	xorFd := uint32(objs.BpfXorPath.FD())
+	if err := objs.ProgArray.Put(uint32(1), xorFd); err != nil {
 		_ = objs.Close()
-		return nil, fmt.Errorf("configuring tail call map: %w", err)
+		return nil, fmt.Errorf("configuring tail call map index 1: %w", err)
+	}
+
+	// Wire up tail call: index 2 -> bpf_h_extract (GHASH key H extraction)
+	hExtFd := uint32(objs.BpfH_extract.FD())
+	if err := objs.ProgArray.Put(uint32(2), hExtFd); err != nil {
+		_ = objs.Close()
+		return nil, fmt.Errorf("configuring tail call map index 2: %w", err)
+	}
+
+	// Wire up tc tail call: index 0 -> tc_ghash_update
+	tcGhashFd := uint32(objs.TcGhashUpdate.FD())
+	if err := objs.TcProgArray.Put(uint32(0), tcGhashFd); err != nil {
+		_ = objs.Close()
+		return nil, fmt.Errorf("configuring tc tail call map: %w", err)
 	}
 
 	// Populate the cgroup ancestor map so the exec tracepoint can catch
@@ -253,6 +296,109 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	m.links = append(m.links, krp)
 	m.log.Info("Attached kretprobe", "function", "udp_recvmsg")
 
+	// Attach kprobe on tcp_sendmsg to bridge xor_pending → tc_pending.
+	// This runs after SSL_write encrypts and calls write/send, giving us
+	// access to the struct sock (source port) for per-connection keying.
+	tkp, err := link.Kprobe("tcp_sendmsg", m.objs.BpfKprobeTcpSendmsg, nil)
+	if err != nil {
+		return fmt.Errorf("attaching kprobe tcp_sendmsg: %w", err)
+	}
+	m.links = append(m.links, tkp)
+	m.log.Info("Attached kprobe", "function", "tcp_sendmsg")
+
+	return nil
+}
+
+// attachTCEgress attaches the tc egress BPF program to eth0 and lo inside a
+// container's network namespace. eth0 covers external traffic; lo covers
+// intra-pod traffic (e.g. sidecar → sidecar via a ClusterIP Service that
+// DNATs back to the same pod, routing through loopback).
+//
+// The controller enters the container's netns via /proc/<pid>/ns/net
+// (requires hostPID: true), attaches tc, then returns to its own netns.
+func (m *TLSUprobeManager) attachTCEgress(pid int) error {
+	// Check if this network namespace already has tc attached by reading
+	// the netns inode. We keep an open fd to the netns file — this prevents
+	// the kernel from freeing the inode, so a new pod's netns always gets a
+	// different inode (no false dedup from inode reuse).
+	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+	if fi, err := os.Stat(netnsPath); err == nil {
+		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+			if _, loaded := m.tcAttached.Load(stat.Ino); loaded {
+				m.log.V(1).Info("tc egress already attached for this netns", "pid", pid, "netns_ino", stat.Ino)
+				return nil
+			}
+		}
+	}
+
+	// Open the netns fd for two purposes:
+	// 1. setns to enter the container's network namespace
+	// 2. Keep it open (stored in tcAttached) to pin the inode
+	containerNS, err := os.Open(netnsPath)
+	if err != nil {
+		return fmt.Errorf("opening container netns %s: %w", netnsPath, err)
+	}
+	// NOTE: containerNS is NOT closed here — it's stored in tcAttachEntry
+	// to pin the netns inode. Closed in UntrackCgroup when the pod is deleted.
+
+	// Save our current network namespace.
+	selfNS, err := os.Open("/proc/self/ns/net")
+	if err != nil {
+		_ = containerNS.Close()
+		return fmt.Errorf("opening self netns: %w", err)
+	}
+	defer func() { _ = selfNS.Close() }()
+
+	// Lock OS thread — setns is per-thread.
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	// Switch to the container's network namespace.
+	if err := unix.Setns(int(containerNS.Fd()), unix.CLONE_NEWNET); err != nil {
+		_ = containerNS.Close()
+		return fmt.Errorf("setns to container netns: %w", err)
+	}
+
+	// Ensure we return to our original netns.
+	defer func() {
+		if err := unix.Setns(int(selfNS.Fd()), unix.CLONE_NEWNET); err != nil {
+			m.log.Error(err, "failed to restore original netns")
+		}
+	}()
+
+	// Attach tc egress to both eth0 (external) and lo (intra-pod loopback).
+	for _, ifName := range []string{"eth0", "lo"} {
+		iface, err := net.InterfaceByName(ifName)
+		if err != nil {
+			// lo should always exist; eth0 might not in some setups.
+			if ifName == "lo" {
+				_ = containerNS.Close()
+				return fmt.Errorf("finding %s in container netns: %w", ifName, err)
+			}
+			m.log.V(1).Info("interface not found, skipping", "pid", pid, "interface", ifName)
+			continue
+		}
+
+		tcLink, err := link.AttachTCX(link.TCXOptions{
+			Interface: iface.Index,
+			Program:   m.objs.TcEgressPatch,
+			Attach:    ebpf.AttachTCXEgress,
+		})
+		if err != nil {
+			_ = containerNS.Close()
+			return fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", ifName, iface.Index, pid, err)
+		}
+		m.links = append(m.links, tcLink)
+		m.log.Info("Attached tc egress to container", "pid", pid, "interface", ifName, "ifindex", iface.Index)
+	}
+
+	// Store the open netns fd keyed by inode. The open fd pins the inode —
+	// the kernel won't reuse it until we close the fd in UntrackCgroup.
+	if fi, err := os.Stat(netnsPath); err == nil {
+		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+			m.tcAttached.Store(stat.Ino, &tcAttachEntry{netnsFd: containerNS})
+		}
+	}
 	return nil
 }
 
@@ -279,9 +425,52 @@ func (m *TLSUprobeManager) TrackCgroup(cgroupID uint64, cgroupPath string) error
 	return nil
 }
 
-// UntrackCgroup removes a container cgroup ID from the tracked_cgroups map.
+// RecordCgroupNetns records the cgroup → netns inode mapping for a container
+// process. This enables cleanup of the tcAttached entry (which pins the netns
+// fd) when the cgroup is untracked on pod deletion.
+func (m *TLSUprobeManager) RecordCgroupNetns(cgroupID uint64, pid int) {
+	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+	fi, err := os.Stat(netnsPath)
+	if err != nil {
+		return
+	}
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return
+	}
+	m.cgroupToNetns.Store(cgroupID, stat.Ino)
+}
+
+// UntrackCgroup removes a container cgroup ID from the tracked_cgroups map
+// and cleans up the associated tc attachment state. When the last cgroup
+// referencing a netns is untracked, the pinned netns fd is closed, allowing
+// the kernel to free the inode for reuse.
 func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 	m.cgroupPaths.Delete(cgroupID)
+
+	// Clean up tcAttached: close the pinned netns fd so the kernel can
+	// reclaim the inode. Check if any other cgroup still maps to the same
+	// netns before closing (multi-container pods share a netns).
+	if inoVal, ok := m.cgroupToNetns.LoadAndDelete(cgroupID); ok {
+		ino := inoVal.(uint64)
+		// Check if any other cgroup still references this netns.
+		otherRefs := false
+		m.cgroupToNetns.Range(func(_, v any) bool {
+			if v.(uint64) == ino {
+				otherRefs = true
+				return false // stop iteration
+			}
+			return true
+		})
+		if !otherRefs {
+			if entry, ok := m.tcAttached.LoadAndDelete(ino); ok {
+				if e, ok := entry.(*tcAttachEntry); ok && e.netnsFd != nil {
+					_ = e.netnsFd.Close()
+				}
+			}
+		}
+	}
+
 	return m.objs.TrackedCgroups.Delete(cgroupID)
 }
 
@@ -298,6 +487,9 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	} else {
 		m.log.Info("Tracking TGID for DNS/connect verification", "pid", pid)
 	}
+
+	// H extraction now happens in the entry uprobe via 4-step pointer chain.
+	// The offsets are pushed to the BPF config map by pushTLSOffsets below.
 
 	// Open the executable to check for statically linked TLS
 	ex, err := link.OpenExecutable(exePath)
@@ -353,9 +545,52 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	}
 
 	if attached {
+		// Try to detect the OpenSSL version and push struct offsets for the
+		// XOR-patch path. Non-fatal: if detection fails, the XOR path simply
+		// won't activate and the shadow secret is sent as-is (fail-secure).
+		m.pushTLSOffsets(pid, containerLibs)
+
+		// Attach tc egress to the container's eth0 for kernel-only ciphertext
+		// patching. Required for secret rewriting.
+		if err := m.attachTCEgress(pid); err != nil {
+			m.log.Error(err, "Failed to attach tc egress to container — secrets will not be rewritten", "pid", pid)
+		}
+
 		return nil
 	}
 	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
+}
+
+// pushTLSOffsets detects the OpenSSL version in the container's TLS libraries
+// and pushes struct offsets to the tls_offset_config BPF map. This enables the
+// XOR-patch path for TLS 1.3 AES-GCM connections.
+func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
+	for _, libPath := range containerLibs {
+		version, offsets, err := DetectOpenSSLVersion(pid, libPath)
+		if err != nil {
+			m.log.V(1).Info("OpenSSL version detection skipped", "lib", libPath, "reason", err)
+			continue
+		}
+
+		// Push offsets to the BPF config map.
+		// Must match struct tls_offsets in tls_uprobe.c.
+		type bpfTLSOffsets struct {
+			SSLToWRL       uint32
+			WRLToEncCtx    uint32
+			EncCtxToAlgctx uint32
+			AlgctxToH      uint32
+		}
+		val := bpfTLSOffsets(offsets)
+		if err := m.objs.TlsOffsetConfig.Update(uint32(0), &val, 0); err != nil {
+			m.log.Error(err, "Failed to push TLS offsets to BPF map")
+			continue
+		}
+
+		m.log.Info("Pushed TLS offsets for XOR-patch path",
+			"lib", libPath, "version", version,
+			"offsets", fmt.Sprintf("%+v", offsets))
+		return // Only need one successful push.
+	}
 }
 
 // findContainerTLSLibraries scans common library directories in the container's
@@ -471,9 +706,26 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 		}
 
 		if event.Type == 1 { // exec
+			// Only attach to processes whose cgroup was explicitly registered by
+			// the controller via TrackCgroup (i.e. kloak-enabled pods).
+			// sched_process_exec fires for ALL kubepods containers; without this
+			// guard, AttachTLS would attach tc egress to non-kloak pods and
+			// corrupt their outbound TLS (wrong H key → bad GHASH tag).
+			if _, ok := m.cgroupPaths.Load(event.CgroupID); !ok {
+				m.log.V(1).Info("exec in untracked cgroup, skipping", "tgid", event.Tgid, "cgroupID", event.CgroupID)
+				continue
+			}
 			m.log.Info("Detected exec in tracked container, attaching uprobes", "tgid", event.Tgid, "cgroupID", event.CgroupID)
 			if err := m.AttachTLS(int(event.Tgid)); err != nil {
-				m.log.V(1).Info("could not attach TLS uprobes to exec'd process", "tgid", event.Tgid, "err", err)
+				// libssl may not be loaded yet (e.g. Python hasn't imported ssl).
+				// Retry after a delay to catch lazy-loaded libraries.
+				m.log.V(1).Info("first attach attempt failed, scheduling retry", "tgid", event.Tgid, "err", err)
+				go func(tgid uint32) {
+					time.Sleep(2 * time.Second)
+					if err := m.AttachTLS(int(tgid)); err != nil {
+						m.log.V(1).Info("retry attach also failed", "tgid", tgid, "err", err)
+					}
+				}(event.Tgid)
 			}
 		}
 	}
@@ -543,9 +795,14 @@ var debugCounterNames = []string{
 	"kprobe_dport_other", "kprobe_iov_ok", "kretprobe_entry", "kretprobe_ret_small",
 	"kretprobe_read_fail", "kretprobe_read_ok", "dns_parse_entry", "dns_not_response",
 	"dns_no_answers", "dns_qname_fail", "dns_not_watched", "dns_watched_hit",
-	"dns_answer_stored", "phase2_entered",
+	"dns_answer_stored",
 	"resolve_ssl_fd_hit", "resolve_last_vfd_hit", "resolve_fd_scan_hit",
 	"resolve_no_fd", "resolve_no_conn", "resolve_no_dns", "resolve_host_ok",
+	"xor_conn_check", "xor_conn_hit", "xor_prescan_match", "xor_tailcall",
+	"xor_path_entered", "xor_secret_found", "xor_delta_done",
+	"tc_entry", "tc_match", "tc_patched",
+	"tc_skip_reclen", "tc_skip_load", "tc_skip_store", "tc_skip_nontls",
+	"tc_no_tail", "tc_empty", "tc_no_entry",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

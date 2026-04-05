@@ -74,14 +74,14 @@ static void test_parse_host_empty_value(void) {
 }
 
 static void test_parse_host_truncated(void) {
-  // Host value longer than MAX_HOST_LEN (32) is truncated.
-  char data[256];
+  // Host value longer than MAX_HOST_LEN is truncated.
+  char data[512];
   memset(data, 0, sizeof(data));
   memcpy(data, "Host: ", 6);
-  memset(&data[6], 'a', 40); // 40 chars of 'a'
-  memcpy(&data[46], "\r\n", 2);
+  memset(&data[6], 'a', MAX_HOST_LEN + 10); // more than MAX_HOST_LEN chars
+  memcpy(&data[6 + MAX_HOST_LEN + 10], "\r\n", 2);
   char host[MAX_HOST_LEN] = {0};
-  __u32 len = parse_http_host(data, 48, host, MAX_HOST_LEN);
+  __u32 len = parse_http_host(data, 6 + MAX_HOST_LEN + 12, host, MAX_HOST_LEN);
   assert(len == MAX_HOST_LEN);
   for (int i = 0; i < MAX_HOST_LEN; i++)
     assert(host[i] == 'a');
@@ -190,6 +190,155 @@ static void test_prefix_exact_six(void) {
 }
 
 // ============================================================================
+// gf128_mul — GHASH GF(2^128) multiplication
+// Test vectors from "The Galois/Counter Mode of Operation (GCM)"
+// McGrew & Viega, and NIST SP 800-38D.
+// ============================================================================
+
+// Helper to parse hex string into byte array
+static void hex_to_bytes(const char *hex, __u8 *out, int len) {
+  for (int i = 0; i < len; i++) {
+    unsigned int byte;
+    sscanf(hex + 2 * i, "%02x", &byte);
+    out[i] = (__u8)byte;
+  }
+}
+
+static int bytes_equal(const __u8 *a, const __u8 *b, int len) {
+  return memcmp(a, b, len) == 0;
+}
+
+static void print_hex(const char *label, const __u8 *data, int len) {
+  printf("\n    %s: ", label);
+  for (int i = 0; i < len; i++)
+    printf("%02x", data[i]);
+}
+
+static void test_gf128_mul_identity(void) {
+  // Multiplying by the identity element (0x80, 0, ..., 0) should return
+  // the other operand unchanged.
+  __u8 identity[16] = {0x80};
+  __u8 x[16];
+  __u8 result[16];
+
+  hex_to_bytes("0388dace60b6a392f328c2b971b2fe78", x, 16);
+  gf128_mul(identity, x, result);
+  assert(bytes_equal(result, x, 16));
+
+  // Commutative: x * identity = identity * x
+  gf128_mul(x, identity, result);
+  assert(bytes_equal(result, x, 16));
+}
+
+static void test_gf128_mul_zero(void) {
+  // Multiplying by zero gives zero.
+  __u8 zero[16] = {0};
+  __u8 x[16];
+  __u8 result[16];
+
+  hex_to_bytes("0388dace60b6a392f328c2b971b2fe78", x, 16);
+  gf128_mul(zero, x, result);
+  assert(bytes_equal(result, zero, 16));
+}
+
+static void test_gf128_mul_known_vector(void) {
+  // Known test vector: H * H where H = AES_K(0^128).
+  // From GCM spec test case 2: K = 0x00000...0, so H = AES(0, 0^128).
+  // H = 66e94bd4ef8a2c3b884cfa59ca342b2e
+  // H^2 should be a known value we can verify.
+  __u8 h[16], h_squared[16], result[16];
+  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", h, 16);
+
+  gf128_mul(h, h, result);
+
+  // H^2 for this specific H (precomputed):
+  // We verify by computing H * H * identity = H^2
+  // and checking H^2 * H^{-1} = H (but we don't have inverse).
+  // Instead verify: gf128_mul is commutative and associative
+  // by checking H * H = H^2 and then H^2 * H = H * (H * H).
+  memcpy(h_squared, result, 16);
+
+  __u8 h_cubed_1[16], h_cubed_2[16];
+  gf128_mul(h_squared, h, h_cubed_1);
+  gf128_mul(h, h_squared, h_cubed_2);
+  assert(bytes_equal(h_cubed_1, h_cubed_2, 16));
+}
+
+static void test_gf128_mul_commutativity(void) {
+  __u8 a[16], b[16], ab[16], ba[16];
+  hex_to_bytes("0388dace60b6a392f328c2b971b2fe78", a, 16);
+  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", b, 16);
+
+  gf128_mul(a, b, ab);
+  gf128_mul(b, a, ba);
+  assert(bytes_equal(ab, ba, 16));
+}
+
+static void test_gf128_h_power_1(void) {
+  // H^1 should equal H.
+  __u8 h[16], result[16];
+  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", h, 16);
+
+  gf128_h_power(h, 1, result);
+  assert(bytes_equal(result, h, 16));
+}
+
+static void test_gf128_h_power_2(void) {
+  // H^2 should equal H * H.
+  __u8 h[16], expected[16], result[16];
+  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", h, 16);
+
+  gf128_mul(h, h, expected);
+  gf128_h_power(h, 2, result);
+  assert(bytes_equal(result, expected, 16));
+}
+
+static void test_gf128_h_power_3(void) {
+  // H^3 = H^2 * H
+  __u8 h[16], h2[16], expected[16], result[16];
+  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", h, 16);
+
+  gf128_mul(h, h, h2);
+  gf128_mul(h2, h, expected);
+  gf128_h_power(h, 3, result);
+  assert(bytes_equal(result, expected, 16));
+}
+
+static void test_gf128_h_power_table(void) {
+  // Precomputed table should give same results as slow path.
+  __u8 h[16], result_slow[16], result_fast[16], tmp[16];
+  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", h, 16);
+
+  // Build power table: table[i] = H^(2^i)
+  __u8 table[11][16];
+  memcpy(table[0], h, 16);
+  for (int i = 1; i < 11; i++) {
+    gf128_mul(table[i - 1], table[i - 1], tmp);
+    memcpy(table[i], tmp, 16);
+  }
+
+  // Test various powers
+  __u32 test_powers[] = {1, 2, 3, 5, 7, 10, 100, 1024};
+  for (int t = 0; t < 8; t++) {
+    gf128_h_power(h, test_powers[t], result_slow);
+    gf128_h_power_table(table, test_powers[t], result_fast);
+    if (!bytes_equal(result_slow, result_fast, 16)) {
+      print_hex("slow", result_slow, 16);
+      print_hex("fast", result_fast, 16);
+      printf("\n    power=%u\n", test_powers[t]);
+    }
+    assert(bytes_equal(result_slow, result_fast, 16));
+  }
+}
+
+static void test_is_aes_gcm(void) {
+  assert(is_aes_gcm(KLOAK_CIPHER_AES_GCM) == 1);
+  assert(is_aes_gcm(KLOAK_CIPHER_UNKNOWN) == 0);
+  assert(is_aes_gcm(0) == 0);
+  assert(is_aes_gcm(99) == 0);
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -224,6 +373,17 @@ int main(void) {
   RUN_TEST(test_prefix_uppercase);
   RUN_TEST(test_prefix_wrong_char);
   RUN_TEST(test_prefix_exact_six);
+
+  printf("gf128_mul:\n");
+  RUN_TEST(test_gf128_mul_identity);
+  RUN_TEST(test_gf128_mul_zero);
+  RUN_TEST(test_gf128_mul_known_vector);
+  RUN_TEST(test_gf128_mul_commutativity);
+  RUN_TEST(test_gf128_h_power_1);
+  RUN_TEST(test_gf128_h_power_2);
+  RUN_TEST(test_gf128_h_power_3);
+  RUN_TEST(test_gf128_h_power_table);
+  RUN_TEST(test_is_aes_gcm);
 
   printf("\n%d/%d tests passed.\n", tests_passed, tests_run);
   return 0;

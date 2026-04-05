@@ -1,0 +1,36 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tls-echo
+  namespace: kloak-demo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: tls-echo
+  template:
+    metadata:
+      labels:
+        app: tls-echo
+    spec:
+      containers:
+        - name: tls-echo
+          image: kloak-tls-echo:latest
+          imagePullPolicy: Never
+          env:
+            - name: TLS_MIN_VERSION
+              value: "1.2"
+          ports:
+            - containerPort: 8443
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tls-echo
+  namespace: kloak-demo
+spec:
+  selector:
+    app: tls-echo
+  ports:
+    - port: 443
+      targetPort: 8443
