@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os/exec"
 	"strings"
 	"testing"
@@ -354,6 +355,24 @@ func scrapeMetrics(t *testing.T, baseURL string) string {
 	}
 	if resp.StatusCode != 200 {
 		t.Fatalf("metrics endpoint returned %d: %s", resp.StatusCode, string(body))
+	}
+	return string(body)
+}
+
+// queryClickHouse runs a SQL query against the ClickHouse HTTP interface and returns the response body.
+func queryClickHouse(t *testing.T, baseURL, query string) string {
+	t.Helper()
+	resp, err := http.Get(baseURL + "/?query=" + url.QueryEscape(query))
+	if err != nil {
+		t.Fatalf("clickhouse query failed: %v", err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("failed to read clickhouse response: %v", err)
+	}
+	if resp.StatusCode != 200 {
+		t.Fatalf("clickhouse returned %d: %s", resp.StatusCode, string(body))
 	}
 	return string(body)
 }

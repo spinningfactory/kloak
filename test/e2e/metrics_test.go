@@ -95,3 +95,72 @@ func TestMetrics_OTLPPush(t *testing.T) {
 
 	t.Log("OTLP push verified: collector received kloak_ metrics")
 }
+
+func TestMetrics_ClickHouseExport(t *testing.T) {
+	// Create a secret to generate metrics that flow through the pipeline
+	secretData := map[string][]byte{
+		"db-password": []byte("clickhouse-test-secret-val"),
+	}
+	createEnabledSecret(t, "ch-test-secret", secretData, nil)
+	assertShadowSecret(t, "ch-test-secret", secretData)
+
+	// Wait for: reconciler -> OTel SDK -> PeriodicReader (10s) -> Collector -> batch (5s) -> ClickHouse
+	t.Log("Waiting for metrics to flow through pipeline to ClickHouse...")
+	time.Sleep(25 * time.Second)
+
+	// Port-forward to ClickHouse HTTP interface
+	chURL, cleanup := portForwardPod(t, kloakNamespace, "app=clickhouse", 18123, 8123)
+	defer cleanup()
+
+	// Verify the otel database and tables were created by the exporter
+	tables := queryClickHouse(t, chURL, "SHOW TABLES FROM otel")
+	t.Logf("ClickHouse otel tables:\n%s", tables)
+
+	if !strings.Contains(tables, "otel_metrics_sum") {
+		t.Fatal("otel_metrics_sum table not found -- exporter didn't create schema")
+	}
+	if !strings.Contains(tables, "otel_metrics_gauge") {
+		t.Fatal("otel_metrics_gauge table not found")
+	}
+
+	// Query counter metrics (Sum type) -- these should have kloak_ data
+	sumMetrics := queryClickHouse(t, chURL,
+		"SELECT DISTINCT MetricName FROM otel.otel_metrics_sum WHERE MetricName LIKE 'kloak_%' ORDER BY MetricName")
+	t.Logf("ClickHouse kloak sum metrics:\n%s", sumMetrics)
+
+	expectedSumMetrics := []string{
+		"kloak_secret_sync_total",
+		"kloak_secret_reconcile_total",
+	}
+	for _, m := range expectedSumMetrics {
+		if !strings.Contains(sumMetrics, m) {
+			t.Errorf("expected metric %q not found in ClickHouse otel_metrics_sum", m)
+		}
+	}
+
+	// Query gauge metrics -- eBPF debug counters and BPF map sizes
+	gaugeMetrics := queryClickHouse(t, chURL,
+		"SELECT DISTINCT MetricName FROM otel.otel_metrics_gauge WHERE MetricName LIKE 'kloak_%' ORDER BY MetricName")
+	t.Logf("ClickHouse kloak gauge metrics:\n%s", gaugeMetrics)
+
+	expectedGaugeMetrics := []string{
+		"kloak_ebpf_debug_counter",
+		"kloak_bpf_map_entries",
+	}
+	for _, m := range expectedGaugeMetrics {
+		if !strings.Contains(gaugeMetrics, m) {
+			t.Errorf("expected metric %q not found in ClickHouse otel_metrics_gauge", m)
+		}
+	}
+
+	// Verify actual data points exist with values
+	count := queryClickHouse(t, chURL,
+		"SELECT count() FROM otel.otel_metrics_sum WHERE MetricName LIKE 'kloak_%'")
+	t.Logf("Total kloak sum data points in ClickHouse: %s", strings.TrimSpace(count))
+
+	if strings.TrimSpace(count) == "0" {
+		t.Error("no kloak_ data points found in ClickHouse")
+	}
+
+	t.Log("ClickHouse export verified: kloak_ metrics stored in otel database")
+}

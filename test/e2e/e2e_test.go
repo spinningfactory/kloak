@@ -66,10 +66,29 @@ func TestMain(m *testing.M) {
 		os.Exit(1)
 	}
 
-	// Create namespace and deploy OTel Collector for metrics e2e testing
+	// Create namespace and deploy infra (ClickHouse must be ready before the collector)
 	if _, err := kubectl("create", "namespace", kloakNamespace, "--dry-run=client", "-o", "yaml"); err == nil {
 		_, _ = kubectl("create", "namespace", kloakNamespace)
 	}
+	clickhouseManifest := filepath.Join(repoRoot, "test", "e2e", "clickhouse.yaml")
+	if _, err := kubectl("apply", "-f", clickhouseManifest, "-n", kloakNamespace); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to deploy clickhouse: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Wait for ClickHouse before deploying the collector (collector connects on startup)
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), defaultTimeout)
+		defer cancel()
+		fmt.Println("Waiting for clickhouse Deployment...")
+		if err := waitForDeploymentReady(ctx, kloakNamespace, "clickhouse"); err != nil {
+			fmt.Fprintf(os.Stderr, "clickhouse not ready: %v\n", err)
+			dumpLogs()
+			teardown()
+			os.Exit(1)
+		}
+	}
+
 	collectorManifest := filepath.Join(repoRoot, "test", "e2e", "otel-collector.yaml")
 	if _, err := kubectl("apply", "-f", collectorManifest, "-n", kloakNamespace); err != nil {
 		fmt.Fprintf(os.Stderr, "failed to deploy otel-collector: %v\n", err)

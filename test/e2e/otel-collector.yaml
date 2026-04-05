@@ -9,14 +9,24 @@ data:
         protocols:
           http:
             endpoint: "0.0.0.0:4318"
+    processors:
+      batch:
+        send_batch_size: 100
+        timeout: 5s
     exporters:
       debug:
         verbosity: detailed
+      clickhouse:
+        endpoint: tcp://clickhouse:9000
+        database: otel
+        create_schema: true
+        ttl: 72h
     service:
       pipelines:
         metrics:
           receivers: [otlp]
-          exporters: [debug]
+          processors: [batch]
+          exporters: [debug, clickhouse]
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -36,7 +46,7 @@ spec:
     spec:
       containers:
         - name: collector
-          image: otel/opentelemetry-collector:0.115.0
+          image: otel/opentelemetry-collector-contrib:0.114.0
           args: ["--config=/etc/otel/config.yaml"]
           ports:
             - containerPort: 4318
@@ -50,7 +60,7 @@ spec:
               memory: 64Mi
             limits:
               cpu: 200m
-              memory: 128Mi
+              memory: 256Mi
       volumes:
         - name: config
           configMap:
