@@ -22,8 +22,11 @@ func TestLoadObjects(t *testing.T) {
 	objs := loadTestObjects(t)
 
 	// Verify all expected programs were loaded
-	if objs.BpfPhase2Rewrite == nil {
-		t.Error("BpfPhase2Rewrite program not loaded")
+	if objs.BpfXorPath == nil {
+		t.Error("BpfXorPath program not loaded")
+	}
+	if objs.BpfH_extract == nil {
+		t.Error("BpfH_extract program not loaded")
 	}
 	if objs.BpfUprobeGoTlsWrite == nil {
 		t.Error("BpfUprobeGoTlsWrite program not loaded")
@@ -52,15 +55,15 @@ func TestTailCallWiring(t *testing.T) {
 	objs := loadTestObjects(t)
 
 	// Wire the tail call like NewTLSUprobeManager does
-	phase2FD := uint32(objs.BpfPhase2Rewrite.FD())
-	if err := objs.ProgArray.Update(uint32(0), &phase2FD, 0); err != nil {
+	xorFD := uint32(objs.BpfXorPath.FD())
+	if err := objs.ProgArray.Update(uint32(1), &xorFD, 0); err != nil {
 		t.Fatalf("failed to wire tail call: %v", err)
 	}
 
 	// Verify the entry exists (prog_array remaps FDs internally,
 	// so we just check lookup succeeds, not the exact value)
 	var fd uint32
-	if err := objs.ProgArray.Lookup(uint32(0), &fd); err != nil {
+	if err := objs.ProgArray.Lookup(uint32(1), &fd); err != nil {
 		t.Fatalf("failed to read tail call entry: %v", err)
 	}
 }

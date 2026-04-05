@@ -47,8 +47,8 @@
 // Chunk stride for bpf_loop scanning: overlap of SECRET_KEY_LEN-1 bytes
 // ensures tokens straddling chunk boundaries are always detected.
 #define CHUNK_STRIDE (MAX_DATA_SIZE - (SECRET_KEY_LEN - 1)) // 249
-// Max host length for matching (compared as 4 x uint64, no loop needed)
-#define MAX_HOST_LEN 32
+// Max host length for matching
+#define MAX_HOST_LEN 64
 // Maximum DNS packet size we can parse in BPF
 #define MAX_DNS_PKT 512
 // Maximum number of DNS answer records to process
@@ -177,6 +177,9 @@ enum {
   DBG_TC_ENTRY,               // tc egress program entered (any packet)
   DBG_TC_MATCH,               // tc_pending lookup matched
   DBG_TC_PATCHED,             // tc XOR patch applied to skb
+  DBG_KPROBE_BRIDGE,          // kprobe successfully bridged xor_pending → tc_pending
+  DBG_KPROBE_BRIDGE_NO_ENTRY, // kprobe found no xor_pending entry
+  DBG_KPROBE_BRIDGE_H_FAIL,   // kprobe H extraction failed (no tc_pending written)
   DBG_MAX,
 };
 
@@ -422,6 +425,7 @@ struct xor_pending_val {
   struct xor_patch patches[XOR_MAX_PATCHES];
   __u8  active;
   __u8  _pad[3];
+  __u32 plaintext_len;      // SSL_write data length (for TLS version detection in tc)
 };
 
 // Per-thread pending XOR patches, keyed by pid_tgid.
@@ -469,6 +473,7 @@ struct tc_pending_val {
   struct xor_patch patches[XOR_MAX_PATCHES];
   __u8  active;
   __u8  _pad[3];
+  __u32 plaintext_len;      // SSL_write data length (for TLS version detection)
 };
 
 // Holds all large structs and buffers that would otherwise exceed the 512-byte
@@ -1069,10 +1074,29 @@ int tp_enter_close(struct trace_event_raw_sys_enter *ctx) {
   return 0;
 }
 
+// Offsets for reading fd from SSL struct's BIO (stable across OpenSSL 3.x).
+// SSL_CONNECTION.wbio → BIO*, BIO.num → int fd
+// Verified via pahole: identical on aarch64 and x86_64, OpenSSL 3.0-3.5.
+#define SSL_WBIO_OFFSET 88  // offsetof(ssl_connection_st, wbio) for 3.2+
+#define BIO_NUM_OFFSET  56  // offsetof(bio_st, num)
+
+// Read the socket fd directly from the SSL struct's write BIO.
+// Returns the fd, or 0 if the read fails.
+static __always_inline __u32 ssl_read_fd(__u64 ssl_ptr) {
+  if (!ssl_ptr) return 0;
+  __u64 wbio = 0;
+  if (bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + SSL_WBIO_OFFSET)) < 0 || !wbio)
+    return 0;
+  __u32 fd = 0;
+  if (bpf_probe_read_user(&fd, 4, (void *)(wbio + BIO_NUM_OFFSET)) < 0)
+    return 0;
+  return fd;
+}
+
 // =============================================================================
 // Resolve host for the current SSL/TLS connection using DNS chain.
 //
-// Chain: ssl_fd_map (cache) -> last_verified_fd -> conn_ip_map -> dns_ip_map
+// Chain: ssl_fd_map (cache) -> BIO fd read -> last_verified_fd -> conn_ip_map -> dns_ip_map
 // =============================================================================
 static __always_inline void resolve_host(struct scratch_buf *scratch_data,
                                          __u64 ssl_ptr) {
@@ -1101,7 +1125,26 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     }
   }
 
-  // Path 2: last_verified_fd (fast path if connect happened after DNS)
+  // Path 2: Read fd directly from the SSL struct's BIO.
+  // This covers new connections where ssl_fd_map hasn't been populated yet
+  // (e.g., raw TLS sockets, first SSL_write on a fresh connection).
+  if (!found && ssl_ptr != 0) {
+    __u32 bio_fd = ssl_read_fd(ssl_ptr);
+    if (bio_fd > 0) {
+      fd = bio_fd;
+      found = 1;
+      // Cache it in ssl_fd_map for subsequent SSL_writes on same connection.
+      struct ssl_fd_key sfk;
+      __builtin_memset(&sfk, 0, sizeof(sfk));
+      sfk.tgid = tgid;
+      sfk.ssl_ptr = ssl_ptr;
+      struct ssl_fd_val new_sfv = {.fd = fd};
+      bpf_map_update_elem(&ssl_fd_map, &sfk, &new_sfv, BPF_ANY);
+      dbg_inc(DBG_RESOLVE_SSL_FD_HIT);
+    }
+  }
+
+  // Path 3: last_verified_fd (fast path if connect happened after DNS)
   if (!found) {
     __u32 *vfd = bpf_map_lookup_elem(&last_verified_fd, &tgid);
     if (vfd) {
@@ -1321,6 +1364,7 @@ int bpf_xor_path(void *ctx) {
     wi->staged_pending.ssl_ptr = sd->ssl_ptr;
     wi->staged_pending.tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
     wi->staged_pending.active = 1;
+    wi->staged_pending.plaintext_len = sd->total_data_len;
   }
 
   dbg_inc(DBG_XOR_PATH_ENTERED);
@@ -1407,7 +1451,7 @@ finalize:;
 
   // ssl_ptr, tgid, active already set during mi=0 initialization.
   bpf_map_update_elem(&xor_pending, &pid_tgid, &wf->staged_pending, BPF_ANY);
-  bpf_printk("kloak [1-UPROBE] pid=%u patches=%u", (__u32)pid_tgid, wf->staged_pending.patch_count);
+  // bpf_printk("kloak [1-UPROBE] pid=%u patches=%u", (__u32)pid_tgid, wf->staged_pending.patch_count);
 
   dbg_inc(DBG_XOR_DELTA_DONE);
   return 0;
@@ -1650,6 +1694,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   w->staged_tc.tgid = (__u32)(pid_tgid >> 32);
   w->staged_tc.ssl_ptr = pending->ssl_ptr;
   w->staged_tc.active = 1;
+  w->staged_tc.plaintext_len = pending->plaintext_len;
   w->staged_tc.patch_count = pending->patch_count;
   if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
     w->staged_tc.patch_count = XOR_MAX_PATCHES;
@@ -1666,8 +1711,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   bpf_map_delete_elem(&xor_pending, &pid_tgid);
 
   // Extract H from the SSL struct. At tcp_sendmsg time, the TLS handshake
-  // has completed and the encryption context (with H) is available — unlike
-  // at SSL_write entry where the handshake may not have happened yet.
+  // has completed and the encryption context (with H) is available.
   struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &zero);
   if (!offsets || offsets->ssl_to_wrl == 0)
     return 0;
@@ -1887,9 +1931,10 @@ int tp_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
 
   __u32 tgid = ctx->pid; // pid field is the TGID in this context
 
-  // Ensure the new process is in tracked_tgids for DNS/connect tracking
+  // Ensure the new process is tracked for DNS/connect and SSL_write filtering.
   __u8 val = 1;
   bpf_map_update_elem(&tracked_tgids, &tgid, &val, BPF_ANY);
+  bpf_map_update_elem(&tracked_cgroups, &cgroup_id, &val, BPF_ANY);
 
   // Notify userspace to attach uprobes to the new binary
   struct kloak_proc_event *evt = bpf_ringbuf_reserve(&proc_events, sizeof(*evt), 0);
@@ -1981,8 +2026,21 @@ int tc_egress_patch(struct __sk_buff *skb) {
     return 0 /* TC_ACT_OK */;
 
   // Save header fields to locals before helper calls invalidate direct pointers.
-  __u32 daddr = ip->daddr;
   __u16 sport = tcp->source;
+
+  // Read the original (pre-DNAT) destination IP from the socket, not the packet.
+  // For cluster services, iptables/kube-proxy DNATs the packet's dst_ip to the
+  // pod IP, but the socket's skc_daddr still holds the service ClusterIP —
+  // matching what the kprobe stored in tc_pending.
+  __u32 daddr = ip->daddr; // fallback: packet dst_ip
+  struct bpf_sock *bsk = skb->sk;
+  if (bsk) {
+    bsk = bpf_sk_fullsock(bsk);
+    if (bsk) {
+      // bpf_sock.dst_ip4 is the original connect() destination
+      daddr = bsk->dst_ip4;
+    }
+  }
 
   // Build key from destination IP + source port (per-connection isolation).
   struct tc_dest_key key = {};
@@ -2001,6 +2059,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
   __u8 tls_hdr[5];
   if (bpf_skb_load_bytes(skb, payload_off, tls_hdr, 5) < 0)
     return 0 /* TC_ACT_OK */;
+  bpf_printk("kloak tc tls_hdr=%x ver=%x%x plen=%u", tls_hdr[0], tls_hdr[1], tls_hdr[2], payload_len);
   // Validate TLS application_data record:
   //   byte 0: content type must be 0x17
   //   bytes 1-2: version must be 0x0301..0x0303 (TLS 1.0-1.3)
@@ -2042,7 +2101,15 @@ int tc_egress_patch(struct __sk_buff *skb) {
 
   dbg_inc(DBG_TC_MATCH);
 
-  __u32 nonce_len = 8; // TLS 1.2
+  // Detect TLS version from record_len vs plaintext_len:
+  //   TLS 1.2: record_len = plaintext_len + 8 (nonce) + 16 (tag) = pt + 24
+  //   TLS 1.3: record_len = plaintext_len + 1 (content_type) + 16 (tag) = pt + 17
+  __u32 pt_len = pending->plaintext_len;
+  __u32 nonce_len;
+  if (pt_len > 0 && record_len == pt_len + 17)
+    nonce_len = 0;  // TLS 1.3
+  else
+    nonce_len = 8;  // TLS 1.2 (default)
   __u32 ct_len = record_len - 16 - nonce_len;
 
   // Copy ALL data from pending to ghash_scratch staging area.

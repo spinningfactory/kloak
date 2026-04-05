@@ -9,10 +9,10 @@ import (
 	"net"
 	"os"
 	"path/filepath"
-	"syscall"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
@@ -52,7 +52,7 @@ type secretValue struct {
 	Len         uint32
 	RealSecret  [128]byte
 	HostLen     uint32
-	AllowedHost [32]byte
+	AllowedHost [64]byte
 	PrefixLen   uint32
 	FullPrefix  [42]byte // SECRET_PREFIX_MAX
 	_           [2]byte  // padding to match C struct alignment
@@ -60,7 +60,7 @@ type secretValue struct {
 
 // watchedHostKey matches C struct watched_host_key
 type watchedHostKey struct {
-	Host [32]byte
+	Host [64]byte
 }
 
 // Generate eBPF bindings. The KLOAK_TARGET_ARCH env var (set by Dockerfile or
@@ -84,10 +84,18 @@ type TLSUprobeManager struct {
 	// Populated by TrackCgroup.
 	cgroupPaths sync.Map // uint64 -> string
 	// tcAttached tracks network namespace inodes where tc egress is already
-	// attached, preventing duplicate attachment when new processes exec in the
-	// same container.
-	tcAttached sync.Map // uint64 (netns inode) -> bool
+	// attached. Stores an open fd to the netns — keeping it open prevents the
+	// kernel from freeing the inode, so a new pod's netns always gets a
+	// different inode. This avoids false "already attached" dedup hits from
+	// inode reuse after pod deletion. The fd is closed in UntrackCgroup.
+	tcAttached sync.Map // uint64 (netns inode) -> *tcAttachEntry
+	// cgroupToNetns maps cgroup ID → netns inode for cleanup on UntrackCgroup.
+	cgroupToNetns sync.Map // uint64 (cgroup ID) -> uint64 (netns inode)
+}
 
+// tcAttachEntry holds an open fd to a network namespace to prevent inode reuse.
+type tcAttachEntry struct {
+	netnsFd *os.File // kept open to pin the inode
 }
 
 // setupCgroupAncestor finds the kubepods cgroup directory and stores its fd
@@ -301,34 +309,42 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	return nil
 }
 
-// attachTCEgress attaches the tc egress BPF program to eth0 inside a
-// container's network namespace. The program patches TLS ciphertext in
-// kernel skb memory, ensuring the encrypted real secret never exists in
-// user-space memory.
+// attachTCEgress attaches the tc egress BPF program to eth0 and lo inside a
+// container's network namespace. eth0 covers external traffic; lo covers
+// intra-pod traffic (e.g. sidecar → sidecar via a ClusterIP Service that
+// DNATs back to the same pod, routing through loopback).
 //
 // The controller enters the container's netns via /proc/<pid>/ns/net
 // (requires hostPID: true), attaches tc, then returns to its own netns.
 func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	// Check if this network namespace already has tc attached by reading
-	// the netns inode. Multiple processes in the same container share a netns.
+	// the netns inode. We keep an open fd to the netns file — this prevents
+	// the kernel from freeing the inode, so a new pod's netns always gets a
+	// different inode (no false dedup from inode reuse).
 	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
 	if fi, err := os.Stat(netnsPath); err == nil {
 		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
-			if _, loaded := m.tcAttached.LoadOrStore(stat.Ino, true); loaded {
+			if _, loaded := m.tcAttached.Load(stat.Ino); loaded {
 				m.log.V(1).Info("tc egress already attached for this netns", "pid", pid, "netns_ino", stat.Ino)
 				return nil
 			}
 		}
 	}
+
+	// Open the netns fd for two purposes:
+	// 1. setns to enter the container's network namespace
+	// 2. Keep it open (stored in tcAttached) to pin the inode
 	containerNS, err := os.Open(netnsPath)
 	if err != nil {
 		return fmt.Errorf("opening container netns %s: %w", netnsPath, err)
 	}
-	defer func() { _ = containerNS.Close() }()
+	// NOTE: containerNS is NOT closed here — it's stored in tcAttachEntry
+	// to pin the netns inode. Closed in UntrackCgroup when the pod is deleted.
 
 	// Save our current network namespace.
 	selfNS, err := os.Open("/proc/self/ns/net")
 	if err != nil {
+		_ = containerNS.Close()
 		return fmt.Errorf("opening self netns: %w", err)
 	}
 	defer func() { _ = selfNS.Close() }()
@@ -339,6 +355,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 
 	// Switch to the container's network namespace.
 	if err := unix.Setns(int(containerNS.Fd()), unix.CLONE_NEWNET); err != nil {
+		_ = containerNS.Close()
 		return fmt.Errorf("setns to container netns: %w", err)
 	}
 
@@ -349,22 +366,39 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 		}
 	}()
 
-	// Find eth0 inside the container's network namespace.
-	iface, err := net.InterfaceByName("eth0")
-	if err != nil {
-		return fmt.Errorf("finding eth0 in container netns: %w", err)
+	// Attach tc egress to both eth0 (external) and lo (intra-pod loopback).
+	for _, ifName := range []string{"eth0", "lo"} {
+		iface, err := net.InterfaceByName(ifName)
+		if err != nil {
+			// lo should always exist; eth0 might not in some setups.
+			if ifName == "lo" {
+				_ = containerNS.Close()
+				return fmt.Errorf("finding %s in container netns: %w", ifName, err)
+			}
+			m.log.V(1).Info("interface not found, skipping", "pid", pid, "interface", ifName)
+			continue
+		}
+
+		tcLink, err := link.AttachTCX(link.TCXOptions{
+			Interface: iface.Index,
+			Program:   m.objs.TcEgressPatch,
+			Attach:    ebpf.AttachTCXEgress,
+		})
+		if err != nil {
+			_ = containerNS.Close()
+			return fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", ifName, iface.Index, pid, err)
+		}
+		m.links = append(m.links, tcLink)
+		m.log.Info("Attached tc egress to container", "pid", pid, "interface", ifName, "ifindex", iface.Index)
 	}
 
-	tcLink, err := link.AttachTCX(link.TCXOptions{
-		Interface: iface.Index,
-		Program:   m.objs.TcEgressPatch,
-		Attach:    ebpf.AttachTCXEgress,
-	})
-	if err != nil {
-		return fmt.Errorf("attaching tc egress to eth0 (ifindex %d) in pid %d netns: %w", iface.Index, pid, err)
+	// Store the open netns fd keyed by inode. The open fd pins the inode —
+	// the kernel won't reuse it until we close the fd in UntrackCgroup.
+	if fi, err := os.Stat(netnsPath); err == nil {
+		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
+			m.tcAttached.Store(stat.Ino, &tcAttachEntry{netnsFd: containerNS})
+		}
 	}
-	m.links = append(m.links, tcLink)
-	m.log.Info("Attached tc egress to container", "pid", pid, "interface", "eth0", "ifindex", iface.Index)
 	return nil
 }
 
@@ -391,9 +425,52 @@ func (m *TLSUprobeManager) TrackCgroup(cgroupID uint64, cgroupPath string) error
 	return nil
 }
 
-// UntrackCgroup removes a container cgroup ID from the tracked_cgroups map.
+// RecordCgroupNetns records the cgroup → netns inode mapping for a container
+// process. This enables cleanup of the tcAttached entry (which pins the netns
+// fd) when the cgroup is untracked on pod deletion.
+func (m *TLSUprobeManager) RecordCgroupNetns(cgroupID uint64, pid int) {
+	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+	fi, err := os.Stat(netnsPath)
+	if err != nil {
+		return
+	}
+	stat, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return
+	}
+	m.cgroupToNetns.Store(cgroupID, stat.Ino)
+}
+
+// UntrackCgroup removes a container cgroup ID from the tracked_cgroups map
+// and cleans up the associated tc attachment state. When the last cgroup
+// referencing a netns is untracked, the pinned netns fd is closed, allowing
+// the kernel to free the inode for reuse.
 func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 	m.cgroupPaths.Delete(cgroupID)
+
+	// Clean up tcAttached: close the pinned netns fd so the kernel can
+	// reclaim the inode. Check if any other cgroup still maps to the same
+	// netns before closing (multi-container pods share a netns).
+	if inoVal, ok := m.cgroupToNetns.LoadAndDelete(cgroupID); ok {
+		ino := inoVal.(uint64)
+		// Check if any other cgroup still references this netns.
+		otherRefs := false
+		m.cgroupToNetns.Range(func(_, v any) bool {
+			if v.(uint64) == ino {
+				otherRefs = true
+				return false // stop iteration
+			}
+			return true
+		})
+		if !otherRefs {
+			if entry, ok := m.tcAttached.LoadAndDelete(ino); ok {
+				if e, ok := entry.(*tcAttachEntry); ok && e.netnsFd != nil {
+					_ = e.netnsFd.Close()
+				}
+			}
+		}
+	}
+
 	return m.objs.TrackedCgroups.Delete(cgroupID)
 }
 
@@ -631,7 +708,15 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 		if event.Type == 1 { // exec
 			m.log.Info("Detected exec in tracked container, attaching uprobes", "tgid", event.Tgid, "cgroupID", event.CgroupID)
 			if err := m.AttachTLS(int(event.Tgid)); err != nil {
-				m.log.V(1).Info("could not attach TLS uprobes to exec'd process", "tgid", event.Tgid, "err", err)
+				// libssl may not be loaded yet (e.g. Python hasn't imported ssl).
+				// Retry after a delay to catch lazy-loaded libraries.
+				m.log.V(1).Info("first attach attempt failed, scheduling retry", "tgid", event.Tgid, "err", err)
+				go func(tgid uint32) {
+					time.Sleep(2 * time.Second)
+					if err := m.AttachTLS(int(tgid)); err != nil {
+						m.log.V(1).Info("retry attach also failed", "tgid", tgid, "err", err)
+					}
+				}(event.Tgid)
 			}
 		}
 	}

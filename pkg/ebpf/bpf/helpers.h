@@ -15,7 +15,7 @@ typedef uint32_t __u32;
 typedef uint64_t __u64;
 #define HELPER_INLINE static inline
 #ifndef MAX_HOST_LEN
-#define MAX_HOST_LEN 32
+#define MAX_HOST_LEN 64
 #endif
 #ifndef SECRET_MAX_LEN
 #define SECRET_MAX_LEN 128
@@ -64,19 +64,16 @@ HELPER_INLINE __u32 parse_http_host(const char *data, __u32 data_len,
   return host_len;
 }
 
-// Compare two host buffers (each MAX_HOST_LEN = 32 bytes) as 4x uint64.
-// Returns 1 if all 32 bytes match, 0 otherwise.
+// Compare two host buffers (each MAX_HOST_LEN bytes) as uint64 chunks.
+// Returns 1 if all bytes match, 0 otherwise.
 HELPER_INLINE int hosts_match(const char *a, const char *b) {
-  __u64 a0, a1, a2, a3, b0, b1, b2, b3;
-  __builtin_memcpy(&a0, a, 8);
-  __builtin_memcpy(&a1, a + 8, 8);
-  __builtin_memcpy(&a2, a + 16, 8);
-  __builtin_memcpy(&a3, a + 24, 8);
-  __builtin_memcpy(&b0, b, 8);
-  __builtin_memcpy(&b1, b + 8, 8);
-  __builtin_memcpy(&b2, b + 16, 8);
-  __builtin_memcpy(&b3, b + 24, 8);
-  return (a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3) ? 1 : 0;
+  for (__u32 i = 0; i < MAX_HOST_LEN; i += 8) {
+    __u64 va, vb;
+    __builtin_memcpy(&va, a + i, 8);
+    __builtin_memcpy(&vb, b + i, 8);
+    if (va != vb) return 0;
+  }
+  return 1;
 }
 
 // Clamp a secret value length to [1, SECRET_MAX_LEN] using bitwise arithmetic.

@@ -74,14 +74,14 @@ static void test_parse_host_empty_value(void) {
 }
 
 static void test_parse_host_truncated(void) {
-  // Host value longer than MAX_HOST_LEN (32) is truncated.
-  char data[256];
+  // Host value longer than MAX_HOST_LEN is truncated.
+  char data[512];
   memset(data, 0, sizeof(data));
   memcpy(data, "Host: ", 6);
-  memset(&data[6], 'a', 40); // 40 chars of 'a'
-  memcpy(&data[46], "\r\n", 2);
+  memset(&data[6], 'a', MAX_HOST_LEN + 10); // more than MAX_HOST_LEN chars
+  memcpy(&data[6 + MAX_HOST_LEN + 10], "\r\n", 2);
   char host[MAX_HOST_LEN] = {0};
-  __u32 len = parse_http_host(data, 48, host, MAX_HOST_LEN);
+  __u32 len = parse_http_host(data, 6 + MAX_HOST_LEN + 12, host, MAX_HOST_LEN);
   assert(len == MAX_HOST_LEN);
   for (int i = 0; i < MAX_HOST_LEN; i++)
     assert(host[i] == 'a');
