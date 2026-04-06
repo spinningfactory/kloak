@@ -89,7 +89,6 @@ var ebpfTests = []ebpfRewriteTest{
 		demoDir:        "demo-go",
 		deploymentName: "demo-go",
 		appLabel:       "app=demo-go",
-		skip:           "Go crypto/tls H extraction not yet implemented",
 	},
 	{
 		name:           "go-boringssl",
