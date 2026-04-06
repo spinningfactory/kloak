@@ -552,14 +552,27 @@ struct {
 // Userspace-configured struct offsets for extracting TLS key material.
 // Populated once per library at uprobe attach time after the controller
 // detects the OpenSSL version. Supports a 4-level pointer chain:
-//   SSL* + off1 → wrl* + off2 → enc_ctx* + off3 → algctx* + off4 → H (16 bytes)
-// For OpenSSL 3.2+, the record layer refactoring added an extra hop.
+//   OpenSSL 3.2+: SSL* → wrl* → enc_ctx* → algctx* → H (4 pointer derefs)
+//   BoringSSL:    SSL* → s3* → aead_write_ctx* → H (2 derefs + direct read)
+// Layout must match Go's TLSOffsets struct exactly.
+#define CHAIN_OPENSSL_4HOP 0
+#define CHAIN_BORINGSSL    1
+
 struct tls_offsets {
+  __u32 chain_type;         // 0=OpenSSL 4-hop, 1=BoringSSL
+
+  // OpenSSL 3.2+ (4-hop chain)
   __u32 ssl_to_wrl;         // SSL* + off → OSSL_RECORD_LAYER* (pointer deref)
   __u32 wrl_to_enc_ctx;     // wrl* + off → EVP_CIPHER_CTX* (pointer deref)
   __u32 enc_ctx_to_algctx;  // enc_ctx* + off → algctx/PROV_GCM_CTX* (pointer deref)
   __u32 algctx_to_h;        // algctx* + off → H (16 bytes, direct read)
   __u32 ssl_to_version;     // SSL_CONNECTION* + off → int version (0xFFFFFFFF=unknown)
+
+  // BoringSSL (2-deref chain)
+  __u32 ssl_to_s3;          // SSL* + off → SSL3_STATE* (pointer deref)
+  __u32 s3_to_aead;         // s3* + off → SSLAEADContext* (pointer deref)
+  __u32 aead_to_h;          // aead_ctx* + off → H (16 bytes, direct read)
+
   // ssl_to_wbio is the offset from the SSL/SSL_CONNECTION pointer to its
   // `wbio` BIO* field. Used by ssl_read_fd() to walk SSL → wbio → BIO.num
   // (the socket fd). 3.0/3.1 use struct ssl_st where wbio lives at 24;
@@ -1374,6 +1387,8 @@ static __always_inline __u32 resolve_wbio_offset(void) {
 }
 
 // Read the socket fd directly from the SSL struct's write BIO.
+// Uses configurable offsets from tls_offset_config if available,
+// falling back to OpenSSL defaults.
 // Returns the fd, or 0 if the read fails.
 static __always_inline __u32 ssl_read_fd(__u64 ssl_ptr) {
   if (!ssl_ptr) return 0;
@@ -1382,7 +1397,7 @@ static __always_inline __u32 ssl_read_fd(__u64 ssl_ptr) {
   if (bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + wbio_off)) < 0 || !wbio)
     return 0;
   __u32 fd = 0;
-  if (bpf_probe_read_user(&fd, 4, (void *)(wbio + BIO_NUM_OFFSET)) < 0)
+  if (bpf_probe_read_user(&fd, 4, (void *)(wbio + bio_num_off)) < 0)
     return 0;
   return fd;
 }
@@ -2345,10 +2360,10 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     struct task_struct *ssl_task = (struct task_struct *)bpf_get_current_task();
     bk.exe_inode = BPF_CORE_READ(ssl_task, mm, exe_file, f_inode, i_ino);
     struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
-    if (!offsets || offsets->ssl_to_wrl == 0) {
+    if (!offsets || (offsets->ssl_to_wrl == 0 && offsets->chain_type != CHAIN_BORINGSSL)) {
       bk.exe_inode = 0;
       offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
-      if (!offsets || offsets->ssl_to_wrl == 0) {
+      if (!offsets || (offsets->ssl_to_wrl == 0 && offsets->chain_type != CHAIN_BORINGSSL)) {
 #ifdef KLOAK_DEBUG
         bpf_printk("kloak [2-KPROBE] H-fail: no offsets cgid=%llx",
                    bk.cgroup_id);
@@ -2358,43 +2373,57 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
       }
     }
 
-    __u64 ptr = 0;
-    if (offsets->wrl_to_enc_ctx > 0) {
-      if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr) {
-#ifdef KLOAK_DEBUG
-        bpf_printk("kloak [2-KPROBE] H-fail: 4hop wrl null ssl=%llx off=%u", ssl_ptr, offsets->ssl_to_wrl);
-#endif
+    __u64 h_ptr = 0;
+    if (offsets->chain_type == CHAIN_BORINGSSL) {
+      if (offsets->ssl_to_s3 == 0)
         return 0;
-      }
-      wrl_val = ptr;
-      if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr) {
-#ifdef KLOAK_DEBUG
-        bpf_printk("kloak [2-KPROBE] H-fail: 4hop enc_ctx null wrl=%llx off=%u", wrl_val, offsets->wrl_to_enc_ctx);
-#endif
+      __u64 s3_ptr = 0;
+      if (bpf_probe_read_user(&s3_ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_s3)) < 0 || !s3_ptr)
         return 0;
-      }
+      __u64 aead_ptr = 0;
+      if (bpf_probe_read_user(&aead_ptr, 8, (void *)(s3_ptr + offsets->s3_to_aead)) < 0 || !aead_ptr)
+        return 0;
+      h_ptr = aead_ptr + offsets->aead_to_h;
     } else {
-      if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr) {
+      __u64 ptr = 0;
+      if (offsets->wrl_to_enc_ctx > 0) {
+        if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr) {
 #ifdef KLOAK_DEBUG
-        __u32 ver = 0;
-        bpf_probe_read_user(&ver, 4, (void *)ssl_ptr);
-        __u64 wbio = 0;
-        bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + 24));
-        bpf_printk("kloak [2-KPROBE] H-fail: enc_write_ctx null ssl=%llx off=%u ver=0x%x wbio=%llx", ssl_ptr, offsets->ssl_to_wrl, ver, wbio);
+          bpf_printk("kloak [2-KPROBE] H-fail: 4hop wrl null ssl=%llx off=%u", ssl_ptr, offsets->ssl_to_wrl);
+#endif
+          return 0;
+        }
+        wrl_val = ptr;
+        if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr) {
+#ifdef KLOAK_DEBUG
+          bpf_printk("kloak [2-KPROBE] H-fail: 4hop enc_ctx null wrl=%llx off=%u", wrl_val, offsets->wrl_to_enc_ctx);
+#endif
+          return 0;
+        }
+      } else {
+        if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr) {
+#ifdef KLOAK_DEBUG
+          __u32 ver = 0;
+          bpf_probe_read_user(&ver, 4, (void *)ssl_ptr);
+          __u64 wbio = 0;
+          bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + 24));
+          bpf_printk("kloak [2-KPROBE] H-fail: enc_write_ctx null ssl=%llx off=%u ver=0x%x wbio=%llx", ssl_ptr, offsets->ssl_to_wrl, ver, wbio);
+#endif
+          return 0;
+        }
+      }
+      if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr) {
+#ifdef KLOAK_DEBUG
+        bpf_printk("kloak [2-KPROBE] H-fail: algctx null");
 #endif
         return 0;
       }
+      h_ptr = ptr + offsets->algctx_to_h;
     }
-    if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr) {
+
+    if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)h_ptr) < 0) {
 #ifdef KLOAK_DEBUG
-      bpf_printk("kloak [2-KPROBE] H-fail: algctx null");
-#endif
-      return 0;
-    }
-    if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0) {
-#ifdef KLOAK_DEBUG
-      bpf_printk("kloak [2-KPROBE] H-fail: H read failed ptr=%llx off=%u",
-                 ptr, offsets->algctx_to_h);
+      bpf_printk("kloak [2-KPROBE] H-fail: H read failed ptr=%llx", h_ptr);
 #endif
       dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
       return 0;
@@ -2403,8 +2432,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     __u64 *h64 = (__u64 *)new_conn.ghash_h;
     if (h64[0] == 0 && h64[1] == 0) {
 #ifdef KLOAK_DEBUG
-      bpf_printk("kloak [2-KPROBE] H-fail: H zero ptr=%llx off=%u",
-                 ptr, offsets->algctx_to_h);
+      bpf_printk("kloak [2-KPROBE] H-fail: H zero ptr=%llx", h_ptr);
 #endif
       dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
       return 0;
@@ -2481,6 +2509,31 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   // validation to skip wrong records.
   if (!is_membio)
     bpf_map_delete_elem(&xor_pending, &tgid);
+
+  // Now safe to create tc_pending and bridge the xor_pending entry.
+  // tc_egress can always find the H in tls_conn_state.
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w) return 0;
+
+  pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
+  if (!pending) return 0;
+
+  __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
+  w->staged_tc.tgid = tgid;
+  w->staged_tc.ssl_ptr = ssl_ptr;
+  w->staged_tc.active = 1;
+  w->staged_tc.plaintext_len = plaintext_len;
+  w->staged_tc.patch_count = pending->patch_count;
+  if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
+    w->staged_tc.patch_count = XOR_MAX_PATCHES;
+  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < w->staged_tc.patch_count; p++)
+    w->staged_tc.patches[p] = pending->patches[p];
+
+  bpf_map_update_elem(&tc_pending, &tdk, &w->staged_tc, BPF_ANY);
+  bpf_printk("kloak [2-KPROBE] sport=%u cg=%x", src_port_h, (__u32)tdk.cgroup_id);
+
+  // Delete xor_pending — the entry has been bridged to tc_pending.
+  bpf_map_delete_elem(&xor_pending, &pid_tgid);
 
   return 0;
 }

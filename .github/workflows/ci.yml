@@ -355,6 +355,11 @@ jobs:
             -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
 
           docker buildx build --load \
+            --cache-from type=registry,ref=${CACHE}:demo-boringssl \
+            --cache-to type=registry,ref=${CACHE}:demo-boringssl,mode=max,ignore-error=true \
+            -t kloak-demo-boringssl:latest ./examples/demo-boringssl/
+
+          docker buildx build --load \
             --cache-from type=registry,ref=${CACHE}:demo-gnutls \
             --cache-to type=registry,ref=${CACHE}:demo-gnutls,mode=max,ignore-error=true \
             -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
@@ -371,6 +376,7 @@ jobs:
 
           docker save kloak:e2e kloak-demo-go:latest kloak-demo-python:latest \
             kloak-demo-js:latest kloak-demo-go-boring:latest \
+            kloak-demo-boringssl:latest \
             kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest \
             kloak-tls-echo:latest | sudo k3s ctr -n k8s.io images import -
 
@@ -519,7 +525,7 @@ jobs:
           echo "=== Kloak Webhook Logs ==="
           kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook --tail=500 2>/dev/null || true
           echo "=== Demo App Logs ==="
-          for app in demo-go demo-python demo-js demo-go-boring demo-python-raw-tls; do
+          for app in demo-go demo-python demo-js demo-go-boring demo-boringssl demo-python-raw-tls; do
             echo "--- $app ---"
             kubectl logs -n kloak-e2e -l app=$app --tail=200 2>/dev/null || true
           done

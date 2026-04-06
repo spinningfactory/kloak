@@ -216,3 +216,40 @@ func TestFindVersionInData(t *testing.T) {
 		})
 	}
 }
+
+func TestIsLibSSL(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"/usr/lib/libssl.so", true},
+		{"/usr/lib/libssl.so.3", true},
+		{"/proc/123/root/usr/lib/x86_64-linux-gnu/libssl.so.3", true},
+		{"/usr/lib/libcrypto.so", false},
+		{"/usr/lib/libboringssl.so", false},
+		{"/app/demo-app", false},
+	}
+	for _, tt := range tests {
+		if got := isLibSSL(tt.path); got != tt.want {
+			t.Errorf("isLibSSL(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestContainsBytes(t *testing.T) {
+	tests := []struct {
+		data    []byte
+		pattern []byte
+		want    bool
+	}{
+		{[]byte("hello BoringSSL world"), []byte("BoringSSL"), true},
+		{[]byte("hello OpenSSL world"), []byte("BoringSSL"), false},
+		{[]byte("BoringSSL"), []byte("BoringSSL"), true},
+		{[]byte("Boring"), []byte("BoringSSL"), false},
+	}
+	for _, tt := range tests {
+		if got := containsBytes(tt.data, tt.pattern); got != tt.want {
+			t.Errorf("containsBytes(%q, %q) = %v, want %v", tt.data, tt.pattern, got, tt.want)
+		}
+	}
+}
