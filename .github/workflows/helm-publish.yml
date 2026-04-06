@@ -6,10 +6,8 @@ on:
 
 jobs:
   publish:
-    name: Publish Helm Chart
+    name: Publish Helm Chart to R2
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
@@ -28,33 +26,29 @@ jobs:
       - name: Package chart
         run: helm package charts/kloak -d .helm-pkg
 
-      - name: Configure git
+      - name: Download existing index
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_REGION: auto
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          aws s3 cp s3://kloak-chart/index.yaml .helm-pkg/existing-index.yaml 2>/dev/null || true
 
-      - name: Checkout or create gh-pages branch
+      - name: Build repo index
         run: |
-          git fetch origin gh-pages || true
-          if git rev-parse --verify origin/gh-pages >/dev/null 2>&1; then
-            git branch gh-pages origin/gh-pages
-            git worktree add gh-pages gh-pages
+          if [ -f .helm-pkg/existing-index.yaml ]; then
+            helm repo index .helm-pkg --url https://chart.getkloak.io --merge .helm-pkg/existing-index.yaml
           else
-            git worktree add --detach gh-pages
-            cd gh-pages
-            git checkout --orphan gh-pages
-            git rm -rf . 2>/dev/null || true
-            git commit --allow-empty -m "initialize gh-pages"
+            helm repo index .helm-pkg --url https://chart.getkloak.io
           fi
+          rm -f .helm-pkg/existing-index.yaml
 
-      - name: Update Helm repo
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_REGION: auto
         run: |
-          cp .helm-pkg/*.tgz gh-pages/
-          helm repo index gh-pages --url https://chart.getkloak.io
-
-      - name: Push to gh-pages
-        run: |
-          cd gh-pages
-          git add .
-          git commit -m "publish helm chart ${VERSION}"
-          git push origin gh-pages
+          aws s3 sync .helm-pkg/ s3://kloak-chart/ --delete
