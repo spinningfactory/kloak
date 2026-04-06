@@ -625,7 +625,8 @@ func (m *TLSUprobeManager) pushGoTLSOffsets(pid int) {
 		"pid", pid, "goVersion", version,
 		"connToCipher", offsets.ConnToCipher,
 		"aeadIfaceOff", offsets.AEADIfaceOff,
-		"gcmToH", offsets.GCMToH)
+		"h2HiOff", offsets.H2HiOff,
+		"h2LoOff", offsets.H2LoOff)
 
 	// Get TGID for the per-process BPF map key.
 	tgid := uint32(pid) // PID == TGID for the main thread

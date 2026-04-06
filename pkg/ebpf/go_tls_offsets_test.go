@@ -21,16 +21,49 @@ func TestExtractGoMajorMinor(t *testing.T) {
 }
 
 func TestGoTLSOffsetTableEntries(t *testing.T) {
-	// Verify all entries have non-zero H offset.
-	for version, offsets := range goTLSOffsetTable {
-		if offsets.ConnToCipher == 0 {
-			t.Errorf("goTLSOffsetTable[%q].ConnToCipher is 0", version)
+	// Verify all entries have non-zero offsets when resolved for amd64.
+	for version, entry := range goTLSOffsetTableBase {
+		if entry.ConnToCipher == 0 {
+			t.Errorf("goTLSOffsetTableBase[%q].ConnToCipher is 0", version)
 		}
-		if offsets.AEADIfaceOff == 0 {
-			t.Errorf("goTLSOffsetTable[%q].AEADIfaceOff is 0", version)
+		if entry.AEADIfaceOff == 0 {
+			t.Errorf("goTLSOffsetTableBase[%q].AEADIfaceOff is 0", version)
 		}
-		if offsets.GCMToH == 0 {
-			t.Errorf("goTLSOffsetTable[%q].GCMToH is 0", version)
+		if entry.PDBase == 0 {
+			t.Errorf("goTLSOffsetTableBase[%q].PDBase is 0", version)
 		}
+
+		// Verify arch-specific resolution produces non-zero H2 offsets.
+		for _, arch := range []string{"amd64", "arm64"} {
+			offsets := goTLSOffsetsForArch(entry, arch)
+			if offsets.H2HiOff == 0 {
+				t.Errorf("goTLSOffsetsForArch(%q, %q).H2HiOff is 0", version, arch)
+			}
+			if offsets.H2LoOff == 0 {
+				t.Errorf("goTLSOffsetsForArch(%q, %q).H2LoOff is 0", version, arch)
+			}
+			// Hi and Lo should differ by exactly 8 bytes.
+			diff := int(offsets.H2HiOff) - int(offsets.H2LoOff)
+			if diff != 8 && diff != -8 {
+				t.Errorf("goTLSOffsetsForArch(%q, %q): H2HiOff=%d H2LoOff=%d, expected 8-byte difference",
+					version, arch, offsets.H2HiOff, offsets.H2LoOff)
+			}
+		}
+	}
+}
+
+func TestGoTLSOffsetsForArch(t *testing.T) {
+	entry := goTLSOffsetEntry{ConnToCipher: 560, AEADIfaceOff: 24, PDBase: 728}
+
+	amd64 := goTLSOffsetsForArch(entry, "amd64")
+	// AMD64 PSHUFB: hi at +8, lo at +0
+	if amd64.H2HiOff != 736 || amd64.H2LoOff != 728 {
+		t.Errorf("amd64: H2HiOff=%d (want 736), H2LoOff=%d (want 728)", amd64.H2HiOff, amd64.H2LoOff)
+	}
+
+	arm64 := goTLSOffsetsForArch(entry, "arm64")
+	// ARM64 VREV64: hi at +0, lo at +8
+	if arm64.H2HiOff != 728 || arm64.H2LoOff != 736 {
+		t.Errorf("arm64: H2HiOff=%d (want 728), H2LoOff=%d (want 736)", arm64.H2HiOff, arm64.H2LoOff)
 	}
 }

@@ -56,8 +56,6 @@ func main() {
 	fmt.Println("Waiting 10s for Kloak controller to sync...")
 	time.Sleep(10 * time.Second)
 
-	// Use default HTTP/2 — the eBPF scanner supports both HTTP/1.1 plaintext
-	// and HTTP/2 HPACK Huffman-encoded headers.
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}

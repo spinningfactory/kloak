@@ -5,6 +5,7 @@ import (
 	"debug/dwarf"
 	"debug/elf"
 	"fmt"
+	"runtime"
 	"strings"
 )
 
@@ -12,32 +13,70 @@ import (
 // Go's crypto/tls internal structures. The layout must match struct
 // go_tls_offsets in tls_uprobe.c exactly.
 //
-// H extraction chain (3 pointer dereferences):
+// H extraction chain (3 pointer dereferences + GF(2^128) halving):
 //
 //	Conn + ConnToCipher → cipher interface data_ptr → AEAD wrapper
 //	  + AEADIfaceOff → inner aead interface data_ptr → GCM struct
-//	    + GCMToH → H (16 bytes from productTable[reverseBits(1)])
+//	    + H2HiOff / H2LoOff → H×2 (two 64-bit words from productTable[224])
+//
+// Go's gcmAesInit assembly computes H = AES_K(0^128), byte-swaps, then
+// doubles in GF(2^128) before storing at productTable offset 224. The BPF
+// code reads the two words and applies GF halving to recover standard H.
+//
+// The word order at offset 224 is architecture-dependent:
+//   - AMD64 (PSHUFB full reversal): hi word at +8, lo word at +0
+//   - ARM64 (VREV64 per-lane reversal): hi word at +0, lo word at +8
 type GoTLSOffsets struct {
 	ConnToCipher uint32 // Conn.out offset + halfConn.cipher offset + 8 (interface data_ptr)
 	AEADIfaceOff uint32 // prefixNonceAEAD.aead offset + 8 (interface data_ptr)
-	GCMToH       uint32 // GCM.gcmPlatformData + productTable offset + 128 (H index)
-	_            uint32 // padding to match BPF struct
+	H2HiOff      uint32 // GCM + off → high 64 bits of H×2 (byte-swapped)
+	H2LoOff      uint32 // GCM + off → low 64 bits of H×2 (byte-swapped)
 }
 
-// goTLSOffsetTable maps Go major.minor versions to struct offsets.
+// goTLSOffsetTableBase stores architecture-independent offsets plus the
+// productTable base offset. The arch-dependent H2 word offsets are computed
+// at lookup time by goTLSOffsetsForArch.
+type goTLSOffsetEntry struct {
+	ConnToCipher uint32
+	AEADIfaceOff uint32
+	PDBase       uint32 // GCM + gcmPlatformData + productTable + 224 (H×2 entry)
+}
+
+// goTLSOffsetTableBase maps Go major.minor versions to base struct offsets.
 // Discovered by running tools/go-tls-offsets against binaries built
 // with each Go version.
 //
 // TODO: Populate with offsets for Go 1.21, 1.22, 1.23 via the offset tool.
-var goTLSOffsetTable = map[string]GoTLSOffsets{
+var goTLSOffsetTableBase = map[string]goTLSOffsetEntry{
 	// Go 1.25/1.26 (FIPS module, gcmPlatformData):
 	//   Conn.out=520, halfConn.cipher=32, prefixNonceAEAD.aead=16
-	//   GCM.gcmPlatformData=504, gcmPlatformData.productTable=0, H at [8]=128
+	//   GCM.gcmPlatformData=504, gcmPlatformData.productTable=0
+	//   H×2 at productTable offset 224 → PDBase = 504 + 0 + 224 = 728
 	//   ConnToCipher = 520 + 32 + 8 = 560
 	//   AEADIfaceOff = 16 + 8 = 24
-	//   GCMToH = 504 + 0 + 128 = 632
-	"1.25": {ConnToCipher: 560, AEADIfaceOff: 24, GCMToH: 632},
-	"1.26": {ConnToCipher: 560, AEADIfaceOff: 24, GCMToH: 632},
+	"1.25": {ConnToCipher: 560, AEADIfaceOff: 24, PDBase: 728},
+	"1.26": {ConnToCipher: 560, AEADIfaceOff: 24, PDBase: 728},
+}
+
+// goTLSOffsetsForArch converts a base entry to arch-specific GoTLSOffsets
+// by applying the correct word order for the H×2 entry.
+//
+// AMD64 PSHUFB (full 16-byte reversal): hi word at +8, lo word at +0
+// ARM64 VREV64 (per-lane 8-byte reversal): hi word at +0, lo word at +8
+func goTLSOffsetsForArch(entry goTLSOffsetEntry, goarch string) GoTLSOffsets {
+	o := GoTLSOffsets{
+		ConnToCipher: entry.ConnToCipher,
+		AEADIfaceOff: entry.AEADIfaceOff,
+	}
+	switch goarch {
+	case "amd64":
+		o.H2HiOff = entry.PDBase + 8
+		o.H2LoOff = entry.PDBase + 0
+	default: // arm64 and others with per-lane byte reversal
+		o.H2HiOff = entry.PDBase + 0
+		o.H2LoOff = entry.PDBase + 8
+	}
+	return o
 }
 
 // DetectGoTLSOffsets reads a Go binary and returns the struct offsets needed
@@ -60,12 +99,35 @@ func detectGoTLSByVersion(exePath string) (string, GoTLSOffsets, error) {
 	}
 
 	majorMinor := extractGoMajorMinor(bi.GoVersion)
-	offsets, ok := goTLSOffsetTable[majorMinor]
+	entry, ok := goTLSOffsetTableBase[majorMinor]
 	if !ok {
 		return bi.GoVersion, GoTLSOffsets{}, fmt.Errorf("unsupported Go version %s (major.minor=%s)", bi.GoVersion, majorMinor)
 	}
 
-	return bi.GoVersion, offsets, nil
+	// Determine target architecture from the ELF binary, not the host.
+	goarch, err := elfGoArch(exePath)
+	if err != nil {
+		goarch = runtime.GOARCH // fallback to host arch
+	}
+
+	return bi.GoVersion, goTLSOffsetsForArch(entry, goarch), nil
+}
+
+// elfGoArch returns the GOARCH string for an ELF binary.
+func elfGoArch(path string) (string, error) {
+	f, err := elf.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = f.Close() }()
+	switch f.Machine {
+	case elf.EM_X86_64:
+		return "amd64", nil
+	case elf.EM_AARCH64:
+		return "arm64", nil
+	default:
+		return "", fmt.Errorf("unknown ELF machine %v", f.Machine)
+	}
 }
 
 func detectGoTLSFromDWARF(exePath string) (string, GoTLSOffsets, error) {
@@ -149,27 +211,45 @@ func detectGoTLSFromDWARF(exePath string) (string, GoTLSOffsets, error) {
 		missing = append(missing, "prefixNonceAEAD.aead")
 	}
 
-	// 3. GCMToH = path to productTable + 128 (H at index reverseBits(1)=8)
-	gcmH, foundH := uint32(0), false
+	// 3. H×2 word offsets from productTable offset 224.
+	// gcmAesInit stores H×2 (H doubled in GF(2^128)) at productTable[224].
+	// The two 64-bit words are in different order on AMD64 vs ARM64.
+	pdBase, foundPD := uint32(0), false
 
 	// Go 1.24+: GCM.gcmPlatformData → gcmPlatformData.productTable
 	gcmPD, okPD := getField(structFields, "crypto/internal/fips140/aes/gcm.GCM", "gcmPlatformData")
 	pdPT, okPT := getField(structFields, "crypto/internal/fips140/aes/gcm.gcmPlatformData", "productTable")
 	if okPD && okPT {
-		gcmH = gcmPD + pdPT + 128
-		foundH = true
+		pdBase = gcmPD + pdPT + 224 // H×2 at entry 14 (offset 224 within productTable)
+		foundPD = true
 	}
 
 	// Go <1.24: crypto/cipher.gcmAES.productTable
-	if !foundH {
+	if !foundPD {
 		if pt, ok := getField(structFields, "crypto/cipher.gcmAES", "productTable"); ok {
-			gcmH = pt + 128
-			foundH = true
+			pdBase = pt + 224
+			foundPD = true
 		}
 	}
 
-	if foundH {
-		result.GCMToH = gcmH
+	if foundPD {
+		// Determine target architecture from the ELF binary.
+		goarch := ""
+		switch f.Machine {
+		case elf.EM_X86_64:
+			goarch = "amd64"
+		case elf.EM_AARCH64:
+			goarch = "arm64"
+		}
+		if goarch == "amd64" {
+			// PSHUFB full 16-byte reversal: hi word at +8, lo word at +0
+			result.H2HiOff = pdBase + 8
+			result.H2LoOff = pdBase + 0
+		} else {
+			// ARM64 VREV64 per-lane reversal: hi word at +0, lo word at +8
+			result.H2HiOff = pdBase + 0
+			result.H2LoOff = pdBase + 8
+		}
 	} else {
 		missing = append(missing, "gcmAES.productTable")
 	}

@@ -111,9 +111,10 @@ struct {
 // Tail-call program array:
 //   index 1 = bpf_xor_path (AES-GCM ciphertext patching path)
 //   index 2 = bpf_h_extract (GHASH key H extraction on first SSL_write)
+//   index 3 = bpf_go_write_path (Go plaintext patching — writes real secrets directly)
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-  __uint(max_entries, 3); // indices 1 and 2 used
+  __uint(max_entries, 4); // indices 1, 2, and 3 used
   __type(key, __u32);
   __type(value, __u32);
 } prog_array SEC(".maps");
@@ -462,10 +463,15 @@ struct {
 // Go crypto/tls struct offsets for H extraction.
 // Keyed by TGID (per-process), allowing different Go versions to coexist.
 //
-// H extraction chain (3 pointer dereferences):
+// H extraction chain (3 pointer dereferences + GF halving):
 //   Conn + conn_to_cipher → cipher interface data_ptr (1st deref)
 //     → prefixNonceAEAD/xorNonceAEAD + aead_iface_off → aead interface data_ptr (2nd deref)
-//       → GCM + gcm_to_h → H (16 bytes, direct read)
+//       → GCM + h2_hi_off / h2_lo_off → H×2 (two 64-bit words from productTable[224])
+//
+// Go's gcmAesInit assembly computes H = AES_K(0^128), byte-swaps, then doubles
+// in GF(2^128) before storing in productTable at offset 224. We read the two
+// 64-bit words (arch-dependent order: AMD64 PSHUFB vs ARM64 VREV64) and apply
+// GF(2^128) halving to recover the standard big-endian GHASH H key.
 //
 // conn_to_cipher combines Conn.out offset + halfConn.cipher offset + 8 (interface data_ptr).
 // aead_iface_off is the offset to the inner aead interface data_ptr within the AEAD wrapper.
@@ -474,8 +480,8 @@ struct {
 struct go_tls_offsets {
   __u32 conn_to_cipher;   // Conn* + off → halfConn.cipher interface data_ptr (combined offset)
   __u32 aead_iface_off;   // wrapper + off → inner aead interface data_ptr
-  __u32 gcm_to_h;         // GCM* + off → H (16 bytes, direct read from productTable)
-  __u32 _pad;
+  __u32 h2_hi_off;        // GCM* + off → high 64 bits of H×2 (byte-swapped, arch-dependent)
+  __u32 h2_lo_off;        // GCM* + off → low 64 bits of H×2 (byte-swapped, arch-dependent)
 };
 
 struct {
@@ -1759,7 +1765,9 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   __u64 wrl_val = 0;
 
   if (chain == CHAIN_GO_TLS) {
-    // Go crypto/tls: H lives in gcmAES.productTable[reverseBits(1)].
+    // Go crypto/tls: H×2 stored at productTable offset 224 (entry 14).
+    // gcmAesInit computes H = AES_K(0^128), byte-swaps, doubles in GF(2^128).
+    // We read the two 64-bit words and apply GF halving to recover H.
     struct go_tls_offsets *go_off = bpf_map_lookup_elem(&go_tls_offset_config, &tgid);
     if (!go_off)
       return 0; // No Go offsets — bail (fail-secure, no corruption).
@@ -1773,18 +1781,49 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
         (void *)(cipher_data + go_off->aead_iface_off)) < 0 || !gcm_ptr)
       return 0;
 
-    if (bpf_probe_read_user(new_conn.ghash_h, 16,
-        (void *)(gcm_ptr + go_off->gcm_to_h)) < 0)
+    // Read H×2 as two separate 64-bit words (arch-aware offsets from userspace).
+    // h2_hi_off points to the GF "high" word (contains the GF MSB at bit 63).
+    // h2_lo_off points to the GF "low" word (contains the GF LSB at bit 0).
+    __u64 hi = 0, lo = 0;
+    if (bpf_probe_read_user(&hi, 8, (void *)(gcm_ptr + go_off->h2_hi_off)) < 0)
+      return 0;
+    if (bpf_probe_read_user(&lo, 8, (void *)(gcm_ptr + go_off->h2_lo_off)) < 0)
       return 0;
 
-    __u64 *h64 = (__u64 *)new_conn.ghash_h;
-    if (h64[0] == 0 && h64[1] == 0)
+    if (hi == 0 && lo == 0)
       return 0;
-    // Go stores gcmFieldElement{low, high uint64} where low/high are the
-    // big-endian interpretation stored as native uint64. On LE machines the
-    // raw bytes are swapped — bswap64 recovers the GHASH big-endian form.
-    h64[0] = __builtin_bswap64(h64[0]);
-    h64[1] = __builtin_bswap64(h64[1]);
+
+    // GF(2^128) halving: recover H from H×2.
+    //
+    // Go's gcmAesInit computes H×2 as a 128-bit GF(2^128) left shift with
+    // conditional reduction. The 128-bit value V = hi * 2^64 + lo, where:
+    //   - AMD64: hi = XMM[64:127], lo = XMM[0:63]
+    //   - ARM64: hi = D[0], lo = D[1]
+    //
+    // The doubling was: V' = (V << 1) ^ (V.MSB ? poly : 0)
+    //   poly = {hi: 0xC200000000000000, lo: 0x0000000000000001}
+    //
+    // Reduction indicator: lo.bit0. During left-shift, lo.bit0 becomes 0.
+    // If reduction happened, poly.lo.bit0 = 1 is XORed in, so lo.bit0 = 1.
+    // The carry from hi to lo doesn't affect lo.bit0 (it goes to lo.bit63).
+    int reduced = lo & 1;
+    if (reduced) {
+      hi ^= 0xC200000000000000ULL;
+      lo ^= 0x0000000000000001ULL;
+    }
+    // V is now (H << 1) without reduction. Undo the 128-bit left shift:
+    // Carry from hi.bit0 → lo.bit63 (the bit that crossed the word boundary).
+    __u64 carry = hi & 1;
+    hi >>= 1;
+    lo = (lo >> 1) | (carry << 63);
+    if (reduced)
+      hi |= (1ULL << 63); // Restore GF MSB that was shifted out.
+
+    // Convert from register representation (byte-reversed per 8-byte lane
+    // by PSHUFB/VREV64) to standard big-endian GHASH H.
+    *(__u64 *)&new_conn.ghash_h[0] = __builtin_bswap64(hi);
+    *(__u64 *)&new_conn.ghash_h[8] = __builtin_bswap64(lo);
+
     new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
   } else {
     // OpenSSL/BoringSSL: 4-hop pointer chain from SSL* to H.
