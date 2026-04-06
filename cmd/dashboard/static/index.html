@@ -3,74 +3,252 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Kloak - Secret Flow Graph</title>
+  <title>Kloak // Secret Flow</title>
   <script src="https://cdn.jsdelivr.net/npm/d3@7"></script>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
+    :root {
+      --bg-deep: #06090f;
+      --bg-panel: #0b1120;
+      --bg-card: #0f1729;
+      --border: #1a2744;
+      --border-glow: #1e3a5f;
+      --text: #c8d6e5;
+      --text-dim: #5a6d82;
+      --text-bright: #e8f0fe;
+      --accent-cyan: #00e5ff;
+      --accent-cyan-dim: rgba(0,229,255,0.15);
+      --accent-gold: #ffd54f;
+      --accent-gold-dim: rgba(255,213,79,0.15);
+      --go: #61afef;
+      --python: #56d6a0;
+      --rust: #ef8547;
+      --js: #f0db4f;
+      --gnutls: #c678dd;
+      --unknown: #5a6d82;
+      --font-display: 'Outfit', sans-serif;
+      --font-mono: 'JetBrains Mono', monospace;
+    }
+
     body {
-      background: #1a1a2e;
-      color: #e0e0e0;
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: var(--bg-deep);
+      color: var(--text);
+      font-family: var(--font-display);
       height: 100vh;
       display: flex;
       flex-direction: column;
       overflow: hidden;
     }
 
+    /* === HEADER === */
     header {
-      padding: 12px 24px;
-      background: #0f0f23;
-      border-bottom: 1px solid #2a2a4e;
+      padding: 0 24px;
+      height: 56px;
+      background: var(--bg-panel);
+      border-bottom: 1px solid var(--border);
       display: flex;
       align-items: center;
-      gap: 12px;
+      gap: 16px;
       flex-shrink: 0;
+      position: relative;
+      z-index: 10;
     }
 
-    header h1 {
-      font-size: 18px;
-      font-weight: 600;
-      color: #a0c4ff;
-      letter-spacing: 0.04em;
+    header::after {
+      content: '';
+      position: absolute;
+      bottom: -1px;
+      left: 0;
+      right: 0;
+      height: 1px;
+      background: linear-gradient(90deg, transparent, var(--accent-cyan), transparent);
+      opacity: 0.3;
     }
 
-    header .subtitle {
-      font-size: 13px;
-      color: #667;
+    .logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
     }
 
-    .status-dot {
+    .logo-icon {
+      width: 28px;
+      height: 28px;
+      border: 2px solid var(--accent-cyan);
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      box-shadow: 0 0 12px rgba(0,229,255,0.2);
+    }
+
+    .logo-icon::before {
+      content: '';
       width: 8px;
       height: 8px;
-      border-radius: 50%;
-      background: #3CB371;
+      background: var(--accent-cyan);
+      border-radius: 2px;
+      box-shadow: 0 0 8px var(--accent-cyan);
+    }
+
+    .logo h1 {
+      font-size: 17px;
+      font-weight: 700;
+      color: var(--text-bright);
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .logo .tag {
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--accent-cyan);
+      background: var(--accent-cyan-dim);
+      padding: 2px 8px;
+      border-radius: 3px;
+      border: 1px solid rgba(0,229,255,0.2);
+      letter-spacing: 0.05em;
+    }
+
+    .header-stats {
+      display: flex;
+      gap: 24px;
       margin-left: auto;
-      box-shadow: 0 0 6px #3CB371;
-      animation: pulse 2s ease-in-out infinite;
+      align-items: center;
     }
 
-    @keyframes pulse {
-      0%, 100% { opacity: 1; }
-      50% { opacity: 0.4; }
+    .stat {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 1px;
     }
 
+    .stat-value {
+      font-family: var(--font-mono);
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text-bright);
+      line-height: 1;
+    }
+
+    .stat-label {
+      font-size: 9px;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--text-dim);
+    }
+
+    .stat-value.cyan { color: var(--accent-cyan); }
+    .stat-value.gold { color: var(--accent-gold); }
+
+    .live-indicator {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--accent-cyan);
+      letter-spacing: 0.05em;
+      padding-left: 16px;
+      border-left: 1px solid var(--border);
+    }
+
+    .live-dot {
+      width: 6px;
+      height: 6px;
+      border-radius: 50%;
+      background: var(--accent-cyan);
+      box-shadow: 0 0 8px var(--accent-cyan);
+      animation: livePulse 2s ease-in-out infinite;
+    }
+
+    .live-dot.error { background: #ef5350; box-shadow: 0 0 8px #ef5350; }
+
+    @keyframes livePulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(0.8); }
+    }
+
+    /* === SEARCH === */
+    .search-wrap {
+      position: relative;
+      margin-left: 20px;
+    }
+
+    .search-wrap input {
+      background: var(--bg-deep);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 12px 6px 30px;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text);
+      width: 180px;
+      outline: none;
+      transition: border-color 0.2s, width 0.2s;
+    }
+
+    .search-wrap input:focus {
+      border-color: var(--accent-cyan);
+      width: 240px;
+    }
+
+    .search-wrap input::placeholder { color: var(--text-dim); }
+
+    .search-wrap::before {
+      content: '\u2315';
+      position: absolute;
+      left: 10px;
+      top: 50%;
+      transform: translateY(-50%);
+      font-size: 13px;
+      color: var(--text-dim);
+      pointer-events: none;
+    }
+
+    /* === MAIN === */
     .main-content {
       display: flex;
       flex: 1;
       overflow: hidden;
     }
 
+    /* === GRAPH === */
     #graph-container {
       flex: 1;
       position: relative;
       overflow: hidden;
+      background:
+        radial-gradient(ellipse at 30% 50%, rgba(0,229,255,0.03) 0%, transparent 60%),
+        radial-gradient(ellipse at 70% 40%, rgba(255,213,79,0.02) 0%, transparent 50%),
+        var(--bg-deep);
+    }
+
+    /* Subtle grid */
+    #graph-container::before {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background-image:
+        linear-gradient(var(--border) 1px, transparent 1px),
+        linear-gradient(90deg, var(--border) 1px, transparent 1px);
+      background-size: 60px 60px;
+      opacity: 0.15;
+      pointer-events: none;
     }
 
     #graph {
       width: 100%;
       height: 100%;
+      cursor: grab;
     }
+
+    #graph:active { cursor: grabbing; }
 
     .empty-state {
       position: absolute;
@@ -78,262 +256,491 @@
       left: 50%;
       transform: translate(-50%, -50%);
       text-align: center;
-      color: #445;
       pointer-events: none;
     }
 
     .empty-state h2 {
-      font-size: 22px;
-      margin-bottom: 8px;
-      color: #556;
-    }
-
-    .empty-state p {
+      font-family: var(--font-mono);
       font-size: 14px;
-    }
-
-    #sidebar {
-      width: 25%;
-      min-width: 220px;
-      max-width: 320px;
-      background: #16213e;
-      border-left: 1px solid #2a2a4e;
-      display: flex;
-      flex-direction: column;
-      overflow: hidden;
-    }
-
-    .sidebar-header {
-      padding: 16px 20px 12px;
-      border-bottom: 1px solid #2a2a4e;
-    }
-
-    .sidebar-header h2 {
-      font-size: 14px;
-      font-weight: 600;
-      color: #a0c4ff;
-      text-transform: uppercase;
+      color: var(--text-dim);
       letter-spacing: 0.08em;
     }
 
+    .empty-state p {
+      font-size: 12px;
+      color: var(--text-dim);
+      opacity: 0.5;
+      margin-top: 4px;
+    }
+
+    /* === TOOLTIP === */
+    .tooltip {
+      position: fixed;
+      background: var(--bg-card);
+      border: 1px solid var(--border-glow);
+      border-radius: 8px;
+      padding: 12px 16px;
+      pointer-events: none;
+      z-index: 100;
+      display: none;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5), 0 0 1px var(--accent-cyan);
+      max-width: 280px;
+    }
+
+    .tooltip-title {
+      font-weight: 600;
+      font-size: 13px;
+      color: var(--text-bright);
+      margin-bottom: 6px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .tooltip-title .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+
+    .tooltip-row {
+      font-family: var(--font-mono);
+      font-size: 11px;
+      color: var(--text-dim);
+      line-height: 1.6;
+    }
+
+    .tooltip-row span { color: var(--text); }
+
+    /* === SIDEBAR === */
+    #sidebar {
+      width: 300px;
+      background: var(--bg-panel);
+      border-left: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+      flex-shrink: 0;
+    }
+
+    .sidebar-section {
+      padding: 16px 20px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .sidebar-section h2 {
+      font-size: 10px;
+      font-weight: 600;
+      color: var(--text-dim);
+      text-transform: uppercase;
+      letter-spacing: 0.12em;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .sidebar-section h2::before {
+      content: '';
+      width: 3px;
+      height: 12px;
+      background: var(--accent-cyan);
+      border-radius: 2px;
+    }
+
+    /* === LEADERBOARD === */
     #top-secrets {
       list-style: none;
       overflow-y: auto;
       flex: 1;
-      padding: 8px 0;
+      padding: 0;
     }
 
-    #top-secrets::-webkit-scrollbar { width: 4px; }
+    #top-secrets::-webkit-scrollbar { width: 3px; }
     #top-secrets::-webkit-scrollbar-track { background: transparent; }
-    #top-secrets::-webkit-scrollbar-thumb { background: #2a2a4e; border-radius: 2px; }
+    #top-secrets::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
     .secret-item {
-      padding: 10px 20px;
-      border-bottom: 1px solid #1e2d50;
+      padding: 12px 20px;
+      border-bottom: 1px solid var(--border);
       transition: background 0.15s;
+      position: relative;
     }
 
-    .secret-item:hover { background: #1e2d50; }
+    .secret-item:hover { background: rgba(0,229,255,0.03); }
 
-    .secret-item:last-child { border-bottom: none; }
+    .secret-item-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 4px;
+    }
 
     .secret-rank {
-      font-size: 11px;
-      color: #667;
-      margin-bottom: 3px;
+      font-family: var(--font-mono);
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--border-glow);
+      line-height: 1;
+      width: 28px;
+      flex-shrink: 0;
     }
+
+    .secret-rank.top { color: var(--accent-gold); }
+
+    .secret-info { flex: 1; min-width: 0; }
 
     .secret-name {
       font-weight: 600;
       font-size: 13px;
-      color: #FFD700;
+      color: var(--accent-gold);
       white-space: nowrap;
       overflow: hidden;
       text-overflow: ellipsis;
+      font-family: var(--font-mono);
     }
 
     .secret-ns {
-      font-size: 11px;
-      color: #778;
-      margin-bottom: 5px;
+      font-size: 10px;
+      color: var(--text-dim);
     }
 
     .secret-count {
-      font-size: 12px;
-      color: #a0c4ff;
-      margin-bottom: 4px;
+      font-family: var(--font-mono);
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--text-bright);
+      text-align: right;
+      white-space: nowrap;
     }
 
     .bar-track {
-      height: 3px;
-      background: #2a2a4e;
-      border-radius: 2px;
+      height: 2px;
+      background: var(--border);
+      border-radius: 1px;
       overflow: hidden;
+      margin-top: 8px;
     }
 
     .bar-fill {
       height: 100%;
-      background: linear-gradient(90deg, #4A90D9, #a0c4ff);
-      border-radius: 2px;
-      transition: width 0.4s ease;
+      border-radius: 1px;
+      transition: width 0.6s cubic-bezier(0.16, 1, 0.3, 1);
+      background: linear-gradient(90deg, var(--accent-cyan), var(--accent-gold));
     }
 
+    /* === LEGEND === */
     .legend {
-      padding: 12px 20px;
-      border-top: 1px solid #2a2a4e;
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
+      padding: 14px 20px;
+      border-top: 1px solid var(--border);
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 6px;
     }
 
     .legend-item {
       display: flex;
       align-items: center;
-      gap: 5px;
-      font-size: 11px;
-      color: #889;
+      gap: 6px;
+      font-family: var(--font-mono);
+      font-size: 10px;
+      color: var(--text-dim);
+      letter-spacing: 0.02em;
     }
 
     .legend-dot {
-      width: 10px;
-      height: 10px;
+      width: 8px;
+      height: 8px;
       border-radius: 50%;
+      flex-shrink: 0;
+      box-shadow: 0 0 4px currentColor;
     }
 
     .legend-diamond {
-      width: 10px;
-      height: 10px;
-      background: #FFD700;
+      width: 8px;
+      height: 8px;
+      background: var(--accent-gold);
       transform: rotate(45deg);
+      flex-shrink: 0;
+      box-shadow: 0 0 4px var(--accent-gold);
     }
 
-    /* D3 graph elements */
-    .node-label {
-      font-size: 11px;
-      fill: #ccc;
-      text-anchor: middle;
-      pointer-events: none;
-      user-select: none;
-    }
-
+    /* === D3 GRAPH ELEMENTS === */
     .link {
-      stroke: #556677;
-      stroke-opacity: 0.7;
+      stroke-linecap: round;
     }
 
     .node-pod {
-      stroke: white;
-      stroke-width: 2;
       cursor: grab;
+      transition: filter 0.2s;
     }
 
+    .node-pod:hover { filter: brightness(1.3); }
     .node-pod:active { cursor: grabbing; }
 
     .node-secret {
-      stroke: white;
-      stroke-width: 2;
       cursor: grab;
-      fill: #FFD700;
+      transition: filter 0.2s;
     }
 
+    .node-secret:hover { filter: brightness(1.3); }
     .node-secret:active { cursor: grabbing; }
+
+    .node-label {
+      font-family: var(--font-mono);
+      font-size: 9px;
+      fill: var(--text-dim);
+      text-anchor: middle;
+      pointer-events: none;
+      user-select: none;
+      letter-spacing: 0.02em;
+    }
+
+    .node-label-pod { fill: var(--text); font-size: 10px; }
+
+    /* Particle animations */
+    .flow-particle {
+      fill: var(--accent-cyan);
+      opacity: 0;
+    }
+
+    /* Glow filters defined in SVG defs */
+
+    /* === RESPONSIVE === */
+    @media (max-width: 900px) {
+      #sidebar { width: 240px; }
+      .header-stats { gap: 16px; }
+    }
+
+    @media (max-width: 700px) {
+      #sidebar { display: none; }
+      .search-wrap { display: none; }
+    }
   </style>
 </head>
 <body>
   <header>
-    <h1>Kloak</h1>
-    <span class="subtitle">Secret Flow Graph</span>
-    <span class="status-dot" id="status-dot" title="Live"></span>
+    <div class="logo">
+      <div class="logo-icon"></div>
+      <h1>Kloak</h1>
+      <span class="tag">eBPF</span>
+    </div>
+
+    <div class="search-wrap">
+      <input type="text" id="search" placeholder="Filter nodes..." />
+    </div>
+
+    <div class="header-stats">
+      <div class="stat">
+        <span class="stat-value cyan" id="stat-pods">0</span>
+        <span class="stat-label">Pods</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value gold" id="stat-secrets">0</span>
+        <span class="stat-label">Secrets</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value" id="stat-rewrites">0</span>
+        <span class="stat-label">Rewrites</span>
+      </div>
+      <div class="stat">
+        <span class="stat-value cyan" id="stat-rate">0</span>
+        <span class="stat-label">/sec</span>
+      </div>
+    </div>
+
+    <div class="live-indicator">
+      <div class="live-dot" id="live-dot"></div>
+      <span>LIVE</span>
+    </div>
   </header>
 
   <div class="main-content">
     <div id="graph-container">
       <svg id="graph"></svg>
       <div class="empty-state" id="empty-state">
-        <h2>Waiting for data...</h2>
-        <p>No rewrite events received yet.</p>
+        <h2>// AWAITING SIGNAL</h2>
+        <p>No rewrite events received yet</p>
       </div>
     </div>
 
     <div id="sidebar">
-      <div class="sidebar-header">
+      <div class="sidebar-section">
         <h2>Top Secrets</h2>
       </div>
       <ol id="top-secrets"></ol>
       <div class="legend">
-        <div class="legend-item">
-          <div class="legend-dot" style="background:#4A90D9"></div> Go
-        </div>
-        <div class="legend-item">
-          <div class="legend-dot" style="background:#3CB371"></div> Python
-        </div>
-        <div class="legend-item">
-          <div class="legend-dot" style="background:#E8793A"></div> Rust
-        </div>
-        <div class="legend-item">
-          <div class="legend-dot" style="background:#888"></div> Unknown
-        </div>
-        <div class="legend-item">
-          <div class="legend-diamond"></div> Secret
-        </div>
+        <div class="legend-item"><div class="legend-dot" style="color:var(--go);background:var(--go)"></div>Go</div>
+        <div class="legend-item"><div class="legend-dot" style="color:var(--python);background:var(--python)"></div>Python</div>
+        <div class="legend-item"><div class="legend-dot" style="color:var(--rust);background:var(--rust)"></div>Rust</div>
+        <div class="legend-item"><div class="legend-dot" style="color:var(--js);background:var(--js)"></div>JS</div>
+        <div class="legend-item"><div class="legend-dot" style="color:var(--gnutls);background:var(--gnutls)"></div>GnuTLS</div>
+        <div class="legend-item"><div class="legend-diamond"></div>Secret</div>
       </div>
     </div>
   </div>
 
+  <div class="tooltip" id="tooltip"></div>
+
   <script>
+    // === CONFIG ===
     const RUNTIME_COLORS = {
-      go: '#4A90D9',
-      python: '#3CB371',
-      rust: '#E8793A',
-      unknown: '#888',
+      go: '#61afef',
+      python: '#56d6a0',
+      rust: '#ef8547',
+      js: '#f0db4f',
+      gnutls: '#c678dd',
+      unknown: '#5a6d82',
     };
 
+    const RUNTIME_GLOW = {
+      go: 'rgba(97,175,239,0.4)',
+      python: 'rgba(86,214,160,0.4)',
+      rust: 'rgba(239,133,71,0.4)',
+      js: 'rgba(240,219,79,0.4)',
+      gnutls: 'rgba(198,120,221,0.4)',
+      unknown: 'rgba(90,109,130,0.3)',
+    };
+
+    // === SVG SETUP ===
     const svg = d3.select('#graph');
     const container = document.getElementById('graph-container');
-
     let width = container.clientWidth;
     let height = container.clientHeight;
-
     svg.attr('width', width).attr('height', height);
+
+    // Defs for glow effects
+    const defs = svg.append('defs');
+
+    // Pod glow filter
+    const podGlow = defs.append('filter').attr('id', 'glow-pod').attr('x', '-50%').attr('y', '-50%').attr('width', '200%').attr('height', '200%');
+    podGlow.append('feGaussianBlur').attr('stdDeviation', '4').attr('result', 'blur');
+    podGlow.append('feComposite').attr('in', 'SourceGraphic').attr('in2', 'blur').attr('operator', 'over');
+
+    // Secret glow filter
+    const secretGlow = defs.append('filter').attr('id', 'glow-secret').attr('x', '-50%').attr('y', '-50%').attr('width', '200%').attr('height', '200%');
+    secretGlow.append('feGaussianBlur').attr('stdDeviation', '6').attr('result', 'blur');
+    secretGlow.append('feComposite').attr('in', 'SourceGraphic').attr('in2', 'blur').attr('operator', 'over');
+
+    // Edge glow
+    const edgeGlow = defs.append('filter').attr('id', 'glow-edge').attr('x', '-20%').attr('y', '-20%').attr('width', '140%').attr('height', '140%');
+    edgeGlow.append('feGaussianBlur').attr('stdDeviation', '2').attr('result', 'blur');
+    edgeGlow.append('feComposite').attr('in', 'SourceGraphic').attr('in2', 'blur').attr('operator', 'over');
 
     const g = svg.append('g');
 
     // Zoom + pan
-    svg.call(d3.zoom()
-      .scaleExtent([0.3, 4])
-      .on('zoom', (event) => g.attr('transform', event.transform))
-    );
+    const zoom = d3.zoom()
+      .scaleExtent([0.2, 5])
+      .on('zoom', (event) => g.attr('transform', event.transform));
+    svg.call(zoom);
 
+    // Layers
+    const edgeLayer = g.append('g').attr('class', 'edges');
+    const particleLayer = g.append('g').attr('class', 'particles');
+    const nodeLayer = g.append('g').attr('class', 'nodes');
+
+    // === SIMULATION ===
     let simulation = d3.forceSimulation([])
-      .force('link', d3.forceLink([]).id(d => d.id).distance(150))
-      .force('charge', d3.forceManyBody().strength(-300))
+      .force('link', d3.forceLink([]).id(d => d.id).distance(180).strength(0.7))
+      .force('charge', d3.forceManyBody().strength(-400))
       .force('center', d3.forceCenter(width / 2, height / 2))
-      .force('collision', d3.forceCollide(30));
-
-    let linkSel = g.append('g').attr('class', 'links').selectAll('.link');
-    let nodeSel = g.append('g').attr('class', 'nodes').selectAll('.node-group');
+      .force('collision', d3.forceCollide(40))
+      .force('x', d3.forceX(width / 2).strength(0.03))
+      .force('y', d3.forceY(height / 2).strength(0.03));
 
     let currentNodes = [];
     let currentEdges = [];
+    let linkSel, nodeSel;
+    let prevTotalRewrites = 0;
+    let rewriteRate = 0;
+    let searchFilter = '';
 
+    // === TOOLTIP ===
+    const tooltip = document.getElementById('tooltip');
+
+    function showTooltip(event, d) {
+      let html = '';
+      if (d.type === 'pod') {
+        const color = RUNTIME_COLORS[d.runtime] || RUNTIME_COLORS.unknown;
+        const totalWeight = currentEdges
+          .filter(e => (e.source.id || e.source) === d.id)
+          .reduce((s, e) => s + (e.weight || 0), 0);
+        html = `
+          <div class="tooltip-title"><div class="dot" style="background:${color}"></div>${esc(d.label)}</div>
+          <div class="tooltip-row">runtime <span>${esc(d.runtime)}</span></div>
+          <div class="tooltip-row">rewrites <span>${totalWeight.toLocaleString()}</span></div>
+        `;
+      } else {
+        const totalWeight = currentEdges
+          .filter(e => (e.target.id || e.target) === d.id)
+          .reduce((s, e) => s + (e.weight || 0), 0);
+        html = `
+          <div class="tooltip-title"><div class="dot" style="background:#ffd54f;transform:rotate(45deg);border-radius:1px"></div>${esc(d.label)}</div>
+          <div class="tooltip-row">type <span>secret</span></div>
+          <div class="tooltip-row">rewrites <span>${totalWeight.toLocaleString()}</span></div>
+        `;
+      }
+      tooltip.innerHTML = html;
+      tooltip.style.display = 'block';
+      tooltip.style.left = (event.clientX + 14) + 'px';
+      tooltip.style.top = (event.clientY - 10) + 'px';
+    }
+
+    function hideTooltip() {
+      tooltip.style.display = 'none';
+    }
+
+    // === DRAG ===
     function drag(sim) {
       return d3.drag()
         .on('start', (event, d) => {
           if (!event.active) sim.alphaTarget(0.3).restart();
-          d.fx = d.x;
-          d.fy = d.y;
+          d.fx = d.x; d.fy = d.y;
         })
-        .on('drag', (event, d) => {
-          d.fx = event.x;
-          d.fy = event.y;
-        })
+        .on('drag', (event, d) => { d.fx = event.x; d.fy = event.y; })
         .on('end', (event, d) => {
           if (!event.active) sim.alphaTarget(0);
-          d.fx = null;
-          d.fy = null;
+          d.fx = null; d.fy = null;
         });
     }
 
+    // === PARTICLES ===
+    function animateParticles() {
+      currentEdges.forEach(edge => {
+        const src = edge.source;
+        const tgt = edge.target;
+        if (!src.x || !tgt.x) return;
+        const weight = edge.weight || 1;
+        // More particles for heavier edges, cap at 3
+        const count = Math.min(3, Math.max(1, Math.floor(Math.log2(weight + 1) / 2)));
+
+        for (let i = 0; i < count; i++) {
+          const particle = particleLayer.append('circle')
+            .attr('class', 'flow-particle')
+            .attr('r', 2.5)
+            .attr('cx', src.x)
+            .attr('cy', src.y)
+            .style('fill', '#00e5ff')
+            .style('opacity', 0);
+
+          particle.transition()
+            .delay(i * (600 + Math.random() * 400))
+            .duration(0)
+            .style('opacity', 0.8)
+            .transition()
+            .duration(1200 + Math.random() * 800)
+            .ease(d3.easeLinear)
+            .attr('cx', tgt.x)
+            .attr('cy', tgt.y)
+            .style('opacity', 0)
+            .remove();
+        }
+      });
+    }
+
+    // === UPDATE GRAPH ===
     function updateGraph(data) {
       const { nodes: newNodes, edges: newEdges } = data;
 
@@ -344,9 +751,34 @@
       }
       emptyState.style.display = 'none';
 
-      // Merge: preserve existing node positions
+      // Filter
+      let filteredNodes = newNodes;
+      let filteredEdges = newEdges || [];
+      if (searchFilter) {
+        const q = searchFilter.toLowerCase();
+        const matchIds = new Set();
+        newNodes.forEach(n => {
+          if (n.label.toLowerCase().includes(q) || n.id.toLowerCase().includes(q)) matchIds.add(n.id);
+        });
+        // Include connected nodes
+        filteredEdges.forEach(e => {
+          const sid = typeof e.source === 'object' ? e.source.id : e.source;
+          const tid = typeof e.target === 'object' ? e.target.id : e.target;
+          if (matchIds.has(sid)) matchIds.add(tid);
+          if (matchIds.has(tid)) matchIds.add(sid);
+        });
+        filteredNodes = newNodes.filter(n => matchIds.has(n.id));
+        const nodeIds = new Set(filteredNodes.map(n => n.id));
+        filteredEdges = filteredEdges.filter(e => {
+          const sid = typeof e.source === 'object' ? e.source.id : e.source;
+          const tid = typeof e.target === 'object' ? e.target.id : e.target;
+          return nodeIds.has(sid) && nodeIds.has(tid);
+        });
+      }
+
+      // Merge positions
       const existingById = new Map(currentNodes.map(n => [n.id, n]));
-      const mergedNodes = newNodes.map(n => {
+      const mergedNodes = filteredNodes.map(n => {
         const existing = existingById.get(n.id);
         return existing
           ? Object.assign(existing, { label: n.label, type: n.type, runtime: n.runtime })
@@ -354,107 +786,182 @@
       });
 
       currentNodes = mergedNodes;
-      currentEdges = newEdges || [];
+      currentEdges = filteredEdges;
 
       simulation.nodes(currentNodes);
       simulation.force('link').links(currentEdges);
-      simulation.alpha(0.3).restart();
+      simulation.alpha(0.15).restart();
 
-      // Edges
-      linkSel = g.select('.links').selectAll('.link').data(currentEdges, d => d.source.id + '-' + d.target.id);
-      linkSel.exit().remove();
-      linkSel = linkSel.enter()
+      // Update stats
+      const totalRewrites = currentEdges.reduce((s, e) => s + (e.weight || 0), 0);
+      const pods = currentNodes.filter(n => n.type === 'pod').length;
+      const secrets = currentNodes.filter(n => n.type === 'secret').length;
+
+      document.getElementById('stat-pods').textContent = pods;
+      document.getElementById('stat-secrets').textContent = secrets;
+      document.getElementById('stat-rewrites').textContent = totalRewrites.toLocaleString();
+
+      if (prevTotalRewrites > 0) {
+        rewriteRate = Math.round((totalRewrites - prevTotalRewrites) / 5);
+        if (rewriteRate < 0) rewriteRate = 0;
+      }
+      prevTotalRewrites = totalRewrites;
+      document.getElementById('stat-rate').textContent = rewriteRate;
+
+      // === EDGES ===
+      linkSel = edgeLayer.selectAll('.link').data(currentEdges, d => {
+        const sid = d.source.id || d.source;
+        const tid = d.target.id || d.target;
+        return sid + '|' + tid;
+      });
+      linkSel.exit().transition().duration(300).style('opacity', 0).remove();
+
+      const linkEnter = linkSel.enter()
         .append('line')
         .attr('class', 'link')
-        .merge(linkSel);
+        .attr('filter', 'url(#glow-edge)')
+        .style('opacity', 0);
 
-      linkSel.attr('stroke-width', d => Math.max(1.5, Math.min(8, Math.log2((d.weight || 1) + 1))));
+      linkSel = linkEnter.merge(linkSel);
 
-      // Nodes
-      nodeSel = g.select('.nodes').selectAll('.node-group').data(currentNodes, d => d.id);
-      nodeSel.exit().remove();
+      linkSel.transition().duration(400)
+        .style('opacity', 1)
+        .style('stroke', d => {
+          const w = d.weight || 1;
+          if (w > 1000) return 'rgba(0,229,255,0.6)';
+          if (w > 100) return 'rgba(0,229,255,0.4)';
+          return 'rgba(0,229,255,0.25)';
+        })
+        .attr('stroke-width', d => Math.max(1, Math.min(6, Math.log2((d.weight || 1) + 1))));
+
+      // === NODES ===
+      nodeSel = nodeLayer.selectAll('.node-group').data(currentNodes, d => d.id);
+      nodeSel.exit().transition().duration(300).style('opacity', 0).remove();
 
       const nodeEnter = nodeSel.enter()
         .append('g')
         .attr('class', 'node-group')
-        .call(drag(simulation));
+        .style('opacity', 0)
+        .call(drag(simulation))
+        .on('mouseover', showTooltip)
+        .on('mousemove', (event) => {
+          tooltip.style.left = (event.clientX + 14) + 'px';
+          tooltip.style.top = (event.clientY - 10) + 'px';
+        })
+        .on('mouseout', hideTooltip);
 
-      // Pod: circle
-      nodeEnter.filter(d => d.type === 'pod')
-        .append('circle')
+      // Pod nodes: outer glow ring + inner circle
+      const podEnter = nodeEnter.filter(d => d.type === 'pod');
+      podEnter.append('circle')
+        .attr('class', 'node-pod-glow')
+        .attr('r', 28)
+        .attr('fill', 'none')
+        .attr('stroke', d => RUNTIME_GLOW[d.runtime] || RUNTIME_GLOW.unknown)
+        .attr('stroke-width', 1);
+      podEnter.append('circle')
         .attr('class', 'node-pod')
-        .attr('r', 22)
-        .attr('fill', d => RUNTIME_COLORS[d.runtime] || RUNTIME_COLORS.unknown);
+        .attr('r', 20)
+        .attr('fill', d => RUNTIME_COLORS[d.runtime] || RUNTIME_COLORS.unknown)
+        .attr('stroke', d => RUNTIME_COLORS[d.runtime] || RUNTIME_COLORS.unknown)
+        .attr('stroke-width', 2)
+        .attr('stroke-opacity', 0.3)
+        .attr('filter', 'url(#glow-pod)');
+      podEnter.append('text')
+        .attr('class', 'node-label node-label-pod')
+        .attr('dy', 34)
+        .text(d => d.label.replace(/-[a-z0-9]+-[a-z0-9]+$/, '')); // trim k8s suffix
 
-      // Secret: diamond (rect rotated 45deg)
-      nodeEnter.filter(d => d.type === 'secret')
-        .append('rect')
+      // Secret nodes: hexagon
+      const secretEnter = nodeEnter.filter(d => d.type === 'secret');
+      const hex = (r) => {
+        const pts = [];
+        for (let i = 0; i < 6; i++) {
+          const angle = (Math.PI / 3) * i - Math.PI / 6;
+          pts.push([r * Math.cos(angle), r * Math.sin(angle)]);
+        }
+        return pts.map(p => p.join(',')).join(' ');
+      };
+      secretEnter.append('polygon')
         .attr('class', 'node-secret')
-        .attr('width', 28)
-        .attr('height', 28)
-        .attr('x', -14)
-        .attr('y', -14)
-        .attr('transform', 'rotate(45)');
-
-      nodeEnter.append('text')
+        .attr('points', hex(22))
+        .attr('fill', 'rgba(255,213,79,0.15)')
+        .attr('stroke', '#ffd54f')
+        .attr('stroke-width', 2)
+        .attr('filter', 'url(#glow-secret)');
+      secretEnter.append('polygon')
+        .attr('points', hex(12))
+        .attr('fill', '#ffd54f')
+        .attr('stroke', 'none')
+        .attr('opacity', 0.6);
+      secretEnter.append('text')
         .attr('class', 'node-label')
-        .attr('dy', d => d.type === 'pod' ? 36 : 30)
+        .attr('dy', 34)
+        .style('fill', '#ffd54f')
         .text(d => d.label);
 
+      nodeEnter.transition().duration(400).style('opacity', 1);
       nodeSel = nodeEnter.merge(nodeSel);
 
-      // Update colors on existing pod nodes
-      nodeSel.select('circle.node-pod')
-        .attr('fill', d => RUNTIME_COLORS[d.runtime] || RUNTIME_COLORS.unknown);
-
+      // Tick
       simulation.on('tick', () => {
         linkSel
           .attr('x1', d => d.source.x)
           .attr('y1', d => d.source.y)
           .attr('x2', d => d.target.x)
           .attr('y2', d => d.target.y);
-
         nodeSel.attr('transform', d => `translate(${d.x},${d.y})`);
       });
     }
 
+    // === UPDATE SIDEBAR ===
     function updateTopSecrets(data) {
       const list = document.getElementById('top-secrets');
       const secrets = (data && data.secrets) ? data.secrets : [];
-      list.innerHTML = '';
 
       if (secrets.length === 0) {
-        const li = document.createElement('li');
-        li.style.cssText = 'padding:20px;color:#445;font-size:13px;text-align:center;';
-        li.textContent = 'No data yet';
-        list.appendChild(li);
+        list.innerHTML = '<li style="padding:24px 20px;color:var(--text-dim);font-family:var(--font-mono);font-size:11px;text-align:center;">// no data</li>';
         return;
       }
 
       const maxRewrites = Math.max(...secrets.map(s => s.total_rewrites), 1);
 
+      // Build new HTML
+      let html = '';
       secrets.forEach((s, i) => {
         const pct = Math.round((s.total_rewrites / maxRewrites) * 100);
-        const li = document.createElement('li');
-        li.className = 'secret-item';
-        li.innerHTML = `
-          <div class="secret-rank">#${i + 1}</div>
-          <div class="secret-name">${escHtml(s.name)}</div>
-          <div class="secret-ns">${escHtml(s.namespace)}</div>
-          <div class="secret-count">${s.total_rewrites.toLocaleString()} rewrites</div>
-          <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>
+        const isTop = i === 0;
+        html += `
+          <li class="secret-item">
+            <div class="secret-item-header">
+              <span class="secret-rank ${isTop ? 'top' : ''}">${i + 1}</span>
+              <div class="secret-info">
+                <div class="secret-name">${esc(s.name)}</div>
+                <div class="secret-ns">${esc(s.namespace)}</div>
+              </div>
+              <span class="secret-count">${s.total_rewrites.toLocaleString()}</span>
+            </div>
+            <div class="bar-track"><div class="bar-fill" style="width:${pct}%"></div></div>
+          </li>
         `;
-        list.appendChild(li);
       });
+      list.innerHTML = html;
     }
 
-    function escHtml(s) {
-      return String(s)
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;');
+    function esc(s) {
+      const d = document.createElement('div');
+      d.textContent = s;
+      return d.innerHTML;
     }
+
+    // === SEARCH ===
+    document.getElementById('search').addEventListener('input', (e) => {
+      searchFilter = e.target.value;
+      // Re-render with current data
+      if (lastGraphData) updateGraph(lastGraphData);
+    });
+
+    // === FETCH ===
+    let lastGraphData = null;
 
     async function fetchAndUpdate() {
       try {
@@ -462,25 +969,29 @@
           fetch('/api/graph').then(r => r.json()),
           fetch('/api/top-secrets').then(r => r.json()),
         ]);
+        lastGraphData = graphData;
         updateGraph(graphData);
         updateTopSecrets(topData);
-        document.getElementById('status-dot').style.background = '#3CB371';
+        animateParticles();
+        document.getElementById('live-dot').classList.remove('error');
       } catch (err) {
         console.error('fetch error:', err);
-        document.getElementById('status-dot').style.background = '#cc4444';
+        document.getElementById('live-dot').classList.add('error');
       }
     }
 
-    // Handle resize
+    // === RESIZE ===
     window.addEventListener('resize', () => {
       width = container.clientWidth;
       height = container.clientHeight;
       svg.attr('width', width).attr('height', height);
       simulation.force('center', d3.forceCenter(width / 2, height / 2));
+      simulation.force('x', d3.forceX(width / 2).strength(0.03));
+      simulation.force('y', d3.forceY(height / 2).strength(0.03));
       simulation.alpha(0.1).restart();
     });
 
-    // Initial fetch + poll
+    // === START ===
     fetchAndUpdate();
     setInterval(fetchAndUpdate, 5000);
   </script>
