@@ -497,26 +497,15 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		return fmt.Errorf("opening executable %s: %w", exePath, err)
 	}
 
-	// 1. Try Go crypto/tls (statically linked into the binary).
-	// Use PID-scoped attachment because Go binaries are unique per container
-	// and system-wide uprobes via overlay don't fire for the same binary.
-	goWriteSym := "crypto/tls.(*Conn).Write"
-	if up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, &link.UprobeOptions{PID: pid}); err == nil {
-		m.log.Info("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
-		m.links = append(m.links, up)
-		return nil
-	}
-
-	// 2. Scan all TLS shared libraries in the container filesystem and attach
-	// system-wide uprobes. Uses /proc/<pid>/root to access the container's
-	// overlay mount — all processes in the same container share the same
-	// overlay inode, so the uprobe fires for any of them.
+	// 1. Try SSL_write in the main executable first (statically linked
+	// OpenSSL/BoringSSL). This must come before the Go crypto/tls check
+	// because Go+BoringCrypto binaries have BOTH crypto/tls.(*Conn).Write
+	// AND SSL_write — the SSL_write path supports XOR patching while the
+	// Go wrapper does not.
 	sslSymbols := []string{"SSL_write", "SSL_write_ex"}
 	gnutlsSymbols := []string{"gnutls_record_send", "gnutls_record_send2"}
 	attached := false
 
-	// Try main executable first (statically linked OpenSSL/BoringSSL/GnuTLS).
-	// Use PID-scoped because the main exe is unique per container.
 	for _, sym := range append(sslSymbols, gnutlsSymbols...) {
 		if up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid}); err == nil {
 			m.log.Info("Attached uprobe to main exe", "pid", pid, "symbol", sym)
@@ -524,6 +513,22 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 			attached = true
 		}
 	}
+
+	// 2. If no SSL_write found in main exe, try Go crypto/tls.
+	// Use PID-scoped attachment because Go binaries are unique per container.
+	if !attached {
+		goWriteSym := "crypto/tls.(*Conn).Write"
+		if up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, &link.UprobeOptions{PID: pid}); err == nil {
+			m.log.Info("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
+			m.links = append(m.links, up)
+			return nil
+		}
+	}
+
+	// 3. Scan all TLS shared libraries in the container filesystem and attach
+	// system-wide uprobes. Uses /proc/<pid>/root to access the container's
+	// overlay mount — all processes in the same container share the same
+	// overlay inode, so the uprobe fires for any of them.
 
 	// Scan container filesystem for all TLS shared libraries
 	containerLibs := findContainerTLSLibraries(pid)
@@ -561,36 +566,44 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
 }
 
-// pushTLSOffsets detects the OpenSSL version in the container's TLS libraries
-// and pushes struct offsets to the tls_offset_config BPF map. This enables the
-// XOR-patch path for TLS 1.3 AES-GCM connections.
+// pushTLSOffsets detects the TLS library (OpenSSL or BoringSSL) in the
+// container and pushes struct offsets to the tls_offset_config BPF map.
+// This enables the XOR-patch path for AES-GCM connections.
 func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
+	// Try container shared libraries first.
 	for _, libPath := range containerLibs {
-		version, offsets, err := DetectOpenSSLVersion(pid, libPath)
+		version, offsets, err := DetectTLSLibrary(pid, libPath)
 		if err != nil {
-			m.log.V(1).Info("OpenSSL version detection skipped", "lib", libPath, "reason", err)
+			m.log.Info("TLS library detection failed", "pid", pid, "lib", libPath, "error", err)
 			continue
 		}
-
-		// Push offsets to the BPF config map.
-		// Must match struct tls_offsets in tls_uprobe.c.
-		type bpfTLSOffsets struct {
-			SSLToWRL       uint32
-			WRLToEncCtx    uint32
-			EncCtxToAlgctx uint32
-			AlgctxToH      uint32
+		if m.pushOffsets(libPath, version, offsets) {
+			return
 		}
-		val := bpfTLSOffsets(offsets)
-		if err := m.objs.TlsOffsetConfig.Update(uint32(0), &val, 0); err != nil {
-			m.log.Error(err, "Failed to push TLS offsets to BPF map")
-			continue
-		}
-
-		m.log.Info("Pushed TLS offsets for XOR-patch path",
-			"lib", libPath, "version", version,
-			"offsets", fmt.Sprintf("%+v", offsets))
-		return // Only need one successful push.
 	}
+	// Try the main executable (statically linked BoringSSL in Go binaries).
+	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+	version, offsets, err := detectTLSLibraryFromHostPath(exePath)
+	if err != nil {
+		m.log.Info("TLS library detection failed for exe", "pid", pid, "exe", exePath, "error", err)
+		return
+	}
+	m.pushOffsets(exePath, version, offsets)
+}
+
+func (m *TLSUprobeManager) pushOffsets(libPath, version string, offsets TLSOffsets) bool {
+
+	// Push offsets to the BPF config map.
+	// TLSOffsets layout must match struct tls_offsets in tls_uprobe.c exactly.
+	if err := m.objs.TlsOffsetConfig.Update(uint32(0), &offsets, 0); err != nil {
+		m.log.Error(err, "Failed to push TLS offsets to BPF map")
+		return false
+	}
+
+	m.log.Info("Pushed TLS offsets for XOR-patch path",
+		"lib", libPath, "version", version, "chainType", offsets.ChainType,
+		"offsets", fmt.Sprintf("%+v", offsets))
+	return true
 }
 
 // findContainerTLSLibraries scans common library directories in the container's

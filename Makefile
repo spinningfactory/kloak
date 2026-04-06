@@ -99,13 +99,14 @@ e2e-setup:
 	@docker build -t kloak-demo-js:latest ./examples/demo-js/
 	@docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
 	@docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
+	@docker build -t kloak-demo-boringssl:latest ./examples/demo-boringssl/
 	@docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
 	@docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
 	@echo "==> Importing images into k3d (via tar to avoid pipe EOF)..."
 	@mkdir -p /tmp/k3d-images
 	@for img in $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest \
 		kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest \
-		kloak-demo-python-raw-tls:latest kloak-tls-echo:latest; do \
+		kloak-demo-boringssl:latest kloak-demo-python-raw-tls:latest kloak-tls-echo:latest; do \
 		echo "  Importing $$img..."; \
 		docker save $$img -o /tmp/k3d-images/$$(echo $$img | tr ':/' '__').tar && \
 		k3d image import /tmp/k3d-images/$$(echo $$img | tr ':/' '__').tar -c $(E2E_CLUSTER); \
@@ -134,7 +135,7 @@ e2e-local-push:
 	@echo "==> Building and pushing images to $(E2E_REGISTRY) ..."
 	@docker build -t $(E2E_REGISTRY)/kloak:e2e .
 	@docker push $(E2E_REGISTRY)/kloak:e2e
-	@for demo in demo-go demo-python demo-js demo-go-boring demo-gnutls demo-python-raw-tls; do \
+	@for demo in demo-go demo-python demo-js demo-go-boring demo-gnutls demo-boringssl demo-python-raw-tls; do \
 		echo "  Pushing kloak-$$demo..."; \
 		docker build -t $(E2E_REGISTRY)/kloak-$$demo:latest ./examples/$$demo/ && \
 		docker push $(E2E_REGISTRY)/kloak-$$demo:latest; \

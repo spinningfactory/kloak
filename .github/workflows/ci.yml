@@ -199,9 +199,10 @@ jobs:
           docker build -t kloak-demo-js:latest ./examples/demo-js/
           docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
           docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
+          docker build -t kloak-demo-boringssl:latest ./examples/demo-boringssl/
           docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
           docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
-          k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest -c kloak-e2e
+          k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest kloak-demo-boringssl:latest kloak-demo-python-raw-tls:latest -c kloak-e2e
           k3d image import kloak-tls-echo:latest -c kloak-e2e
 
       - name: Install Helm
@@ -232,6 +233,8 @@ jobs:
           kubectl logs -n kloak-e2e -l app=demo-js --tail=50 2>/dev/null || true
           echo "=== Demo Go BoringSSL Logs ==="
           kubectl logs -n kloak-e2e -l app=demo-go-boring --tail=50 2>/dev/null || true
+          echo "=== Demo BoringSSL C Logs ==="
+          kubectl logs -n kloak-e2e -l app=demo-boringssl --tail=50 2>/dev/null || true
           echo "=== Demo Python Raw TLS Logs ==="
           kubectl logs -n kloak-e2e -l app=demo-python-raw-tls --tail=50 2>/dev/null || true
           echo "=== All Pods ==="

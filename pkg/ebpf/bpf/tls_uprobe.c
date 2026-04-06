@@ -441,13 +441,30 @@ struct {
 // Userspace-configured struct offsets for extracting TLS key material.
 // Populated once per library at uprobe attach time after the controller
 // detects the OpenSSL version. Supports a 4-level pointer chain:
-//   SSL* + off1 → wrl* + off2 → enc_ctx* + off3 → algctx* + off4 → H (16 bytes)
-// For OpenSSL 3.2+, the record layer refactoring added an extra hop.
+//   OpenSSL 3.2+: SSL* → wrl* → enc_ctx* → algctx* → H (4 pointer derefs)
+//   BoringSSL:    SSL* → s3* → aead_write_ctx* → H (2 derefs + direct read)
+// Layout must match Go's TLSOffsets struct exactly.
+#define CHAIN_OPENSSL_4HOP 0
+#define CHAIN_BORINGSSL    1
+
 struct tls_offsets {
+  __u32 chain_type;         // 0=OpenSSL 4-hop, 1=BoringSSL
+
+  // OpenSSL 3.2+ (4-hop chain)
   __u32 ssl_to_wrl;         // SSL* + off → OSSL_RECORD_LAYER* (pointer deref)
   __u32 wrl_to_enc_ctx;     // wrl* + off → EVP_CIPHER_CTX* (pointer deref)
   __u32 enc_ctx_to_algctx;  // enc_ctx* + off → algctx/PROV_GCM_CTX* (pointer deref)
   __u32 algctx_to_h;        // algctx* + off → H (16 bytes, direct read)
+
+  // BoringSSL (2-deref chain)
+  __u32 ssl_to_s3;          // SSL* + off → SSL3_STATE* (pointer deref)
+  __u32 s3_to_aead;         // s3* + off → SSLAEADContext* (pointer deref)
+  __u32 aead_to_h;          // aead_ctx* + off → H (16 bytes, direct read)
+
+  // Shared: configurable BIO offsets for ssl_read_fd.
+  // 0 means use the default (88 for wbio, 56 for bio_num).
+  __u32 wbio_offset;
+  __u32 bio_num_offset;
 };
 
 struct {
@@ -1075,20 +1092,35 @@ int tp_enter_close(struct trace_event_raw_sys_enter *ctx) {
 }
 
 // Offsets for reading fd from SSL struct's BIO (stable across OpenSSL 3.x).
-// SSL_CONNECTION.wbio → BIO*, BIO.num → int fd
-// Verified via pahole: identical on aarch64 and x86_64, OpenSSL 3.0-3.5.
-#define SSL_WBIO_OFFSET 88  // offsetof(ssl_connection_st, wbio) for 3.2+
-#define BIO_NUM_OFFSET  56  // offsetof(bio_st, num)
+// Default BIO offsets (OpenSSL 3.2+). Overridden by tls_offset_config for BoringSSL.
+#define DEFAULT_WBIO_OFFSET 88  // offsetof(ssl_connection_st, wbio)
+#define DEFAULT_BIO_NUM_OFFSET 56  // offsetof(bio_st, num)
 
 // Read the socket fd directly from the SSL struct's write BIO.
+// Uses configurable offsets from tls_offset_config if available,
+// falling back to OpenSSL defaults.
 // Returns the fd, or 0 if the read fails.
 static __always_inline __u32 ssl_read_fd(__u64 ssl_ptr) {
   if (!ssl_ptr) return 0;
+
+  __u32 wbio_off = DEFAULT_WBIO_OFFSET;
+  __u32 bio_num_off = DEFAULT_BIO_NUM_OFFSET;
+
+  // Read configurable offsets if available.
+  __u32 zero = 0;
+  struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &zero);
+  if (offsets) {
+    if (offsets->wbio_offset != 0)
+      wbio_off = offsets->wbio_offset;
+    if (offsets->bio_num_offset != 0)
+      bio_num_off = offsets->bio_num_offset;
+  }
+
   __u64 wbio = 0;
-  if (bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + SSL_WBIO_OFFSET)) < 0 || !wbio)
+  if (bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + wbio_off)) < 0 || !wbio)
     return 0;
   __u32 fd = 0;
-  if (bpf_probe_read_user(&fd, 4, (void *)(wbio + BIO_NUM_OFFSET)) < 0)
+  if (bpf_probe_read_user(&fd, 4, (void *)(wbio + bio_num_off)) < 0)
     return 0;
   return fd;
 }
@@ -1293,38 +1325,53 @@ int bpf_h_extract(void *ctx) {
     return 0;
 
   struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &zero);
-  if (!offsets || offsets->ssl_to_wrl == 0)
+  if (!offsets)
     return 0;
 
-  // 4-step pointer chase: SSL* → wrl* → enc_ctx* → algctx* → H
   __u64 wrl_ptr = 0;
-  if (bpf_probe_read_user(&wrl_ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !wrl_ptr)
-    return 0;
-  __u64 ptr = wrl_ptr;
-  if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
-    return 0;
-  if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr)
-    return 0;
+  __u64 h_ptr = 0; // final pointer to read H from
+
+  if (offsets->chain_type == CHAIN_BORINGSSL) {
+    // BoringSSL: SSL* → s3 → aead_write_ctx → H (2 derefs + direct read)
+    if (offsets->ssl_to_s3 == 0)
+      return 0;
+    __u64 s3_ptr = 0;
+    if (bpf_probe_read_user(&s3_ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_s3)) < 0 || !s3_ptr)
+      return 0;
+    __u64 aead_ptr = 0;
+    if (bpf_probe_read_user(&aead_ptr, 8, (void *)(s3_ptr + offsets->s3_to_aead)) < 0 || !aead_ptr)
+      return 0;
+    h_ptr = aead_ptr + offsets->aead_to_h;
+  } else {
+    // OpenSSL 3.2+: SSL* → wrl* → enc_ctx* → algctx* → H (4 pointer derefs)
+    if (offsets->ssl_to_wrl == 0)
+      return 0;
+    if (bpf_probe_read_user(&wrl_ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !wrl_ptr)
+      return 0;
+    __u64 ptr = wrl_ptr;
+    if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
+      return 0;
+    if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr)
+      return 0;
+    h_ptr = ptr + offsets->algctx_to_h;
+  }
 
   // Read H directly into a stack-allocated tls_conn_state.
-  // Only set ghash_h + cipher_type (rest stays zero).
-  // The struct is 276 bytes but we only write 18 bytes — the rest is zero from stack init.
   struct tls_conn_state new_conn;
   __builtin_memset(&new_conn, 0, sizeof(new_conn));
-  if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0)
+  if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)h_ptr) < 0)
     return 0;
 
-  // OpenSSL stores H as two u64 in native (little-endian) byte order.
-  // GHASH expects big-endian byte order. Byte-swap each 8-byte half.
+  // Both OpenSSL and BoringSSL store H as two u64 in native (little-endian)
+  // byte order. GHASH expects big-endian byte order. Byte-swap each half.
   __u64 *h64 = (__u64 *)new_conn.ghash_h;
   if (h64[0] == 0 && h64[1] == 0)
     return 0;
   h64[0] = __builtin_bswap64(h64[0]);
   h64[1] = __builtin_bswap64(h64[1]);
 
-  // Successful H extraction implies AES-GCM (only GCM contexts have a valid H key).
-  // Non-GCM ciphers (CBC, ChaCha20) don't have a GCM128_CONTEXT, so the pointer
-  // chain fails or H is all-zeros — both caught above.
+  // Successful H extraction implies AES-GCM (only GCM contexts have a valid
+  // H key). Non-GCM ciphers fail the pointer chain or yield all-zeros H.
   new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
   new_conn.wrl_ptr = wrl_ptr;
 
@@ -1682,52 +1729,54 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   tdk.src_port = __bpf_htons(src_port_h);
   tdk.cgroup_id = bpf_get_current_cgroup_id();
 
-  // Copy from xor_pending to tc_pending. Re-lookup pending after helper calls.
+  // Save values from xor_pending before helper calls invalidate the pointer.
   __u32 zero = 0;
-  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w) return 0;
 
   pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
   if (!pending) return 0;
 
-  __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
-  w->staged_tc.tgid = (__u32)(pid_tgid >> 32);
-  w->staged_tc.ssl_ptr = pending->ssl_ptr;
-  w->staged_tc.active = 1;
-  w->staged_tc.plaintext_len = pending->plaintext_len;
-  w->staged_tc.patch_count = pending->patch_count;
-  if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
-    w->staged_tc.patch_count = XOR_MAX_PATCHES;
-  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < w->staged_tc.patch_count; p++)
-    w->staged_tc.patches[p] = pending->patches[p];
-
   __u64 ssl_ptr = pending->ssl_ptr;
-  __u32 tgid = w->staged_tc.tgid;
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+  __u32 plaintext_len = pending->plaintext_len;
 
-  bpf_map_update_elem(&tc_pending, &tdk, &w->staged_tc, BPF_ANY);
-  bpf_printk("kloak [2-KPROBE] sport=%u cg=%x", src_port_h, (__u32)tdk.cgroup_id);
-
-  // Delete xor_pending — the entry has been bridged to tc_pending.
-  bpf_map_delete_elem(&xor_pending, &pid_tgid);
-
-  // Extract H from the SSL struct. At tcp_sendmsg time, the TLS handshake
-  // has completed and the encryption context (with H) is available.
+  // Extract H from the SSL struct BEFORE creating tc_pending.
+  // If H extraction fails, we must NOT create tc_pending — otherwise tc_egress
+  // would XOR-patch the ciphertext without being able to recompute the GHASH
+  // authentication tag, causing "bad record MAC" errors on the server.
   struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &zero);
-  if (!offsets || offsets->ssl_to_wrl == 0)
+  if (!offsets)
     return 0;
 
-  __u64 ptr = 0;
-  if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
-    return 0;
-  __u64 wrl_val = ptr;
-  if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
-    return 0;
-  if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr)
-    return 0;
+  __u64 wrl_val = 0;
+  __u64 h_ptr = 0;
+
+  if (offsets->chain_type == CHAIN_BORINGSSL) {
+    if (offsets->ssl_to_s3 == 0)
+      return 0;
+    __u64 s3_ptr = 0;
+    if (bpf_probe_read_user(&s3_ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_s3)) < 0 || !s3_ptr)
+      return 0;
+    __u64 aead_ptr = 0;
+    if (bpf_probe_read_user(&aead_ptr, 8, (void *)(s3_ptr + offsets->s3_to_aead)) < 0 || !aead_ptr)
+      return 0;
+    h_ptr = aead_ptr + offsets->aead_to_h;
+  } else {
+    if (offsets->ssl_to_wrl == 0)
+      return 0;
+    __u64 ptr = 0;
+    if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
+      return 0;
+    wrl_val = ptr;
+    if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
+      return 0;
+    if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr)
+      return 0;
+    h_ptr = ptr + offsets->algctx_to_h;
+  }
 
   struct tls_conn_state new_conn;
   __builtin_memset(&new_conn, 0, sizeof(new_conn));
-  if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0)
+  if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)h_ptr) < 0)
     return 0;
 
   __u64 *h64 = (__u64 *)new_conn.ghash_h;
@@ -1739,10 +1788,36 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
   new_conn.wrl_ptr = wrl_val;
 
+  // H extraction succeeded — store the connection state.
   struct tls_conn_key ck = {};
   ck.tgid = tgid;
   ck.ssl_ptr = ssl_ptr;
   bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_ANY);
+
+  // Now safe to create tc_pending and bridge the xor_pending entry.
+  // tc_egress can always find the H in tls_conn_state.
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w) return 0;
+
+  pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
+  if (!pending) return 0;
+
+  __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
+  w->staged_tc.tgid = tgid;
+  w->staged_tc.ssl_ptr = ssl_ptr;
+  w->staged_tc.active = 1;
+  w->staged_tc.plaintext_len = plaintext_len;
+  w->staged_tc.patch_count = pending->patch_count;
+  if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
+    w->staged_tc.patch_count = XOR_MAX_PATCHES;
+  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < w->staged_tc.patch_count; p++)
+    w->staged_tc.patches[p] = pending->patches[p];
+
+  bpf_map_update_elem(&tc_pending, &tdk, &w->staged_tc, BPF_ANY);
+  bpf_printk("kloak [2-KPROBE] sport=%u cg=%x", src_port_h, (__u32)tdk.cgroup_id);
+
+  // Delete xor_pending — the entry has been bridged to tc_pending.
+  bpf_map_delete_elem(&xor_pending, &pid_tgid);
 
   return 0;
 }

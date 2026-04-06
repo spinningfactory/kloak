@@ -96,7 +96,13 @@ var ebpfTests = []ebpfRewriteTest{
 		demoDir:        "demo-go-boring",
 		deploymentName: "demo-go-boring",
 		appLabel:       "app=demo-go-boring",
-		skip:           "BoringSSL H extraction not yet implemented",
+		skip:           "Go+BoringCrypto uses EVP_AEAD directly (no SSL*); needs Go struct offsets for H extraction",
+	},
+	{
+		name:           "boringssl",
+		demoDir:        "demo-boringssl",
+		deploymentName: "demo-boringssl",
+		appLabel:       "app=demo-boringssl",
 	},
 	{
 		name:           "gnutls",
