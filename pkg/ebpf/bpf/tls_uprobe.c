@@ -1630,6 +1630,35 @@ static int ghash_block_iter(__u32 block_idx, void *_unused) {
   return 0;
 }
 
+// bpf_loop callback: process one patch for GHASH tag recomputation.
+// Replaces the unrolled for-loop over patches in tc_ghash_update to keep
+// verifier complexity O(1) per patch instead of O(XOR_MAX_PATCHES).
+static int ghash_patch_iter(__u32 p, void *_unused) {
+  __u32 zero = 0;
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w) return 1;
+
+  // Skip patches that tc_egress_patch failed to apply (secret_len zeroed).
+  __u32 raw_len = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len;
+  if (raw_len == 0) return 0;
+
+  __u32 sec_off = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_offset;
+  __u32 sec_len = clamp_write_len(raw_len);
+
+  w->ghash_secret_offset = sec_off;
+  w->ghash_patch_len = sec_len;
+  __builtin_memcpy(w->ghash_xor_delta,
+      w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].xor_delta,
+      SECRET_MAX_LEN);
+  w->ghash_first_block = sec_off / 16;
+
+  __u32 num_blocks = (sec_off + sec_len - 1) / 16 - w->ghash_first_block + 1;
+  if (num_blocks > 9) num_blocks = 9;
+
+  bpf_loop(num_blocks, ghash_block_iter, NULL, 0);
+  return 0;
+}
+
 // -----------------------------------------------------------------------------
 // kprobe/tcp_sendmsg — Bridge xor_pending to tc_pending with per-connection key.
 //
@@ -2236,33 +2265,17 @@ int tc_ghash_update(struct __sk_buff *skb) {
   // Iterate ALL patches — the GHASH formula is additive:
   // tag_delta = Σ Σ (delta_block * H^power) for each patch, each block.
   // tag_delta accumulates across all ghash_block_iter calls.
+  //
+  // Uses bpf_loop instead of a for-loop to avoid compiler unrolling
+  // XOR_MAX_PATCHES iterations. Each unrolled iteration contains nested
+  // bpf_loop calls (ghash_block_iter → h_power_step → gf128_mul_iter),
+  // causing the verifier to re-analyze the full callback tree per iteration
+  // and exceed the 1M instruction limit on newer kernels.
   __u32 pc = w->staged_pending.patch_count;
   if (pc > XOR_MAX_PATCHES) pc = XOR_MAX_PATCHES;
+  w->ghash_ct_blocks = ct_blocks;
 
-  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++) {
-    w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-    if (!w) return 0 /* TC_ACT_OK */;
-
-    // Skip patches that tc_egress_patch failed to apply (secret_len zeroed).
-    __u32 raw_len = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len;
-    if (raw_len == 0) continue;
-
-    __u32 sec_off = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_offset;
-    __u32 sec_len = clamp_write_len(raw_len);
-
-    w->ghash_secret_offset = sec_off;
-    w->ghash_patch_len = sec_len;
-    __builtin_memcpy(w->ghash_xor_delta,
-        w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].xor_delta,
-        SECRET_MAX_LEN);
-    w->ghash_first_block = sec_off / 16;
-    w->ghash_ct_blocks = ct_blocks;
-
-    __u32 num_blocks = (sec_off + sec_len - 1) / 16 - w->ghash_first_block + 1;
-    if (num_blocks > 9) num_blocks = 9;
-
-    bpf_loop(num_blocks, ghash_block_iter, NULL, 0);
-  }
+  bpf_loop(pc, ghash_patch_iter, NULL, 0);
 
   w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w)
