@@ -60,8 +60,6 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Binary may be stripped (-ldflags='-s -w'). DWARF is required.\n")
 		os.Exit(1)
 	}
-	defer func() { _ = f.Close() }()
-
 	result := OffsetResult{}
 	if bi != nil {
 		result.GoVersion = bi.GoVersion
@@ -197,9 +195,11 @@ func main() {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(result); err != nil {
+		_ = f.Close()
 		fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
 		os.Exit(1)
 	}
+	_ = f.Close()
 }
 
 func isTargetStruct(name string) bool {
