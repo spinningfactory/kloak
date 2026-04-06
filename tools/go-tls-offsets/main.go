@@ -2,11 +2,13 @@
 // to extract the GHASH H key from Go's crypto/tls internal structures.
 //
 // It reads DWARF debug info from a Go binary and prints the offset chain:
-//   tls.Conn → halfConn.cipher (interface) → concrete AEAD → gcmAES.productTable → H
+//
+//	tls.Conn → halfConn.cipher (interface) → concrete AEAD → gcmAES.productTable → H
 //
 // Usage:
-//   go run ./tools/go-tls-offsets /path/to/go-binary
-//   go run ./tools/go-tls-offsets  # uses itself as the binary
+//
+//	go run ./tools/go-tls-offsets /path/to/go-binary
+//	go run ./tools/go-tls-offsets  # uses itself as the binary
 package main
 
 import (
@@ -50,14 +52,15 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Error opening ELF: %v\n", err)
 		os.Exit(1)
 	}
-	defer f.Close()
 
 	dw, err := f.DWARF()
 	if err != nil {
+		_ = f.Close()
 		fmt.Fprintf(os.Stderr, "Error reading DWARF: %v\n", err)
 		fmt.Fprintf(os.Stderr, "Binary may be stripped (-ldflags='-s -w'). DWARF is required.\n")
 		os.Exit(1)
 	}
+	defer func() { _ = f.Close() }()
 
 	result := OffsetResult{}
 	if bi != nil {
@@ -193,7 +196,10 @@ func main() {
 	// Output JSON.
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
-	enc.Encode(result)
+	if err := enc.Encode(result); err != nil {
+		fmt.Fprintf(os.Stderr, "Error encoding JSON: %v\n", err)
+		os.Exit(1)
+	}
 }
 
 func isTargetStruct(name string) bool {
