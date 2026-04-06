@@ -3,7 +3,13 @@
 //
 // It reads DWARF debug info from a Go binary and prints the offset chain:
 //
-//	tls.Conn → halfConn.cipher (interface) → concrete AEAD → gcmAES.productTable → H
+//	tls.Conn → halfConn.cipher (interface) → AEAD wrapper → GCM.productTable → H×2
+//
+// The output matches the go_tls_offsets struct in tls_uprobe.c:
+//   - conn_to_cipher: combined offset to cipher interface data_ptr
+//   - aead_iface_off: offset to inner aead interface data_ptr
+//   - h2_hi_off: GCM offset to high 64-bit word of H×2
+//   - h2_lo_off: GCM offset to low 64-bit word of H×2
 //
 // Usage:
 //
@@ -21,14 +27,24 @@ import (
 	"strings"
 )
 
+// OffsetResult matches the go_tls_offsets BPF struct layout.
 type OffsetResult struct {
-	GoVersion        string `json:"go_version"`
-	Arch             string `json:"arch"`
-	ConnToHalfConn   uint32 `json:"conn_to_half_conn"`
-	HalfConnToCipher uint32 `json:"half_conn_to_cipher"`
-	CipherDataToGCM  uint32 `json:"cipher_data_to_gcm"`
-	GCMToH           uint32 `json:"gcm_to_h"`
-	Notes            string `json:"notes,omitempty"`
+	GoVersion    string `json:"go_version"`
+	Arch         string `json:"arch"`
+	ConnToCipher uint32 `json:"conn_to_cipher"`  // Conn.out + halfConn.cipher + 8
+	AEADIfaceOff uint32 `json:"aead_iface_off"`  // prefixNonceAEAD.aead + 8
+	H2HiOff      uint32 `json:"h2_hi_off"`       // GCM + off → high 64 bits of H×2
+	H2LoOff      uint32 `json:"h2_lo_off"`       // GCM + off → low 64 bits of H×2
+	Notes        string `json:"notes,omitempty"`
+
+	// Raw offsets for debugging (not used by BPF).
+	Raw struct {
+		ConnOut      uint32 `json:"conn_out"`
+		CipherOff    uint32 `json:"cipher_off"`
+		AEADOff      uint32 `json:"aead_off"`
+		ProductTable uint32 `json:"product_table"`
+		PDBase       uint32 `json:"pd_base"` // productTable + 224 (H×2 entry)
+	} `json:"raw"`
 }
 
 func main() {
@@ -39,7 +55,6 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "Analyzing: %s\n", path)
 
-	// Read Go build info for version.
 	bi, err := buildinfo.ReadFile(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: could not read buildinfo: %v\n", err)
@@ -60,6 +75,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "Binary may be stripped (-ldflags='-s -w'). DWARF is required.\n")
 		os.Exit(1)
 	}
+
 	result := OffsetResult{}
 	if bi != nil {
 		result.GoVersion = bi.GoVersion
@@ -73,19 +89,17 @@ func main() {
 		result.Arch = fmt.Sprintf("unknown(%d)", f.Machine)
 	}
 
-	// Walk DWARF entries to find our target structs.
-	structs := map[string]map[string]uint32{} // structName -> fieldName -> offset
+	// Walk DWARF entries to find target structs.
+	structs := map[string]map[string]uint32{}
 	reader := dw.Reader()
 	for {
 		entry, err := reader.Next()
 		if err != nil || entry == nil {
 			break
 		}
-
 		if entry.Tag != dwarf.TagStructType {
 			continue
 		}
-
 		name, _ := entry.Val(dwarf.AttrName).(string)
 		if !isTargetStruct(name) {
 			reader.SkipChildren()
@@ -94,7 +108,6 @@ func main() {
 
 		fmt.Fprintf(os.Stderr, "\nFound struct: %s\n", name)
 		fields := map[string]uint32{}
-
 		for {
 			child, err := reader.Next()
 			if err != nil || child == nil || child.Tag == 0 {
@@ -104,7 +117,6 @@ func main() {
 				continue
 			}
 			fieldName, _ := child.Val(dwarf.AttrName).(string)
-			// Try DW_AT_data_member_location
 			var offset uint32
 			if loc, ok := child.Val(dwarf.AttrDataMemberLoc).(int64); ok {
 				offset = uint32(loc)
@@ -112,76 +124,77 @@ func main() {
 			fields[fieldName] = offset
 			fmt.Fprintf(os.Stderr, "  .%s = %d\n", fieldName, offset)
 		}
-
 		structs[name] = fields
 	}
 
-	// Extract the offsets we need.
-	// 1. tls.Conn → out (halfConn, embedded struct)
-	if fields, ok := structs["crypto/tls.Conn"]; ok {
-		if off, ok := fields["out"]; ok {
-			result.ConnToHalfConn = off
-			fmt.Fprintf(os.Stderr, "\nConn.out offset: %d\n", off)
-		}
+	// Compute combined offsets matching BPF struct layout.
+	var missing []string
+
+	// 1. ConnToCipher = Conn.out + halfConn.cipher + 8 (interface data_ptr)
+	connOut, ok1 := getField(structs, "crypto/tls.Conn", "out")
+	cipherOff, ok2 := getField(structs, "crypto/tls.halfConn", "cipher")
+	if ok1 && ok2 {
+		result.Raw.ConnOut = connOut
+		result.Raw.CipherOff = cipherOff
+		result.ConnToCipher = connOut + cipherOff + 8
+		fmt.Fprintf(os.Stderr, "\nConnToCipher = %d + %d + 8 = %d\n", connOut, cipherOff, result.ConnToCipher)
+	} else {
+		missing = append(missing, "Conn.out or halfConn.cipher")
 	}
 
-	// 2. halfConn → cipher (interface)
-	if fields, ok := structs["crypto/tls.halfConn"]; ok {
-		if off, ok := fields["cipher"]; ok {
-			result.HalfConnToCipher = off
-			fmt.Fprintf(os.Stderr, "halfConn.cipher offset: %d\n", off)
+	// 2. AEADIfaceOff = prefixNonceAEAD.aead (or xorNonceAEAD.aead) + 8
+	for _, sn := range []string{"crypto/tls.prefixNonceAEAD", "crypto/tls.xorNonceAEAD"} {
+		if off, ok := getField(structs, sn, "aead"); ok {
+			result.Raw.AEADOff = off
+			result.AEADIfaceOff = off + 8
+			fmt.Fprintf(os.Stderr, "AEADIfaceOff = %d + 8 = %d (from %s)\n", off, result.AEADIfaceOff, sn)
+			break
 		}
 	}
-
-	// 3. prefixNonceAEAD → aead (the inner AEAD, typically gcmAES pointer)
-	// TLS 1.2 uses prefixNonceAEAD wrapping the actual GCM cipher.
-	// TLS 1.3 uses xorNonceAEAD wrapping it.
-	// Both have an 'aead' field that is a cipher.AEAD interface.
-	for _, structName := range []string{
-		"crypto/tls.prefixNonceAEAD",
-		"crypto/tls.xorNonceAEAD",
-	} {
-		if fields, ok := structs[structName]; ok {
-			if off, ok := fields["aead"]; ok {
-				result.CipherDataToGCM = off
-				fmt.Fprintf(os.Stderr, "%s.aead offset: %d\n", structName, off)
-				break
-			}
-		}
-	}
-
-	// 4. gcmAES → productTable (the precomputed H powers)
-	// productTable is [16][16]byte. H is at index reverseBits(1) = 8, so byte offset 128.
-	for _, structName := range []string{
-		"crypto/cipher.gcmAES",
-		"crypto/internal/fips140/aes/gcm.GCMForSSH",
-		"crypto/internal/fips140/aes/gcm.GCM",
-	} {
-		if fields, ok := structs[structName]; ok {
-			if off, ok := fields["productTable"]; ok {
-				// H is at productTable[reverseBits(1)] = productTable[8] = offset + 8*16 = offset + 128
-				result.GCMToH = off + 128
-				fmt.Fprintf(os.Stderr, "%s.productTable offset: %d (H at +128 = %d)\n",
-					structName, off, off+128)
-				break
-			}
-		}
-	}
-
-	// Check if we got all offsets.
-	missing := []string{}
-	if result.ConnToHalfConn == 0 {
-		missing = append(missing, "Conn.out")
-	}
-	if result.HalfConnToCipher == 0 {
-		missing = append(missing, "halfConn.cipher")
-	}
-	if result.CipherDataToGCM == 0 {
+	if result.AEADIfaceOff == 0 {
 		missing = append(missing, "prefixNonceAEAD.aead or xorNonceAEAD.aead")
 	}
-	if result.GCMToH == 0 {
-		missing = append(missing, "gcmAES.productTable")
+
+	// 3. H×2 word offsets from productTable.
+	// gcmAesInit stores H×2 (H doubled in GF(2^128)) at productTable offset 224.
+	// The two 64-bit words have architecture-dependent order:
+	//   AMD64 PSHUFB: hi at +8, lo at +0
+	//   ARM64 VREV64: hi at +0, lo at +8
+	pdBase, foundPD := uint32(0), false
+
+	// Go 1.24+: GCM.gcmPlatformData → gcmPlatformData.productTable
+	gcmPD, okPD := getField(structs, "crypto/internal/fips140/aes/gcm.GCM", "gcmPlatformData")
+	pdPT, okPT := getField(structs, "crypto/internal/fips140/aes/gcm.gcmPlatformData", "productTable")
+	if okPD && okPT {
+		pdBase = gcmPD + pdPT + 224
+		foundPD = true
+		fmt.Fprintf(os.Stderr, "PDBase = GCM.gcmPlatformData(%d) + productTable(%d) + 224 = %d\n", gcmPD, pdPT, pdBase)
 	}
+
+	// Go <1.24: crypto/cipher.gcmAES.productTable
+	if !foundPD {
+		if pt, ok := getField(structs, "crypto/cipher.gcmAES", "productTable"); ok {
+			pdBase = pt + 224
+			foundPD = true
+			fmt.Fprintf(os.Stderr, "PDBase = gcmAES.productTable(%d) + 224 = %d\n", pt, pdBase)
+		}
+	}
+
+	if foundPD {
+		result.Raw.ProductTable = pdBase - 224
+		result.Raw.PDBase = pdBase
+		if result.Arch == "amd64" {
+			result.H2HiOff = pdBase + 8
+			result.H2LoOff = pdBase
+		} else {
+			result.H2HiOff = pdBase
+			result.H2LoOff = pdBase + 8
+		}
+		fmt.Fprintf(os.Stderr, "H2HiOff = %d, H2LoOff = %d (arch=%s)\n", result.H2HiOff, result.H2LoOff, result.Arch)
+	} else {
+		missing = append(missing, "productTable")
+	}
+
 	if len(missing) > 0 {
 		result.Notes = fmt.Sprintf("Missing: %s", strings.Join(missing, ", "))
 		fmt.Fprintf(os.Stderr, "\nWARNING: missing offsets: %s\n", result.Notes)
@@ -191,7 +204,6 @@ func main() {
 		}
 	}
 
-	// Output JSON.
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	if err := enc.Encode(result); err != nil {
@@ -202,6 +214,15 @@ func main() {
 	_ = f.Close()
 }
 
+func getField(structs map[string]map[string]uint32, structName, fieldName string) (uint32, bool) {
+	fields, ok := structs[structName]
+	if !ok {
+		return 0, false
+	}
+	off, ok := fields[fieldName]
+	return off, ok
+}
+
 func isTargetStruct(name string) bool {
 	targets := []string{
 		"crypto/tls.Conn",
@@ -209,7 +230,6 @@ func isTargetStruct(name string) bool {
 		"crypto/tls.prefixNonceAEAD",
 		"crypto/tls.xorNonceAEAD",
 		"crypto/cipher.gcmAES",
-		// Go 1.24+ moved gcm into FIPS module
 		"crypto/internal/fips140/aes/gcm.GCMForSSH",
 		"crypto/internal/fips140/aes/gcm.GCM",
 		"crypto/internal/fips140/aes/gcm.gcmAES",
@@ -220,7 +240,7 @@ func isTargetStruct(name string) bool {
 			return true
 		}
 	}
-	// Also match any struct containing "gcm" or "GCM" for discovery
+	// Also match any struct containing "gcm" or "GCM" for discovery.
 	if strings.Contains(name, "gcm") || strings.Contains(name, "GCM") {
 		return true
 	}

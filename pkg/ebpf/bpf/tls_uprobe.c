@@ -2262,10 +2262,14 @@ int tc_egress_patch(struct __sk_buff *skb) {
   // the pending entry. This avoids map lookups on non-TLS packets.
   struct tc_pending_val *pending = bpf_map_lookup_elem(&tc_pending, &key);
   if (!pending || !pending->active) {
+#ifdef KLOAK_DEBUG
     bpf_printk("kloak [3-TC] MISS sport=%u cg=%x", __bpf_ntohs(sport), (__u32)key.cgroup_id);
+#endif
     return 0 /* TC_ACT_OK */;
   }
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak [3-TC] HIT sport=%u cg=%x", __bpf_ntohs(sport), (__u32)key.cgroup_id);
+#endif
 
   __u32 tls_total = 5 + record_len; // header + body
 
@@ -2352,11 +2356,15 @@ int tc_egress_patch(struct __sk_buff *skb) {
     dbg_inc(DBG_TC_PATCHED);
   }
 
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak [4-PATCH] sport=%u pc=%u ct=%u", __bpf_ntohs(sport), pc, ct_len);
+#endif
 
   // Tail-call to tc GHASH program.
   bpf_tail_call(skb, &tc_prog_array, 0);
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak [4-PATCH] TAILCALL_FAILED");
+#endif
   return 0 /* TC_ACT_OK */;
 }
 

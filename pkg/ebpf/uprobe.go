@@ -409,8 +409,11 @@ func (m *TLSUprobeManager) TrackTGID(tgid uint32) error {
 	return m.objs.TrackedTgids.Update(tgid, &val, 0)
 }
 
-// UntrackTGID removes a process TGID from the tracked_tgids map.
+// UntrackTGID removes a process TGID from the tracked_tgids map
+// and cleans up any per-TGID Go TLS offset config.
 func (m *TLSUprobeManager) UntrackTGID(tgid uint32) error {
+	// Clean up Go TLS offsets (best-effort, ignore not-found).
+	_ = m.objs.GoTlsOffsetConfig.Delete(tgid)
 	return m.objs.TrackedTgids.Delete(tgid)
 }
 
@@ -605,20 +608,11 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 func (m *TLSUprobeManager) pushGoTLSOffsets(pid int) {
 	exePath := fmt.Sprintf("/proc/%d/exe", pid)
 
-	// Try DWARF-based detection first.
+	// DetectGoTLSOffsets tries DWARF first, then falls back to version-based lookup.
 	version, offsets, err := DetectGoTLSOffsets(exePath)
 	if err != nil {
-		m.log.Info("Go TLS offset detection failed — trying version fallback",
-			"pid", pid, "dwarfError", err)
-		// Try reading just the Go version for the hardcoded table.
-		version2, offsets2, err2 := detectGoTLSByVersion(exePath)
-		if err2 != nil {
-			m.log.Error(err2, "Go TLS offset detection failed completely — Go secrets will NOT be rewritten",
-				"pid", pid, "dwarfError", err, "versionError", err2)
-			return
-		}
-		version = version2
-		offsets = offsets2
+		m.log.Error(err, "Go TLS offset detection failed — Go secrets will NOT be rewritten", "pid", pid)
+		return
 	}
 
 	m.log.Info("Detected Go TLS offsets",
