@@ -1852,11 +1852,16 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     new_conn.wrl_ptr = wrl_val;
   }
 
-  // H extraction succeeded — store connection state.
+  // H extraction succeeded — store connection state (only if H changed).
   struct tls_conn_key ck = {};
   ck.tgid = tgid;
   ck.ssl_ptr = ssl_ptr;
-  bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_ANY);
+  struct tls_conn_state *existing = bpf_map_lookup_elem(&tls_conn_state, &ck);
+  if (!existing ||
+      ((__u64 *)existing->ghash_h)[0] != ((__u64 *)new_conn.ghash_h)[0] ||
+      ((__u64 *)existing->ghash_h)[1] != ((__u64 *)new_conn.ghash_h)[1]) {
+    bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_ANY);
+  }
 
   // Now safe to create tc_pending — tc_egress can always find H.
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
@@ -1877,7 +1882,9 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     w->staged_tc.patches[p] = pending->patches[p];
 
   bpf_map_update_elem(&tc_pending, &tdk, &w->staged_tc, BPF_ANY);
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak [2-KPROBE] sport=%u cg=%x", src_port_h, (__u32)tdk.cgroup_id);
+#endif
 
   // Delete xor_pending — the entry has been bridged to tc_pending.
   bpf_map_delete_elem(&xor_pending, &pid_tgid);
