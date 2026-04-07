@@ -203,7 +203,11 @@ generate-vmlinux: $(BPF_DIR)/vmlinux.h
 
 # Check if Lima is installed
 lima-check:
-	@which limactl > /dev/null || (echo "Error: limactl not found. Install with: brew install lima" && exit 1)
+	@if [ "$$(uname)" = "Linux" ]; then \
+		exit 0; \
+	else \
+		which limactl > /dev/null || (echo "Error: limactl not found. Install with: brew install lima" && exit 1); \
+	fi
 
 # Ensure Lima VM is running (idempotent)
 lima-ensure: lima-check $(LIMA_CONFIG)
