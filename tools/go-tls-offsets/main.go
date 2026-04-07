@@ -31,10 +31,10 @@ import (
 type OffsetResult struct {
 	GoVersion    string `json:"go_version"`
 	Arch         string `json:"arch"`
-	ConnToCipher uint32 `json:"conn_to_cipher"`  // Conn.out + halfConn.cipher + 8
-	AEADIfaceOff uint32 `json:"aead_iface_off"`  // prefixNonceAEAD.aead + 8
-	H2HiOff      uint32 `json:"h2_hi_off"`       // GCM + off → high 64 bits of H×2
-	H2LoOff      uint32 `json:"h2_lo_off"`       // GCM + off → low 64 bits of H×2
+	ConnToCipher uint32 `json:"conn_to_cipher"` // Conn.out + halfConn.cipher + 8
+	AEADIfaceOff uint32 `json:"aead_iface_off"` // prefixNonceAEAD.aead + 8
+	H2HiOff      uint32 `json:"h2_hi_off"`      // GCM + off → high 64 bits of H×2
+	H2LoOff      uint32 `json:"h2_lo_off"`      // GCM + off → low 64 bits of H×2
 	Notes        string `json:"notes,omitempty"`
 
 	// Raw offsets for debugging (not used by BPF).
