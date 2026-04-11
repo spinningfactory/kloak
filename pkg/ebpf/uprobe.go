@@ -409,8 +409,11 @@ func (m *TLSUprobeManager) TrackTGID(tgid uint32) error {
 	return m.objs.TrackedTgids.Update(tgid, &val, 0)
 }
 
-// UntrackTGID removes a process TGID from the tracked_tgids map.
+// UntrackTGID removes a process TGID from the tracked_tgids map
+// and cleans up any per-TGID Go TLS offset config.
 func (m *TLSUprobeManager) UntrackTGID(tgid uint32) error {
+	// Clean up Go TLS offsets (best-effort, ignore not-found).
+	_ = m.objs.GoTlsOffsetConfig.Delete(tgid)
 	return m.objs.TrackedTgids.Delete(tgid)
 }
 
@@ -504,6 +507,13 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	if up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, &link.UprobeOptions{PID: pid}); err == nil {
 		m.log.Info("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
 		m.links = append(m.links, up)
+
+		// Push Go-specific struct offsets for H extraction and attach tc egress
+		// for ciphertext patching. Both are required for the XOR-patch path.
+		m.pushGoTLSOffsets(pid)
+		if err := m.attachTCEgress(pid); err != nil {
+			m.log.Error(err, "Failed to attach tc egress for Go TLS — secrets will not be rewritten", "pid", pid)
+		}
 		return nil
 	}
 
@@ -591,6 +601,36 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 			"offsets", fmt.Sprintf("%+v", offsets))
 		return // Only need one successful push.
 	}
+}
+
+// pushGoTLSOffsets detects Go struct offsets from the binary's DWARF or
+// buildinfo and pushes them to the go_tls_offset_config BPF map (per-TGID).
+func (m *TLSUprobeManager) pushGoTLSOffsets(pid int) {
+	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+
+	// DetectGoTLSOffsets tries DWARF first, then falls back to version-based lookup.
+	version, offsets, err := DetectGoTLSOffsets(exePath)
+	if err != nil {
+		m.log.Error(err, "Go TLS offset detection failed — Go secrets will NOT be rewritten", "pid", pid)
+		return
+	}
+
+	m.log.Info("Detected Go TLS offsets",
+		"pid", pid, "goVersion", version,
+		"connToCipher", offsets.ConnToCipher,
+		"aeadIfaceOff", offsets.AEADIfaceOff,
+		"h2HiOff", offsets.H2HiOff,
+		"h2LoOff", offsets.H2LoOff)
+
+	// Get TGID for the per-process BPF map key.
+	tgid := uint32(pid) // PID == TGID for the main thread
+	if err := m.objs.GoTlsOffsetConfig.Update(tgid, &offsets, 0); err != nil {
+		m.log.Error(err, "Failed to push Go TLS offsets to BPF map", "pid", pid)
+		return
+	}
+
+	m.log.Info("Pushed Go TLS offsets for XOR-patch path",
+		"pid", pid, "goVersion", version)
 }
 
 // findContainerTLSLibraries scans common library directories in the container's

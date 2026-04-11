@@ -81,9 +81,10 @@ struct {
 // Per-CPU array used as scratch space for reading and scanning data.
 struct scratch_buf {
   __u64 user_data_ptr;
-  __u64 ssl_ptr;        // SSL* pointer (0 for Go); used by XOR path tail call
+  __u64 ssl_ptr;        // SSL* or Go *tls.Conn pointer; used by XOR path tail call
   __u32 read_len;       // bytes read into data[] (max 256, for host parsing)
   __u32 total_data_len; // full TLS write length (for bpf_loop scanning)
+  __u8  chain_type;     // 0=OpenSSL/BoringSSL, CHAIN_GO_TLS=Go crypto/tls
   __u32 host_offset;
   __u32 host_value_len; // length of extracted host value
   __u32 xor_fd;         // socket fd resolved by resolve_host (for tc_pending key)
@@ -110,9 +111,10 @@ struct {
 // Tail-call program array:
 //   index 1 = bpf_xor_path (AES-GCM ciphertext patching path)
 //   index 2 = bpf_h_extract (GHASH key H extraction on first SSL_write)
+//   index 3 = bpf_go_write_path (Go plaintext patching — writes real secrets directly)
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
-  __uint(max_entries, 3); // indices 1 and 2 used
+  __uint(max_entries, 4); // indices 1, 2, and 3 used
   __type(key, __u32);
   __type(value, __u32);
 } prog_array SEC(".maps");
@@ -446,7 +448,8 @@ struct xor_pending_val {
   __u32 patch_count;        // number of valid patches (0..XOR_MAX_PATCHES)
   struct xor_patch patches[XOR_MAX_PATCHES];
   __u8  active;
-  __u8  _pad[3];
+  __u8  chain_type;         // 0=OpenSSL/BoringSSL, CHAIN_GO_TLS=Go crypto/tls
+  __u8  _pad[2];
   __u32 plaintext_len;      // SSL_write data length (for TLS version detection in tc)
 };
 
@@ -478,6 +481,37 @@ struct {
   __type(key, __u32);
   __type(value, struct tls_offsets);
 } tls_offset_config SEC(".maps");
+
+// Go crypto/tls struct offsets for H extraction.
+// Keyed by TGID (per-process), allowing different Go versions to coexist.
+//
+// H extraction chain (3 pointer dereferences + GF halving):
+//   Conn + conn_to_cipher → cipher interface data_ptr (1st deref)
+//     → prefixNonceAEAD/xorNonceAEAD + aead_iface_off → aead interface data_ptr (2nd deref)
+//       → GCM + h2_hi_off / h2_lo_off → H×2 (two 64-bit words from productTable[224])
+//
+// Go's gcmAesInit assembly computes H = AES_K(0^128), byte-swaps, then doubles
+// in GF(2^128) before storing in productTable at offset 224. We read the two
+// 64-bit words (arch-dependent order: AMD64 PSHUFB vs ARM64 VREV64) and apply
+// GF(2^128) halving to recover the standard big-endian GHASH H key.
+//
+// conn_to_cipher combines Conn.out offset + halfConn.cipher offset + 8 (interface data_ptr).
+// aead_iface_off is the offset to the inner aead interface data_ptr within the AEAD wrapper.
+#define CHAIN_GO_TLS 2
+
+struct go_tls_offsets {
+  __u32 conn_to_cipher;   // Conn* + off → halfConn.cipher interface data_ptr (combined offset)
+  __u32 aead_iface_off;   // wrapper + off → inner aead interface data_ptr
+  __u32 h2_hi_off;        // GCM* + off → high 64 bits of H×2 (byte-swapped, arch-dependent)
+  __u32 h2_lo_off;        // GCM* + off → low 64 bits of H×2 (byte-swapped, arch-dependent)
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 256);
+  __type(key, __u32);
+  __type(value, struct go_tls_offsets);
+} go_tls_offset_config SEC(".maps");
 
 // Per-CPU scratch space for XOR-path programs (bpf_xor_path + tcp_sendmsg kprobe).
 // tc egress struct definitions (needed by ghash_work below and tc maps further down).
@@ -1452,6 +1486,7 @@ int bpf_xor_path(void *ctx) {
     wi->staged_pending.ssl_ptr = sd->ssl_ptr;
     wi->staged_pending.tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
     wi->staged_pending.active = 1;
+    wi->staged_pending.chain_type = sd->chain_type;
     wi->staged_pending.plaintext_len = sd->total_data_len;
   }
 
@@ -1799,8 +1834,124 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   tdk.src_port = __bpf_htons(src_port_h);
   tdk.cgroup_id = bpf_get_current_cgroup_id();
 
-  // Copy from xor_pending to tc_pending. Re-lookup pending after helper calls.
+  // Save values from xor_pending before helper calls invalidate the pointer.
   __u32 zero = 0;
+
+  pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
+  if (!pending) return 0;
+
+  __u64 ssl_ptr = pending->ssl_ptr;
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+  __u32 plaintext_len = pending->plaintext_len;
+  __u8 chain = pending->chain_type;
+
+  // Extract H BEFORE creating tc_pending. If H extraction fails, we must NOT
+  // create tc_pending — otherwise tc_egress would XOR-patch the ciphertext
+  // without being able to recompute the GHASH tag, causing "bad record MAC".
+  struct tls_conn_state new_conn;
+  __builtin_memset(&new_conn, 0, sizeof(new_conn));
+  __u64 wrl_val = 0;
+
+  if (chain == CHAIN_GO_TLS) {
+    // Go crypto/tls: H×2 stored at productTable offset 224 (entry 14).
+    // gcmAesInit computes H = AES_K(0^128), byte-swaps, doubles in GF(2^128).
+    // We read the two 64-bit words and apply GF halving to recover H.
+    struct go_tls_offsets *go_off = bpf_map_lookup_elem(&go_tls_offset_config, &tgid);
+    if (!go_off)
+      return 0; // No Go offsets — bail (fail-secure, no corruption).
+
+    __u64 cipher_data = 0;
+    if (bpf_probe_read_user(&cipher_data, 8,
+        (void *)(ssl_ptr + go_off->conn_to_cipher)) < 0 || !cipher_data)
+      return 0;
+    __u64 gcm_ptr = 0;
+    if (bpf_probe_read_user(&gcm_ptr, 8,
+        (void *)(cipher_data + go_off->aead_iface_off)) < 0 || !gcm_ptr)
+      return 0;
+
+    // Read H×2 as two separate 64-bit words (arch-aware offsets from userspace).
+    // h2_hi_off points to the GF "high" word (contains the GF MSB at bit 63).
+    // h2_lo_off points to the GF "low" word (contains the GF LSB at bit 0).
+    __u64 hi = 0, lo = 0;
+    if (bpf_probe_read_user(&hi, 8, (void *)(gcm_ptr + go_off->h2_hi_off)) < 0)
+      return 0;
+    if (bpf_probe_read_user(&lo, 8, (void *)(gcm_ptr + go_off->h2_lo_off)) < 0)
+      return 0;
+
+    if (hi == 0 && lo == 0)
+      return 0;
+
+    // GF(2^128) halving: recover H from H×2.
+    //
+    // Go's gcmAesInit computes H×2 as a 128-bit GF(2^128) left shift with
+    // conditional reduction. The 128-bit value V = hi * 2^64 + lo, where:
+    //   - AMD64: hi = XMM[64:127], lo = XMM[0:63]
+    //   - ARM64: hi = D[0], lo = D[1]
+    //
+    // The doubling was: V' = (V << 1) ^ (V.MSB ? poly : 0)
+    //   poly = {hi: 0xC200000000000000, lo: 0x0000000000000001}
+    //
+    // Reduction indicator: lo.bit0. During left-shift, lo.bit0 becomes 0.
+    // If reduction happened, poly.lo.bit0 = 1 is XORed in, so lo.bit0 = 1.
+    // The carry from hi to lo doesn't affect lo.bit0 (it goes to lo.bit63).
+    int reduced = lo & 1;
+    if (reduced) {
+      hi ^= 0xC200000000000000ULL;
+      lo ^= 0x0000000000000001ULL;
+    }
+    // V is now (H << 1) without reduction. Undo the 128-bit left shift:
+    // Carry from hi.bit0 → lo.bit63 (the bit that crossed the word boundary).
+    __u64 carry = hi & 1;
+    hi >>= 1;
+    lo = (lo >> 1) | (carry << 63);
+    if (reduced)
+      hi |= (1ULL << 63); // Restore GF MSB that was shifted out.
+
+    // Convert from register representation (byte-reversed per 8-byte lane
+    // by PSHUFB/VREV64) to standard big-endian GHASH H.
+    *(__u64 *)&new_conn.ghash_h[0] = __builtin_bswap64(hi);
+    *(__u64 *)&new_conn.ghash_h[8] = __builtin_bswap64(lo);
+
+    new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
+  } else {
+    // OpenSSL/BoringSSL: 4-hop pointer chain from SSL* to H.
+    struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &zero);
+    if (!offsets || offsets->ssl_to_wrl == 0)
+      return 0;
+
+    __u64 ptr = 0;
+    if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
+      return 0;
+    wrl_val = ptr;
+    if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
+      return 0;
+    if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr)
+      return 0;
+    if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0)
+      return 0;
+
+    __u64 *h64 = (__u64 *)new_conn.ghash_h;
+    if (h64[0] == 0 && h64[1] == 0)
+      return 0;
+    h64[0] = __builtin_bswap64(h64[0]);
+    h64[1] = __builtin_bswap64(h64[1]);
+
+    new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
+    new_conn.wrl_ptr = wrl_val;
+  }
+
+  // H extraction succeeded — store connection state (only if H changed).
+  struct tls_conn_key ck = {};
+  ck.tgid = tgid;
+  ck.ssl_ptr = ssl_ptr;
+  struct tls_conn_state *existing = bpf_map_lookup_elem(&tls_conn_state, &ck);
+  if (!existing ||
+      ((__u64 *)existing->ghash_h)[0] != ((__u64 *)new_conn.ghash_h)[0] ||
+      ((__u64 *)existing->ghash_h)[1] != ((__u64 *)new_conn.ghash_h)[1]) {
+    bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_ANY);
+  }
+
+  // Now safe to create tc_pending — tc_egress can always find H.
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w) return 0;
 
@@ -1808,58 +1959,23 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   if (!pending) return 0;
 
   __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
-  w->staged_tc.tgid = (__u32)(pid_tgid >> 32);
-  w->staged_tc.ssl_ptr = pending->ssl_ptr;
+  w->staged_tc.tgid = tgid;
+  w->staged_tc.ssl_ptr = ssl_ptr;
   w->staged_tc.active = 1;
-  w->staged_tc.plaintext_len = pending->plaintext_len;
+  w->staged_tc.plaintext_len = plaintext_len;
   w->staged_tc.patch_count = pending->patch_count;
   if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
     w->staged_tc.patch_count = XOR_MAX_PATCHES;
   for (__u32 p = 0; p < XOR_MAX_PATCHES && p < w->staged_tc.patch_count; p++)
     w->staged_tc.patches[p] = pending->patches[p];
 
-  __u64 ssl_ptr = pending->ssl_ptr;
-  __u32 tgid = w->staged_tc.tgid;
-
   bpf_map_update_elem(&tc_pending, &tdk, &w->staged_tc, BPF_ANY);
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak [2-KPROBE] sport=%u cg=%x", src_port_h, (__u32)tdk.cgroup_id);
+#endif
 
   // Delete xor_pending — the entry has been bridged to tc_pending.
   bpf_map_delete_elem(&xor_pending, &pid_tgid);
-
-  // Extract H from the SSL struct. At tcp_sendmsg time, the TLS handshake
-  // has completed and the encryption context (with H) is available.
-  struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &zero);
-  if (!offsets || offsets->ssl_to_wrl == 0)
-    return 0;
-
-  __u64 ptr = 0;
-  if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
-    return 0;
-  __u64 wrl_val = ptr;
-  if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
-    return 0;
-  if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr)
-    return 0;
-
-  struct tls_conn_state new_conn;
-  __builtin_memset(&new_conn, 0, sizeof(new_conn));
-  if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0)
-    return 0;
-
-  __u64 *h64 = (__u64 *)new_conn.ghash_h;
-  if (h64[0] == 0 && h64[1] == 0)
-    return 0;
-  h64[0] = __builtin_bswap64(h64[0]);
-  h64[1] = __builtin_bswap64(h64[1]);
-
-  new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
-  new_conn.wrl_ptr = wrl_val;
-
-  struct tls_conn_key ck = {};
-  ck.tgid = tgid;
-  ck.ssl_ptr = ssl_ptr;
-  bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_ANY);
 
   return 0;
 }
@@ -1880,17 +1996,20 @@ int bpf_uprobe_go_tls_write(void *ctx) {
   // No cgroup filter — Go uprobes use PID-scoped attachment because
   // Go binaries are statically linked (unique per container).
 
+  void *conn_ptr; // *tls.Conn receiver — used as connection ID and for H extraction
   void *data_ptr;
   __u64 data_len;
 
 #if defined(bpf_target_x86)
   // x86_64 Go register ABI: RAX=receiver, RBX=data, RCX=len
-  // pt_regs offsets: rbx=40, rcx=88
+  // pt_regs offsets: rax=80, rbx=40, rcx=88
+  bpf_probe_read_kernel(&conn_ptr, sizeof(void *), (char *)ctx + 80);
   bpf_probe_read_kernel(&data_ptr, sizeof(void *), (char *)ctx + 40);
   bpf_probe_read_kernel(&data_len, sizeof(__u64), (char *)ctx + 88);
 #elif defined(bpf_target_arm64)
   // ARM64 Go register ABI: R0=receiver, R1=data, R2=len
-  // user_pt_regs offsets: regs[1]=8, regs[2]=16
+  // user_pt_regs offsets: regs[0]=0, regs[1]=8, regs[2]=16
+  bpf_probe_read_kernel(&conn_ptr, sizeof(void *), (char *)ctx + 0);
   bpf_probe_read_kernel(&data_ptr, sizeof(void *), (char *)ctx + 8);
   bpf_probe_read_kernel(&data_len, sizeof(__u64), (char *)ctx + 16);
 #else
@@ -1899,8 +2018,8 @@ int bpf_uprobe_go_tls_write(void *ctx) {
 
 #ifdef KLOAK_DEBUG
   __u32 pid = bpf_get_current_pid_tgid();
-  bpf_printk("kloak go_tls: ptr=%llx len=%llu pid=%d", (__u64)data_ptr,
-             data_len, pid);
+  bpf_printk("kloak go_tls: conn=%llx ptr=%llx len=%llu pid=%d",
+             (__u64)conn_ptr, (__u64)data_ptr, data_len, pid);
 #endif
 
   if (!data_ptr || data_len == 0)
@@ -1926,13 +2045,28 @@ int bpf_uprobe_go_tls_write(void *ctx) {
   scratch_data->read_len = read_len;
   scratch_data->total_data_len = (__u32)data_len;
 
-  // Go doesn't use OpenSSL, no ssl_ptr — pass 0.
-  // resolve_host will use last_verified_fd -> conn_ip_map -> dns_ip_map.
+  // resolve_host uses last_verified_fd -> conn_ip_map -> dns_ip_map for Go.
   resolve_host(scratch_data, 0);
 
-  // XOR-patch path not yet supported for Go (needs Go struct offset work).
-  // Secret is NOT rewritten (fail-secure).
-  // TODO: implement Go crypto/tls key extraction to enable XOR path.
+  // Pre-scan for kloak: prefix and tail-call to xor_path.
+  // Same flow as SSL_write — the downstream pipeline is generic.
+  dbg_inc(DBG_XOR_CONN_CHECK);
+  scratch_data->ssl_ptr = (__u64)conn_ptr; // reuse ssl_ptr field as connection ID
+  scratch_data->chain_type = CHAIN_GO_TLS;
+  scratch_data->xor_match_count = 0;
+  scratch_data->xor_current_match = 0;
+
+  {
+    struct prescan_ctx pctx = {
+      .user_data_ptr = scratch_data->user_data_ptr,
+      .total_len = scratch_data->total_data_len,
+    };
+    __u32 num_chunks = (pctx.total_len + CHUNK_STRIDE - 1) / CHUNK_STRIDE;
+    bpf_loop(num_chunks, prescan_chunk, &pctx, 0);
+  }
+
+  // H extraction is deferred to the tcp_sendmsg kprobe (same as OpenSSL).
+  bpf_tail_call(ctx, &prog_array, 1);
 
   return 0;
 }
@@ -2027,6 +2161,7 @@ int bpf_uprobe_ssl_write(void *ctx) {
   // h_extract and xor_path have the match position in scratch_buf.
   dbg_inc(DBG_XOR_CONN_CHECK);
   scratch_data->ssl_ptr = (__u64)ssl_ptr;
+  scratch_data->chain_type = 0; // OpenSSL/BoringSSL
   scratch_data->xor_match_count = 0;
   scratch_data->xor_current_match = 0;
 
@@ -2215,10 +2350,14 @@ int tc_egress_patch(struct __sk_buff *skb) {
   // the pending entry. This avoids map lookups on non-TLS packets.
   struct tc_pending_val *pending = bpf_map_lookup_elem(&tc_pending, &key);
   if (!pending || !pending->active) {
+#ifdef KLOAK_DEBUG
     bpf_printk("kloak [3-TC] MISS sport=%u cg=%x", __bpf_ntohs(sport), (__u32)key.cgroup_id);
+#endif
     return 0 /* TC_ACT_OK */;
   }
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak [3-TC] HIT sport=%u cg=%x", __bpf_ntohs(sport), (__u32)key.cgroup_id);
+#endif
 
   __u32 tls_total = 5 + record_len; // header + body
 
@@ -2305,11 +2444,15 @@ int tc_egress_patch(struct __sk_buff *skb) {
     dbg_inc(DBG_TC_PATCHED);
   }
 
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak [4-PATCH] sport=%u pc=%u ct=%u", __bpf_ntohs(sport), pc, ct_len);
+#endif
 
   // Tail-call to tc GHASH program.
   bpf_tail_call(skb, &tc_prog_array, 0);
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak [4-PATCH] TAILCALL_FAILED");
+#endif
   return 0 /* TC_ACT_OK */;
 }
 
