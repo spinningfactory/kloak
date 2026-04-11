@@ -2365,7 +2365,9 @@ int tc_egress_patch(struct __sk_buff *skb) {
   __u8 tls_hdr[5];
   if (bpf_skb_load_bytes(skb, payload_off, tls_hdr, 5) < 0)
     return 0 /* TC_ACT_OK */;
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak tc tls_hdr=%x ver=%x%x plen=%u", tls_hdr[0], tls_hdr[1], tls_hdr[2], payload_len);
+#endif
   // Validate TLS application_data record:
   //   byte 0: content type must be 0x17
   //   bytes 1-2: version must be 0x0301..0x0303 (TLS 1.0-1.3)
@@ -2550,9 +2552,11 @@ int tc_ghash_update(struct __sk_buff *skb) {
 
   bpf_skb_store_bytes(skb, tag_offset, w->new_tag, 16, 0);
 
+#ifdef KLOAK_DEBUG
   __u32 dsum = 0;
   for (__u32 di = 0; di < 16; di++) dsum += w->tag_delta[di];
   bpf_printk("kloak [5-GHASH] tag_off=%u dsum=%u", tag_offset, dsum);
+#endif
 
   return 0 /* TC_ACT_OK */;
 }
