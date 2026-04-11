@@ -2,13 +2,19 @@ package main
 
 import (
 	"context"
+	"net"
 	"os"
+	"strings"
 
+	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
@@ -41,12 +47,14 @@ var (
 	controllerProbeAddr string
 	enableEBPF          bool
 	cgroupPath          string
+	trustedDNSServers   string
 )
 
 func init() {
 	controllerCmd.Flags().StringVar(&controllerProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	controllerCmd.Flags().BoolVar(&enableEBPF, "enable-ebpf", false, "Enable eBPF traffic redirection (requires Linux + CAP_BPF).")
 	controllerCmd.Flags().StringVar(&cgroupPath, "cgroup-path", "/sys/fs/cgroup", "Path to cgroup v2 filesystem.")
+	controllerCmd.Flags().StringVar(&trustedDNSServers, "trusted-dns-servers", "", "Comma-separated trusted DNS server IPs. If empty, auto-discovers kube-dns.")
 }
 
 func runController(cmd *cobra.Command, args []string) {
@@ -125,6 +133,14 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	// Configure trusted DNS servers for the eBPF DNS chain of trust.
+	if uprobeMgr != nil {
+		dnsIPs := discoverTrustedDNSServers(mgr.GetAPIReader(), setupLog)
+		if err := uprobeMgr.PopulateTrustedDNSServers(dnsIPs); err != nil {
+			setupLog.Error(err, "failed to populate trusted DNS servers")
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Start eBPF TLS event poller (syncs secrets to BPF map and reads events)
@@ -153,4 +169,57 @@ func runController(cmd *cobra.Command, args []string) {
 			setupLog.Error(err, "failed to close uprobe manager")
 		}
 	}
+}
+
+// discoverTrustedDNSServers returns the list of trusted DNS server IPs.
+// Always includes the kube-dns ClusterIP (auto-discovered). If
+// --trusted-dns-servers is set, those are added too (deduplicated).
+func discoverTrustedDNSServers(reader client.Reader, log logr.Logger) []net.IP {
+	seen := make(map[string]bool)
+	var ips []net.IP
+
+	addIP := func(ip net.IP, source string) {
+		key := ip.String()
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		ips = append(ips, ip)
+		log.Info("Added trusted DNS server", "ip", key, "source", source)
+	}
+
+	// Always auto-discover kube-dns
+	svc := &corev1.Service{}
+	err := reader.Get(context.Background(), types.NamespacedName{
+		Name:      "kube-dns",
+		Namespace: "kube-system",
+	}, svc)
+	if err != nil {
+		log.Error(err, "Failed to auto-discover kube-dns service")
+	} else if ip := net.ParseIP(svc.Spec.ClusterIP); ip != nil {
+		addIP(ip, "kube-dns auto-discovery")
+	}
+
+	// Add user-provided DNS servers
+	if trustedDNSServers != "" {
+		for _, s := range strings.Split(trustedDNSServers, ",") {
+			s = strings.TrimSpace(s)
+			if s == "" {
+				continue
+			}
+			ip := net.ParseIP(s)
+			if ip == nil {
+				log.Error(nil, "Invalid trusted DNS server IP", "ip", s)
+				continue
+			}
+			addIP(ip, "user-configured")
+		}
+	}
+
+	if len(ips) == 0 {
+		log.Error(nil, "No trusted DNS servers found — DNS whitelist will reject all DNS responses. "+
+			"Ensure kube-dns is running or provide --trusted-dns-servers")
+	}
+
+	return ips
 }

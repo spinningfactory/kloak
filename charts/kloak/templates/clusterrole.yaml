@@ -21,6 +21,10 @@ rules:
   - apiGroups: ["apps"]
     resources: ["replicasets", "deployments", "daemonsets", "statefulsets"]
     verbs: ["get", "list", "watch"]
+  # Service reading for trusted DNS server auto-discovery (kube-dns)
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get"]
   # Events for debugging
   - apiGroups: [""]
     resources: ["events"]

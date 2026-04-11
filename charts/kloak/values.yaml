@@ -7,6 +7,10 @@ controller:
   ebpf:
     enabled: true
   cgroupPath: /host/sys/fs/cgroup
+  dns:
+    # Trusted DNS server IPs. Only DNS responses from these servers are used
+    # for host-based secret filtering. If empty, auto-discovers kube-dns ClusterIP.
+    trustedServers: []
   resources:
     requests:
       cpu: 10m
