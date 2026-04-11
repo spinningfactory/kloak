@@ -15,6 +15,14 @@ import (
 // The client connects on a specific port, and the port is verified at
 // connect() time to enable port-based secret filtering.
 func TestEBPFRawTLSPortFiltering(t *testing.T) {
+	// Wait for stale secrets from previous tests to be cleaned up.
+	gcCtx, gcCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer gcCancel()
+	_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-allowed")
+	_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-blocked")
+	_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-allowed-kloak")
+	_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-blocked-kloak")
+
 	echoHostFQDN := "tls." + testNamespace + ".svc.cluster.local"
 	// The echo server runs on port 8443
 	echoPort := "8443"
@@ -23,17 +31,19 @@ func TestEBPFRawTLSPortFiltering(t *testing.T) {
 	allowedData := map[string][]byte{"api-key": []byte("REAL-ALLOWED-PORT-KEY")}
 	blockedData := map[string][]byte{"api-key": []byte("REAL-BLOCKED-PORT-KEY")}
 
-	createEnabledSecret(t, "secret-port-allowed", allowedData, map[string]string{
+	// Secret names must match the deployment manifest volume references
+	// (secret-allowed, secret-blocked) — not custom names.
+	createEnabledSecret(t, "secret-allowed", allowedData, map[string]string{
 		"getkloak.io/hosts": echoHostFQDN,
-		"getkloak.io/port": echoPort,
+		"getkloak.io/port":  echoPort,
 	})
-	createEnabledSecret(t, "secret-port-blocked", blockedData, map[string]string{
+	createEnabledSecret(t, "secret-blocked", blockedData, map[string]string{
 		"getkloak.io/hosts": echoHostFQDN,
-		"getkloak.io/port": wrongPort,
+		"getkloak.io/port":  wrongPort,
 	})
 
-	assertShadowSecret(t, "secret-port-allowed", allowedData)
-	assertShadowSecret(t, "secret-port-blocked", blockedData)
+	assertShadowSecret(t, "secret-allowed", allowedData)
+	assertShadowSecret(t, "secret-blocked", blockedData)
 
 	demoManifest := filepath.Join(repoRoot, "examples", "demo-python-raw-tls", "deployment.yaml")
 	if err := applyManifest(t, demoManifest); err != nil {
