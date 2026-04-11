@@ -781,6 +781,48 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 	}
 }
 
+// dnsIPKey matches C struct dns_ip_key (16-byte IPv4-mapped-IPv6).
+type dnsIPKey struct {
+	IP [16]byte
+}
+
+// PopulateTrustedDNSServers adds trusted DNS server IPs to the BPF map and
+// enables the whitelist. If ips is empty, the whitelist is not enabled and
+// all DNS responses are accepted.
+func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
+	if len(ips) == 0 {
+		m.log.Error(nil, "No trusted DNS servers — all DNS responses will be rejected")
+	}
+
+	val := uint8(1)
+
+	// Always enable the whitelist — we never want untrusted DNS
+	flagKey := uint32(0)
+	if err := m.objs.DnsWhitelistEnabled.Update(flagKey, val, 0); err != nil {
+		return fmt.Errorf("enabling DNS whitelist: %w", err)
+	}
+
+	for _, ip := range ips {
+		var key dnsIPKey
+		ip4 := ip.To4()
+		if ip4 != nil {
+			// IPv4-mapped-IPv6
+			key.IP[10] = 0xff
+			key.IP[11] = 0xff
+			copy(key.IP[12:], ip4)
+		} else {
+			copy(key.IP[:], ip.To16())
+		}
+		if err := m.objs.TrustedDnsServers.Update(&key, &val, 0); err != nil {
+			return fmt.Errorf("adding trusted DNS server %s: %w", ip, err)
+		}
+		m.log.Info("Added trusted DNS server", "ip", ip.String())
+	}
+
+	m.log.Info("DNS server whitelist enabled", "count", len(ips))
+	return nil
+}
+
 // syncSecretsToBPF updates the eBPF map with the latest shadow secret values
 // and the watched_hosts map with hostnames from secret entries.
 func (m *TLSUprobeManager) syncSecretsToBPF() {

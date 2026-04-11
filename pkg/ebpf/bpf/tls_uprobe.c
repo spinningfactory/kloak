@@ -281,11 +281,33 @@ struct {
   __type(value, __u32); // fd
 } last_verified_fd SEC(".maps");
 
+// Trusted DNS server IPs. Only DNS responses from these IPs populate
+// dns_ip_map. Populated from userspace at startup (auto-discovered
+// kube-dns or user-configured). Empty = accept all (backwards compatible).
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 32);
+  __type(key, struct dns_ip_key);  // 16-byte IPv4-mapped-IPv6
+  __type(value, __u8);             // 1 = trusted
+} trusted_dns_servers SEC(".maps");
+
+// Flag: 1 if trusted_dns_servers whitelist is active, 0 if not configured.
+// Used to distinguish "map empty = allow all" from "IP not in map = reject".
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, __u8);  // 0 = allow all, 1 = whitelist active
+} dns_whitelist_enabled SEC(".maps");
+
 // Scratch for kprobe udp_recvmsg enter->return correlation.
-// Saves the user buffer pointer from msghdr on entry so the
-// kretprobe can read the DNS response after it's been copied.
+// Saves the user buffer pointer and the peer IP (DNS server) from the
+// socket so the kretprobe can validate the source.
 struct udp_recv_pending {
-  __u64 iov_base;  // user buffer (first iovec base)
+  __u64 iov_base;     // user buffer (first iovec base)
+  __u8 peer_ip[16];   // DNS server IP (IPv4-mapped-IPv6)
+  __u8 has_peer_ip;   // 1 if peer_ip is valid (connected socket)
+  __u64 msg_name_ptr; // kernel ptr to sockaddr filled by recvmsg (unconnected)
 };
 
 struct {
@@ -891,9 +913,9 @@ int kprobe_udp_recvmsg(void *ctx) {
     return 0;
 
   // Filter for DNS traffic. For connected UDP sockets (Go, Python), skc_dport
-  // is set to 53. For unconnected sockets (Node.js c-ares uses sendto), skc_dport
-  // is 0 — we allow those through since tracked_tgids already limits scope, and
-  // process_dns_packet validates the DNS response format.
+  // is set to 53. For unconnected sockets (Node.js c-ares, musl libc use sendto),
+  // skc_dport is 0 — we allow those through and read the peer IP from msg_name
+  // in the kretprobe after the kernel fills it.
   __be16 dport = 0;
   BPF_CORE_READ_INTO(&dport, sk, __sk_common.skc_dport);
   if (dport == __bpf_htons(53))
@@ -911,7 +933,35 @@ int kprobe_udp_recvmsg(void *ctx) {
     return 0;
   dbg_inc(DBG_KPROBE_IOV_OK);
 
-  struct udp_recv_pending val = {.iov_base = iov_base};
+  struct udp_recv_pending val = {};
+  val.iov_base = iov_base;
+
+  // Read peer IP for DNS server validation.
+  // Connected sockets (dport=53) have the DNS server address in skc_daddr.
+  // Unconnected sockets (dport=0) get the peer IP from msg->msg_name after
+  // recvmsg completes (the kernel fills it with the source address).
+  if (dport == __bpf_htons(53)) {
+    __u16 family = 0;
+    BPF_CORE_READ_INTO(&family, sk, __sk_common.skc_family);
+    if (family == 2) { // AF_INET
+      __u32 ipv4 = 0;
+      BPF_CORE_READ_INTO(&ipv4, sk, __sk_common.skc_daddr);
+      val.peer_ip[10] = 0xff;
+      val.peer_ip[11] = 0xff;
+      __builtin_memcpy(&val.peer_ip[12], &ipv4, 4);
+      val.has_peer_ip = 1;
+    } else if (family == 10) { // AF_INET6
+      BPF_CORE_READ_INTO(val.peer_ip, sk, __sk_common.skc_v6_daddr);
+      val.has_peer_ip = 1;
+    }
+  } else {
+    // Unconnected socket (dport=0): save msg_name pointer so the kretprobe
+    // can read the peer address after the kernel fills it.
+    void *mn = NULL;
+    BPF_CORE_READ_INTO(&mn, msg, msg_name);
+    val.msg_name_ptr = (__u64)mn;
+  }
+
   bpf_map_update_elem(&udp_recv_scratch, &pid_tgid, &val, BPF_ANY);
   return 0;
 }
@@ -928,7 +978,45 @@ int kretprobe_udp_recvmsg(void *ctx) {
   dbg_inc(DBG_KRETPROBE_ENTRY);
 
   __u64 iov_base = pending->iov_base;
+  __u8 peer_ip[16];
+  __u8 has_peer_ip = pending->has_peer_ip;
+  __u64 msg_name_ptr = pending->msg_name_ptr;
+  __builtin_memcpy(peer_ip, pending->peer_ip, 16);
   bpf_map_delete_elem(&udp_recv_scratch, &pid_tgid);
+
+  // For unconnected sockets (dport=0), read the peer address from msg_name
+  // which the kernel filled during recvmsg with the source sockaddr.
+  if (!has_peer_ip && msg_name_ptr) {
+    __u16 sa_family = 0;
+    bpf_probe_read_kernel(&sa_family, sizeof(sa_family), (void *)msg_name_ptr);
+    if (sa_family == 2) { // AF_INET — struct sockaddr_in
+      __u32 ipv4 = 0;
+      // sin_addr is at offset 4 (after sa_family(2) + sin_port(2))
+      bpf_probe_read_kernel(&ipv4, sizeof(ipv4), (void *)(msg_name_ptr + 4));
+      peer_ip[10] = 0xff;
+      peer_ip[11] = 0xff;
+      __builtin_memcpy(&peer_ip[12], &ipv4, 4);
+      has_peer_ip = 1;
+    } else if (sa_family == 10) { // AF_INET6 — struct sockaddr_in6
+      // sin6_addr is at offset 8 (after sa_family(2) + sin6_port(2) + sin6_flowinfo(4))
+      bpf_probe_read_kernel(peer_ip, 16, (void *)(msg_name_ptr + 8));
+      has_peer_ip = 1;
+    }
+  }
+
+  // Validate DNS server source IP against trusted_dns_servers whitelist.
+  // If dns_whitelist_enabled is 1 and the peer IP is not in the map, drop.
+  // If dns_whitelist_enabled is 0 (not configured), accept all DNS responses.
+  if (has_peer_ip) {
+    __u32 flag_key = 0;
+    __u8 *enabled = bpf_map_lookup_elem(&dns_whitelist_enabled, &flag_key);
+    if (enabled && *enabled == 1) {
+      struct dns_ip_key peer_key = {};
+      __builtin_memcpy(peer_key.ip, peer_ip, 16);
+      if (!bpf_map_lookup_elem(&trusted_dns_servers, &peer_key))
+        return 0;  // DNS server not in whitelist — drop
+    }
+  }
 
   // Read return value from pt_regs
   long ret = 0;
