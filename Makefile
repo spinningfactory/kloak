@@ -166,11 +166,17 @@ e2e-k3s: e2e-k3s-setup e2e-k3s-run e2e-k3s-cleanup
 e2e-k3s-setup:
 	@echo "==> Installing k3s..."
 	@curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --disable=traefik" sh -
-	@echo "==> Waiting for k3s node to be ready..."
+	@echo "==> Waiting for k3s node to register..."
+	@for i in $$(seq 1 30); do \
+		sudo k3s kubectl get nodes -o name 2>/dev/null | grep -q . && break; \
+		echo "  Waiting for k3s node ($$i/30)..."; \
+		sleep 2; \
+	done
 	@sudo k3s kubectl wait --for=condition=Ready node --all --timeout=120s
 	@mkdir -p $(HOME)/.kube
-	@cp /etc/rancher/k3s/k3s.yaml $(HOME)/.kube/config
-	@chmod 644 $(HOME)/.kube/config
+	@sudo cp /etc/rancher/k3s/k3s.yaml $(HOME)/.kube/k3s-e2e.yaml
+	@sudo chown $$(id -u):$$(id -g) $(HOME)/.kube/k3s-e2e.yaml
+	@chmod 600 $(HOME)/.kube/k3s-e2e.yaml
 	@echo "==> Building images..."
 	@docker build --build-arg TARGETARCH=$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') \
 		--build-arg COVER=1 -t $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) .
@@ -182,23 +188,21 @@ e2e-k3s-setup:
 	@docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
 	@docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
 	@echo "==> Importing images into k3s containerd..."
-	@for img in $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest \
+	@docker save $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest \
 		kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest \
-		kloak-demo-python-raw-tls:latest kloak-tls-echo:latest; do \
-		echo "  Importing $$img..."; \
-		docker save $$img | sudo k3s ctr images import -; \
-	done
+		kloak-demo-python-raw-tls:latest kloak-tls-echo:latest | sudo k3s ctr -n k8s.io images import -
 	@echo "==> k3s e2e environment ready."
 
 # Run e2e tests against local k3s.
 e2e-k3s-run:
-	KUBECONFIG=$(HOME)/.kube/config \
+	KUBECONFIG=$(HOME)/.kube/k3s-e2e.yaml \
 	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 $(if $(E2E_RUN),-run $(E2E_RUN)) ./test/e2e/
 
 # Tear down k3s.
 e2e-k3s-cleanup:
-	@/usr/local/bin/k3s-killall.sh 2>/dev/null || true
+	@sudo /usr/local/bin/k3s-killall.sh 2>/dev/null || true
 	@sudo /usr/local/bin/k3s-uninstall.sh 2>/dev/null || true
+	@rm -f $(HOME)/.kube/k3s-e2e.yaml
 
 clean:
 	$(GOCLEAN)
