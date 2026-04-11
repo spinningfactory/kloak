@@ -1,4 +1,5 @@
 .PHONY: all build build-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup \
+        e2e-k3s e2e-k3s-setup e2e-k3s-run e2e-k3s-cleanup \
         clean deps docker-build generate-ebpf generate-vmlinux run help \
         lima-start lima-stop lima-delete lima-shell lima-exec lima-check \
         lima-k3d-ensure lima-k3d-shell lima-k3d-e2e-setup lima-k3d-e2e-run lima-k3d-e2e lima-k3d-stop lima-k3d-delete
@@ -153,6 +154,55 @@ e2e-local-run:
 # Tear down e2e k3d cluster.
 e2e-cleanup:
 	@k3d cluster delete $(E2E_CLUSTER) 2>/dev/null || true
+
+# ============================================================================
+# k3s-native e2e targets (for CI / Linux workstations — no Docker nesting)
+# ============================================================================
+
+# Full k3s e2e: setup + run + cleanup.
+e2e-k3s: e2e-k3s-setup e2e-k3s-run e2e-k3s-cleanup
+
+# Install k3s, build all images, import into k3s containerd.
+e2e-k3s-setup:
+	@echo "==> Installing k3s..."
+	@curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --disable=traefik" sh -
+	@echo "==> Waiting for k3s node to register..."
+	@for i in $$(seq 1 30); do \
+		sudo k3s kubectl get nodes -o name 2>/dev/null | grep -q . && break; \
+		echo "  Waiting for k3s node ($$i/30)..."; \
+		sleep 2; \
+	done
+	@sudo k3s kubectl wait --for=condition=Ready node --all --timeout=120s
+	@mkdir -p $(HOME)/.kube
+	@sudo cp /etc/rancher/k3s/k3s.yaml $(HOME)/.kube/k3s-e2e.yaml
+	@sudo chown $$(id -u):$$(id -g) $(HOME)/.kube/k3s-e2e.yaml
+	@chmod 600 $(HOME)/.kube/k3s-e2e.yaml
+	@echo "==> Building images..."
+	@docker build --build-arg TARGETARCH=$$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') \
+		--build-arg COVER=1 -t $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) .
+	@docker build -t kloak-demo-go:$(E2E_IMAGE_TAG) -t kloak-demo-go:latest ./examples/demo-go/
+	@docker build -t kloak-demo-python:latest ./examples/demo-python/
+	@docker build -t kloak-demo-js:latest ./examples/demo-js/
+	@docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
+	@docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
+	@docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
+	@docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
+	@echo "==> Importing images into k3s containerd..."
+	@docker save $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest \
+		kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest \
+		kloak-demo-python-raw-tls:latest kloak-tls-echo:latest | sudo k3s ctr -n k8s.io images import -
+	@echo "==> k3s e2e environment ready."
+
+# Run e2e tests against local k3s.
+e2e-k3s-run:
+	KUBECONFIG=$(HOME)/.kube/k3s-e2e.yaml \
+	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 $(if $(E2E_RUN),-run $(E2E_RUN)) ./test/e2e/
+
+# Tear down k3s.
+e2e-k3s-cleanup:
+	@sudo /usr/local/bin/k3s-killall.sh 2>/dev/null || true
+	@sudo /usr/local/bin/k3s-uninstall.sh 2>/dev/null || true
+	@rm -f $(HOME)/.kube/k3s-e2e.yaml
 
 clean:
 	$(GOCLEAN)
@@ -313,6 +363,12 @@ help:
 	@echo "eBPF targets:"
 	@echo "  generate-ebpf   - Generate eBPF Go bindings (uses Lima on macOS)"
 	@echo "  generate-vmlinux - Generate vmlinux.h from kernel BTF"
+	@echo ""
+	@echo "k3s-native e2e targets (CI / Linux workstations):"
+	@echo "  e2e-k3s         - Full e2e: setup + run + cleanup (k3s-native)"
+	@echo "  e2e-k3s-setup   - Install k3s, build and import images"
+	@echo "  e2e-k3s-run     - Run e2e tests against local k3s"
+	@echo "  e2e-k3s-cleanup - Uninstall k3s"
 	@echo ""
 	@echo "Lima VM targets (for eBPF on macOS):"
 	@echo "  lima-start      - Start the Lima VM"
