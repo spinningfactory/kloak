@@ -173,27 +173,33 @@ jobs:
           go-version: ${{ env.GO_VERSION }}
           cache: true
 
-      - name: Install clang for eBPF generation
-        run: sudo apt-get update && sudo apt-get install -y clang llvm libbpf-dev
+      - name: Install clang and bpftool for eBPF
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev
+          KVER="$(uname -r)" && sudo apt-get install -y linux-tools-common "linux-tools-${KVER}" 2>/dev/null || true
 
       - name: Generate eBPF bindings
         run: KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/
 
-      - name: Install k3d
-        run: curl -s https://raw.githubusercontent.com/k3d-io/k3d/main/install.sh | bash
-
-      - name: Create k3d cluster (with BPF mounts)
+      - name: Install k3s
         run: |
-          k3d cluster create kloak-e2e --wait --timeout 120s \
-            --volume /sys/kernel/btf:/sys/kernel/btf:ro@server:0 \
-            --volume /sys/fs/bpf:/sys/fs/bpf:rw@server:0 \
-            --volume /sys/kernel/tracing:/sys/kernel/tracing:ro@server:0
-          k3d kubeconfig get kloak-e2e > /tmp/kubeconfig-e2e.yaml
+          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --disable=traefik" sh -
+          # Wait for node to register before running kubectl wait
+          for i in $(seq 1 30); do
+            sudo k3s kubectl get nodes -o name 2>/dev/null | grep -q . && break
+            echo "Waiting for k3s node to register ($i/30)..."
+            sleep 2
+          done
+          sudo k3s kubectl wait --for=condition=Ready node --all --timeout=120s
+          mkdir -p ~/.kube
+          sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/k3s-e2e.yaml
+          sudo chown "$(id -u):$(id -g)" ~/.kube/k3s-e2e.yaml
+          chmod 600 ~/.kube/k3s-e2e.yaml
 
-      - name: Build and import images into k3d
+      - name: Build and import images into k3s
         run: |
           docker build --build-arg TARGETARCH=amd64 --build-arg COVER=1 -t kloak:e2e .
-          k3d image import kloak:e2e -c kloak-e2e
           docker build -t kloak-demo-go:latest ./examples/demo-go/
           docker build -t kloak-demo-python:latest ./examples/demo-python/
           docker build -t kloak-demo-js:latest ./examples/demo-js/
@@ -201,8 +207,10 @@ jobs:
           docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
           docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
           docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
-          k3d image import kloak-demo-go:latest kloak-demo-python:latest kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest -c kloak-e2e
-          k3d image import kloak-tls-echo:latest -c kloak-e2e
+          docker save kloak:e2e kloak-demo-go:latest kloak-demo-python:latest \
+            kloak-demo-js:latest kloak-demo-go-boring:latest \
+            kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest \
+            kloak-tls-echo:latest | sudo k3s ctr -n k8s.io images import -
 
       - name: Install Helm
         uses: azure/setup-helm@v4
@@ -210,37 +218,40 @@ jobs:
       - name: Run E2E tests (with eBPF)
         run: go test -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
-          KUBECONFIG: /tmp/kubeconfig-e2e.yaml
+          KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
 
-      # E2e coverage collection and merge disabled — unit coverage artifact
-      # upload was removed to save storage quota, so merge has nothing to work with.
-
-      - name: Collect logs on failure
+      - name: Collect logs and BPF debug info on failure
         if: failure()
         env:
-          KUBECONFIG: /tmp/kubeconfig-e2e.yaml
+          KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
         run: |
           echo "=== Kloak Controller Logs ==="
           kubectl logs -n kloak-system -l app.kubernetes.io/component=controller --tail=200 2>/dev/null || true
           echo "=== Kloak Webhook Logs ==="
           kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook --tail=100 2>/dev/null || true
-          echo "=== Demo Go Logs ==="
-          kubectl logs -n kloak-e2e -l app=demo-go --tail=50 2>/dev/null || true
-          echo "=== Demo Python Logs ==="
-          kubectl logs -n kloak-e2e -l app=demo-python --tail=50 2>/dev/null || true
-          echo "=== Demo JS Logs ==="
-          kubectl logs -n kloak-e2e -l app=demo-js --tail=50 2>/dev/null || true
-          echo "=== Demo Go BoringSSL Logs ==="
-          kubectl logs -n kloak-e2e -l app=demo-go-boring --tail=50 2>/dev/null || true
-          echo "=== Demo Python Raw TLS Logs ==="
-          kubectl logs -n kloak-e2e -l app=demo-python-raw-tls --tail=50 2>/dev/null || true
+          echo "=== Demo App Logs ==="
+          for app in demo-go demo-python demo-js demo-go-boring demo-python-raw-tls; do
+            echo "--- $app ---"
+            kubectl logs -n kloak-e2e -l app=$app --tail=50 2>/dev/null || true
+          done
           echo "=== All Pods ==="
           kubectl get pods -A 2>/dev/null || true
           echo "=== Events ==="
           kubectl get events -n kloak-e2e --sort-by='.lastTimestamp' 2>/dev/null || true
           echo "=== Describe Controller ==="
           kubectl describe daemonset -n kloak-system kloak-controller 2>/dev/null || true
+          echo "=== BPF Programs ==="
+          sudo bpftool prog list 2>/dev/null || true
+          echo "=== BPF Maps ==="
+          sudo bpftool map list 2>/dev/null || true
+          echo "=== Kernel dmesg (last 50 lines) ==="
+          sudo dmesg | tail -50 2>/dev/null || true
+          echo "=== BPF trace_pipe (buffered) ==="
+          sudo timeout 2 cat /sys/kernel/tracing/trace_pipe 2>/dev/null | head -100 || true
 
-      - name: Delete k3d cluster
+      - name: Stop k3s
         if: always()
-        run: k3d cluster delete kloak-e2e
+        run: |
+          sudo /usr/local/bin/k3s-killall.sh 2>/dev/null || true
+          sudo /usr/local/bin/k3s-uninstall.sh 2>/dev/null || true
+          rm -f ~/.kube/k3s-e2e.yaml
