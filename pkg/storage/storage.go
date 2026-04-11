@@ -10,6 +10,8 @@ import (
 type Entry struct {
 	Value        string   `json:"value"`
 	AllowedHosts []string `json:"allowed_hosts"`
+	Port         uint16   `json:"port"`
+	Protocol     uint8    `json:"protocol"`
 }
 
 // Storage defines the interface for hash-to-value storage.

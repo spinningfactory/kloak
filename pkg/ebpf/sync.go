@@ -11,9 +11,6 @@ import (
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
-// syncSecrets updates the BPF secret_map with the latest shadow secret values
-// from the given storage, and syncs the watched_hosts map with unique hostnames
-// from secret entries (used for DNS filtering).
 func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, log logr.Logger) error {
 	secrets, err := store.List(context.Background())
 	if err != nil {
@@ -82,10 +79,15 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 		}
 		// HostLen == 0 means wildcard (allow all hosts)
 
+		// Set allowed port for port-based filtering
+		// Port == 0 means wildcard (allow all ports)
+		val.Port = entry.Port
+		val.Protocol = entry.Protocol
+
 		if err := secretMap.Update(&key, &val, 0); err != nil {
 			log.Error(err, "failed to update BPF secret_map", "hash", hash)
 		} else {
-			log.Info("Synced secret into eBPF map", "hash", hash, "hostLen", val.HostLen)
+			log.Info("Synced secret into eBPF map", "hash", hash, "hostLen", val.HostLen, "port", val.Port, "protocol", val.Protocol)
 		}
 
 		// Also store a Huffman-encoded variant for HTTP/2 HPACK interception.
@@ -122,6 +124,8 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 				copy(huffVal.RealSecret[:], huffReal[:huffLen])
 				huffVal.HostLen = val.HostLen
 				huffVal.AllowedHost = val.AllowedHost
+				huffVal.Port = val.Port
+				huffVal.Protocol = val.Protocol
 				huffPrefixLen := len(huffShadow)
 				if huffPrefixLen > 42 {
 					huffPrefixLen = 42

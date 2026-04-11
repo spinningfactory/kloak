@@ -23,6 +23,8 @@ typedef uint64_t __u64;
 #ifndef MAX_DATA_SIZE
 #define MAX_DATA_SIZE 256
 #endif
+typedef uint16_t __u16;
+typedef int int32_t;
 #endif
 
 // Parse HTTP "Host: " header from a data buffer.
