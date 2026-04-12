@@ -1,0 +1,115 @@
+name: CD
+
+on:
+  release:
+    types: [published]
+
+concurrency:
+  group: cd-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+env:
+  GO_VERSION: '1.25'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  validate:
+    name: Validate Release Tag
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.parse.outputs.version }}
+    steps:
+      - name: Parse and validate tag
+        id: parse
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Release tag '$TAG' does not match vx.x.x format"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+  docker:
+    name: Docker Build & Push
+    runs-on: ubuntu-latest
+    needs: [validate]
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up QEMU (for arm64 final stage)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push multi-arch image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ needs.validate.outputs.version }}
+            ghcr.io/${{ github.repository }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  helm:
+    name: Publish Helm Chart
+    runs-on: ubuntu-latest
+    needs: [validate]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set chart version
+        env:
+          VERSION: ${{ needs.validate.outputs.version }}
+        run: |
+          sed -i "s/^version:.*/version: ${VERSION}/" charts/kloak/Chart.yaml
+          sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/kloak/Chart.yaml
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+
+      - name: Package chart
+        run: helm package charts/kloak -d .helm-pkg
+
+      - name: Download existing index
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_REGION: auto
+        run: |
+          aws s3 cp s3://kloak-chart/index.yaml .helm-pkg/existing-index.yaml 2>/dev/null || true
+
+      - name: Build repo index
+        run: |
+          if [ -f .helm-pkg/existing-index.yaml ]; then
+            helm repo index .helm-pkg --url https://chart.getkloak.io --merge .helm-pkg/existing-index.yaml
+          else
+            helm repo index .helm-pkg --url https://chart.getkloak.io
+          fi
+          rm -f .helm-pkg/existing-index.yaml
+
+      - name: Upload to R2
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          AWS_REGION: auto
+        run: |
+          aws s3 sync .helm-pkg/ s3://kloak-chart/ --delete
