@@ -6,7 +6,7 @@
 
 <p align="center">
   <b>Secure Your Secrets, Agentless</b><br>
-  Kubernetes eBPF Secret Interceptor for HTTPS. Secure secret management without application changes or sidecars.
+  Kubernetes eBPF HTTPS interceptor. Transparent secret injection without application changes or sidecars.
 </p>
 
 <div align="center">
@@ -15,26 +15,27 @@
 ![Coverage](https://img.shields.io/badge/Coverage-80.8%25-brightgreen)
 [![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://go.dev/)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.28+-326CE5?logo=kubernetes)](https://kubernetes.io/)
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
 </div>
 
 ---
 
-Kloak transparently intercepts HTTPS traffic in Kubernetes using **pure eBPF**, replacing hashed placeholders with real secrets at the network edge. Your applications never see the actual credentials, and **no sidecars are required.**
+Kloak transparently intercepts outbound TLS traffic in Kubernetes using eBPF uprobes, replacing hashed placeholders with real secrets at the kernel level before encryption. Applications never handle actual credentials, and no sidecars or code changes are required.
 
-## ✨ Features
+## Features
 
-- 🔐 **Secure by Design** - Secrets are replaced at the network edge. Your application code never sees real credentials.
-- ⚡ **Zero Latency Impact** - eBPF-powered traffic redirection happens in kernel space, adding negligible overhead.
-- ☸️ **Kubernetes Native** - Works seamlessly with standard Kubernetes Secrets. Just add a label.
-- 🎯 **DNS-Verified Host Filtering** - Secrets are only sent to hosts verified through the DNS resolution chain. No DNS match, no secret.
-- 🛠 **Zero Code Changes** - No SDK required. Works with any language or framework (Go, Python, Node.js, and any OpenSSL-based runtime).
-- 🚀 **Pure eBPF Integration** - No bulky sidecars or complex CNI plugins. Operates purely at the kernel level for maximum efficiency.
+- **Secret isolation** -- Applications only see hashed shadow values (`kloak:<UUID>`). Real secrets exist solely in eBPF maps and are injected in-kernel at TLS write time.
+- **Zero overhead** -- eBPF uprobes operate in kernel space with negligible latency impact. No userspace proxy or sidecar in the data path.
+- **Kubernetes native** -- Works with standard Kubernetes Secrets. Enable with a single label.
+- **DNS-verified host filtering** -- Secrets annotated with `getkloak.io/hosts` are only sent to destinations verified through the DNS resolution chain, preventing exfiltration to unauthorized servers.
+- **Port-based filtering** -- Secrets annotated with `getkloak.io/port` are restricted to connections on a specific destination port.
+- **Broad runtime support** -- Hooks into OpenSSL, BoringSSL, and Go's native `crypto/tls`. Works with Python, Node.js, Go, Rust, Ruby, PHP, curl, and any OpenSSL-linked runtime.
+- **No code changes** -- No SDK, no library, no application modifications. Mount a secret, make HTTPS requests, and Kloak handles the rest.
 
-## 🏗 Architecture
+## Architecture
 
-Kloak separates concerns into a robust control plane and an ultra-fast data plane.
+Kloak consists of a control plane (controller + webhook) and an eBPF data plane that runs entirely in kernel space.
 
 ```mermaid
 graph TD
@@ -64,19 +65,27 @@ graph TD
     TP -->|Populates conn_ip_map| UP
 ```
 
-### Component Breakdown
+### Components
 
 | Component | Description |
 |-----------|-------------|
-| **Controller** (DaemonSet) | Watches Secrets labeled `getkloak.io/enabled=true`, creates shadow secrets with `kloak:<UUID>` placeholders, syncs real values to eBPF maps, attaches TLS uprobes to container processes. |
-| **Webhook** (Deployment) | Mutating admission webhook that intercepts Pod creation. Rewrites Secret volume mounts to point to shadow secrets. Checks enablement via pod annotations, namespace labels, or owner workload labels. |
-| **TLS Uprobes** | Attach to `SSL_write`/`SSL_write_ex` (OpenSSL/BoringSSL) or `crypto/tls.(*Conn).Write` (Go). Intercept TLS writes, scan for `kloak:` prefixes, and rewrite with real secrets via `bpf_probe_write_user`. |
-| **DNS Kprobe** | Hooks `udp_recvmsg` to capture DNS responses globally. Parses A/AAAA records for watched hostnames and populates `dns_ip_map` (IP → hostname). |
-| **Connect Tracepoints** | Hooks `sys_enter/exit_connect` to track TCP connections (fd → destination IP). When a connection's IP matches a DNS-verified hostname, sets `last_verified_fd`. |
+| **Controller** (DaemonSet) | Watches Secrets labeled `getkloak.io/enabled=true`, creates shadow secrets with length-matched `kloak:<UUID>` placeholders, syncs real values into eBPF maps, and attaches TLS uprobes to container processes via cgroup discovery. |
+| **Webhook** (Deployment) | Mutating admission webhook that intercepts Pod creation. Rewrites Secret volume mounts to point to shadow secrets. Evaluates enablement through pod annotations, namespace labels, and owner workload labels (following ReplicaSet to Deployment chains). |
+| **TLS Uprobes** | Attach to `SSL_write` / `SSL_write_ex` (OpenSSL/BoringSSL) and `crypto/tls.(*Conn).Write` (Go native). Intercept outbound TLS writes, scan for `kloak:` prefixes, and perform in-kernel rewrite via a two-phase tail-call design. |
+| **DNS Kprobe** | Hooks `udp_recvmsg` to capture DNS responses system-wide. Parses A/AAAA records for watched hostnames and populates `dns_ip_map` (IP to hostname mapping). |
+| **Connect Tracepoints** | Hooks `sys_enter/exit_connect` to track TCP connections (fd to destination IP). When a connection's destination IP matches a DNS-verified hostname, the fd is marked as verified. |
 
-## 🔒 DNS-Verified Trust Chain
+### Supported Runtimes
 
-Secrets with `getkloak.io/hosts` are only rewritten when the destination is verified through the DNS resolution chain. This prevents secret exfiltration to unauthorized servers.
+| Runtime | TLS Library | Hook Point |
+|---------|------------|------------|
+| Python, Rust, Ruby, PHP, curl | OpenSSL (libssl.so) | `SSL_write` / `SSL_write_ex` uprobe |
+| Node.js | BoringSSL (statically linked) | `SSL_write` uprobe |
+| Go | crypto/tls (native) | `crypto/tls.(*Conn).Write` uprobe |
+
+## DNS-Verified Trust Chain
+
+Secrets with `getkloak.io/hosts` annotations are only rewritten when the destination is verified through the full DNS resolution chain. This prevents secret exfiltration to unauthorized servers, even if an application is compromised.
 
 ```mermaid
 sequenceDiagram
@@ -88,47 +97,48 @@ sequenceDiagram
     participant P2 as Phase 2 Rewrite
     participant Srv as api.stripe.com
 
-    Note over App,Srv: Step 1 - DNS Resolution
+    Note over App,Srv: 1. DNS Resolution
     App->>DNS: resolve api.stripe.com
     DNS-->>App: A 52.55.108.115
     KP->>KP: dns_ip_map[52.55.108.115] = api.stripe.com
 
-    Note over App,Srv: Step 2 - TCP Connect
+    Note over App,Srv: 2. TCP Connect
     App->>Srv: connect(fd=7, 52.55.108.115:443)
     TP->>TP: conn_ip_map[tgid,fd=7] = 52.55.108.115
-    TP->>TP: IP in dns_ip_map, set last_verified_fd = 7
+    TP->>TP: IP in dns_ip_map -> mark fd as verified
 
-    Note over App,Srv: Step 3 - TLS Write (Allowed)
+    Note over App,Srv: 3. TLS Write (Allowed)
     App->>UP: SSL_write with kloak:a1b2c3d4
     UP->>UP: resolve_host -> api.stripe.com
     UP->>P2: Tail call
-    P2->>P2: allowed_host matches, rewrite secret
+    P2->>P2: allowed_host matches -> rewrite secret
     P2->>Srv: Real secret sent to api.stripe.com
 
-    Note over App,Srv: Step 4 - TLS Write (Blocked)
+    Note over App,Srv: 4. TLS Write (Blocked)
     App->>UP: SSL_write to evil.com with kloak:a1b2c3d4
     UP->>UP: resolve_host -> evil.com
     UP->>P2: Tail call
-    P2->>P2: allowed_host mismatch, BLOCKED
+    P2->>P2: allowed_host mismatch -> BLOCKED
     P2--xApp: Placeholder sent as-is
 ```
 
 ### How Host Verification Works
 
-1. **DNS Capture** — A kprobe on `udp_recvmsg` intercepts all DNS responses on the node. For hostnames in `watched_hosts` (derived from `getkloak.io/hosts` labels), the resolved IPs are stored in `dns_ip_map`.
+1. **DNS capture** -- A kprobe on `udp_recvmsg` intercepts DNS responses on the node. For hostnames listed in `getkloak.io/hosts`, resolved IPs are stored in `dns_ip_map` with TTL tracking.
 
-2. **Connection Tracking** — Tracepoints on `sys_enter/exit_connect` record every TCP connection's fd → destination IP mapping in `conn_ip_map`. If the IP exists in `dns_ip_map`, the fd is cached in `last_verified_fd`.
+2. **Connection tracking** -- Tracepoints on `sys_enter/exit_connect` record each TCP connection's fd-to-destination-IP mapping in `conn_ip_map`. If the destination IP exists in `dns_ip_map`, the fd is marked as verified.
 
-3. **Host Resolution** — At `SSL_write` time, `resolve_host()` chains: `last_verified_fd` → `conn_ip_map` → `dns_ip_map` to determine the hostname of the current TLS connection.
+3. **Host resolution** -- At `SSL_write` time, `resolve_host()` chains through verified fd, `conn_ip_map`, and `dns_ip_map` to determine the hostname of the current TLS connection.
 
-4. **Secret Filtering** — Phase 2 compares the resolved hostname against the secret's `allowed_host`. Match → rewrite. Mismatch → placeholder sent as-is (secret stays safe).
+4. **Secret filtering** -- Phase 2 compares the resolved hostname against the secret's `allowed_host`. Match: rewrite. Mismatch: placeholder sent as-is, keeping the secret safe.
 
-5. **TTL Enforcement** — DNS entries include a TTL. Expired entries are skipped on lookup, forcing re-verification through fresh DNS responses.
+5. **TTL enforcement** -- DNS entries include a TTL. Expired entries are skipped on lookup, requiring re-verification through fresh DNS responses.
 
-## 🚀 How It Works
+## How It Works
 
-### 1. Register Your Secrets
-Label your Kubernetes secrets with `getkloak.io/enabled=true`. Kloak generates a shadow secret with `kloak:<UUID>` placeholders matching the original value lengths.
+### 1. Label Your Secrets
+
+Add `getkloak.io/enabled=true` to any Kubernetes Secret. Kloak generates a shadow secret with `kloak:<UUID>` placeholders that are length-matched to the original values.
 
 ```yaml
 apiVersion: v1
@@ -137,100 +147,95 @@ metadata:
   name: api-credentials
   labels:
     getkloak.io/enabled: "true"
+  annotations:
     getkloak.io/hosts: "api.stripe.com"
+    getkloak.io/port: "443"
 data:
   api-key: c2stbGl2ZS14eXoxMjM=  # sk-live-xyz123
 ```
 
-### 2. Use Hash Placeholders
-Your application mounts the shadow secret (automatically rewritten by the webhook) and uses the `kloak:<UUID>` placeholder. It never sees the real value.
+### 2. Deploy Your Application
 
-```yaml
-headers:
-  Authorization: "Bearer kloak:a1b2c3d4-e5f6-7890"
+The webhook automatically rewrites volume mounts to use the shadow secret. Your application sees only `kloak:<UUID>` placeholders and never handles real credentials.
+
+```
+# What the application reads from the mounted secret:
+kloak:a1b2c3d4-e5f6-7890
 ```
 
 ### 3. Automatic In-Kernel Rewrite
-When your app makes an outbound HTTPS request, the eBPF uprobe intercepts the TLS write, verifies the destination host via the DNS chain, and replaces the placeholder with the real secret before encryption.
+
+When the application makes an outbound HTTPS request, the eBPF uprobe intercepts the TLS write, verifies the destination through the DNS trust chain, and replaces the placeholder with the real secret before encryption.
 
 ```
-# What your app writes:
+# What the application writes:
 Authorization: Bearer kloak:a1b2c3d4-e5f6-7890
 
-# What actually leaves the pod (after eBPF rewrite):
+# What leaves the node (after eBPF rewrite):
 Authorization: Bearer sk-live-xyz123
 ```
 
-### Supported Runtimes
-
-| Runtime | TLS Library | Hook Point |
-|---------|------------|------------|
-| Python | OpenSSL (libssl.so) | `SSL_write` uprobe |
-| Node.js | BoringSSL (statically linked) | `SSL_write` uprobe |
-| Go | crypto/tls | `crypto/tls.(*Conn).Write` uprobe |
-| Rust, Ruby, PHP, curl | OpenSSL/BoringSSL | `SSL_write` / `SSL_write_ex` uprobe |
-
-## 🛠 Quick Start
+## Quick Start
 
 ### Prerequisites
-- A Kubernetes cluster (1.28+) with Linux kernel 5.17+
+
+- Kubernetes cluster (1.28+) with Linux kernel 5.17+
 - [Helm](https://helm.sh/docs/intro/install/) 3.12+
 - `kubectl` configured with cluster access
 
 ### Install with Helm
 
 ```bash
-# Add the Kloak Helm repository
-helm repo add kloak https://getkloak.github.io/kloak
+helm repo add kloak https://chart.getkloak.io
 helm repo update
 
-# Install Kloak
 helm install kloak kloak/kloak -n kloak-system --create-namespace
 
-# Verify the installation
 kubectl get pods -n kloak-system
 ```
 
+### Labels and Annotations
+
+| Key | Type | Scope | Description |
+|-----|------|-------|-------------|
+| `getkloak.io/enabled=true` | Label | Secret, Namespace, Workload | Enables Kloak for the target resource |
+| `getkloak.io/enabled=true` | Annotation | Pod | Enables Kloak for a specific pod |
+| `getkloak.io/hosts=host1,host2` | Annotation | Secret | Restricts which destination hosts a secret can be sent to |
+| `getkloak.io/port=443` | Annotation | Secret | Restricts which destination port a secret can be sent to |
+| `getkloak.io/managed=true` | Label | Secret | Marks shadow secrets created by Kloak (do not set manually) |
+
 ### Try the Demo
 
-The easiest way to see Kloak in action is to run the local demo:
-
 ```bash
-# Run the full demo (creates Lima VM with K3s, deploys everything)
+# Full demo: creates a Lima VM with K3s, deploys Kloak and sample apps
 ./examples/setup-demo.sh
 
-# Access the cluster
 export KUBECONFIG=/tmp/kloak-k3s.yaml
 
-# View demo logs (should show real secrets in httpbin.org responses)
+# View logs (should show real secrets in httpbin.org responses)
 kubectl logs -f -l app=demo-python -n kloak-demo -c demo-app
 
 # Cleanup
 ./examples/destroy-demo.sh
 ```
 
-### Manual Build & Development
+## Development
 
 ```bash
-# Build binary
-make build
-
-# Run tests
-make test
-
-# Build Docker image
-make docker-build
+make build          # Build the kloak binary
+make test           # Run all tests
+make docker-build   # Build Docker image
 ```
 
-**eBPF Development (macOS)**: Kloak uses Lima for eBPF development on macOS.
+eBPF development requires Linux. On macOS, Kloak uses Lima VMs:
 
 ```bash
-make lima-start    # Start Lima VM
-make generate-ebpf # Generate eBPF code
-make test-linux    # Run tests in Linux VM
-make lima-shell    # Open shell in Lima VM
+make lima-start      # Start Lima VM
+make generate-ebpf   # Generate eBPF Go bindings
+make test-linux      # Run tests in Linux VM
+make lima-shell      # Shell into VM
 ```
 
-## 📄 License
+## License
 
-Apache 2.0
+AGPL-3.0
