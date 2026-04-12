@@ -28,7 +28,7 @@ jobs:
         with:
           path-to-signatures: 'signatures.json'
           path-to-document: 'https://github.com/spinningfactory/kloak/blob/main/CLA.md'
-          remote-repository-name: spinningfactory/kloak-cla
+          remote-repository-name: kloak-cla
           remote-organization-name: spinningfactory
           branch: main
           allowlist: dhiaayachi,dependabot[bot],github-actions[bot]
