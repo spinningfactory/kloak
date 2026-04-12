@@ -46,9 +46,14 @@ graph TD
 
     subgraph Data_Plane [Data Plane - eBPF in Kernel]
         UP[TLS Uprobes]
-        KP[DNS Kprobe]
-        TP[Connect Tracepoints]
         P2[Phase 2 Rewrite]
+        XOR[XOR Path]
+        KP[DNS Kprobe/Kretprobe]
+        TP[Connect/Close Tracepoints]
+        PROC[Process Tracepoints]
+        TCP[tcp_sendmsg Kprobe]
+        TC[TC Egress Patch]
+        GHASH[TC GHASH Update]
     end
 
     subgraph App [Application]
@@ -56,13 +61,19 @@ graph TD
     end
 
     C -->|Creates shadow secrets and syncs BPF maps| UP
-    C -->|Attaches uprobes to container processes| UP
+    C -->|Attaches probes to container processes| UP
     W -->|Rewrites volume mounts to shadow secrets| P
     P -->|TLS write with kloak:UUID| UP
-    UP -->|Tail call| P2
+    UP -->|Tail call: plaintext rewrite| P2
+    UP -->|Tail call: ciphertext rewrite| XOR
+    XOR -->|Stores xor_pending| TCP
+    TCP -->|Stores tc_pending| TC
+    TC -->|Tail call| GHASH
     P2 -->|Real secret injected| Internet
+    TC -->|Patched ciphertext| Internet
     KP -->|Populates dns_ip_map| UP
-    TP -->|Populates conn_ip_map| UP
+    TP -->|Populates conn_ip_map / last_verified_fd| UP
+    PROC -->|Tracks process lifecycle| C
 ```
 
 ### Components
@@ -71,9 +82,11 @@ graph TD
 |-----------|-------------|
 | **Controller** (DaemonSet) | Watches Secrets labeled `getkloak.io/enabled=true`, creates shadow secrets with length-matched `kloak:<UUID>` placeholders, syncs real values into eBPF maps, and attaches TLS uprobes to container processes via cgroup discovery. |
 | **Webhook** (Deployment) | Mutating admission webhook that intercepts Pod creation. Rewrites Secret volume mounts to point to shadow secrets. Evaluates enablement through pod annotations, namespace labels, and owner workload labels (following ReplicaSet to Deployment chains). |
-| **TLS Uprobes** | Attach to `SSL_write` / `SSL_write_ex` (OpenSSL/BoringSSL) and `crypto/tls.(*Conn).Write` (Go native). Intercept outbound TLS writes, scan for `kloak:` prefixes, and perform in-kernel rewrite via a two-phase tail-call design. |
-| **DNS Kprobe** | Hooks `udp_recvmsg` to capture DNS responses system-wide. Parses A/AAAA records for watched hostnames and populates `dns_ip_map` (IP to hostname mapping). |
-| **Connect Tracepoints** | Hooks `sys_enter/exit_connect` to track TCP connections (fd to destination IP). When a connection's destination IP matches a DNS-verified hostname, the fd is marked as verified. |
+| **TLS Uprobes** | Attach to `SSL_write` / `SSL_write_ex` (OpenSSL/BoringSSL) and `crypto/tls.(*Conn).Write` (Go native). Intercept outbound TLS writes, scan for `kloak:` prefixes. Two rewrite paths: Phase 2 for plaintext rewrite (before encryption), and XOR path for ciphertext patching (after encryption). |
+| **XOR Path + TC Egress** | For Go native TLS: computes XOR diff in the uprobe, bridges through `tcp_sendmsg` kprobe to TC egress, which patches the encrypted packet in-flight and recomputes the GHASH authentication tag via a tail call to `tc_ghash_update`. |
+| **DNS Kprobe** | Kprobe/kretprobe on `udp_recvmsg` captures DNS responses system-wide. Parses A/AAAA records for watched hostnames and populates `dns_ip_map` (IP to hostname) with TTL tracking. |
+| **Connect/Close Tracepoints** | Hooks `sys_enter/exit_connect` to track TCP connections (fd to destination IP in `conn_ip_map`). When the destination matches a DNS-verified hostname, caches the fd in `last_verified_fd`. Hooks `sys_enter_close` to clean up stale entries. |
+| **Process Tracepoints** | Hooks `sched_process_exec` and `sched_process_exit` to track container process lifecycle for uprobe attachment and cleanup. |
 
 ### Supported Runtimes
 
