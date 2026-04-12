@@ -132,9 +132,12 @@ func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, nam
 		// Check if secret is enabled
 		var secret corev1.Secret
 		if err := h.client.Get(ctx, client.ObjectKey{Name: secretName, Namespace: ns}, &secret); err != nil {
-			// Secret not found or error -- skip rewriting. The secret may not be
-			// kloak-managed, and pod admission will fail downstream if it's truly missing.
-			h.log.V(1).Info("failed to look up secret for volume rewriting", "name", secretName, "error", err)
+			if client.IgnoreNotFound(err) != nil {
+				// API error (permissions, transient failure) -- deny to maintain fail-closed posture
+				return fmt.Errorf("failed to look up secret %s/%s: %w", ns, secretName, err)
+			}
+			// Secret not found -- skip rewriting. Pod admission will fail downstream if it's truly missing.
+			h.log.V(1).Info("secret not found for volume rewriting", "name", secretName)
 			continue
 		}
 
@@ -150,6 +153,9 @@ func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, nam
 		var shadowSecret corev1.Secret
 		if err := h.client.Get(ctx, client.ObjectKey{Name: shadowName, Namespace: ns}, &shadowSecret); err != nil {
 			return fmt.Errorf("shadow secret %s/%s not found for kloak-enabled secret %s (controller may not have reconciled yet)", ns, shadowName, secretName)
+		}
+		if shadowSecret.Labels["getkloak.io/managed"] != "true" {
+			return fmt.Errorf("secret %s/%s exists but is not a kloak-managed shadow secret", ns, shadowName)
 		}
 
 		h.log.Info("Rewriting volume to use shadow secret", "original", secretName, "shadow", shadowName)
