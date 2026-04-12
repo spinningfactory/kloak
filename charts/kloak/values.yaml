@@ -1,5 +1,5 @@
 image:
-  repository: dhiaayachi/kloak
+  repository: ghcr.io/spinningfactory/kloak
   tag: dev
   pullPolicy: IfNotPresent
 
