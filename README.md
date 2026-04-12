@@ -81,7 +81,7 @@ graph TD
 | Component | Description |
 |-----------|-------------|
 | **Controller** (DaemonSet) | Watches Secrets labeled `getkloak.io/enabled=true`, creates shadow secrets with length-matched `kloak:<UUID>` placeholders, syncs real values into eBPF maps, and attaches TLS uprobes to container processes via cgroup discovery. |
-| **Webhook** (Deployment) | Mutating admission webhook that intercepts Pod creation. Rewrites Secret volume mounts to point to shadow secrets. Evaluates enablement through pod annotations, namespace labels, and owner workload labels (following ReplicaSet to Deployment chains). |
+| **Webhook** (Deployment) | Mutating admission webhook that intercepts Pod creation. Rewrites Secret volume mounts to point to shadow secrets. Evaluates enablement through pod labels or namespace labels. Rejects pods if the shadow secret has not been created yet (fail-closed). Two webhook entries ensure only kloak-enabled namespaces and pods are affected; non-kloak workloads are never impacted, even when the webhook is down. |
 | **TLS Uprobes** | Attach to `SSL_write` / `SSL_write_ex` (OpenSSL/BoringSSL) and `crypto/tls.(*Conn).Write` (Go native). Intercept outbound TLS writes, scan for `kloak:` prefixes. Two rewrite paths: Phase 2 for plaintext rewrite (before encryption), and XOR path for ciphertext patching (after encryption). |
 | **XOR Path + TC Egress** | For Go native TLS: computes XOR diff in the uprobe, bridges through `tcp_sendmsg` kprobe to TC egress, which patches the encrypted packet in-flight and recomputes the GHASH authentication tag via a tail call to `tc_ghash_update`. |
 | **DNS Kprobe** | Kprobe/kretprobe on `udp_recvmsg` captures DNS responses system-wide. Parses A/AAAA records for watched hostnames and populates `dns_ip_map` (IP to hostname) with TTL tracking. |
@@ -211,8 +211,7 @@ kubectl get pods -n kloak-system
 
 | Key | Type | Scope | Description |
 |-----|------|-------|-------------|
-| `getkloak.io/enabled=true` | Label | Secret, Namespace, Workload | Enables Kloak for the target resource |
-| `getkloak.io/enabled=true` | Annotation | Pod | Enables Kloak for a specific pod |
+| `getkloak.io/enabled=true` | Label | Secret, Namespace, Pod | Enables Kloak for the target resource. On namespaces and pods, controls webhook scope. On secrets, triggers shadow secret creation. |
 | `getkloak.io/hosts=host1,host2` | Annotation | Secret | Restricts which destination hosts a secret can be sent to |
 | `getkloak.io/port=443` | Annotation | Secret | Restricts which destination port a secret can be sent to |
 | `getkloak.io/managed=true` | Label | Secret | Marks shadow secrets created by Kloak (do not set manually) |

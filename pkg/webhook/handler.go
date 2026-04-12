@@ -5,9 +5,9 @@ package webhook
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -17,7 +17,13 @@ import (
 )
 
 const (
-	// AnnotationEnabled is the annotation to enable Kloak on a pod.
+	// LabelEnabled is the label used to enable Kloak on a pod or namespace.
+	// Pod-level enablement uses a label (not annotation) so that Kubernetes
+	// objectSelector can match it, allowing the webhook to be scoped precisely.
+	LabelEnabled = "getkloak.io/enabled"
+
+	// AnnotationEnabled is the annotation injected by the webhook onto mutated pods.
+	// The controller (DaemonSet) reads this to determine if a pod is kloak-enabled.
 	AnnotationEnabled = "getkloak.io/enabled"
 )
 
@@ -66,7 +72,10 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 	mutatedPod.Annotations[AnnotationEnabled] = "true"
 
 	// Rewrite Secret volumes (swap with shadow secrets)
-	h.rewriteSecretVolumes(ctx, mutatedPod, req.Namespace)
+	if err := h.rewriteSecretVolumes(ctx, mutatedPod, req.Namespace); err != nil {
+		h.log.Error(err, "shadow secret not ready, rejecting pod")
+		return admission.Denied(fmt.Sprintf("kloak: %v", err))
+	}
 
 	// Create JSON patch
 	marshaledPod, err := json.Marshal(mutatedPod)
@@ -78,119 +87,74 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 }
 
 // isEnabled checks if Kloak should process this pod.
-// It checks for the explicit pod annotation first, then falls back to the namespace label.
+// Enablement is determined by pod label or namespace label only.
+// Workload-level inheritance (Deployment, DaemonSet, etc.) is not supported;
+// use pod template labels or namespace labels instead.
 func (h *Handler) isEnabled(ctx context.Context, pod *corev1.Pod, namespace string) (bool, error) {
-	// 1. Check explicit Pod annotation
-	if pod.Annotations != nil {
-		if val, ok := pod.Annotations[AnnotationEnabled]; ok {
+	// 1. Check pod label
+	if pod.Labels != nil {
+		if val, ok := pod.Labels[LabelEnabled]; ok {
 			return val == "true", nil
 		}
 	}
 
-	// 2. Check Namespace label (inheritance)
-	// We need to fetch the namespace object to check labels
+	// 2. Check namespace label
 	ns := &corev1.Namespace{}
 	if err := h.client.Get(ctx, client.ObjectKey{Name: namespace}, ns); err != nil {
 		h.log.Error(err, "failed to fetch namespace for label check", "namespace", namespace)
 		return false, err
 	}
 
-	if ns.Labels != nil && ns.Labels[AnnotationEnabled] == "true" {
+	if ns.Labels != nil && ns.Labels[LabelEnabled] == "true" {
 		return true, nil
-	}
-
-	// 3. Check OwnerReferences (Workload inheritance)
-	// Traverse up to find Deployment, DaemonSet, StatefulSet
-	for _, ref := range pod.OwnerReferences {
-		// Handle ReplicaSet (Deployment -> ReplicaSet -> Pod)
-		if ref.Kind == "ReplicaSet" {
-			rs := &appsv1.ReplicaSet{}
-			if err := h.client.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: namespace}, rs); err == nil {
-				// Check RS itself
-				if h.isObjectEnabled(rs.Labels, rs.Annotations) {
-					return true, nil
-				}
-
-				// Check RS owner (Deployment)
-				for _, rsRef := range rs.OwnerReferences {
-					if rsRef.Kind == "Deployment" {
-						deploy := &appsv1.Deployment{}
-						if err := h.client.Get(ctx, client.ObjectKey{Name: rsRef.Name, Namespace: namespace}, deploy); err == nil {
-							if h.isObjectEnabled(deploy.Labels, deploy.Annotations) {
-								return true, nil
-							}
-						}
-					}
-				}
-			}
-		}
-
-		// Handle DaemonSet
-		if ref.Kind == "DaemonSet" {
-			ds := &appsv1.DaemonSet{}
-			if err := h.client.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: namespace}, ds); err == nil {
-				if h.isObjectEnabled(ds.Labels, ds.Annotations) {
-					return true, nil
-				}
-			}
-		}
-
-		// Handle StatefulSet
-		if ref.Kind == "StatefulSet" {
-			sts := &appsv1.StatefulSet{}
-			if err := h.client.Get(ctx, client.ObjectKey{Name: ref.Name, Namespace: namespace}, sts); err == nil {
-				if h.isObjectEnabled(sts.Labels, sts.Annotations) {
-					return true, nil
-				}
-			}
-		}
 	}
 
 	return false, nil
 }
 
-// isObjectEnabled checks if the given labels or annotations have the enabled flag.
-func (h *Handler) isObjectEnabled(labels, annotations map[string]string) bool {
-	if labels != nil && labels[AnnotationEnabled] == "true" {
-		return true
-	}
-	if annotations != nil && annotations[AnnotationEnabled] == "true" {
-		return true
-	}
-	return false
-}
-
 // rewriteSecretVolumes checks volume mounts and swaps enabled secrets with shadow secrets.
-func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, namespace string) {
+// Returns an error if a kloak-enabled secret's shadow does not exist (fail closed).
+func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, namespace string) error {
 	for i := range pod.Spec.Volumes {
 		vol := &pod.Spec.Volumes[i]
-		if vol.Secret != nil {
-			secretName := vol.Secret.SecretName
-
-			// Resolve namespace (pod namespace usually)
-			ns := namespace
-			if ns == "" {
-				ns = "default" // Fallback
-			}
-
-			// Check if secret is enabled
-			var secret corev1.Secret
-			err := h.client.Get(ctx, client.ObjectKey{Name: secretName, Namespace: ns}, &secret)
-			if err != nil {
-				// If not found or error, just skip rewriting (safest default? or fail?)
-				// If we can't find it, we can't verify label.
-				// Pod admission will likely fail downstream if secret is missing anyway.
-				h.log.V(1).Info("failed to look up secret for volume rewriting", "name", secretName, "error", err)
-				continue
-			}
-
-			// Check annotation/label
-			enabled := secret.Labels[AnnotationEnabled] == "true" || secret.Annotations[AnnotationEnabled] == "true"
-			if enabled {
-				shadowName := secretName + "-kloak"
-				h.log.Info("Rewriting volume to use shadow secret", "original", secretName, "shadow", shadowName)
-				vol.Secret.SecretName = shadowName
-			}
+		if vol.Secret == nil {
+			continue
 		}
+
+		secretName := vol.Secret.SecretName
+
+		// Resolve namespace
+		ns := namespace
+		if ns == "" {
+			ns = "default"
+		}
+
+		// Check if secret is enabled
+		var secret corev1.Secret
+		if err := h.client.Get(ctx, client.ObjectKey{Name: secretName, Namespace: ns}, &secret); err != nil {
+			// Secret not found or error -- skip rewriting. The secret may not be
+			// kloak-managed, and pod admission will fail downstream if it's truly missing.
+			h.log.V(1).Info("failed to look up secret for volume rewriting", "name", secretName, "error", err)
+			continue
+		}
+
+		enabled := secret.Labels[LabelEnabled] == "true" || secret.Annotations[LabelEnabled] == "true"
+		if !enabled {
+			continue
+		}
+
+		// Secret is kloak-enabled -- verify shadow exists before rewriting.
+		// If the shadow doesn't exist (controller hasn't reconciled yet), reject
+		// the pod to prevent mounting real secrets.
+		shadowName := secretName + "-kloak"
+		var shadowSecret corev1.Secret
+		if err := h.client.Get(ctx, client.ObjectKey{Name: shadowName, Namespace: ns}, &shadowSecret); err != nil {
+			return fmt.Errorf("shadow secret %s/%s not found for kloak-enabled secret %s (controller may not have reconciled yet)", ns, shadowName, secretName)
+		}
+
+		h.log.Info("Rewriting volume to use shadow secret", "original", secretName, "shadow", shadowName)
+		vol.Secret.SecretName = shadowName
 	}
+
+	return nil
 }
