@@ -80,6 +80,7 @@ jobs:
         run: |
           sed -i "s/^version:.*/version: ${VERSION}/" charts/kloak/Chart.yaml
           sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/kloak/Chart.yaml
+          sed -i "s/^  tag:.*/  tag: ${VERSION}/" charts/kloak/values.yaml
 
       - name: Install Helm
         uses: azure/setup-helm@v4
