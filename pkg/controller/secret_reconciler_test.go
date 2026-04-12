@@ -7,6 +7,7 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -306,6 +307,8 @@ func TestSecretReconciler_MultipleKeys(t *testing.T) {
 }
 
 func TestSecretReconciler_ShortSecret(t *testing.T) {
+	// Test that secrets shorter than ShadowPrefixLen (8 bytes) are skipped
+	// and no shadow secret is created
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      "short-secret",
@@ -313,24 +316,24 @@ func TestSecretReconciler_ShortSecret(t *testing.T) {
 			Labels:    map[string]string{AnnotationSecretEnabled: "true"},
 			UID:       "short-uid",
 		},
-		Data: map[string][]byte{"key": []byte("abc")}, // shorter than "kloak:" prefix
+		Data: map[string][]byte{"key": []byte("abc")}, // shorter than ShadowPrefixLen
 	}
 
 	r, c := newSecretReconciler(secret)
 	ctx := context.Background()
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "short-secret", Namespace: "default"}}
 
+	// Should not error, but should skip processing
 	if _, err := r.Reconcile(ctx, req); err != nil {
 		t.Fatal(err)
 	}
 
+	// Shadow secret should not be created
 	shadow := &corev1.Secret{}
-	if err := c.Get(ctx, types.NamespacedName{Name: "short-secret-kloak", Namespace: "default"}, shadow); err != nil {
-		t.Fatal(err)
-	}
-
-	if len(shadow.Data["key"]) != 3 {
-		t.Errorf("shadow length %d != 3", len(shadow.Data["key"]))
+	if err := c.Get(ctx, types.NamespacedName{Name: "short-secret-kloak", Namespace: "default"}, shadow); err == nil {
+		t.Error("expected no shadow secret for short secret, but got one")
+	} else if !errors.IsNotFound(err) {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 
