@@ -119,7 +119,6 @@ struct {
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
   __uint(max_entries, 4); // indices 1, 2, and 3 used
-  __uint(map_flags, BPF_F_RDONLY_PROG);
   __type(key, __u32);
   __type(value, __u32);
 } prog_array SEC(".maps");
@@ -129,7 +128,6 @@ struct {
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
   __uint(max_entries, 1);
-  __uint(map_flags, BPF_F_RDONLY_PROG);
   __type(key, __u32);
   __type(value, __u32);
 } tc_prog_array SEC(".maps");
