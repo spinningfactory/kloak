@@ -31,7 +31,7 @@ jobs:
           remote-repository-name: kloak-cla
           remote-organization-name: spinningfactory
           branch: main
-          allowlist: dhiaayachi,dependabot[bot],github-actions[bot],claude
+          allowlist: dhiaayachi,elafontaine,ghislainbourgeois,tlsrc,balheru,dependabot[bot],github-actions[bot],claude
           custom-notsigned-prcomment: |
             Thank you for your contribution! Before we can merge this PR, you need to sign our [Contributor License Agreement](https://github.com/spinningfactory/kloak/blob/main/CLA.md).
 
