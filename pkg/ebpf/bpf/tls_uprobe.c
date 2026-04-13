@@ -276,7 +276,6 @@ struct ssl_fd_val {
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, 4096);
-  __uint(map_flags, BPF_F_RDONLY);
   __type(key, struct ssl_fd_key);
   __type(value, struct ssl_fd_val);
 } ssl_fd_map SEC(".maps");
@@ -442,7 +441,6 @@ struct tls_conn_state {
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, 4096);
-  __uint(map_flags, BPF_F_RDONLY);
   __type(key, struct tls_conn_key);
   __type(value, struct tls_conn_state);
 } tls_conn_state SEC(".maps");
@@ -618,7 +616,6 @@ struct {
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, 4096);
-  __uint(map_flags, BPF_F_RDONLY);
   __type(key, struct tc_dest_key);
   __type(value, struct tc_pending_val);
 } tc_pending SEC(".maps");
