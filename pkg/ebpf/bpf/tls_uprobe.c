@@ -76,6 +76,7 @@ struct secret_value {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 1024);
+  __uint(map_flags, BPF_F_RDONLY_PROG);
   __type(key, struct secret_key);
   __type(value, struct secret_value);
 } secret_map SEC(".maps");
@@ -118,6 +119,7 @@ struct {
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
   __uint(max_entries, 4); // indices 1, 2, and 3 used
+  __uint(map_flags, BPF_F_RDONLY_PROG);
   __type(key, __u32);
   __type(value, __u32);
 } prog_array SEC(".maps");
@@ -127,6 +129,7 @@ struct {
 struct {
   __uint(type, BPF_MAP_TYPE_PROG_ARRAY);
   __uint(max_entries, 1);
+  __uint(map_flags, BPF_F_RDONLY_PROG);
   __type(key, __u32);
   __type(value, __u32);
 } tc_prog_array SEC(".maps");
@@ -360,6 +363,7 @@ struct watched_host_key {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 256);
+  __uint(map_flags, BPF_F_RDONLY_PROG);
   __type(key, struct watched_host_key);
   __type(value, __u8);
 } watched_hosts SEC(".maps");
@@ -385,6 +389,7 @@ struct {
 struct {
   __uint(type, BPF_MAP_TYPE_CGROUP_ARRAY);
   __uint(max_entries, 1);
+  __uint(map_flags, BPF_F_RDONLY_PROG);
   __type(key, __u32);
   __type(value, __u32);
 } cgroup_ancestor SEC(".maps");
