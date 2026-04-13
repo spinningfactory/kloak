@@ -1,8 +1,6 @@
 # Maintainers
 
-This file lists the core maintainers of the Kloak project at [Spinning Factory](https://github.com/spinningfactory).
-
-## Core Team
+This file lists the maintainers of the Kloak project at [Spinning Factory](https://github.com/spinningfactory).
 
 | Name | GitHub |
 |------|--------|
