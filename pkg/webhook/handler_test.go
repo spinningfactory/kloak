@@ -4,10 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 
 	admissionv1 "k8s.io/api/admission/v1"
-	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
@@ -22,7 +22,6 @@ import (
 func newTestHandler(objs ...client.Object) *Handler {
 	scheme := k8sruntime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
-	_ = appsv1.AddToScheme(scheme)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 	return &Handler{
 		client:  c,
@@ -48,36 +47,11 @@ func TestIsEnabled(t *testing.T) {
 	nsEnabled := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "enabled-ns",
-			Labels: map[string]string{AnnotationEnabled: "true"},
-		},
-	}
-	deployment := &appsv1.Deployment{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "enabled-deploy", Namespace: "default",
-			Labels: map[string]string{AnnotationEnabled: "true"},
-		},
-	}
-	rs := &appsv1.ReplicaSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "enabled-deploy-rs", Namespace: "default",
-			OwnerReferences: []metav1.OwnerReference{{Kind: "Deployment", Name: "enabled-deploy"}},
-		},
-	}
-	ds := &appsv1.DaemonSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "enabled-ds", Namespace: "default",
-			Annotations: map[string]string{AnnotationEnabled: "true"},
+			Labels: map[string]string{LabelEnabled: "true"},
 		},
 	}
 
-	sts := &appsv1.StatefulSet{
-		ObjectMeta: metav1.ObjectMeta{
-			Name: "enabled-sts", Namespace: "default",
-			Labels: map[string]string{AnnotationEnabled: "true"},
-		},
-	}
-
-	h := newTestHandler(nsDefault, nsEnabled, deployment, rs, ds, sts)
+	h := newTestHandler(nsDefault, nsEnabled)
 
 	tests := []struct {
 		name      string
@@ -86,30 +60,26 @@ func TestIsEnabled(t *testing.T) {
 		expected  bool
 	}{
 		{
-			name:      "no annotations, default ns",
+			name:      "no labels, default ns",
 			pod:       &corev1.Pod{},
 			namespace: "default",
 			expected:  false,
 		},
 		{
-			name: "explicit enabled=true",
+			name: "explicit label enabled=true",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{
-						AnnotationEnabled: "true",
-					},
+					Labels: map[string]string{LabelEnabled: "true"},
 				},
 			},
 			namespace: "default",
 			expected:  true,
 		},
 		{
-			name: "explicit enabled=false",
+			name: "explicit label enabled=false",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{
-						AnnotationEnabled: "false",
-					},
+					Labels: map[string]string{LabelEnabled: "false"},
 				},
 			},
 			namespace: "default",
@@ -125,58 +95,11 @@ func TestIsEnabled(t *testing.T) {
 			name: "disabled pod in enabled namespace",
 			pod: &corev1.Pod{
 				ObjectMeta: metav1.ObjectMeta{
-					Annotations: map[string]string{
-						AnnotationEnabled: "false",
-					},
+					Labels: map[string]string{LabelEnabled: "false"},
 				},
 			},
 			namespace: "enabled-ns",
 			expected:  false,
-		},
-		{
-			name: "inheritance from deployment (via RS)",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					OwnerReferences: []metav1.OwnerReference{
-						{
-							Kind: "ReplicaSet",
-							Name: "enabled-deploy-rs",
-						},
-					},
-				},
-			},
-			namespace: "default",
-			expected:  true,
-		},
-		{
-			name: "inheritance from daemonset",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					OwnerReferences: []metav1.OwnerReference{
-						{
-							Kind: "DaemonSet",
-							Name: "enabled-ds",
-						},
-					},
-				},
-			},
-			namespace: "default",
-			expected:  true,
-		},
-		{
-			name: "inheritance from statefulset",
-			pod: &corev1.Pod{
-				ObjectMeta: metav1.ObjectMeta{
-					OwnerReferences: []metav1.OwnerReference{
-						{
-							Kind: "StatefulSet",
-							Name: "enabled-sts",
-						},
-					},
-				},
-			},
-			namespace: "default",
-			expected:  true,
 		},
 	}
 
@@ -197,7 +120,13 @@ func TestRewriteSecretVolumes(t *testing.T) {
 	enabledSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "my-secret", Namespace: "default",
-			Labels: map[string]string{AnnotationEnabled: "true"},
+			Labels: map[string]string{LabelEnabled: "true"},
+		},
+	}
+	shadowSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "my-secret-kloak", Namespace: "default",
+			Labels: map[string]string{"getkloak.io/managed": "true"},
 		},
 	}
 	disabledSecret := &corev1.Secret{
@@ -206,7 +135,7 @@ func TestRewriteSecretVolumes(t *testing.T) {
 		},
 	}
 
-	h := newTestHandler(enabledSecret, disabledSecret)
+	h := newTestHandler(enabledSecret, shadowSecret, disabledSecret)
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
@@ -242,7 +171,10 @@ func TestRewriteSecretVolumes(t *testing.T) {
 		},
 	}
 
-	h.rewriteSecretVolumes(context.Background(), pod, "default")
+	err := h.rewriteSecretVolumes(context.Background(), pod, "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	// Verify "my-secret" rewrote to "my-secret-kloak"
 	if pod.Spec.Volumes[0].Secret.SecretName != "my-secret-kloak" {
@@ -252,6 +184,39 @@ func TestRewriteSecretVolumes(t *testing.T) {
 	// Verify "other-secret" stayed same
 	if pod.Spec.Volumes[1].Secret.SecretName != "other-secret" {
 		t.Errorf("Expected other-secret, got %s", pod.Spec.Volumes[1].Secret.SecretName)
+	}
+}
+
+func TestRewriteSecretVolumes_MissingShadowRejects(t *testing.T) {
+	enabledSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "my-secret", Namespace: "default",
+			Labels: map[string]string{LabelEnabled: "true"},
+		},
+	}
+	// No shadow secret created
+
+	h := newTestHandler(enabledSecret)
+
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Volumes: []corev1.Volume{
+				{
+					Name: "vol",
+					VolumeSource: corev1.VolumeSource{
+						Secret: &corev1.SecretVolumeSource{SecretName: "my-secret"},
+					},
+				},
+			},
+		},
+	}
+
+	err := h.rewriteSecretVolumes(context.Background(), pod, "default")
+	if err == nil {
+		t.Fatal("expected error when shadow secret is missing, got nil")
+	}
+	if !strings.Contains(err.Error(), "shadow secret") {
+		t.Errorf("expected error about shadow secret, got: %v", err)
 	}
 }
 
@@ -277,16 +242,22 @@ func TestHandle_EnabledPodWithSecretVolume(t *testing.T) {
 	enabledSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "my-secret", Namespace: "default",
-			Labels: map[string]string{AnnotationEnabled: "true"},
+			Labels: map[string]string{LabelEnabled: "true"},
 		},
 	}
-	h := newTestHandler(ns, enabledSecret)
+	shadowSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "my-secret-kloak", Namespace: "default",
+			Labels: map[string]string{"getkloak.io/managed": "true"},
+		},
+	}
+	h := newTestHandler(ns, enabledSecret, shadowSecret)
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:        "test-pod",
-			Namespace:   "default",
-			Annotations: map[string]string{AnnotationEnabled: "true"},
+			Name:      "test-pod",
+			Namespace: "default",
+			Labels:    map[string]string{LabelEnabled: "true"},
 		},
 		Spec: corev1.PodSpec{
 			Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
@@ -321,6 +292,49 @@ func TestHandle_EnabledPodWithSecretVolume(t *testing.T) {
 	if !foundVolumeRewrite {
 		patchJSON, _ := json.Marshal(resp.Patches)
 		t.Errorf("expected patch to rewrite volume to my-secret-kloak, got patches: %s", patchJSON)
+	}
+}
+
+func TestHandle_MissingShadowDenied(t *testing.T) {
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{Name: "default"},
+	}
+	enabledSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "my-secret", Namespace: "default",
+			Labels: map[string]string{LabelEnabled: "true"},
+		},
+	}
+	// No shadow secret
+	h := newTestHandler(ns, enabledSecret)
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-pod",
+			Namespace: "default",
+			Labels:    map[string]string{LabelEnabled: "true"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+			Volumes: []corev1.Volume{
+				{
+					Name: "secret-vol",
+					VolumeSource: corev1.VolumeSource{
+						Secret: &corev1.SecretVolumeSource{SecretName: "my-secret"},
+					},
+				},
+			},
+		},
+	}
+
+	req := makeAdmissionRequest(pod, "default")
+	resp := h.Handle(context.Background(), req)
+
+	if resp.Allowed {
+		t.Fatal("expected denied when shadow secret is missing")
+	}
+	if resp.Result == nil || !strings.Contains(resp.Result.Message, "shadow secret") {
+		t.Errorf("expected denial message about shadow secret, got: %v", resp.Result)
 	}
 }
 
@@ -390,8 +404,10 @@ func TestRewriteSecretVolumes_NonSecretVolumes(t *testing.T) {
 		},
 	}
 
-	// Should not panic or error on non-secret volumes
-	h.rewriteSecretVolumes(context.Background(), pod, "default")
+	err := h.rewriteSecretVolumes(context.Background(), pod, "default")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if pod.Spec.Volumes[0].ConfigMap.Name != "my-config" {
 		t.Error("non-secret volume should be unchanged")
@@ -402,10 +418,16 @@ func TestRewriteSecretVolumes_EmptyNamespace(t *testing.T) {
 	enabledSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: "ns-secret", Namespace: "default",
-			Labels: map[string]string{AnnotationEnabled: "true"},
+			Labels: map[string]string{LabelEnabled: "true"},
 		},
 	}
-	h := newTestHandler(enabledSecret)
+	shadowSecret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "ns-secret-kloak", Namespace: "default",
+			Labels: map[string]string{"getkloak.io/managed": "true"},
+		},
+	}
+	h := newTestHandler(enabledSecret, shadowSecret)
 
 	pod := &corev1.Pod{
 		Spec: corev1.PodSpec{
@@ -421,7 +443,10 @@ func TestRewriteSecretVolumes_EmptyNamespace(t *testing.T) {
 	}
 
 	// Empty namespace should fall back to "default"
-	h.rewriteSecretVolumes(context.Background(), pod, "")
+	err := h.rewriteSecretVolumes(context.Background(), pod, "")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 
 	if pod.Spec.Volumes[0].Secret.SecretName != "ns-secret-kloak" {
 		t.Errorf("expected ns-secret-kloak, got %s", pod.Spec.Volumes[0].Secret.SecretName)
@@ -432,12 +457,12 @@ func TestHandle_NamespaceInheritance(t *testing.T) {
 	nsEnabled := &corev1.Namespace{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:   "enabled-ns",
-			Labels: map[string]string{AnnotationEnabled: "true"},
+			Labels: map[string]string{LabelEnabled: "true"},
 		},
 	}
 	h := newTestHandler(nsEnabled)
 
-	// Pod without annotation in enabled namespace
+	// Pod without label in enabled namespace
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Name: "inherit-pod", Namespace: "enabled-ns"},
 		Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app", Image: "busybox"}}},

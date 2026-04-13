@@ -43,6 +43,33 @@ metadata:
     cert-manager.io/inject-ca-from: {{ .Release.Namespace }}/kloak-webhook-cert
   {{- end }}
 webhooks:
+  - name: ns.pod.mutate.getkloak.io
+    admissionReviewVersions: ["v1"]
+    sideEffects: None
+    clientConfig:
+      service:
+        namespace: {{ .Release.Namespace }}
+        name: kloak-webhook
+        path: /mutate-pods
+      {{- if $caBundle }}
+      caBundle: {{ $caBundle }}
+      {{- end }}
+    rules:
+      - operations: ["CREATE"]
+        apiGroups: [""]
+        apiVersions: ["v1"]
+        resources: ["pods"]
+    namespaceSelector:
+      matchExpressions:
+        - key: getkloak.io/enabled
+          operator: In
+          values:
+            - "true"
+        - key: kubernetes.io/metadata.name
+          operator: NotIn
+          values:
+            - {{ .Release.Namespace }}
+    failurePolicy: Fail
   - name: pod.mutate.getkloak.io
     admissionReviewVersions: ["v1"]
     sideEffects: None
@@ -65,6 +92,7 @@ webhooks:
           operator: NotIn
           values:
             - {{ .Release.Namespace }}
-            - kube-system
-            - kube-public
+    objectSelector:
+      matchLabels:
+        getkloak.io/enabled: "true"
     failurePolicy: Fail
