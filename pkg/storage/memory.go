@@ -11,37 +11,37 @@ type Memory struct {
 	mu sync.RWMutex
 	// hashToEntry maps hash → Entry
 	hashToEntry map[string]Entry
-	// podToHashes maps podID → set of hashes
-	podToHashes map[string]map[string]struct{}
-	// hashToPod maps hash → podID (for reverse lookup)
-	hashToPod map[string]string
+	// ownerToHashes maps ownerID → set of hashes
+	ownerToHashes map[string]map[string]struct{}
+	// hashToOwner maps hash → ownerID (for reverse lookup)
+	hashToOwner map[string]string
 }
 
 // NewMemory creates a new in-memory storage.
 func NewMemory() *Memory {
 	return &Memory{
-		hashToEntry: make(map[string]Entry),
-		podToHashes: make(map[string]map[string]struct{}),
-		hashToPod:   make(map[string]string),
+		hashToEntry:   make(map[string]Entry),
+		ownerToHashes: make(map[string]map[string]struct{}),
+		hashToOwner:   make(map[string]string),
 	}
 }
 
-// Store saves a hash→Entry mapping for a pod.
-func (m *Memory) Store(ctx context.Context, podID, hash string, entry Entry) error {
+// Store saves a hash→Entry mapping for an owner.
+func (m *Memory) Store(ctx context.Context, ownerID, hash string, entry Entry) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	// Store hash → Entry
 	m.hashToEntry[hash] = entry
 
-	// Track hash → pod relationship
-	m.hashToPod[hash] = podID
+	// Track hash → owner relationship
+	m.hashToOwner[hash] = ownerID
 
-	// Track pod → hashes relationship
-	if m.podToHashes[podID] == nil {
-		m.podToHashes[podID] = make(map[string]struct{})
+	// Track owner → hashes relationship
+	if m.ownerToHashes[ownerID] == nil {
+		m.ownerToHashes[ownerID] = make(map[string]struct{})
 	}
-	m.podToHashes[podID][hash] = struct{}{}
+	m.ownerToHashes[ownerID][hash] = struct{}{}
 
 	return nil
 }
@@ -55,13 +55,13 @@ func (m *Memory) Lookup(ctx context.Context, hash string) (Entry, bool, error) {
 	return entry, found, nil
 }
 
-// Delete removes all mappings for a pod.
-func (m *Memory) Delete(ctx context.Context, podID string) error {
+// Delete removes all mappings for an owner.
+func (m *Memory) Delete(ctx context.Context, ownerID string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	// Get all hashes for this pod
-	hashes, exists := m.podToHashes[podID]
+	// Get all hashes for this owner
+	hashes, exists := m.ownerToHashes[ownerID]
 	if !exists {
 		return nil
 	}
@@ -69,11 +69,11 @@ func (m *Memory) Delete(ctx context.Context, podID string) error {
 	// Remove each hash
 	for hash := range hashes {
 		delete(m.hashToEntry, hash)
-		delete(m.hashToPod, hash)
+		delete(m.hashToOwner, hash)
 	}
 
-	// Remove pod tracking
-	delete(m.podToHashes, podID)
+	// Remove owner tracking
+	delete(m.ownerToHashes, ownerID)
 
 	return nil
 }
@@ -89,6 +89,15 @@ func (m *Memory) List(ctx context.Context) (map[string]Entry, error) {
 		result[k] = v
 	}
 	return result, nil
+}
+
+// GetOwnerID returns the ownerID associated with a hash.
+func (m *Memory) GetOwnerID(ctx context.Context, hash string) (string, bool, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	ownerID, found := m.hashToOwner[hash]
+	return ownerID, found, nil
 }
 
 // Compile-time check that Memory implements Storage
