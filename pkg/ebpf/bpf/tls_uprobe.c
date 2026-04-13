@@ -76,6 +76,7 @@ struct secret_value {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 1024);
+  __uint(map_flags, BPF_F_RDONLY_PROG);
   __type(key, struct secret_key);
   __type(value, struct secret_value);
 } secret_map SEC(".maps");
@@ -191,6 +192,7 @@ enum {
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __uint(max_entries, 64); // must be >= DBG_MAX
+
   __type(key, __u32);
   __type(value, __u64);
 } debug_counters SEC(".maps");
@@ -283,6 +285,7 @@ struct {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 16384);
+
   __type(key, __u32);   // tgid
   __type(value, __u32); // fd
 } last_verified_fd SEC(".maps");
@@ -319,6 +322,7 @@ struct udp_recv_pending {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 1024);
+
   __type(key, __u64);   // pid_tgid
   __type(value, struct udp_recv_pending);
 } udp_recv_scratch SEC(".maps");
@@ -333,6 +337,7 @@ struct connect_pending_val {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 1024);
+
   __type(key, __u64);   // pid_tgid
   __type(value, struct connect_pending_val);
 } connect_pending SEC(".maps");
@@ -360,6 +365,7 @@ struct watched_host_key {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 256);
+  __uint(map_flags, BPF_F_RDONLY_PROG);
   __type(key, struct watched_host_key);
   __type(value, __u8);
 } watched_hosts SEC(".maps");
@@ -464,6 +470,7 @@ struct xor_pending_val {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 4096);
+
   __type(key, __u64);  // pid_tgid
   __type(value, struct xor_pending_val);
 } xor_pending SEC(".maps");
