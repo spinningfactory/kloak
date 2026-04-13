@@ -310,7 +310,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 // checkCollisions checks if a shadow value's 8-byte BPF prefix collides with any existing
 // shadow values in storage (excluding shadows from the current secret being reconciled).
 // Returns true if a collision is detected.
-func (r *SecretReconciler) checkCollisions(ctx context.Context, newShadow string, excludeSecretID string) (bool, error) {
+func (r *SecretReconciler) checkCollisions(ctx context.Context, newShadow, excludeSecretID string) (bool, error) {
 	if len(newShadow) < ShadowPrefixLen {
 		return false, fmt.Errorf("shadow secret too short")
 	}

@@ -92,11 +92,11 @@ func (m *Memory) List(ctx context.Context) (map[string]Entry, error) {
 }
 
 // GetOwnerID returns the ownerID associated with a hash.
-func (m *Memory) GetOwnerID(ctx context.Context, hash string) (string, bool, error) {
+func (m *Memory) GetOwnerID(ctx context.Context, hash string) (ownerID string, found bool, err error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 
-	ownerID, found := m.hashToOwner[hash]
+	ownerID, found = m.hashToOwner[hash]
 	return ownerID, found, nil
 }
 
