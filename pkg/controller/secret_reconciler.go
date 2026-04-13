@@ -171,6 +171,29 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// Delete-before-store removes stale keys (e.g. a key removed from the original secret)
 	// while UUIDs are reused where possible to keep shadow values stable.
 
+	// Fetch all existing shadows from storage once for collision detection
+	// This avoids O(N×M) complexity from calling List() for each key
+	allEntries, err := r.Storage.List(ctx)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list storage: %w", err)
+	}
+
+	// Build a map of existing shadow prefixes to detect collisions with other secrets
+	// Key: 8-byte prefix, Value: set of ownerIDs that use this prefix
+	existingPrefixMap := make(map[string]map[string]struct{})
+	for shadow := range allEntries {
+		if len(shadow) >= ShadowPrefixLen {
+			prefix := shadow[:ShadowPrefixLen]
+			ownerID, found, _ := r.Storage.GetOwnerID(ctx, shadow)
+			if found {
+				if existingPrefixMap[prefix] == nil {
+					existingPrefixMap[prefix] = make(map[string]struct{})
+				}
+				existingPrefixMap[prefix][ownerID] = struct{}{}
+			}
+		}
+	}
+
 	// Track all shadows in this batch to detect intra-secret collisions
 	var shadowsInBatch []string
 	newMappings := make(map[string]string) // shadow -> original
@@ -187,11 +210,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				// Check if existing shadow collides with other secrets
 				// Pass secretID to exclude shadows from the current secret
 				if len(existingVal) == originalLen {
-					hasCollision, err := r.checkCollisions(ctx, existingVal, secretID)
-					if err != nil {
-						log.Error(err, "failed to check existing shadow for collisions, regenerating",
-							"key", key)
-					} else if !hasCollision {
+					if !checkCollisionsWithMap(existingVal, secretID, existingPrefixMap) {
 						// Check it doesn't collide with other keys in this same secret
 						if prefix := existingVal[:ShadowPrefixLen]; !isPrefixUsed(shadowsInBatch, prefix) {
 							shadowValue = existingVal
@@ -205,7 +224,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if shadowValue == "" {
 			var err error
 			shadowValue, err = r.generateShadowValueWithCollisionCheck(
-				ctx, originalLen, originalValue, secretID, 3,
+				originalLen, originalValue, secretID, 3, existingPrefixMap,
 			)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to generate shadow value for key %s: %w", key, err)
@@ -307,71 +326,50 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return ctrl.Result{}, nil
 }
 
-// checkCollisions checks if a shadow value's 8-byte BPF prefix collides with any existing
-// shadow values in storage (excluding shadows from the current secret being reconciled).
+// checkCollisionsWithMap checks if a shadow value's 8-byte BPF prefix collides with any existing
+// shadow values in the provided prefix map (excluding shadows from the current secret being reconciled).
 // Returns true if a collision is detected.
-func (r *SecretReconciler) checkCollisions(ctx context.Context, newShadow, excludeSecretID string) (bool, error) {
+func checkCollisionsWithMap(newShadow, excludeSecretID string, existingPrefixMap map[string]map[string]struct{}) bool {
 	if len(newShadow) < ShadowPrefixLen {
-		return false, fmt.Errorf("shadow secret too short")
+		return false
 	}
 
 	newPrefix := newShadow[:ShadowPrefixLen]
 
-	allEntries, err := r.Storage.List(ctx)
-	if err != nil {
-		return false, fmt.Errorf("list storage: %w", err)
-	}
-
-	for existingShadow := range allEntries {
-		if len(existingShadow) < ShadowPrefixLen {
-			// Skip shadows shorter than 8 bytes (shouldn't happen post-fix, but handle defensively)
-			continue
-		}
-		// Check if this shadow belongs to the current secret being reconciled
-		if excludeSecretID != "" {
-			if ownerID, found, _ := r.Storage.GetOwnerID(ctx, existingShadow); found && ownerID == excludeSecretID {
-				// This shadow belongs to the current secret, exclude it from collision check
-				continue
+	// Check if this prefix is used by other secrets
+	if owners, exists := existingPrefixMap[newPrefix]; exists {
+		for ownerID := range owners {
+			if ownerID != excludeSecretID {
+				// Collision with a different secret
+				return true
 			}
 		}
-		existingPrefix := existingShadow[:ShadowPrefixLen]
-		if existingPrefix == newPrefix {
-			r.Log.V(2).Info("8-byte BPF key collision detected",
-				"newShadow", newShadow,
-				"existingShadow", existingShadow,
-				"collisionPrefix", newPrefix)
-			return true, nil
-		}
 	}
 
-	return false, nil
+	return false
 }
 
 // generateShadowValueWithCollisionCheck creates a shadow value and ensures no 8-byte prefix collision
 // with existing secrets (excluding shadows from the current secret being reconciled).
 // It retries generation up to maxRetries times if collisions are detected.
 func (r *SecretReconciler) generateShadowValueWithCollisionCheck(
-	ctx context.Context,
 	originalLen int,
 	realSecret string,
 	excludeSecretID string,
 	maxRetries int,
+	existingPrefixMap map[string]map[string]struct{},
 ) (string, error) {
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		shadow := generateShadowValue(originalLen, realSecret)
 
-		hasCollision, err := r.checkCollisions(ctx, shadow, excludeSecretID)
-		if err != nil {
-			return "", fmt.Errorf("collision check failed: %w", err)
+		if checkCollisionsWithMap(shadow, excludeSecretID, existingPrefixMap) {
+			r.Log.V(2).Info("8-byte BPF key collision detected, regenerating",
+				"attempt", attempt+1, "maxRetries", maxRetries,
+				"prefix", shadow[:ShadowPrefixLen])
+			continue
 		}
 
-		if !hasCollision {
-			return shadow, nil
-		}
-
-		r.Log.V(2).Info("8-byte BPF key collision detected, regenerating",
-			"attempt", attempt+1, "maxRetries", maxRetries,
-			"prefix", shadow[:ShadowPrefixLen])
+		return shadow, nil
 	}
 
 	return "", fmt.Errorf("failed to generate unique shadow value after %d attempts", maxRetries)
