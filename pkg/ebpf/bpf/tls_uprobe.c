@@ -192,6 +192,7 @@ enum {
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __uint(max_entries, 64); // must be >= DBG_MAX
+  __uint(map_flags, BPF_F_RDONLY);
   __type(key, __u32);
   __type(value, __u64);
 } debug_counters SEC(".maps");
@@ -275,6 +276,7 @@ struct ssl_fd_val {
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, 4096);
+  __uint(map_flags, BPF_F_RDONLY);
   __type(key, struct ssl_fd_key);
   __type(value, struct ssl_fd_val);
 } ssl_fd_map SEC(".maps");
@@ -284,6 +286,7 @@ struct {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 16384);
+  __uint(map_flags, BPF_F_RDONLY);
   __type(key, __u32);   // tgid
   __type(value, __u32); // fd
 } last_verified_fd SEC(".maps");
@@ -320,6 +323,7 @@ struct udp_recv_pending {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 1024);
+  __uint(map_flags, BPF_F_RDONLY);
   __type(key, __u64);   // pid_tgid
   __type(value, struct udp_recv_pending);
 } udp_recv_scratch SEC(".maps");
@@ -334,6 +338,7 @@ struct connect_pending_val {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 1024);
+  __uint(map_flags, BPF_F_RDONLY);
   __type(key, __u64);   // pid_tgid
   __type(value, struct connect_pending_val);
 } connect_pending SEC(".maps");
@@ -437,6 +442,7 @@ struct tls_conn_state {
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, 4096);
+  __uint(map_flags, BPF_F_RDONLY);
   __type(key, struct tls_conn_key);
   __type(value, struct tls_conn_state);
 } tls_conn_state SEC(".maps");
@@ -467,6 +473,7 @@ struct xor_pending_val {
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 4096);
+  __uint(map_flags, BPF_F_RDONLY);
   __type(key, __u64);  // pid_tgid
   __type(value, struct xor_pending_val);
 } xor_pending SEC(".maps");
@@ -611,6 +618,7 @@ struct {
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, 4096);
+  __uint(map_flags, BPF_F_RDONLY);
   __type(key, struct tc_dest_key);
   __type(value, struct tc_pending_val);
 } tc_pending SEC(".maps");
