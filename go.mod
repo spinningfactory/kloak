@@ -3,7 +3,7 @@ module github.com/spinningfactory/kloak
 go 1.25.0
 
 require (
-	github.com/cilium/ebpf v0.21.0
+	github.com/cilium/ebpf v0.20.0
 	github.com/go-logr/logr v1.4.3
 	github.com/oklog/ulid/v2 v2.1.1
 	github.com/spf13/cobra v1.10.2
