@@ -62,6 +62,7 @@ func TestIsEnabled(t *testing.T) {
 
 func TestHandleDelete(t *testing.T) {
 	r := &Reconciler{
+		Log:         zap.NewNop().Sugar(),
 		trackedPods: make(map[string]map[uint64]bool),
 		podKeyToUID: make(map[string]string),
 	}
