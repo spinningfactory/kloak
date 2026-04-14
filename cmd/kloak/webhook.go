@@ -53,6 +53,7 @@ func runWebhook(cmd *cobra.Command, args []string) {
 	})
 	if err != nil {
 		setupLog.Errorw("unable to start manager", "error", err)
+		_ = setupLog.Sync()
 		os.Exit(1)
 	}
 
@@ -66,16 +67,19 @@ func runWebhook(cmd *cobra.Command, args []string) {
 	// Add health checks
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Errorw("unable to set up health check", "error", err)
+		_ = setupLog.Sync()
 		os.Exit(1)
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Errorw("unable to set up ready check", "error", err)
+		_ = setupLog.Sync()
 		os.Exit(1)
 	}
 
 	setupLog.Infow("starting webhook server")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
 		setupLog.Errorw("problem running manager", "error", err)
+		_ = setupLog.Sync()
 		os.Exit(1)
 	}
 }

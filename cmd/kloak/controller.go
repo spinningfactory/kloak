@@ -73,6 +73,7 @@ func runController(cmd *cobra.Command, args []string) {
 		uprobeMgr, err = ebpf.NewTLSUprobeManager(store, cgroupPath, setupLog)
 		if err != nil {
 			setupLog.Errorw("failed to initialize eBPF uprobe manager — sleeping to preserve logs", "error", err)
+			_ = setupLog.Sync()
 			select {} // Block forever so the container doesn't restart and logs are preserved.
 		}
 		setupLog.Infow("eBPF TLS uprobes enabled")
@@ -86,6 +87,7 @@ func runController(cmd *cobra.Command, args []string) {
 	})
 	if err != nil {
 		setupLog.Errorw("unable to start manager", "error", err)
+		_ = setupLog.Sync()
 		os.Exit(1)
 	}
 
@@ -97,7 +99,7 @@ func runController(cmd *cobra.Command, args []string) {
 	}
 	reconciler := controller.NewReconciler(
 		mgr.GetClient(),
-		setupLog.Desugar().Named("controller").Named("Pod").Sugar(),
+		setupLog.Named("controller").Named("Pod"),
 		mgr.GetScheme(),
 		uprobeMgr,
 		cgroupPath,
@@ -106,13 +108,14 @@ func runController(cmd *cobra.Command, args []string) {
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Errorw("unable to create controller", "error", err, "controller", "Pod")
+		_ = setupLog.Sync()
 		os.Exit(1)
 	}
 
 	// Create secret reconciler
 	secretReconciler := &controller.SecretReconciler{
 		Client:  mgr.GetClient(),
-		Log:     setupLog.Desugar().Named("controller").Named("Secret").Sugar(),
+		Log:     setupLog.Named("controller").Named("Secret"),
 		Scheme:  mgr.GetScheme(),
 		Storage: store,
 	}
@@ -124,10 +127,12 @@ func runController(cmd *cobra.Command, args []string) {
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Errorw("unable to set up health check", "error", err)
+		_ = setupLog.Sync()
 		os.Exit(1)
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
 		setupLog.Errorw("unable to set up ready check", "error", err)
+		_ = setupLog.Sync()
 		os.Exit(1)
 	}
 
