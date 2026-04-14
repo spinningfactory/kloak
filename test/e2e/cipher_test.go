@@ -98,17 +98,15 @@ func TestCipherSuites(t *testing.T) {
 func deployTLSEchoServer(t *testing.T) string {
 	t.Helper()
 
-	labels := map[string]string{"app": echoServerName}
-
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      echoServerName,
 			Namespace: testNamespace,
-			Labels:    labels,
 			// Explicitly opt out of kloak interception. The echo server is test
 			// infrastructure — attaching tc egress to it corrupts its outbound
 			// TLS records (bad record MAC on readiness probes).
-			Annotations: map[string]string{
+			Labels: map[string]string{
+				"app":                 echoServerName,
 				"getkloak.io/enabled": "false",
 			},
 		},
@@ -186,7 +184,7 @@ func deployCipherClient(t *testing.T, secretName string) string {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      cipherClientName,
 			Namespace: testNamespace,
-			Annotations: map[string]string{
+			Labels: map[string]string{
 				"getkloak.io/enabled": "true",
 			},
 		},

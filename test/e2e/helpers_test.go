@@ -220,7 +220,7 @@ func createPodWithSecretVolume(t *testing.T, name string, secretNames ...string)
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: testNamespace,
-			Annotations: map[string]string{
+			Labels: map[string]string{
 				"getkloak.io/enabled": "true",
 			},
 		},
