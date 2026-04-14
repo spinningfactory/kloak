@@ -358,7 +358,7 @@ func (r *SecretReconciler) generateShadowValueWithCollisionCheck(
 		shadow := generateShadowValue(originalLen, realSecret)
 
 		if checkCollisionsWithMap(shadow, excludeSecretID, existingPrefixMap) {
-			r.Log.V(2).Info("8-byte BPF key collision detected, regenerating",
+			r.Log.Warnw("8-byte BPF key collision detected, regenerating",
 				"attempt", attempt+1, "maxRetries", maxRetries,
 				"prefix", shadow[:ShadowPrefixLen])
 			continue
