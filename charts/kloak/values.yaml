@@ -3,6 +3,12 @@ image:
   tag: dev
   pullPolicy: IfNotPresent
 
+log:
+  # Log level: debug, info, warn, error
+  level: info
+  # Development mode: human-readable console output with colors
+  dev: false
+
 controller:
   ebpf:
     enabled: true

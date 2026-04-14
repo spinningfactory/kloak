@@ -26,6 +26,11 @@ spec:
           command: ["/kloak", "webhook"]
           args:
             - --cert-dir=/certs
+          env:
+            - name: KLOAK_LOG_LEVEL
+              value: {{ .Values.log.level | quote }}
+            - name: KLOAK_LOG_DEV
+              value: {{ .Values.log.dev | quote }}
           ports:
             - name: webhook
               containerPort: 9443
