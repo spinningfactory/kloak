@@ -48,9 +48,9 @@ func TestWebhookAnnotationInjection(t *testing.T) {
 	createEnabledSecret(t, "test-wh-annot", secretData, nil)
 	assertShadowSecret(t, "test-wh-annot", secretData)
 
-	// Create pod WITHOUT the annotation — namespace label should trigger webhook
+	// Create pod WITHOUT the label — namespace label should trigger webhook
 	name := "test-wh-annot-pod"
-	createPodWithoutAnnotation(t, name, "test-wh-annot")
+	createPodWithoutLabel(t, name, "test-wh-annot")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -151,12 +151,12 @@ func TestWebhookMountedContent(t *testing.T) {
 	}
 }
 
-// createPodWithoutAnnotation creates a pod without getkloak.io/enabled annotation.
+// createPodWithoutLabel creates a pod without getkloak.io/enabled label.
 // The namespace label should trigger the webhook instead.
-func createPodWithoutAnnotation(t *testing.T, name, secretName string) {
+func createPodWithoutLabel(t *testing.T, name, secretName string) {
 	t.Helper()
 	pod := createBasePod(name, secretName)
-	pod.Annotations = nil
+	delete(pod.Labels, "getkloak.io/enabled")
 	_, err := clientset.CoreV1().Pods(testNamespace).Create(context.Background(), pod, metav1.CreateOptions{})
 	if err != nil {
 		t.Fatalf("failed to create pod %s: %v", name, err)
@@ -173,7 +173,7 @@ func createPodThatReadsSecret(t *testing.T, name, secretName, key string) {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: testNamespace,
-			Annotations: map[string]string{
+			Labels: map[string]string{
 				"getkloak.io/enabled": "true",
 			},
 		},
@@ -214,7 +214,7 @@ func createBasePod(name, secretName string) *corev1.Pod {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: testNamespace,
-			Annotations: map[string]string{
+			Labels: map[string]string{
 				"getkloak.io/enabled": "true",
 			},
 		},
