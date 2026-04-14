@@ -71,14 +71,12 @@ func TestDNSWhitelist(t *testing.T) {
 func deployDNSWLEchoServer(t *testing.T) (string, string) {
 	t.Helper()
 
-	labels := map[string]string{"app": dnsWLEchoName}
-
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      dnsWLEchoName,
 			Namespace: testNamespace,
-			Labels:    labels,
-			Annotations: map[string]string{
+			Labels: map[string]string{
+				"app":                 dnsWLEchoName,
 				"getkloak.io/enabled": "false",
 			},
 		},
@@ -118,7 +116,7 @@ func deployDNSWLEchoServer(t *testing.T) (string, string) {
 			Namespace: testNamespace,
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: labels,
+			Selector: map[string]string{"app": dnsWLEchoName},
 			Ports: []corev1.ServicePort{{
 				Port:       8443,
 				TargetPort: intstr.FromInt32(8443),
@@ -158,8 +156,6 @@ func deployDNSWLEchoServer(t *testing.T) (string, string) {
 func deployCustomDNS(t *testing.T, echoHost, echoIP string) string {
 	t.Helper()
 
-	labels := map[string]string{"app": customDNSName}
-
 	// Authoritative Corefile: respond to the echo hostname with its ClusterIP.
 	// No forward directive — never contacts kube-dns.
 	corefile := fmt.Sprintf(`.:53 {
@@ -194,8 +190,8 @@ func deployCustomDNS(t *testing.T, echoHost, echoIP string) string {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      customDNSName,
 			Namespace: testNamespace,
-			Labels:    labels,
-			Annotations: map[string]string{
+			Labels: map[string]string{
+				"app":                 customDNSName,
 				"getkloak.io/enabled": "false",
 			},
 		},
@@ -251,7 +247,7 @@ func deployCustomDNS(t *testing.T, echoHost, echoIP string) string {
 			Namespace: testNamespace,
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: labels,
+			Selector: map[string]string{"app": customDNSName},
 			Ports: []corev1.ServicePort{
 				{
 					Name:       "dns-udp",
@@ -305,7 +301,7 @@ func deployCipherClientWithDNS(t *testing.T, secretName, dnsIP string) string {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      dnsWLClientName,
 			Namespace: testNamespace,
-			Annotations: map[string]string{
+			Labels: map[string]string{
 				"getkloak.io/enabled": "true",
 			},
 		},
