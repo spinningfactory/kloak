@@ -20,7 +20,6 @@ import (
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/ebpf"
 	"github.com/spinningfactory/kloak/pkg/logging"
-	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
 var (
@@ -62,25 +61,6 @@ func runController(cmd *cobra.Command, args []string) {
 
 	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath)
 
-	// Create shared storage
-	store := storage.NewMemory()
-
-	// Create uprobe manager instances
-	var uprobeMgr *ebpf.TLSUprobeManager
-	var err error
-
-	if enableEBPF {
-		uprobeMgr, err = ebpf.NewTLSUprobeManager(store, cgroupPath, setupLog)
-		if err != nil {
-			setupLog.Errorw("failed to initialize eBPF uprobe manager — sleeping to preserve logs", "error", err)
-			_ = setupLog.Sync()
-			select {} // Block forever so the container doesn't restart and logs are preserved.
-		}
-		setupLog.Infow("eBPF TLS uprobes enabled")
-	} else {
-		setupLog.Infow("eBPF disabled")
-	}
-
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                 scheme,
 		HealthProbeBindAddress: controllerProbeAddr,
@@ -89,6 +69,21 @@ func runController(cmd *cobra.Command, args []string) {
 		setupLog.Errorw("unable to start manager", "error", err)
 		_ = setupLog.Sync()
 		os.Exit(1)
+	}
+
+	// Create uprobe manager instances
+	var uprobeMgr *ebpf.TLSUprobeManager
+
+	if enableEBPF {
+		uprobeMgr, err = ebpf.NewTLSUprobeManager(mgr.GetClient(), cgroupPath, setupLog)
+		if err != nil {
+			setupLog.Errorw("failed to initialize eBPF uprobe manager — sleeping to preserve logs", "error", err)
+			_ = setupLog.Sync()
+			select {} // Block forever so the container doesn't restart and logs are preserved.
+		}
+		setupLog.Infow("eBPF TLS uprobes enabled")
+	} else {
+		setupLog.Infow("eBPF disabled")
 	}
 
 	// Create pod reconciler
@@ -114,10 +109,9 @@ func runController(cmd *cobra.Command, args []string) {
 
 	// Create secret reconciler
 	secretReconciler := &controller.SecretReconciler{
-		Client:  mgr.GetClient(),
-		Log:     setupLog.Named("controller").Named("Secret"),
-		Scheme:  mgr.GetScheme(),
-		Storage: store,
+		Client: mgr.GetClient(),
+		Log:    setupLog.Named("controller").Named("Secret"),
+		Scheme: mgr.GetScheme(),
 	}
 
 	if err := secretReconciler.SetupWithManager(mgr); err != nil {

@@ -14,8 +14,6 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
-
-	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
 func newSecretReconciler(objs ...client.Object) (*SecretReconciler, client.Client) {
@@ -23,10 +21,9 @@ func newSecretReconciler(objs ...client.Object) (*SecretReconciler, client.Clien
 	_ = corev1.AddToScheme(scheme)
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 	return &SecretReconciler{
-		Client:  c,
-		Log:     zap.NewNop().Sugar(),
-		Scheme:  scheme,
-		Storage: storage.NewMemory(),
+		Client: c,
+		Log:    zap.NewNop().Sugar(),
+		Scheme: scheme,
 	}, c
 }
 
@@ -84,20 +81,6 @@ func TestSecretReconciler_CreatesShadowSecret(t *testing.T) {
 	}
 	if !strings.HasPrefix(string(shadowVal), ValuePrefix) {
 		t.Errorf("shadow value %q should start with %q", shadowVal, ValuePrefix)
-	}
-
-	// Check storage has the mapping
-	entries, err := r.Storage.List(ctx)
-	if err != nil {
-		t.Fatalf("storage list failed: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("expected 1 storage entry, got %d", len(entries))
-	}
-	for _, entry := range entries {
-		if entry.Value != "super-secret-value-12345678" {
-			t.Errorf("storage value %q != original", entry.Value)
-		}
 	}
 }
 
@@ -214,18 +197,6 @@ func TestSecretReconciler_UpdateShadow(t *testing.T) {
 	if len(shadow.Data["key"]) != len("new-value-different-length-here!!!!!!") {
 		t.Errorf("shadow length %d != new original length %d", len(shadow.Data["key"]), len("new-value-different-length-here!!!!!!"))
 	}
-
-	// Storage should have the new value
-	entries, _ := r.Storage.List(ctx)
-	found := false
-	for _, entry := range entries {
-		if entry.Value == "new-value-different-length-here!!!!!!" {
-			found = true
-		}
-	}
-	if !found {
-		t.Error("storage should contain the updated value")
-	}
 }
 
 func TestSecretReconciler_HostsLabel(t *testing.T) {
@@ -250,14 +221,14 @@ func TestSecretReconciler_HostsLabel(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	entries, _ := r.Storage.List(ctx)
-	for _, entry := range entries {
-		if len(entry.AllowedHosts) != 2 {
-			t.Fatalf("expected 2 allowed hosts, got %d: %v", len(entry.AllowedHosts), entry.AllowedHosts)
-		}
-		if entry.AllowedHosts[0] != "api.example.com" || entry.AllowedHosts[1] != "cdn.example.com" {
-			t.Errorf("unexpected hosts: %v", entry.AllowedHosts)
-		}
+	// Verify shadow was created (hosts are stored on the original secret's labels,
+	// read by sync.go at BPF sync time)
+	shadow := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: "host-secret-kloak", Namespace: "default"}, shadow); err != nil {
+		t.Fatalf("shadow secret not found: %v", err)
+	}
+	if len(shadow.Data) != 1 {
+		t.Errorf("expected 1 shadow data key, got %d", len(shadow.Data))
 	}
 }
 
@@ -298,11 +269,6 @@ func TestSecretReconciler_MultipleKeys(t *testing.T) {
 		if len(val) != len(secret.Data[key]) {
 			t.Errorf("key %q: shadow len %d != original len %d", key, len(val), len(secret.Data[key]))
 		}
-	}
-
-	entries, _ := r.Storage.List(ctx)
-	if len(entries) != 3 {
-		t.Errorf("expected 3 storage entries, got %d", len(entries))
 	}
 }
 

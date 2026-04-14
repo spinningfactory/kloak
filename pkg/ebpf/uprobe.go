@@ -21,8 +21,9 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	"github.com/spinningfactory/kloak/pkg/logging"
-	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
 // tlsEvent must match the C struct tls_event (lightweight, no data payload)
@@ -79,8 +80,8 @@ type TLSUprobeManager struct {
 	log        *zap.SugaredLogger
 	links      []link.Link
 
-	// store provides access to secrets
-	store storage.Storage
+	// k8sReader provides access to Kubernetes secrets via the informer cache
+	k8sReader client.Reader
 	// cgroupRoot is the path to the cgroup v2 filesystem (e.g. /sys/fs/cgroup)
 	cgroupRoot string
 	// cgroupPaths maps cgroup inode ID -> filesystem path.
@@ -177,7 +178,7 @@ func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log *zap.Sug
 }
 
 // NewTLSUprobeManager initializes a new uprobe manager.
-func NewTLSUprobeManager(store storage.Storage, cgroupRoot string, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
+func NewTLSUprobeManager(k8sReader client.Reader, cgroupRoot string, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
 	log = log.Named("ebpf-uprobe")
 
 	objs := &tlsuprobeObjects{}
@@ -245,7 +246,7 @@ func NewTLSUprobeManager(store storage.Storage, cgroupRoot string, log *zap.Suga
 		reader:     reader,
 		procReader: procReader,
 		log:        log,
-		store:      store,
+		k8sReader:  k8sReader,
 		cgroupRoot: cgroupRoot,
 	}
 
@@ -869,7 +870,7 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 // syncSecretsToBPF updates the eBPF map with the latest shadow secret values
 // and the watched_hosts map with hostnames from secret entries.
 func (m *TLSUprobeManager) syncSecretsToBPF() {
-	if err := syncSecrets(m.objs.SecretMap, m.objs.WatchedHosts, m.store, m.log); err != nil {
+	if err := syncSecrets(m.objs.SecretMap, m.objs.WatchedHosts, m.k8sReader, m.log); err != nil {
 		m.log.Errorw("failed to sync secrets to BPF map", "error", err)
 	}
 }
