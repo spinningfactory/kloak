@@ -7,12 +7,11 @@ import (
 	"strings"
 	"testing"
 
+	"go.uber.org/zap"
 	admissionv1 "k8s.io/api/admission/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sruntime "k8s.io/apimachinery/pkg/runtime"
-
-	"github.com/go-logr/logr"
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -26,7 +25,7 @@ func newTestHandler(objs ...client.Object) *Handler {
 	return &Handler{
 		client:  c,
 		decoder: admission.NewDecoder(scheme),
-		log:     logr.Discard(),
+		log:     zap.NewNop().Sugar(),
 	}
 }
 
@@ -225,7 +224,7 @@ func TestNewHandler(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	h := NewHandler(c, logr.Discard())
+	h := NewHandler(c, zap.NewNop().Sugar())
 
 	if h == nil {
 		t.Fatal("NewHandler returned nil")

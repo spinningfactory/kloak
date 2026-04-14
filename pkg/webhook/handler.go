@@ -8,12 +8,11 @@ import (
 	"fmt"
 	"net/http"
 
+	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
-
-	"github.com/go-logr/logr"
 )
 
 const (
@@ -30,10 +29,10 @@ const (
 type Handler struct {
 	client  client.Client
 	decoder admission.Decoder
-	log     logr.Logger
+	log     *zap.SugaredLogger
 }
 
-func NewHandler(c client.Client, log logr.Logger) *Handler {
+func NewHandler(c client.Client, log *zap.SugaredLogger) *Handler {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	return &Handler{
@@ -54,7 +53,7 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 	// Check if Kloak is enabled for this pod (explicitly or via namespace inheritance)
 	enabled, err := h.isEnabled(ctx, pod, req.Namespace)
 	if err != nil {
-		h.log.Error(err, "failed to check if pod is enabled")
+		h.log.Errorw("failed to check if pod is enabled", "error", err)
 		return admission.Errored(http.StatusInternalServerError, err)
 	}
 	if !enabled {
@@ -73,7 +72,7 @@ func (h *Handler) Handle(ctx context.Context, req admission.Request) admission.R
 
 	// Rewrite Secret volumes (swap with shadow secrets)
 	if err := h.rewriteSecretVolumes(ctx, mutatedPod, req.Namespace); err != nil {
-		h.log.Error(err, "shadow secret not ready, rejecting pod")
+		h.log.Errorw("shadow secret not ready, rejecting pod", "error", err)
 		return admission.Denied(fmt.Sprintf("kloak: %v", err))
 	}
 
@@ -101,7 +100,7 @@ func (h *Handler) isEnabled(ctx context.Context, pod *corev1.Pod, namespace stri
 	// 2. Check namespace label
 	ns := &corev1.Namespace{}
 	if err := h.client.Get(ctx, client.ObjectKey{Name: namespace}, ns); err != nil {
-		h.log.Error(err, "failed to fetch namespace for label check", "namespace", namespace)
+		h.log.Errorw("failed to fetch namespace for label check", "error", err, "namespace", namespace)
 		return false, err
 	}
 
@@ -137,7 +136,7 @@ func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, nam
 				return fmt.Errorf("failed to look up secret %s/%s: %w", ns, secretName, err)
 			}
 			// Secret not found -- skip rewriting. Pod admission will fail downstream if it's truly missing.
-			h.log.V(1).Info("secret not found for volume rewriting", "name", secretName)
+			h.log.Debugw("secret not found for volume rewriting", "name", secretName)
 			continue
 		}
 
@@ -158,7 +157,7 @@ func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, nam
 			return fmt.Errorf("secret %s/%s exists but is not a kloak-managed shadow secret", ns, shadowName)
 		}
 
-		h.log.Info("Rewriting volume to use shadow secret", "original", secretName, "shadow", shadowName)
+		h.log.Debugw("Rewriting volume to use shadow secret", "original", secretName, "shadow", shadowName)
 		vol.Secret.SecretName = shadowName
 	}
 

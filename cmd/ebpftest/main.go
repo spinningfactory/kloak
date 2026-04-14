@@ -8,13 +8,14 @@ import (
 	"os"
 
 	"github.com/cilium/ebpf"
+	"go.uber.org/zap"
 
 	ebpfpkg "github.com/spinningfactory/kloak/pkg/ebpf"
 )
 
 func main() {
 	fmt.Println("Attempting to load eBPF objects...")
-	mgr, err := ebpfpkg.NewTLSUprobeManager(nil, "")
+	mgr, err := ebpfpkg.NewTLSUprobeManager(nil, "", zap.NewNop().Sugar())
 	if err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {

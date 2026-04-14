@@ -2,6 +2,9 @@ image:
   repository: kloak
   tag: e2e
   pullPolicy: Never
+log:
+  level: debug
+  dev: true
 coverage:
   enabled: true
   hostPath: /tmp/kloak-coverage

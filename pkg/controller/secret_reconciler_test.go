@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/go-logr/logr"
+	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -24,7 +24,7 @@ func newSecretReconciler(objs ...client.Object) (*SecretReconciler, client.Clien
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 	return &SecretReconciler{
 		Client:  c,
-		Log:     logr.Discard(),
+		Log:     zap.NewNop().Sugar(),
 		Scheme:  scheme,
 		Storage: storage.NewMemory(),
 	}, c

@@ -3,6 +3,14 @@ image:
   tag: dev
   pullPolicy: IfNotPresent
 
+log:
+  # Log level: trace, debug, info, warn, error
+  # trace: very verbose (per-secret sync, BPF debug counters)
+  # debug: per-process attach, exec events, retry details
+  level: info
+  # Development mode: human-readable console output with colors
+  dev: false
+
 controller:
   ebpf:
     enabled: true

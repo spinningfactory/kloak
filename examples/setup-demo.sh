@@ -147,6 +147,8 @@ deploy_kloak() {
         --set image.repository=kloak \
         --set image.tag=latest \
         --set image.pullPolicy=Never \
+        --set log.level=debug \
+        --set log.dev=true \
         --wait --timeout 120s
 
     until kubectl get secret kloak-webhook-certs -n kloak-system 2>/dev/null; do
