@@ -39,7 +39,7 @@ jobs:
       packages: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Set up QEMU (for arm64 final stage)
         uses: docker/setup-qemu-action@v3
@@ -72,7 +72,7 @@ jobs:
     needs: [validate]
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Set chart version
         env:
