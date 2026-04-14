@@ -48,7 +48,7 @@ func TestWebhookAnnotationInjection(t *testing.T) {
 	createEnabledSecret(t, "test-wh-annot", secretData, nil)
 	assertShadowSecret(t, "test-wh-annot", secretData)
 
-	// Create pod WITHOUT the annotation — namespace label should trigger webhook
+	// Create pod WITHOUT the label — namespace label should trigger webhook
 	name := "test-wh-annot-pod"
 	createPodWithoutLabel(t, name, "test-wh-annot")
 
