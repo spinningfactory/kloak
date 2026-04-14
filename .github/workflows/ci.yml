@@ -127,7 +127,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Set up QEMU (for arm64 final stage)
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
