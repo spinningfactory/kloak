@@ -5,7 +5,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/go-logr/logr"
+	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -35,7 +35,7 @@ func TestDiscoverTrustedDNSServers_KubeDNSOnly(t *testing.T) {
 	reader := newFakeReader(kubeDNSSvc("10.96.0.10"))
 	trustedDNSServers = "" // no user-configured servers
 
-	ips := discoverTrustedDNSServers(reader, logr.Discard())
+	ips := discoverTrustedDNSServers(reader, zap.NewNop().Sugar())
 
 	if len(ips) != 1 {
 		t.Fatalf("expected 1 IP, got %d: %v", len(ips), ips)
@@ -50,7 +50,7 @@ func TestDiscoverTrustedDNSServers_UserProvidedOnly(t *testing.T) {
 	reader := newFakeReader()
 	trustedDNSServers = "8.8.8.8,1.1.1.1"
 
-	ips := discoverTrustedDNSServers(reader, logr.Discard())
+	ips := discoverTrustedDNSServers(reader, zap.NewNop().Sugar())
 
 	if len(ips) != 2 {
 		t.Fatalf("expected 2 IPs, got %d: %v", len(ips), ips)
@@ -67,7 +67,7 @@ func TestDiscoverTrustedDNSServers_KubeDNSPlusUser(t *testing.T) {
 	reader := newFakeReader(kubeDNSSvc("10.96.0.10"))
 	trustedDNSServers = "8.8.8.8"
 
-	ips := discoverTrustedDNSServers(reader, logr.Discard())
+	ips := discoverTrustedDNSServers(reader, zap.NewNop().Sugar())
 
 	if len(ips) != 2 {
 		t.Fatalf("expected 2 IPs, got %d: %v", len(ips), ips)
@@ -84,7 +84,7 @@ func TestDiscoverTrustedDNSServers_Dedup(t *testing.T) {
 	reader := newFakeReader(kubeDNSSvc("10.96.0.10"))
 	trustedDNSServers = "10.96.0.10,8.8.8.8,10.96.0.10"
 
-	ips := discoverTrustedDNSServers(reader, logr.Discard())
+	ips := discoverTrustedDNSServers(reader, zap.NewNop().Sugar())
 
 	if len(ips) != 2 {
 		t.Fatalf("expected 2 IPs (deduplicated), got %d: %v", len(ips), ips)
@@ -95,7 +95,7 @@ func TestDiscoverTrustedDNSServers_InvalidIPSkipped(t *testing.T) {
 	reader := newFakeReader()
 	trustedDNSServers = "not-an-ip,8.8.8.8,"
 
-	ips := discoverTrustedDNSServers(reader, logr.Discard())
+	ips := discoverTrustedDNSServers(reader, zap.NewNop().Sugar())
 
 	if len(ips) != 1 {
 		t.Fatalf("expected 1 IP (invalid skipped), got %d: %v", len(ips), ips)
@@ -109,7 +109,7 @@ func TestDiscoverTrustedDNSServers_Empty(t *testing.T) {
 	reader := newFakeReader()
 	trustedDNSServers = ""
 
-	ips := discoverTrustedDNSServers(reader, logr.Discard())
+	ips := discoverTrustedDNSServers(reader, zap.NewNop().Sugar())
 
 	if len(ips) != 0 {
 		t.Fatalf("expected 0 IPs, got %d: %v", len(ips), ips)
@@ -120,7 +120,7 @@ func TestDiscoverTrustedDNSServers_IPv6(t *testing.T) {
 	reader := newFakeReader()
 	trustedDNSServers = "2001:db8::1,8.8.8.8"
 
-	ips := discoverTrustedDNSServers(reader, logr.Discard())
+	ips := discoverTrustedDNSServers(reader, zap.NewNop().Sugar())
 
 	if len(ips) != 2 {
 		t.Fatalf("expected 2 IPs, got %d: %v", len(ips), ips)
@@ -139,7 +139,7 @@ func TestDiscoverTrustedDNSServers_WhitespaceHandling(t *testing.T) {
 	reader := newFakeReader()
 	trustedDNSServers = " 8.8.8.8 , 1.1.1.1 "
 
-	ips := discoverTrustedDNSServers(reader, logr.Discard())
+	ips := discoverTrustedDNSServers(reader, zap.NewNop().Sugar())
 
 	if len(ips) != 2 {
 		t.Fatalf("expected 2 IPs, got %d: %v", len(ips), ips)
@@ -239,7 +239,7 @@ func TestDiscoverTrustedDNSServers_ContextUsage(t *testing.T) {
 	reader := newFakeReader(kubeDNSSvc("10.96.0.10"))
 	trustedDNSServers = ""
 
-	ips := discoverTrustedDNSServers(reader, logr.Discard())
+	ips := discoverTrustedDNSServers(reader, zap.NewNop().Sugar())
 	_ = ctx
 
 	// kube-dns should still be discovered (function uses its own context)

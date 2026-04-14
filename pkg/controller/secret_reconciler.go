@@ -10,7 +10,7 @@ import (
 	"math/big"
 	"time"
 
-	"github.com/go-logr/logr"
+	"go.uber.org/zap"
 	"github.com/oklog/ulid/v2"
 	"golang.org/x/net/http2/hpack"
 	"golang.org/x/sys/unix"
@@ -88,14 +88,14 @@ func parsePortSpec(spec string) (PortSpec, error) {
 // SecretReconciler reconciles a Secret object
 type SecretReconciler struct {
 	client.Client
-	Log     logr.Logger
+	Log     *zap.SugaredLogger
 	Scheme  *runtime.Scheme
 	Storage storage.Storage
 }
 
 // Reconcile handles Secret events.
 func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := r.Log.WithValues("secret", req.NamespacedName)
+	log := r.Log.With("secret", req.NamespacedName)
 
 	var secret corev1.Secret
 	if err := r.Get(ctx, req.NamespacedName, &secret); err != nil {
@@ -121,7 +121,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if !enabled {
 			var shadowSecret corev1.Secret
 			if err := r.Get(ctx, shadowNamespacedName, &shadowSecret); err == nil {
-				log.Info("Deleting disabled shadow secret", "shadow", shadowName)
+				log.Infow("Deleting disabled shadow secret", "shadow", shadowName)
 				if err := r.Delete(ctx, &shadowSecret); err != nil {
 					return ctrl.Result{}, fmt.Errorf("failed to delete shadow secret: %w", err)
 				}
@@ -131,13 +131,13 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		// We use the Secret ID as the storage "podID" bucket.
 		secretID := fmt.Sprintf("%s/%s", secret.Namespace, secret.Name)
 		if err := r.Storage.Delete(ctx, secretID); err != nil {
-			log.Error(err, "failed to clean up storage mappings")
+			log.Errorw("failed to clean up storage mappings", "error", err)
 		}
 		return ctrl.Result{}, nil
 	}
 
 	// 4. Reconcile Shadow Secret
-	log.Info("Reconciling enabled secret")
+	log.Infow("Reconciling enabled secret")
 
 	// Validate secret length: eBPF requires at least ShadowPrefixLen bytes for the BPF key lookup
 	// Short secrets cannot be processed correctly by eBPF and are not supported
@@ -240,7 +240,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// Update Storage
 	// We delete first to remove stale keys (keys removed from original secret)
 	if err := r.Storage.Delete(ctx, secretID); err != nil {
-		log.Error(err, "failed to clear old storage mappings")
+		log.Errorw("failed to clear old storage mappings", "error", err)
 	}
 
 	for shadowVal, originalVal := range newMappings {
@@ -263,7 +263,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if v, ok := secret.Labels[AnnotationPort]; ok && v != "" {
 			portSpec, err = parsePortSpec(v)
 			if err != nil {
-				log.Error(err, "Invalid port specification, treating as wildcard", "secret", req.NamespacedName, "label", v)
+				log.Errorw("Invalid port specification, treating as wildcard", "error", err, "secret", req.NamespacedName, "label", v)
 			} else {
 				validPort = true
 			}
@@ -278,7 +278,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 			entry.Protocol = portSpec.Protocol
 		}
 		if err := r.Storage.Store(ctx, secretID, shadowVal, entry); err != nil {
-			log.Error(err, "failed to store mapping", "shadow", shadowVal)
+			log.Errorw("failed to store mapping", "error", err, "shadow", shadowVal)
 			return ctrl.Result{}, err
 		}
 	}
@@ -315,12 +315,12 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if err := r.Update(ctx, &existingShadow); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to update shadow secret: %w", err)
 		}
-		log.Info("Updated shadow secret", "name", shadowName)
+		log.Infow("Updated shadow secret", "name", shadowName)
 	} else {
 		if err := r.Create(ctx, shadowSecret); err != nil {
 			return ctrl.Result{}, fmt.Errorf("failed to create shadow secret: %w", err)
 		}
-		log.Info("Created shadow secret", "name", shadowName)
+		log.Infow("Created shadow secret", "name", shadowName)
 	}
 
 	return ctrl.Result{}, nil

@@ -5,13 +5,13 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf"
-	"github.com/go-logr/logr"
+	"go.uber.org/zap"
 	"golang.org/x/net/http2/hpack"
 
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
-func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, log logr.Logger) error {
+func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, log *zap.SugaredLogger) error {
 	secrets, err := store.List(context.Background())
 	if err != nil {
 		return err
@@ -36,21 +36,21 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 		// The BPF program looks up the first 8 bytes.
 		// Minimum secret size is 8 bytes (kloak: + 2 UUID chars).
 		if len(shadowPrefix) < 8 {
-			log.V(1).Info("Skipping secret too short for BPF key", "hash", hash, "len", len(shadowPrefix))
+			log.Debugw("Skipping secret too short for BPF key", "hash", hash, "len", len(shadowPrefix))
 			continue
 		}
 
 		var key secretKey
 		copy(key.Prefix[:], []byte(shadowPrefix)[:8])
 		if _, exists := newKeys[key]; exists {
-			log.Info("WARNING: 8-byte BPF key collision detected — two secrets share the same prefix, one will be shadowed", "hash", hash, "prefix", shadowPrefix[:8])
+			log.Errorw("8-byte BPF key collision detected — two secrets share the same prefix, one will be shadowed", "hash", hash, "prefix", shadowPrefix[:8])
 		}
 		newKeys[key] = struct{}{}
 
 		var val secretValue
 		val.Len = uint32(len(entry.Value))
 		if val.Len > 128 {
-			log.V(1).Info("Truncating secret value to max BPF size (128)", "hash", hash)
+			log.Debugw("Truncating secret value to max BPF size (128)", "hash", hash)
 			val.Len = 128
 		}
 		copy(val.RealSecret[:], []byte(entry.Value)[:val.Len])
@@ -85,9 +85,9 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 		val.Protocol = entry.Protocol
 
 		if err := secretMap.Update(&key, &val, 0); err != nil {
-			log.Error(err, "failed to update BPF secret_map", "hash", hash)
+			log.Errorw("failed to update BPF secret_map", "error", err, "hash", hash)
 		} else {
-			log.Info("Synced secret into eBPF map", "hash", hash, "hostLen", val.HostLen, "port", val.Port, "protocol", val.Protocol)
+			log.Debugw("Synced secret into eBPF map", "hash", hash, "hostLen", val.HostLen, "port", val.Port, "protocol", val.Protocol)
 		}
 
 		// Also store a Huffman-encoded variant for HTTP/2 HPACK interception.
@@ -134,15 +134,15 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 				copy(huffVal.FullPrefix[:], huffShadow[:huffPrefixLen])
 
 				if err := secretMap.Update(&huffKey, &huffVal, 0); err != nil {
-					log.Error(err, "failed to update BPF secret_map (Huffman)", "hash", hash)
+					log.Errorw("failed to update BPF secret_map (Huffman)", "error", err, "hash", hash)
 				} else {
-					log.Info("Synced Huffman secret into eBPF map", "hash", hash, "huffLen", huffLen)
+					log.Debugw("Synced Huffman secret into eBPF map", "hash", hash, "huffLen", huffLen)
 				}
 			}
 		} else if len(huffShadow) >= 8 && realHuffLen > len(huffShadow) {
 			// This should not happen if the secret reconciler generates shadows
 			// with sufficient Huffman length, but log it just in case.
-			log.Info("Skipping HTTP/2 Huffman variant — shadow Huffman too short",
+			log.Debugw("Skipping HTTP/2 Huffman variant — shadow Huffman too short",
 				"hash", hash, "shadowHuffLen", len(huffShadow), "realHuffLen", realHuffLen)
 		}
 	}
@@ -158,13 +158,13 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 		}
 	}
 	if err := iter.Err(); err != nil {
-		log.Error(err, "error iterating BPF secret_map for pruning")
+		log.Errorw("error iterating BPF secret_map for pruning", "error", err)
 	}
 	for i := range staleKeys {
 		if err := secretMap.Delete(&staleKeys[i]); err != nil {
-			log.Error(err, "failed to delete stale BPF secret_map entry")
+			log.Errorw("failed to delete stale BPF secret_map entry", "error", err)
 		} else {
-			log.Info("Pruned stale entry from eBPF map")
+			log.Debugw("Pruned stale entry from eBPF map")
 		}
 	}
 
@@ -178,12 +178,12 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 
 // syncWatchedHosts updates the watched_hosts BPF map with the given set of
 // hostnames. Adds missing entries and removes stale ones.
-func syncWatchedHosts(watchedHostsMap *ebpf.Map, newHosts map[watchedHostKey]struct{}, log logr.Logger) {
+func syncWatchedHosts(watchedHostsMap *ebpf.Map, newHosts map[watchedHostKey]struct{}, log *zap.SugaredLogger) {
 	// Add all current hosts
 	val := uint8(1)
 	for host := range newHosts {
 		if err := watchedHostsMap.Update(&host, &val, 0); err != nil {
-			log.Error(err, "failed to update watched_hosts map", "host", string(host.Host[:]))
+			log.Errorw("failed to update watched_hosts map", "error", err, "host", string(host.Host[:]))
 		}
 	}
 
@@ -198,13 +198,13 @@ func syncWatchedHosts(watchedHostsMap *ebpf.Map, newHosts map[watchedHostKey]str
 		}
 	}
 	if err := iter.Err(); err != nil {
-		log.Error(err, "error iterating watched_hosts map for pruning")
+		log.Errorw("error iterating watched_hosts map for pruning", "error", err)
 	}
 	for i := range staleHosts {
 		if err := watchedHostsMap.Delete(&staleHosts[i]); err != nil {
-			log.Error(err, "failed to delete stale watched_hosts entry")
+			log.Errorw("failed to delete stale watched_hosts entry", "error", err)
 		} else {
-			log.V(1).Info("Pruned stale watched host")
+			log.Debugw("Pruned stale watched host")
 		}
 	}
 }

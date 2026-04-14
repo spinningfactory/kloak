@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/go-logr/logr"
+	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -109,7 +109,7 @@ func TestNewReconciler(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	r := NewReconciler(c, logr.Discard(), scheme, nil, "", "node-1")
+	r := NewReconciler(c, zap.NewNop().Sugar(), scheme, nil, "", "node-1")
 
 	if r == nil {
 		t.Fatal("NewReconciler returned nil")
@@ -133,7 +133,7 @@ func TestNewReconciler_CustomCgroupRoot(t *testing.T) {
 	_ = corev1.AddToScheme(scheme)
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
 
-	r := NewReconciler(c, logr.Discard(), scheme, nil, "/custom/cgroup", "")
+	r := NewReconciler(c, zap.NewNop().Sugar(), scheme, nil, "/custom/cgroup", "")
 
 	if r.CgroupRoot != "/custom/cgroup" {
 		t.Errorf("expected custom cgroup root, got %q", r.CgroupRoot)
@@ -144,7 +144,7 @@ func TestReconcile_PodNotFound(t *testing.T) {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
-	r := NewReconciler(c, logr.Discard(), scheme, nil, "", "")
+	r := NewReconciler(c, zap.NewNop().Sugar(), scheme, nil, "", "")
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "missing", Namespace: "default"}}
 	result, err := r.Reconcile(context.Background(), req)
@@ -170,7 +170,7 @@ func TestReconcile_DisabledPod(t *testing.T) {
 	}
 
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
-	r := NewReconciler(c, logr.Discard(), scheme, nil, "", "")
+	r := NewReconciler(c, zap.NewNop().Sugar(), scheme, nil, "", "")
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "disabled-pod", Namespace: "default"}}
 	result, err := r.Reconcile(context.Background(), req)
@@ -199,7 +199,7 @@ func TestReconcile_EnabledPodNotRunning(t *testing.T) {
 	}
 
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
-	r := NewReconciler(c, logr.Discard(), scheme, nil, "", "")
+	r := NewReconciler(c, zap.NewNop().Sugar(), scheme, nil, "", "")
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "pending-pod", Namespace: "default"}}
 	result, err := r.Reconcile(context.Background(), req)
@@ -226,7 +226,7 @@ func TestReconcile_WrongNode(t *testing.T) {
 	}
 
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
-	r := NewReconciler(c, logr.Discard(), scheme, nil, "", "node-1")
+	r := NewReconciler(c, zap.NewNop().Sugar(), scheme, nil, "", "node-1")
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "other-node-pod", Namespace: "default"}}
 	result, err := r.Reconcile(context.Background(), req)
@@ -246,7 +246,7 @@ func TestHandleDelete_NotTracked(t *testing.T) {
 	r := &Reconciler{
 		trackedPods: make(map[string]map[uint64]bool),
 		podKeyToUID: make(map[string]string),
-		Log:         logr.Discard(),
+		Log:         zap.NewNop().Sugar(),
 	}
 
 	result, err := r.handleDelete("unknown-uid", "default/unknown")
@@ -281,7 +281,7 @@ func TestReconcile_EnabledRunningPodNoCgroups(t *testing.T) {
 	}
 
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
-	r := NewReconciler(c, logr.Discard(), scheme, nil, "/nonexistent/cgroup", "node-1")
+	r := NewReconciler(c, zap.NewNop().Sugar(), scheme, nil, "/nonexistent/cgroup", "node-1")
 
 	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "running-pod", Namespace: "default"}}
 	result, err := r.Reconcile(context.Background(), req)
@@ -311,7 +311,7 @@ func TestReconcile_DisableRemovesTracking(t *testing.T) {
 	}
 
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pod).Build()
-	r := NewReconciler(c, logr.Discard(), scheme, nil, "", "")
+	r := NewReconciler(c, zap.NewNop().Sugar(), scheme, nil, "", "")
 
 	// Pre-populate as if it was previously tracked
 	r.trackedPods["was-tracked-uid"] = map[uint64]bool{999: true}
@@ -334,7 +334,7 @@ func TestReconcile_DeleteTrackedPod(t *testing.T) {
 
 	// No pod in the cluster (simulates deletion)
 	c := fake.NewClientBuilder().WithScheme(scheme).Build()
-	r := NewReconciler(c, logr.Discard(), scheme, nil, "", "")
+	r := NewReconciler(c, zap.NewNop().Sugar(), scheme, nil, "", "")
 
 	// Pre-populate tracking state
 	r.trackedPods["deleted-uid"] = map[uint64]bool{12345: true}

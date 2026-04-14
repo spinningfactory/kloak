@@ -9,7 +9,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/go-logr/logr"
+	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -30,7 +30,7 @@ const (
 // Reconciler watches pods and manages eBPF cgroup tracking.
 type Reconciler struct {
 	client.Client
-	Log           logr.Logger
+	Log           *zap.SugaredLogger
 	Scheme        *runtime.Scheme
 	UprobeManager *ebpf.TLSUprobeManager
 	CgroupRoot    string
@@ -50,7 +50,7 @@ type Reconciler struct {
 }
 
 // NewReconciler creates a new pod reconciler.
-func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, uprobeMgr *ebpf.TLSUprobeManager, cgroupRoot, nodeName string) *Reconciler {
+func NewReconciler(c client.Client, log *zap.SugaredLogger, scheme *runtime.Scheme, uprobeMgr *ebpf.TLSUprobeManager, cgroupRoot, nodeName string) *Reconciler {
 	if cgroupRoot == "" {
 		cgroupRoot = CgroupBasePath
 	}
@@ -68,7 +68,7 @@ func NewReconciler(c client.Client, log logr.Logger, scheme *runtime.Scheme, upr
 
 // Reconcile handles pod create/update/delete events.
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
-	log := r.Log.WithValues("pod", req.NamespacedName)
+	log := r.Log.With("pod", req.NamespacedName)
 
 	// Fetch the pod
 	pod := &corev1.Pod{}
@@ -101,13 +101,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Filter by node if NodeName is set (per-node controller)
 	if r.NodeName != "" && pod.Spec.NodeName != r.NodeName {
-		log.V(1).Info("skipping pod on different node", "podNode", pod.Spec.NodeName, "ourNode", r.NodeName)
+		log.Debugw("skipping pod on different node", "podNode", pod.Spec.NodeName, "ourNode", r.NodeName)
 		return ctrl.Result{}, nil
 	}
 
 	// Pod is running and enabled
 	if pod.Status.Phase != corev1.PodRunning {
-		log.V(1).Info("pod not running yet", "phase", pod.Status.Phase)
+		log.Debugw("pod not running yet", "phase", pod.Status.Phase)
 		return ctrl.Result{}, nil
 	}
 
@@ -115,7 +115,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	cgroupIDs, err := r.getContainerCgroupIDs(pod)
 	if err != nil {
 		// This is expected during container startup - will retry on next reconcile
-		log.V(1).Info("cgroup IDs not available yet", "reason", err.Error())
+		log.Debugw("cgroup IDs not available yet", "reason", err.Error())
 		return ctrl.Result{Requeue: true}, nil
 	}
 
@@ -137,7 +137,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		attached, tracked := existingCgroups[cgroupID]
 		if !tracked {
 			existingCgroups[cgroupID] = false // tracked but not yet attached
-			log.Info("tracking container cgroup", "cgroupID", cgroupID)
+			log.Infow("tracking container cgroup", "cgroupID", cgroupID)
 			needsAttach = append(needsAttach, cgroupID)
 		} else if !attached {
 			// Retry attachment (e.g. libssl not loaded on first attempt)
@@ -149,7 +149,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	for cgroupID := range existingCgroups {
 		if !cgroupIDs[cgroupID] {
 			delete(existingCgroups, cgroupID)
-			log.Info("removed stale cgroup", "cgroupID", cgroupID)
+			log.Infow("removed stale cgroup", "cgroupID", cgroupID)
 		}
 	}
 
@@ -171,7 +171,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			// processes spawned inside the container are automatically detected.
 			if r.UprobeManager != nil {
 				if err := r.UprobeManager.TrackCgroup(cgroupID, cgroupPath); err != nil {
-					log.Error(err, "failed to track cgroup for exec events", "cgroupID", cgroupID)
+					log.Errorw("failed to track cgroup for exec events", "error", err, "cgroupID", cgroupID)
 				}
 				// Record which netns this cgroup belongs to, so UntrackCgroup
 				// can clean up the pinned netns fd and allow inode reuse.
@@ -209,7 +209,7 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (cg
 		return "", 0
 	}
 
-	r.Log.Info("Trying to attach uprobes to new container", "cgroup", cgroupID)
+	r.Log.Debugw("Trying to attach uprobes to new container", "cgroup", cgroupID)
 
 	// Find the container cgroup path again to read cgroup.procs
 	for i := range pod.Status.ContainerStatuses {
@@ -237,12 +237,12 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (cg
 		// Read PIDs from cgroup.procs
 		pids, err := cgroups.ReadCgroupProcs(containerCgroupPath)
 		if err != nil {
-			r.Log.Error(err, "failed to read cgroup.procs", "path", containerCgroupPath)
+			r.Log.Errorw("failed to read cgroup.procs", "error", err, "path", containerCgroupPath)
 			return "", 0
 		}
 
 		if len(pids) == 0 {
-			r.Log.V(1).Info("no PIDs found in cgroup.procs", "path", containerCgroupPath)
+			r.Log.Debugw("no PIDs found in cgroup.procs", "path", containerCgroupPath)
 			return "", 0
 		}
 
@@ -254,9 +254,9 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (cg
 		attachedPid := 0
 		for _, pid := range pids {
 			if err := r.UprobeManager.AttachTLS(pid); err != nil {
-				r.Log.V(1).Info("could not attach TLS uprobes to pid (no compatible symbols or already attached)", "pid", pid, "container", status.Name, "err", err)
+				r.Log.Debugw("could not attach TLS uprobes to pid (no compatible symbols or already attached)", "pid", pid, "container", status.Name, "err", err)
 			} else {
-				r.Log.Info("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
+				r.Log.Infow("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
 				attached = true
 				if attachedPid == 0 {
 					attachedPid = pid
@@ -269,7 +269,7 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (cg
 		return "", 0
 	}
 
-	r.Log.V(1).Info("could not find matching container for cgroup", "cgroupID", cgroupID)
+	r.Log.Debugw("could not find matching container for cgroup", "cgroupID", cgroupID)
 	return "", 0
 }
 
@@ -289,7 +289,7 @@ func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, erro
 	if r.UprobeManager != nil {
 		for cgroupID := range cgroupIDs {
 			if err := r.UprobeManager.UntrackCgroup(cgroupID); err != nil {
-				r.Log.V(1).Info("failed to untrack cgroup", "cgroupID", cgroupID, "err", err)
+				r.Log.Debugw("failed to untrack cgroup", "cgroupID", cgroupID, "err", err)
 			}
 		}
 	}
@@ -298,7 +298,7 @@ func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, erro
 	delete(r.trackedPods, uid)
 	delete(r.podKeyToUID, namespacedName)
 	r.mu.Unlock()
-	r.Log.Info("stopped tracking pod", "pod", namespacedName, "uid", uid, "cgroupCount", len(cgroupIDs))
+	r.Log.Infow("stopped tracking pod", "pod", namespacedName, "uid", uid, "cgroupCount", len(cgroupIDs))
 
 	return ctrl.Result{}, nil
 }
@@ -336,17 +336,17 @@ func (r *Reconciler) getContainerCgroupIDs(pod *corev1.Pod) (map[uint64]bool, er
 			// Get the container's cgroup path (not the pod's parent cgroup)
 			containerCgroupPath, err := cgroups.FindContainerCgroupPath(r.CgroupRoot, string(pod.UID), containerID)
 			if err != nil {
-				r.Log.V(1).Info("could not find container cgroup", "container", status.Name, "err", err)
+				r.Log.Debugw("could not find container cgroup", "container", status.Name, "err", err)
 				continue
 			}
 
 			cgroupID, err := cgroups.GetCgroupInodeFromPath(containerCgroupPath)
 			if err != nil {
-				r.Log.V(1).Info("could not get cgroup inode", "container", status.Name, "path", containerCgroupPath, "err", err)
+				r.Log.Debugw("could not get cgroup inode", "container", status.Name, "path", containerCgroupPath, "err", err)
 				continue
 			}
 
-			r.Log.Info("Found container cgroup", "container", status.Name, "cgroupPath", containerCgroupPath, "cgroupID", cgroupID)
+			r.Log.Debugw("Found container cgroup", "container", status.Name, "cgroupPath", containerCgroupPath, "cgroupID", cgroupID)
 			cgroupIDs[cgroupID] = true
 		}
 	}

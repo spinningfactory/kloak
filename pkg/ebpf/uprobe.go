@@ -18,9 +18,8 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/cilium/ebpf/ringbuf"
-	"github.com/go-logr/logr"
+	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
-	ctrl "sigs.k8s.io/controller-runtime"
 
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
@@ -76,7 +75,7 @@ type TLSUprobeManager struct {
 	objs       *tlsuprobeObjects
 	reader     *ringbuf.Reader
 	procReader *ringbuf.Reader
-	log        logr.Logger
+	log        *zap.SugaredLogger
 	links      []link.Link
 
 	// store provides access to secrets
@@ -105,7 +104,7 @@ type tcAttachEntry struct {
 // in the BPF cgroup_ancestor map. This enables bpf_current_task_under_cgroup()
 // in the exec tracepoint to catch all container execs without per-container
 // cgroup tracking.
-func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Logger) error {
+func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log *zap.SugaredLogger) error {
 	// Find the kubepods cgroup directory. Strategy:
 	// 1. Try well-known direct paths
 	// 2. Walk the cgroup tree
@@ -160,7 +159,7 @@ func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Log
 		if err != nil {
 			return fmt.Errorf("updating cgroup_ancestor map: %w", err)
 		}
-		log.Info("Configured cgroup ancestor for exec tracepoint", "path", path)
+		log.Infow("Configured cgroup ancestor for exec tracepoint", "path", path)
 		return nil
 	}
 
@@ -171,14 +170,14 @@ func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log logr.Log
 			topLevel = append(topLevel, e.Name())
 		}
 	}
-	log.Error(nil, "kubepods cgroup not found — exec tracepoint will not detect container processes",
+	log.Errorw("kubepods cgroup not found — exec tracepoint will not detect container processes",
 		"cgroupRoot", cgroupRoot, "candidates", candidates, "topLevelDirs", topLevel)
 	return fmt.Errorf("kubepods cgroup not found in %s", cgroupRoot)
 }
 
 // NewTLSUprobeManager initializes a new uprobe manager.
-func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeManager, error) {
-	log := ctrl.Log.WithName("ebpf-uprobe")
+func NewTLSUprobeManager(store storage.Storage, cgroupRoot string, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
+	log = log.Named("ebpf-uprobe")
 
 	objs := &tlsuprobeObjects{}
 	if err := loadTlsuprobeObjects(objs, &ebpf.CollectionOptions{
@@ -191,10 +190,10 @@ func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeMa
 		if errors.As(err, &ve) {
 			// Print only the error summary (includes rejection reason).
 			// The full verifier log can be 100K+ lines and overflows container log buffers.
-			log.Error(err, "eBPF verifier rejected program")
+			log.Errorw("eBPF verifier rejected program", "error", err)
 		} else {
-			log.Error(err, "eBPF loading failed (not a verifier error, check dmesg)",
-				"error_type", fmt.Sprintf("%T", err))
+			log.Errorw("eBPF loading failed (not a verifier error, check dmesg)",
+				"error", err, "error_type", fmt.Sprintf("%T", err))
 		}
 		return nil, fmt.Errorf("loading eBPF objects: %w", err)
 	}
@@ -223,7 +222,7 @@ func NewTLSUprobeManager(store storage.Storage, cgroupRoot string) (*TLSUprobeMa
 	// Populate the cgroup ancestor map so the exec tracepoint can catch
 	// ALL container execs. Find the kubepods cgroup and store its fd.
 	if err := setupCgroupAncestor(objs, cgroupRoot, log); err != nil {
-		log.Error(err, "failed to setup cgroup ancestor — exec tracepoint will not catch initial container processes")
+		log.Errorw("failed to setup cgroup ancestor — exec tracepoint will not catch initial container processes", "error", err)
 		// Non-fatal: exec tracepoint falls back to tracked_cgroups
 	}
 
@@ -281,7 +280,7 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 			return fmt.Errorf("attaching tracepoint %s/%s: %w", t.group, t.name, err)
 		}
 		m.links = append(m.links, l)
-		m.log.Info("Attached tracepoint", "group", t.group, "name", t.name)
+		m.log.Debugw("Attached tracepoint", "group", t.group, "name", t.name)
 	}
 
 	// Attach kprobe/kretprobe on udp_recvmsg for language-agnostic DNS interception.
@@ -290,14 +289,14 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 		return fmt.Errorf("attaching kprobe udp_recvmsg: %w", err)
 	}
 	m.links = append(m.links, kp)
-	m.log.Info("Attached kprobe", "function", "udp_recvmsg")
+	m.log.Debugw("Attached kprobe", "function", "udp_recvmsg")
 
 	krp, err := link.Kretprobe("udp_recvmsg", m.objs.KretprobeUdpRecvmsg, nil)
 	if err != nil {
 		return fmt.Errorf("attaching kretprobe udp_recvmsg: %w", err)
 	}
 	m.links = append(m.links, krp)
-	m.log.Info("Attached kretprobe", "function", "udp_recvmsg")
+	m.log.Debugw("Attached kretprobe", "function", "udp_recvmsg")
 
 	// Attach kprobe on tcp_sendmsg to bridge xor_pending → tc_pending.
 	// This runs after SSL_write encrypts and calls write/send, giving us
@@ -307,7 +306,7 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 		return fmt.Errorf("attaching kprobe tcp_sendmsg: %w", err)
 	}
 	m.links = append(m.links, tkp)
-	m.log.Info("Attached kprobe", "function", "tcp_sendmsg")
+	m.log.Debugw("Attached kprobe", "function", "tcp_sendmsg")
 
 	return nil
 }
@@ -328,7 +327,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	if fi, err := os.Stat(netnsPath); err == nil {
 		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
 			if _, loaded := m.tcAttached.Load(stat.Ino); loaded {
-				m.log.V(1).Info("tc egress already attached for this netns", "pid", pid, "netns_ino", stat.Ino)
+				m.log.Debugw("tc egress already attached for this netns", "pid", pid, "netns_ino", stat.Ino)
 				return nil
 			}
 		}
@@ -365,7 +364,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	// Ensure we return to our original netns.
 	defer func() {
 		if err := unix.Setns(int(selfNS.Fd()), unix.CLONE_NEWNET); err != nil {
-			m.log.Error(err, "failed to restore original netns")
+			m.log.Errorw("failed to restore original netns", "error", err)
 		}
 	}()
 
@@ -378,7 +377,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 				_ = containerNS.Close()
 				return fmt.Errorf("finding %s in container netns: %w", ifName, err)
 			}
-			m.log.V(1).Info("interface not found, skipping", "pid", pid, "interface", ifName)
+			m.log.Debugw("interface not found, skipping", "pid", pid, "interface", ifName)
 			continue
 		}
 
@@ -392,7 +391,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 			return fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", ifName, iface.Index, pid, err)
 		}
 		m.links = append(m.links, tcLink)
-		m.log.Info("Attached tc egress to container", "pid", pid, "interface", ifName, "ifindex", iface.Index)
+		m.log.Debugw("Attached tc egress to container", "pid", pid, "interface", ifName, "ifindex", iface.Index)
 	}
 
 	// Store the open netns fd keyed by inode. The open fd pins the inode —
@@ -489,9 +488,9 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 
 	// Register the process for DNS/connect tracking.
 	if err := m.TrackTGID(uint32(pid)); err != nil {
-		m.log.Error(err, "failed to track TGID for DNS/connect", "pid", pid)
+		m.log.Errorw("failed to track TGID for DNS/connect", "error", err, "pid", pid)
 	} else {
-		m.log.Info("Tracking TGID for DNS/connect verification", "pid", pid)
+		m.log.Debugw("Tracking TGID for DNS/connect verification", "pid", pid)
 	}
 
 	// H extraction now happens in the entry uprobe via 4-step pointer chain.
@@ -508,14 +507,14 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	// and system-wide uprobes via overlay don't fire for the same binary.
 	goWriteSym := "crypto/tls.(*Conn).Write"
 	if up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, &link.UprobeOptions{PID: pid}); err == nil {
-		m.log.Info("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
+		m.log.Debugw("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
 		m.links = append(m.links, up)
 
 		// Push Go-specific struct offsets for H extraction and attach tc egress
 		// for ciphertext patching. Both are required for the XOR-patch path.
 		m.pushGoTLSOffsets(pid)
 		if err := m.attachTCEgress(pid); err != nil {
-			m.log.Error(err, "Failed to attach tc egress for Go TLS — secrets will not be rewritten", "pid", pid)
+			m.log.Errorw("Failed to attach tc egress for Go TLS — secrets will not be rewritten", "error", err, "pid", pid)
 		}
 		return nil
 	}
@@ -532,7 +531,7 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	// Use PID-scoped because the main exe is unique per container.
 	for _, sym := range append(sslSymbols, gnutlsSymbols...) {
 		if up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid}); err == nil {
-			m.log.Info("Attached uprobe to main exe", "pid", pid, "symbol", sym)
+			m.log.Debugw("Attached uprobe to main exe", "pid", pid, "symbol", sym)
 			m.links = append(m.links, up)
 			attached = true
 		}
@@ -540,7 +539,7 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 
 	// Scan container filesystem for all TLS shared libraries
 	containerLibs := findContainerTLSLibraries(pid)
-	m.log.Info("Found container TLS libraries", "pid", pid, "count", len(containerLibs), "libs", containerLibs)
+	m.log.Debugw("Found container TLS libraries", "pid", pid, "count", len(containerLibs), "libs", containerLibs)
 
 	for _, containerPath := range containerLibs {
 		hostPath := fmt.Sprintf("/proc/%d/root%s", pid, containerPath)
@@ -550,7 +549,7 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		}
 		for _, sym := range append(sslSymbols, gnutlsSymbols...) {
 			if up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil); err == nil {
-				m.log.Info("Attached uprobe (system-wide)", "pid", pid, "symbol", sym, "lib", containerPath)
+				m.log.Debugw("Attached uprobe (system-wide)", "pid", pid, "symbol", sym, "lib", containerPath)
 				m.links = append(m.links, up)
 				attached = true
 			}
@@ -566,7 +565,7 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		// Attach tc egress to the container's eth0 for kernel-only ciphertext
 		// patching. Required for secret rewriting.
 		if err := m.attachTCEgress(pid); err != nil {
-			m.log.Error(err, "Failed to attach tc egress to container — secrets will not be rewritten", "pid", pid)
+			m.log.Errorw("Failed to attach tc egress to container — secrets will not be rewritten", "error", err, "pid", pid)
 		}
 
 		return nil
@@ -581,7 +580,7 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 	for _, libPath := range containerLibs {
 		version, offsets, err := DetectOpenSSLVersion(pid, libPath)
 		if err != nil {
-			m.log.V(1).Info("OpenSSL version detection skipped", "lib", libPath, "reason", err)
+			m.log.Debugw("OpenSSL version detection skipped", "lib", libPath, "reason", err)
 			continue
 		}
 
@@ -595,11 +594,11 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 		}
 		val := bpfTLSOffsets(offsets)
 		if err := m.objs.TlsOffsetConfig.Update(uint32(0), &val, 0); err != nil {
-			m.log.Error(err, "Failed to push TLS offsets to BPF map")
+			m.log.Errorw("Failed to push TLS offsets to BPF map", "error", err)
 			continue
 		}
 
-		m.log.Info("Pushed TLS offsets for XOR-patch path",
+		m.log.Debugw("Pushed TLS offsets for XOR-patch path",
 			"lib", libPath, "version", version,
 			"offsets", fmt.Sprintf("%+v", offsets))
 		return // Only need one successful push.
@@ -614,11 +613,11 @@ func (m *TLSUprobeManager) pushGoTLSOffsets(pid int) {
 	// DetectGoTLSOffsets tries DWARF first, then falls back to version-based lookup.
 	version, offsets, err := DetectGoTLSOffsets(exePath)
 	if err != nil {
-		m.log.Error(err, "Go TLS offset detection failed — Go secrets will NOT be rewritten", "pid", pid)
+		m.log.Errorw("Go TLS offset detection failed — Go secrets will NOT be rewritten", "error", err, "pid", pid)
 		return
 	}
 
-	m.log.Info("Detected Go TLS offsets",
+	m.log.Debugw("Detected Go TLS offsets",
 		"pid", pid, "goVersion", version,
 		"connToCipher", offsets.ConnToCipher,
 		"aeadIfaceOff", offsets.AEADIfaceOff,
@@ -628,11 +627,11 @@ func (m *TLSUprobeManager) pushGoTLSOffsets(pid int) {
 	// Get TGID for the per-process BPF map key.
 	tgid := uint32(pid) // PID == TGID for the main thread
 	if err := m.objs.GoTlsOffsetConfig.Update(tgid, &offsets, 0); err != nil {
-		m.log.Error(err, "Failed to push Go TLS offsets to BPF map", "pid", pid)
+		m.log.Errorw("Failed to push Go TLS offsets to BPF map", "error", err, "pid", pid)
 		return
 	}
 
-	m.log.Info("Pushed Go TLS offsets for XOR-patch path",
+	m.log.Debugw("Pushed Go TLS offsets for XOR-patch path",
 		"pid", pid, "goVersion", version)
 }
 
@@ -721,7 +720,7 @@ func (m *TLSUprobeManager) Close() error {
 // PollExecEvents reads process exec events from the proc_events ring buffer
 // and attaches TLS uprobes to newly exec'd processes in tracked containers.
 func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
-	m.log.Info("Starting process exec event poller")
+	m.log.Infow("Starting process exec event poller")
 	for {
 		select {
 		case <-ctx.Done():
@@ -738,13 +737,13 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				continue
 			}
-			m.log.Error(err, "reading from proc events ringbuf")
+			m.log.Errorw("reading from proc events ringbuf", "error", err)
 			continue
 		}
 
 		var event procEvent
 		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
-			m.log.Error(err, "failed to parse proc event")
+			m.log.Errorw("failed to parse proc event", "error", err)
 			continue
 		}
 
@@ -755,18 +754,18 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 			// guard, AttachTLS would attach tc egress to non-kloak pods and
 			// corrupt their outbound TLS (wrong H key → bad GHASH tag).
 			if _, ok := m.cgroupPaths.Load(event.CgroupID); !ok {
-				m.log.V(1).Info("exec in untracked cgroup, skipping", "tgid", event.Tgid, "cgroupID", event.CgroupID)
+				m.log.Debugw("exec in untracked cgroup, skipping", "tgid", event.Tgid, "cgroupID", event.CgroupID)
 				continue
 			}
-			m.log.Info("Detected exec in tracked container, attaching uprobes", "tgid", event.Tgid, "cgroupID", event.CgroupID)
+			m.log.Debugw("Detected exec in tracked container, attaching uprobes", "tgid", event.Tgid, "cgroupID", event.CgroupID)
 			if err := m.AttachTLS(int(event.Tgid)); err != nil {
 				// libssl may not be loaded yet (e.g. Python hasn't imported ssl).
 				// Retry after a delay to catch lazy-loaded libraries.
-				m.log.V(1).Info("first attach attempt failed, scheduling retry", "tgid", event.Tgid, "err", err)
+				m.log.Debugw("first attach attempt failed, scheduling retry", "tgid", event.Tgid, "err", err)
 				go func(tgid uint32) {
 					time.Sleep(2 * time.Second)
 					if err := m.AttachTLS(int(tgid)); err != nil {
-						m.log.V(1).Info("retry attach also failed", "tgid", tgid, "err", err)
+						m.log.Debugw("retry attach also failed", "tgid", tgid, "err", err)
 					}
 				}(event.Tgid)
 			}
@@ -776,7 +775,7 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 
 // PollEvents reads TLS events from the ring buffer and periodically syncs secrets to the eBPF map.
 func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
-	m.log.Info("Starting eBPF TLS event poller and secret syncer")
+	m.log.Infow("Starting eBPF TLS event poller and secret syncer")
 
 	// Trigger an initial sync
 	m.syncSecretsToBPF()
@@ -806,20 +805,20 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 			if errors.Is(err, os.ErrDeadlineExceeded) {
 				continue
 			}
-			m.log.Error(err, "reading from ringbuf")
+			m.log.Errorw("reading from ringbuf", "error", err)
 			continue
 		}
 
 		var event tlsEvent
 		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
-			m.log.Error(err, "failed to parse ringbuf event")
+			m.log.Errorw("failed to parse ringbuf event", "error", err)
 			continue
 		}
 
 		if event.IsRewritten == 1 {
-			m.log.Info("REWRITE SUCCESS: eBPF synchronously rewrote a secret", "pid", event.Pid)
+			m.log.Debugw("REWRITE SUCCESS: eBPF synchronously rewrote a secret", "pid", event.Pid)
 		} else {
-			m.log.V(2).Info("Intercepted TLS packet (no rewrite)", "pid", event.Pid, "len", event.Len)
+			m.log.Debugw("Intercepted TLS packet (no rewrite)", "pid", event.Pid, "len", event.Len)
 		}
 	}
 }
@@ -834,7 +833,7 @@ type dnsIPKey struct {
 // all DNS responses are accepted.
 func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 	if len(ips) == 0 {
-		m.log.Error(nil, "No trusted DNS servers — all DNS responses will be rejected")
+		m.log.Errorw("No trusted DNS servers — all DNS responses will be rejected")
 	}
 
 	val := uint8(1)
@@ -859,10 +858,10 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 		if err := m.objs.TrustedDnsServers.Update(&key, &val, 0); err != nil {
 			return fmt.Errorf("adding trusted DNS server %s: %w", ip, err)
 		}
-		m.log.Info("Added trusted DNS server", "ip", ip.String())
+		m.log.Infow("Added trusted DNS server", "ip", ip.String())
 	}
 
-	m.log.Info("DNS server whitelist enabled", "count", len(ips))
+	m.log.Infow("DNS server whitelist enabled", "count", len(ips))
 	return nil
 }
 
@@ -870,7 +869,7 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 // and the watched_hosts map with hostnames from secret entries.
 func (m *TLSUprobeManager) syncSecretsToBPF() {
 	if err := syncSecrets(m.objs.SecretMap, m.objs.WatchedHosts, m.store, m.log); err != nil {
-		m.log.Error(err, "failed to sync secrets to BPF map")
+		m.log.Errorw("failed to sync secrets to BPF map", "error", err)
 	}
 }
 
@@ -906,7 +905,7 @@ func (m *TLSUprobeManager) DumpDebugCounters() {
 			total += v
 		}
 		if total > 0 {
-			m.log.Info("eBPF debug counter", "name", name, "count", total)
+			m.log.Debugw("eBPF debug counter", "name", name, "count", total)
 		}
 	}
 }

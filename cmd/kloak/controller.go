@@ -6,8 +6,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/go-logr/logr"
 	"github.com/spf13/cobra"
+	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -16,10 +16,10 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/ebpf"
+	"github.com/spinningfactory/kloak/pkg/logging"
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
@@ -58,11 +58,9 @@ func init() {
 }
 
 func runController(cmd *cobra.Command, args []string) {
-	opts := zap.Options{Development: true}
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&opts)))
+	setupLog := logging.Setup().Named("setup")
 
-	setupLog := ctrl.Log.WithName("setup")
-	setupLog.Info("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath)
+	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath)
 
 	// Create shared storage
 	store := storage.NewMemory()
@@ -72,14 +70,14 @@ func runController(cmd *cobra.Command, args []string) {
 	var err error
 
 	if enableEBPF {
-		uprobeMgr, err = ebpf.NewTLSUprobeManager(store, cgroupPath)
+		uprobeMgr, err = ebpf.NewTLSUprobeManager(store, cgroupPath, setupLog)
 		if err != nil {
-			setupLog.Error(err, "failed to initialize eBPF uprobe manager — sleeping to preserve logs")
+			setupLog.Errorw("failed to initialize eBPF uprobe manager — sleeping to preserve logs", "error", err)
 			select {} // Block forever so the container doesn't restart and logs are preserved.
 		}
-		setupLog.Info("eBPF TLS uprobes enabled")
+		setupLog.Infow("eBPF TLS uprobes enabled")
 	} else {
-		setupLog.Info("eBPF disabled")
+		setupLog.Infow("eBPF disabled")
 	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -87,7 +85,7 @@ func runController(cmd *cobra.Command, args []string) {
 		HealthProbeBindAddress: controllerProbeAddr,
 	})
 	if err != nil {
-		setupLog.Error(err, "unable to start manager")
+		setupLog.Errorw("unable to start manager", "error", err)
 		os.Exit(1)
 	}
 
@@ -95,11 +93,11 @@ func runController(cmd *cobra.Command, args []string) {
 	// NODE_NAME is used to filter pods to only those on this node (DaemonSet per-node controller)
 	nodeName := os.Getenv("NODE_NAME")
 	if nodeName != "" {
-		setupLog.Info("Node filtering enabled", "nodeName", nodeName)
+		setupLog.Infow("Node filtering enabled", "nodeName", nodeName)
 	}
 	reconciler := controller.NewReconciler(
 		mgr.GetClient(),
-		ctrl.Log.WithName("controller").WithName("Pod"),
+		setupLog.Desugar().Named("controller").Named("Pod").Sugar(),
 		mgr.GetScheme(),
 		uprobeMgr,
 		cgroupPath,
@@ -107,29 +105,29 @@ func runController(cmd *cobra.Command, args []string) {
 	)
 
 	if err := reconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Pod")
+		setupLog.Errorw("unable to create controller", "error", err, "controller", "Pod")
 		os.Exit(1)
 	}
 
 	// Create secret reconciler
 	secretReconciler := &controller.SecretReconciler{
 		Client:  mgr.GetClient(),
-		Log:     ctrl.Log.WithName("controller").WithName("Secret"),
+		Log:     setupLog.Desugar().Named("controller").Named("Secret").Sugar(),
 		Scheme:  mgr.GetScheme(),
 		Storage: store,
 	}
 
 	if err := secretReconciler.SetupWithManager(mgr); err != nil {
-		setupLog.Error(err, "unable to create controller", "controller", "Secret")
+		setupLog.Errorw("unable to create controller", "error", err, "controller", "Secret")
 		os.Exit(1)
 	}
 
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up health check")
+		setupLog.Errorw("unable to set up health check", "error", err)
 		os.Exit(1)
 	}
 	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
-		setupLog.Error(err, "unable to set up ready check")
+		setupLog.Errorw("unable to set up ready check", "error", err)
 		os.Exit(1)
 	}
 
@@ -137,7 +135,7 @@ func runController(cmd *cobra.Command, args []string) {
 	if uprobeMgr != nil {
 		dnsIPs := discoverTrustedDNSServers(mgr.GetAPIReader(), setupLog)
 		if err := uprobeMgr.PopulateTrustedDNSServers(dnsIPs); err != nil {
-			setupLog.Error(err, "failed to populate trusted DNS servers")
+			setupLog.Errorw("failed to populate trusted DNS servers", "error", err)
 		}
 	}
 
@@ -147,26 +145,26 @@ func runController(cmd *cobra.Command, args []string) {
 	if uprobeMgr != nil {
 		go func() {
 			if err := uprobeMgr.PollEvents(ctx); err != nil && ctx.Err() == nil {
-				setupLog.Error(err, "eBPF TLS event poller failed")
+				setupLog.Errorw("eBPF TLS event poller failed", "error", err)
 			}
 		}()
 		go func() {
 			if err := uprobeMgr.PollExecEvents(ctx); err != nil && ctx.Err() == nil {
-				setupLog.Error(err, "eBPF process exec event poller failed")
+				setupLog.Errorw("eBPF process exec event poller failed", "error", err)
 			}
 		}()
 	}
 
-	setupLog.Info("starting manager")
+	setupLog.Infow("starting manager")
 	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Error(err, "problem running manager")
+		setupLog.Errorw("problem running manager", "error", err)
 	}
 
 	// Cleanup
 	cancel()
 	if uprobeMgr != nil {
 		if err := uprobeMgr.Close(); err != nil {
-			setupLog.Error(err, "failed to close uprobe manager")
+			setupLog.Errorw("failed to close uprobe manager", "error", err)
 		}
 	}
 }
@@ -174,7 +172,7 @@ func runController(cmd *cobra.Command, args []string) {
 // discoverTrustedDNSServers returns the list of trusted DNS server IPs.
 // Always includes the kube-dns ClusterIP (auto-discovered). If
 // --trusted-dns-servers is set, those are added too (deduplicated).
-func discoverTrustedDNSServers(reader client.Reader, log logr.Logger) []net.IP {
+func discoverTrustedDNSServers(reader client.Reader, log *zap.SugaredLogger) []net.IP {
 	seen := make(map[string]bool)
 	var ips []net.IP
 
@@ -185,7 +183,7 @@ func discoverTrustedDNSServers(reader client.Reader, log logr.Logger) []net.IP {
 		}
 		seen[key] = true
 		ips = append(ips, ip)
-		log.Info("Added trusted DNS server", "ip", key, "source", source)
+		log.Infow("Added trusted DNS server", "ip", key, "source", source)
 	}
 
 	// Always auto-discover kube-dns
@@ -195,7 +193,7 @@ func discoverTrustedDNSServers(reader client.Reader, log logr.Logger) []net.IP {
 		Namespace: "kube-system",
 	}, svc)
 	if err != nil {
-		log.Error(err, "Failed to auto-discover kube-dns service")
+		log.Errorw("Failed to auto-discover kube-dns service", "error", err)
 	} else if ip := net.ParseIP(svc.Spec.ClusterIP); ip != nil {
 		addIP(ip, "kube-dns auto-discovery")
 	}
@@ -209,7 +207,7 @@ func discoverTrustedDNSServers(reader client.Reader, log logr.Logger) []net.IP {
 			}
 			ip := net.ParseIP(s)
 			if ip == nil {
-				log.Error(nil, "Invalid trusted DNS server IP", "ip", s)
+				log.Errorw("Invalid trusted DNS server IP", "ip", s)
 				continue
 			}
 			addIP(ip, "user-configured")
@@ -217,7 +215,7 @@ func discoverTrustedDNSServers(reader client.Reader, log logr.Logger) []net.IP {
 	}
 
 	if len(ips) == 0 {
-		log.Error(nil, "No trusted DNS servers found — DNS whitelist will reject all DNS responses. "+
+		log.Errorw("No trusted DNS servers found — DNS whitelist will reject all DNS responses. " +
 			"Ensure kube-dns is running or provide --trusted-dns-servers")
 	}
 

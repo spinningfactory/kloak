@@ -8,16 +8,10 @@ import (
 	"testing"
 
 	ciliumebpf "github.com/cilium/ebpf"
-	"github.com/go-logr/logr"
-	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+	"go.uber.org/zap"
 
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
-
-func init() {
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
-}
 
 // createTestSecretMap creates a BPF hash map matching the secret_map spec.
 func createTestSecretMap(t *testing.T) *ciliumebpf.Map {
@@ -51,8 +45,8 @@ func createTestWatchedHostsMap(t *testing.T) *ciliumebpf.Map {
 	return m
 }
 
-func testLog() logr.Logger {
-	return ctrl.Log.WithName("test")
+func testLog() *zap.SugaredLogger {
+	return zap.NewNop().Sugar()
 }
 
 func TestSyncSecrets_BasicSync(t *testing.T) {
