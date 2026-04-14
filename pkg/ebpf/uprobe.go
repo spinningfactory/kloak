@@ -491,7 +491,7 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	if err := m.TrackTGID(uint32(pid)); err != nil {
 		m.log.Errorw("failed to track TGID for DNS/connect", "error", err, "pid", pid)
 	} else {
-		m.log.Debugw("Tracking TGID for DNS/connect verification", "pid", pid)
+		logging.Tracew(m.log, "tracking TGID for DNS/connect verification", "pid", pid)
 	}
 
 	// H extraction now happens in the entry uprobe via 4-step pointer chain.
@@ -540,7 +540,7 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 
 	// Scan container filesystem for all TLS shared libraries
 	containerLibs := findContainerTLSLibraries(pid)
-	m.log.Debugw("Found container TLS libraries", "pid", pid, "count", len(containerLibs), "libs", containerLibs)
+	logging.Tracew(m.log, "found container TLS libraries", "pid", pid, "count", len(containerLibs), "libs", containerLibs)
 
 	for _, containerPath := range containerLibs {
 		hostPath := fmt.Sprintf("/proc/%d/root%s", pid, containerPath)
@@ -758,7 +758,7 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 				m.log.Debugw("exec in untracked cgroup, skipping", "tgid", event.Tgid, "cgroupID", event.CgroupID)
 				continue
 			}
-			m.log.Debugw("Detected exec in tracked container, attaching uprobes", "tgid", event.Tgid, "cgroupID", event.CgroupID)
+			logging.Tracew(m.log, "detected exec in tracked container, attaching uprobes", "tgid", event.Tgid, "cgroupID", event.CgroupID)
 			if err := m.AttachTLS(int(event.Tgid)); err != nil {
 				// libssl may not be loaded yet (e.g. Python hasn't imported ssl).
 				// Retry after a delay to catch lazy-loaded libraries.

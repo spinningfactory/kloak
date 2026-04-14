@@ -17,6 +17,7 @@ import (
 
 	"github.com/spinningfactory/kloak/pkg/cgroups"
 	"github.com/spinningfactory/kloak/pkg/ebpf"
+	"github.com/spinningfactory/kloak/pkg/logging"
 )
 
 const (
@@ -209,7 +210,7 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (cg
 		return "", 0
 	}
 
-	r.Log.Debugw("Trying to attach uprobes to new container", "cgroup", cgroupID)
+	logging.Tracew(r.Log, "trying to attach uprobes to container", "cgroup", cgroupID)
 
 	// Find the container cgroup path again to read cgroup.procs
 	for i := range pod.Status.ContainerStatuses {
@@ -254,7 +255,7 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (cg
 		attachedPid := 0
 		for _, pid := range pids {
 			if err := r.UprobeManager.AttachTLS(pid); err != nil {
-				r.Log.Debugw("could not attach TLS uprobes to pid (no compatible symbols or already attached)", "pid", pid, "container", status.Name, "err", err)
+				logging.Tracew(r.Log, "could not attach TLS uprobes to pid", "pid", pid, "container", status.Name, "err", err)
 			} else {
 				r.Log.Infow("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
 				attached = true
@@ -346,7 +347,7 @@ func (r *Reconciler) getContainerCgroupIDs(pod *corev1.Pod) (map[uint64]bool, er
 				continue
 			}
 
-			r.Log.Debugw("Found container cgroup", "container", status.Name, "cgroupPath", containerCgroupPath, "cgroupID", cgroupID)
+			logging.Tracew(r.Log, "found container cgroup", "container", status.Name, "cgroupPath", containerCgroupPath, "cgroupID", cgroupID)
 			cgroupIDs[cgroupID] = true
 		}
 	}
