@@ -154,7 +154,7 @@ jobs:
   e2e:
     name: E2E Tests
     runs-on: ubuntu-latest
-    if: contains(github.event.pull_request.labels.*.name, 'e2e')
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'e2e')
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
