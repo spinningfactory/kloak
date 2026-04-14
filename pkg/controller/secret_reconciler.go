@@ -154,7 +154,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 	}
 
-	// Fetch existing shadow secret to preserve UUIDs if possible
+	// Fetch existing shadow secret to preserve ULIDs if possible
 	var existingShadow corev1.Secret
 	shadowExists := false
 	if err := r.Get(ctx, shadowNamespacedName, &existingShadow); err == nil {
