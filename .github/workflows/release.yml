@@ -88,23 +88,18 @@ jobs:
       - name: Package chart
         run: helm package charts/kloak -d .helm-pkg
 
-      - name: Download existing index
+      - name: Download existing charts from R2
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
           AWS_ENDPOINT_URL: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           AWS_REGION: auto
         run: |
-          aws s3 cp s3://kloak-chart/index.yaml .helm-pkg/existing-index.yaml 2>/dev/null || true
+          aws s3 sync s3://kloak-chart/ .helm-pkg/ --exclude "index.yaml"
 
       - name: Build repo index
         run: |
-          if [ -f .helm-pkg/existing-index.yaml ]; then
-            helm repo index .helm-pkg --url https://chart.getkloak.io --merge .helm-pkg/existing-index.yaml
-          else
-            helm repo index .helm-pkg --url https://chart.getkloak.io
-          fi
-          rm -f .helm-pkg/existing-index.yaml
+          helm repo index .helm-pkg --url https://chart.getkloak.io
 
       - name: Upload to R2
         env:
