@@ -146,7 +146,7 @@ func deployTLSEchoServer(t *testing.T) string {
 			Namespace: testNamespace,
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: labels,
+			Selector: map[string]string{"app": echoServerName},
 			Ports: []corev1.ServicePort{{
 				Port:       8443,
 				TargetPort: intstr.FromInt32(8443),

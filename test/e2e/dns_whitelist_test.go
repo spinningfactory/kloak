@@ -116,7 +116,7 @@ func deployDNSWLEchoServer(t *testing.T) (string, string) {
 			Namespace: testNamespace,
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: labels,
+			Selector: map[string]string{"app": dnsWLEchoName},
 			Ports: []corev1.ServicePort{{
 				Port:       8443,
 				TargetPort: intstr.FromInt32(8443),
@@ -247,7 +247,7 @@ func deployCustomDNS(t *testing.T, echoHost, echoIP string) string {
 			Namespace: testNamespace,
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: labels,
+			Selector: map[string]string{"app": customDNSName},
 			Ports: []corev1.ServicePort{
 				{
 					Name:       "dns-udp",
