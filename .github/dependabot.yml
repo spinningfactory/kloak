@@ -6,7 +6,7 @@ updates:
     schedule:
       interval: weekly
     reviewers:
-      - dhiaayachi
+      - spinningfactory/core
     labels:
       - dependencies
     open-pull-requests-limit: 10
@@ -17,7 +17,7 @@ updates:
     schedule:
       interval: weekly
     reviewers:
-      - dhiaayachi
+      - spinningfactory/core
     labels:
       - dependencies
       - ci
@@ -28,6 +28,6 @@ updates:
     schedule:
       interval: monthly
     reviewers:
-      - dhiaayachi
+      - spinningfactory/core
     labels:
       - dependencies
