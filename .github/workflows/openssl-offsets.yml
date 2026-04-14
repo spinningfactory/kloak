@@ -45,7 +45,7 @@ jobs:
             | tee tools/openssl-offsets/results/openssl-${{ matrix.openssl }}-${ARCH}.json
 
       - name: Upload results
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: offsets-${{ matrix.openssl }}-${{ matrix.platform == 'linux/amd64' && 'x86_64' || 'aarch64' }}
           path: tools/openssl-offsets/results/
