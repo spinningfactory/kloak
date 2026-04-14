@@ -13,11 +13,16 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 )
 
+// TraceLevel is a custom log level below Debug for very verbose output
+// (per-secret sync, BPF debug counters, etc.).
+// Enabled by KLOAK_LOG_LEVEL=trace.
+const TraceLevel = zapcore.DebugLevel - 1
+
 // Setup initializes a zap logger and configures controller-runtime to use it.
 //
 // Environment variables:
 //   - KLOAK_LOG_DEV=true: use development config (console output, colors)
-//   - KLOAK_LOG_LEVEL: override log level (debug, info, warn, error)
+//   - KLOAK_LOG_LEVEL: override log level (trace, debug, info, warn, error)
 //
 // Returns a *zap.SugaredLogger for use throughout the application.
 func Setup() *zap.SugaredLogger {
@@ -34,9 +39,13 @@ func Setup() *zap.SugaredLogger {
 
 	// Allow level override via environment variable.
 	if lvl := os.Getenv("KLOAK_LOG_LEVEL"); lvl != "" {
-		var level zapcore.Level
-		if err := level.UnmarshalText([]byte(lvl)); err == nil {
-			cfg.Level = zap.NewAtomicLevelAt(level)
+		if strings.EqualFold(lvl, "trace") {
+			cfg.Level = zap.NewAtomicLevelAt(TraceLevel)
+		} else {
+			var level zapcore.Level
+			if err := level.UnmarshalText([]byte(lvl)); err == nil {
+				cfg.Level = zap.NewAtomicLevelAt(level)
+			}
 		}
 	}
 
@@ -50,4 +59,22 @@ func Setup() *zap.SugaredLogger {
 	ctrl.SetLogger(zapr.NewLogger(zapLogger))
 
 	return zapLogger.Sugar()
+}
+
+// Tracew logs at trace level (below debug). Use for very verbose output
+// like per-secret sync details, BPF debug counters, and per-map-entry operations.
+func Tracew(log *zap.SugaredLogger, msg string, keysAndValues ...interface{}) {
+	if ce := log.Desugar().Check(TraceLevel, msg); ce != nil {
+		ce.Write(sweetenFields(keysAndValues)...)
+	}
+}
+
+// sweetenFields converts key-value pairs to zap.Fields.
+func sweetenFields(keysAndValues []interface{}) []zap.Field {
+	fields := make([]zap.Field, 0, len(keysAndValues)/2)
+	for i := 0; i < len(keysAndValues)-1; i += 2 {
+		key, _ := keysAndValues[i].(string)
+		fields = append(fields, zap.Any(key, keysAndValues[i+1]))
+	}
+	return fields
 }

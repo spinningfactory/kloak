@@ -8,6 +8,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/net/http2/hpack"
 
+	"github.com/spinningfactory/kloak/pkg/logging"
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
@@ -36,7 +37,7 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 		// The BPF program looks up the first 8 bytes.
 		// Minimum secret size is 8 bytes (kloak: + 2 UUID chars).
 		if len(shadowPrefix) < 8 {
-			log.Debugw("Skipping secret too short for BPF key", "hash", hash, "len", len(shadowPrefix))
+			logging.Tracew(log, "skipping secret too short for BPF key", "hash", hash, "len", len(shadowPrefix))
 			continue
 		}
 
@@ -50,7 +51,7 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 		var val secretValue
 		val.Len = uint32(len(entry.Value))
 		if val.Len > 128 {
-			log.Debugw("Truncating secret value to max BPF size (128)", "hash", hash)
+			logging.Tracew(log, "truncating secret value to max BPF size (128)", "hash", hash)
 			val.Len = 128
 		}
 		copy(val.RealSecret[:], []byte(entry.Value)[:val.Len])
@@ -87,7 +88,7 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 		if err := secretMap.Update(&key, &val, 0); err != nil {
 			log.Errorw("failed to update BPF secret_map", "error", err, "hash", hash)
 		} else {
-			log.Debugw("Synced secret into eBPF map", "hash", hash, "hostLen", val.HostLen, "port", val.Port, "protocol", val.Protocol)
+			logging.Tracew(log, "synced secret into eBPF map", "hash", hash, "hostLen", val.HostLen, "port", val.Port, "protocol", val.Protocol)
 		}
 
 		// Also store a Huffman-encoded variant for HTTP/2 HPACK interception.
@@ -136,13 +137,13 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 				if err := secretMap.Update(&huffKey, &huffVal, 0); err != nil {
 					log.Errorw("failed to update BPF secret_map (Huffman)", "error", err, "hash", hash)
 				} else {
-					log.Debugw("Synced Huffman secret into eBPF map", "hash", hash, "huffLen", huffLen)
+					logging.Tracew(log, "synced Huffman secret into eBPF map", "hash", hash, "huffLen", huffLen)
 				}
 			}
 		} else if len(huffShadow) >= 8 && realHuffLen > len(huffShadow) {
 			// This should not happen if the secret reconciler generates shadows
 			// with sufficient Huffman length, but log it just in case.
-			log.Debugw("Skipping HTTP/2 Huffman variant — shadow Huffman too short",
+			logging.Tracew(log, "skipping HTTP/2 Huffman variant — shadow Huffman too short",
 				"hash", hash, "shadowHuffLen", len(huffShadow), "realHuffLen", realHuffLen)
 		}
 	}
@@ -164,7 +165,7 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 		if err := secretMap.Delete(&staleKeys[i]); err != nil {
 			log.Errorw("failed to delete stale BPF secret_map entry", "error", err)
 		} else {
-			log.Debugw("Pruned stale entry from eBPF map")
+			logging.Tracew(log, "pruned stale entry from eBPF map")
 		}
 	}
 
@@ -172,6 +173,8 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, store storage.Storage, lo
 	if watchedHostsMap != nil {
 		syncWatchedHosts(watchedHostsMap, newHosts, log)
 	}
+
+	log.Debugw("secret sync complete", "secrets", len(secrets), "bpfKeys", len(newKeys), "pruned", len(staleKeys), "watchedHosts", len(newHosts))
 
 	return nil
 }
@@ -204,7 +207,7 @@ func syncWatchedHosts(watchedHostsMap *ebpf.Map, newHosts map[watchedHostKey]str
 		if err := watchedHostsMap.Delete(&staleHosts[i]); err != nil {
 			log.Errorw("failed to delete stale watched_hosts entry", "error", err)
 		} else {
-			log.Debugw("Pruned stale watched host")
+			logging.Tracew(log, "pruned stale watched host")
 		}
 	}
 }

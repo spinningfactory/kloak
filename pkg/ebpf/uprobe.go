@@ -21,6 +21,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 
+	"github.com/spinningfactory/kloak/pkg/logging"
 	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
@@ -905,7 +906,7 @@ func (m *TLSUprobeManager) DumpDebugCounters() {
 			total += v
 		}
 		if total > 0 {
-			m.log.Debugw("eBPF debug counter", "name", name, "count", total)
+			logging.Tracew(m.log, "eBPF debug counter", "name", name, "count", total)
 		}
 	}
 }
