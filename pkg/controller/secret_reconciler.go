@@ -169,7 +169,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// Recalculate all mappings, then clear old ones and store the new ones.
 	// Delete-before-store removes stale keys (e.g. a key removed from the original secret)
-	// while UUIDs are reused where possible to keep shadow values stable.
+	// while ULIDs are reused where possible to keep shadow values stable.
 
 	// Fetch all existing shadows from storage once for collision detection
 	// This avoids O(N×M) complexity from calling List() for each key
