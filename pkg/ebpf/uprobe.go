@@ -765,6 +765,13 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 				m.log.V(1).Info("first attach attempt failed, scheduling retry", "tgid", event.Tgid, "err", err)
 				go func(tgid uint32) {
 					time.Sleep(2 * time.Second)
+					// Check if process is still alive before retrying.
+					// Short-lived processes (health checks, probes) exit before
+					// the retry and produce noisy "no such file" errors.
+					if _, err := os.Stat(fmt.Sprintf("/proc/%d", tgid)); err != nil {
+						m.log.V(1).Info("process exited before retry, skipping", "tgid", tgid)
+						return
+					}
 					if err := m.AttachTLS(int(tgid)); err != nil {
 						m.log.V(1).Info("retry attach also failed", "tgid", tgid, "err", err)
 					}
