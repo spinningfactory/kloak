@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@v6
 
       - name: Set chart version
         run: |
@@ -21,7 +21,7 @@ jobs:
           sed -i "s/^appVersion:.*/appVersion: \"${VERSION}\"/" charts/kloak/Chart.yaml
 
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
 
       - name: Package chart
         run: helm package charts/kloak -d .helm-pkg

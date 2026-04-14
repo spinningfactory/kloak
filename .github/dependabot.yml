@@ -1,0 +1,33 @@
+version: 2
+updates:
+  # Go modules
+  - package-ecosystem: gomod
+    directory: /
+    schedule:
+      interval: weekly
+    reviewers:
+      - spinningfactory/core
+    labels:
+      - dependencies
+    open-pull-requests-limit: 10
+
+  # GitHub Actions
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    reviewers:
+      - spinningfactory/core
+    labels:
+      - dependencies
+      - ci
+
+  # Docker (Dockerfile base images)
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    reviewers:
+      - spinningfactory/core
+    labels:
+      - dependencies
