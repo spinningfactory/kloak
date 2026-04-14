@@ -330,10 +330,6 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 // shadow values in the provided prefix map (excluding shadows from the current secret being reconciled).
 // Returns true if a collision is detected.
 func checkCollisionsWithMap(newShadow, excludeSecretID string, existingPrefixMap map[string]map[string]struct{}) bool {
-	if len(newShadow) < ShadowPrefixLen {
-		return false
-	}
-
 	newPrefix := newShadow[:ShadowPrefixLen]
 
 	// Check if this prefix is used by other secrets
