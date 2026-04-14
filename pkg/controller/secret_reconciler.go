@@ -5,14 +5,12 @@ import (
 	"crypto/rand"
 	"fmt"
 	"math/big"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/oklog/ulid/v2"
 	"go.uber.org/zap"
 	"golang.org/x/net/http2/hpack"
-	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -43,44 +41,6 @@ const (
 	// The BPF program uses the first 8 bytes as the lookup key.
 	ShadowPrefixLen = 8
 )
-
-type PortSpec struct {
-	Port     uint16
-	Protocol uint8
-}
-
-func parsePortSpec(spec string) (PortSpec, error) {
-	spec = strings.TrimSpace(spec)
-	spec = strings.ToLower(spec)
-
-	protoStr := "tcp"
-	parts := strings.Split(spec, "/")
-	if len(parts) == 0 || len(parts) > 2 {
-		return PortSpec{}, fmt.Errorf("invalid port format: %s", spec)
-	} else if len(parts) == 2 {
-		protoStr = parts[1]
-	}
-	portStr := parts[0]
-
-	port, err := strconv.ParseUint(portStr, 10, 16)
-	if err != nil {
-		return PortSpec{}, err
-	} else if port == 0 || port > 65535 {
-		return PortSpec{}, fmt.Errorf("invalid port: %d", port)
-	}
-
-	var proto uint8
-	switch protoStr {
-	case "tcp":
-		proto = uint8(unix.IPPROTO_TCP)
-	case "udp":
-		proto = uint8(unix.IPPROTO_UDP)
-	default:
-		return PortSpec{}, fmt.Errorf("invalid proto: %s", protoStr)
-	}
-
-	return PortSpec{Port: uint16(port), Protocol: proto}, nil
-}
 
 // SecretReconciler reconciles a Secret object
 type SecretReconciler struct {
@@ -166,7 +126,8 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// Build a map of existing shadow prefixes to detect collisions with other secrets
 	// Key: 8-byte prefix, Value: set of ownerIDs that use this prefix
 	existingPrefixMap := make(map[string]map[string]struct{})
-	for _, shadow := range shadowSecrets.Items {
+	for i := range shadowSecrets.Items {
+		shadow := &shadowSecrets.Items[i]
 		ownerName := shadow.Labels["getkloak.io/owner"]
 		ownerID := shadow.Namespace + "/" + ownerName
 		for _, val := range shadow.Data {
