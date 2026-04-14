@@ -41,6 +41,10 @@ const (
 	// ValuePrefix is the prefix for generated UUID values.
 	// Must match what the eBPF program expects.
 	ValuePrefix = "kloak:"
+
+	// ShadowPrefixLen is the length of the prefix used for BPF map key collision detection.
+	// The BPF program uses the first 8 bytes as the lookup key.
+	ShadowPrefixLen = 8
 )
 
 type PortSpec struct {
@@ -135,7 +139,22 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// 4. Reconcile Shadow Secret
 	log.Info("Reconciling enabled secret")
 
-	// Fetch existing shadow secret to preserve UUIDs if possible
+	// Validate secret length: eBPF requires at least ShadowPrefixLen bytes for the BPF key lookup
+	// Short secrets cannot be processed correctly by eBPF and are not supported
+	for key, originalBytes := range secret.Data {
+		originalLen := len(originalBytes)
+		if originalLen < ShadowPrefixLen {
+			log.Info("Skipping secret with value too short for eBPF (minimum ShadowPrefixLen bytes required)",
+				"secret", req.String(),
+				"key", key,
+				"length", originalLen,
+				"minimumRequired", ShadowPrefixLen)
+			// Return early without creating shadow secret
+			return ctrl.Result{}, nil
+		}
+	}
+
+	// Fetch existing shadow secret to preserve ULIDs if possible
 	var existingShadow corev1.Secret
 	shadowExists := false
 	if err := r.Get(ctx, shadowNamespacedName, &existingShadow); err == nil {
@@ -150,9 +169,34 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// Recalculate all mappings, then clear old ones and store the new ones.
 	// Delete-before-store removes stale keys (e.g. a key removed from the original secret)
-	// while UUIDs are reused where possible to keep shadow values stable.
+	// while ULIDs are reused where possible to keep shadow values stable.
 
-	newMappings := make(map[string]string) // uuid -> original
+	// Fetch all existing shadows from storage once for collision detection
+	// This avoids O(N×M) complexity from calling List() for each key
+	allEntries, err := r.Storage.List(ctx)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list storage: %w", err)
+	}
+
+	// Build a map of existing shadow prefixes to detect collisions with other secrets
+	// Key: 8-byte prefix, Value: set of ownerIDs that use this prefix
+	existingPrefixMap := make(map[string]map[string]struct{})
+	for shadow := range allEntries {
+		if len(shadow) >= ShadowPrefixLen {
+			prefix := shadow[:ShadowPrefixLen]
+			ownerID, found, _ := r.Storage.GetOwnerID(ctx, shadow)
+			if found {
+				if existingPrefixMap[prefix] == nil {
+					existingPrefixMap[prefix] = make(map[string]struct{})
+				}
+				existingPrefixMap[prefix][ownerID] = struct{}{}
+			}
+		}
+	}
+
+	// Track all shadows in this batch to detect intra-secret collisions
+	var shadowsInBatch []string
+	newMappings := make(map[string]string) // shadow -> original
 
 	for key, originalBytes := range secret.Data {
 		originalValue := string(originalBytes)
@@ -163,19 +207,32 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		if shadowExists && len(existingShadow.Data[key]) > 0 {
 			existingVal := string(existingShadow.Data[key])
 			if strings.HasPrefix(existingVal, ValuePrefix) {
-				// Strip padding if necessary to compare/reuse the true UUID part
-				// For now, let's just use the exact existing padded string if lengths match
+				// Check if existing shadow collides with other secrets
+				// Pass secretID to exclude shadows from the current secret
 				if len(existingVal) == originalLen {
-					shadowValue = existingVal
+					if !checkCollisionsWithMap(existingVal, secretID, existingPrefixMap) {
+						// Check it doesn't collide with other keys in this same secret
+						if prefix := existingVal[:ShadowPrefixLen]; !isPrefixUsed(shadowsInBatch, prefix) {
+							shadowValue = existingVal
+						}
+					}
 				}
 			}
 		}
 
-		// Generate new if needed or if length mismatch
+		// Generate new if needed or if length mismatch or collision detected
 		if shadowValue == "" {
-			shadowValue = generateShadowValue(originalLen, originalValue)
+			var err error
+			shadowValue, err = r.generateShadowValueWithCollisionCheck(
+				originalLen, originalValue, secretID, 3, existingPrefixMap,
+			)
+			if err != nil {
+				return ctrl.Result{}, fmt.Errorf("failed to generate shadow value for key %s: %w", key, err)
+			}
 		}
 
+		// Track this shadow to detect collisions with other keys in same secret
+		shadowsInBatch = append(shadowsInBatch, shadowValue)
 		newData[key] = []byte(shadowValue)
 		newMappings[shadowValue] = originalValue
 	}
@@ -267,6 +324,61 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// checkCollisionsWithMap checks if a shadow value's 8-byte BPF prefix collides with any existing
+// shadow values in the provided prefix map (excluding shadows from the current secret being reconciled).
+// Returns true if a collision is detected.
+func checkCollisionsWithMap(newShadow, excludeSecretID string, existingPrefixMap map[string]map[string]struct{}) bool {
+	newPrefix := newShadow[:ShadowPrefixLen]
+
+	// Check if this prefix is used by other secrets
+	if owners, exists := existingPrefixMap[newPrefix]; exists {
+		for ownerID := range owners {
+			if ownerID != excludeSecretID {
+				// Collision with a different secret
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
+// generateShadowValueWithCollisionCheck creates a shadow value and ensures no 8-byte prefix collision
+// with existing secrets (excluding shadows from the current secret being reconciled).
+// It retries generation up to maxRetries times if collisions are detected.
+func (r *SecretReconciler) generateShadowValueWithCollisionCheck(
+	originalLen int,
+	realSecret string,
+	excludeSecretID string,
+	maxRetries int,
+	existingPrefixMap map[string]map[string]struct{},
+) (string, error) {
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		shadow := generateShadowValue(originalLen, realSecret)
+
+		if checkCollisionsWithMap(shadow, excludeSecretID, existingPrefixMap) {
+			r.Log.V(2).Info("8-byte BPF key collision detected, regenerating",
+				"attempt", attempt+1, "maxRetries", maxRetries,
+				"prefix", shadow[:ShadowPrefixLen])
+			continue
+		}
+
+		return shadow, nil
+	}
+
+	return "", fmt.Errorf("failed to generate unique shadow value after %d attempts", maxRetries)
+}
+
+// isPrefixUsed checks if a prefix is already used in the given shadows.
+func isPrefixUsed(shadows []string, prefix string) bool {
+	for _, shadow := range shadows {
+		if len(shadow) >= ShadowPrefixLen && shadow[:ShadowPrefixLen] == prefix {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *SecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
