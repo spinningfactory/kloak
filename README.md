@@ -25,13 +25,13 @@ Kloak transparently intercepts outbound TLS traffic in Kubernetes using eBPF upr
 
 ## Features
 
+- **No code changes** -- No SDK, no library, no application modifications. Mount a secret, make HTTPS requests, and Kloak handles the rest.
 - **Secret isolation** -- Applications only see hashed shadow values (`kloak:<UUID>`). Real secrets exist solely in eBPF maps and are injected in-kernel at TLS write time.
 - **Zero overhead** -- eBPF uprobes operate in kernel space with negligible latency impact. No userspace proxy or sidecar in the data path.
 - **Kubernetes native** -- Works with standard Kubernetes Secrets. Enable with a single label.
 - **DNS-verified host filtering** -- Secrets annotated with `getkloak.io/hosts` are only sent to destinations verified through the DNS resolution chain, preventing exfiltration to unauthorized servers.
 - **Port-based filtering** -- Secrets annotated with `getkloak.io/port` are restricted to connections on a specific destination port.
 - **Broad runtime support** -- Hooks into OpenSSL, BoringSSL, and Go's native `crypto/tls`. Works with Python, Node.js, Go, Rust, Ruby, PHP, curl, and any OpenSSL-linked runtime.
-- **No code changes** -- No SDK, no library, no application modifications. Mount a secret, make HTTPS requests, and Kloak handles the rest.
 
 ## Architecture
 
