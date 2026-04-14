@@ -2260,21 +2260,19 @@ int tp_sched_process_exec(struct trace_event_raw_sched_process_exec *ctx) {
   return 0;
 }
 
-// tp/sched/sched_process_exit: clean up stale map entries when any kubepods
-// process exits. Uses bpf_current_task_under_cgroup (same as exec handler)
-// to match all container processes — not just tracked_cgroups — so TGIDs
-// added by the broad exec handler are always cleaned up.
+// tp/sched/sched_process_exit: clean up stale map entries when any process
+// exits. Unlike the exec handler, this does NOT gate on cgroup_ancestor
+// because during container teardown the process may already be moved out
+// of the kubepods cgroup hierarchy before the exit tracepoint fires.
+// Unconditional deletes are safe — if the key doesn't exist, it's a no-op.
 SEC("tracepoint/sched/sched_process_exit")
 int tp_sched_process_exit(struct trace_event_raw_sched_process_template *ctx) {
-  if (bpf_current_task_under_cgroup(&cgroup_ancestor, 0) != 1)
-    return 0;
-
   __u32 tgid = ctx->pid;
 
-  // Clean up tracked_tgids
+  // Clean up tracked_tgids (no-op if not tracked)
   bpf_map_delete_elem(&tracked_tgids, &tgid);
 
-  // Clean up last_verified_fd
+  // Clean up last_verified_fd (no-op if not present)
   bpf_map_delete_elem(&last_verified_fd, &tgid);
 
   // Clean up ssl_fd_map entries for this tgid.
