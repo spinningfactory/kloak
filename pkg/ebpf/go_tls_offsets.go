@@ -232,6 +232,22 @@ func detectGoTLSFromDWARF(exePath string) (string, GoTLSOffsets, error) {
 		}
 	}
 
+	// Go 1.25+ non-FIPS, hardware AES: crypto/aes.gcmAsm.productTable
+	if !foundPD {
+		if pt, ok := getField(structFields, "crypto/aes.gcmAsm", "productTable"); ok {
+			pdBase = pt + 224
+			foundPD = true
+		}
+	}
+
+	// Go 1.25+ non-FIPS, software AES: crypto/cipher.gcm.productTable
+	if !foundPD {
+		if pt, ok := getField(structFields, "crypto/cipher.gcm", "productTable"); ok {
+			pdBase = pt + 224
+			foundPD = true
+		}
+	}
+
 	if foundPD {
 		// Determine target architecture from the ELF binary.
 		goarch := ""
@@ -277,6 +293,8 @@ func isGoTLSTargetStruct(name string) bool {
 		"crypto/tls.prefixNonceAEAD",
 		"crypto/tls.xorNonceAEAD",
 		"crypto/cipher.gcmAES",
+		"crypto/aes.gcmAsm",
+		"crypto/cipher.gcm",
 		"crypto/internal/fips140/aes/gcm.GCM",
 		"crypto/internal/fips140/aes/gcm.gcmPlatformData",
 	}
