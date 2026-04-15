@@ -566,7 +566,11 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		// Attach tc egress to the container's eth0 for kernel-only ciphertext
 		// patching. Required for secret rewriting.
 		if err := m.attachTCEgress(pid); err != nil {
-			m.log.Errorw("Failed to attach tc egress to container — secrets will not be rewritten", "error", err, "pid", pid)
+			if errors.Is(err, os.ErrNotExist) {
+				m.log.Debugw("Process exited before tc egress could attach", "error", err, "pid", pid)
+			} else {
+				m.log.Errorw("Failed to attach tc egress to container — secrets will not be rewritten", "error", err, "pid", pid)
+			}
 		}
 
 		return nil
