@@ -5,14 +5,12 @@ import (
 	"crypto/rand"
 	"fmt"
 	"math/big"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/oklog/ulid/v2"
 	"go.uber.org/zap"
 	"golang.org/x/net/http2/hpack"
-	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -20,8 +18,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-
-	"github.com/spinningfactory/kloak/pkg/storage"
 )
 
 const (
@@ -46,50 +42,11 @@ const (
 	ShadowPrefixLen = 8
 )
 
-type PortSpec struct {
-	Port     uint16
-	Protocol uint8
-}
-
-func parsePortSpec(spec string) (PortSpec, error) {
-	spec = strings.TrimSpace(spec)
-	spec = strings.ToLower(spec)
-
-	protoStr := "tcp"
-	parts := strings.Split(spec, "/")
-	if len(parts) == 0 || len(parts) > 2 {
-		return PortSpec{}, fmt.Errorf("invalid port format: %s", spec)
-	} else if len(parts) == 2 {
-		protoStr = parts[1]
-	}
-	portStr := parts[0]
-
-	port, err := strconv.ParseUint(portStr, 10, 16)
-	if err != nil {
-		return PortSpec{}, err
-	} else if port == 0 || port > 65535 {
-		return PortSpec{}, fmt.Errorf("invalid port: %d", port)
-	}
-
-	var proto uint8
-	switch protoStr {
-	case "tcp":
-		proto = uint8(unix.IPPROTO_TCP)
-	case "udp":
-		proto = uint8(unix.IPPROTO_UDP)
-	default:
-		return PortSpec{}, fmt.Errorf("invalid proto: %s", protoStr)
-	}
-
-	return PortSpec{Port: uint16(port), Protocol: proto}, nil
-}
-
 // SecretReconciler reconciles a Secret object
 type SecretReconciler struct {
 	client.Client
-	Log     *zap.SugaredLogger
-	Scheme  *runtime.Scheme
-	Storage storage.Storage
+	Log    *zap.SugaredLogger
+	Scheme *runtime.Scheme
 }
 
 // Reconcile handles Secret events.
@@ -126,12 +83,6 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 				}
 			}
 		}
-		// We also need to clean up Storage mappings.
-		// We use the Secret ID as the storage "podID" bucket.
-		secretID := fmt.Sprintf("%s/%s", secret.Namespace, secret.Name)
-		if err := r.Storage.Delete(ctx, secretID); err != nil {
-			log.Errorw("failed to clean up storage mappings", "error", err)
-		}
 		return ctrl.Result{}, nil
 	}
 
@@ -166,25 +117,23 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	newData := make(map[string][]byte)
 	secretID := fmt.Sprintf("%s/%s", secret.Namespace, secret.Name)
 
-	// Recalculate all mappings, then clear old ones and store the new ones.
-	// Delete-before-store removes stale keys (e.g. a key removed from the original secret)
-	// while ULIDs are reused where possible to keep shadow values stable.
-
-	// Fetch all existing shadows from storage once for collision detection
-	// This avoids O(N×M) complexity from calling List() for each key
-	allEntries, err := r.Storage.List(ctx)
-	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to list storage: %w", err)
+	// Fetch all existing shadow secrets from the informer cache for collision detection
+	var shadowSecrets corev1.SecretList
+	if err := r.List(ctx, &shadowSecrets, client.MatchingLabels{"getkloak.io/managed": "true"}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to list shadow secrets: %w", err)
 	}
 
 	// Build a map of existing shadow prefixes to detect collisions with other secrets
 	// Key: 8-byte prefix, Value: set of ownerIDs that use this prefix
 	existingPrefixMap := make(map[string]map[string]struct{})
-	for shadow := range allEntries {
-		if len(shadow) >= ShadowPrefixLen {
-			prefix := shadow[:ShadowPrefixLen]
-			ownerID, found, _ := r.Storage.GetOwnerID(ctx, shadow)
-			if found {
+	for i := range shadowSecrets.Items {
+		shadow := &shadowSecrets.Items[i]
+		ownerName := shadow.Labels["getkloak.io/owner"]
+		ownerID := shadow.Namespace + "/" + ownerName
+		for _, val := range shadow.Data {
+			shadowStr := string(val)
+			if len(shadowStr) >= ShadowPrefixLen {
+				prefix := shadowStr[:ShadowPrefixLen]
 				if existingPrefixMap[prefix] == nil {
 					existingPrefixMap[prefix] = make(map[string]struct{})
 				}
@@ -195,7 +144,6 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 
 	// Track all shadows in this batch to detect intra-secret collisions
 	var shadowsInBatch []string
-	newMappings := make(map[string]string) // shadow -> original
 
 	for key, originalBytes := range secret.Data {
 		originalValue := string(originalBytes)
@@ -233,53 +181,6 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		// Track this shadow to detect collisions with other keys in same secret
 		shadowsInBatch = append(shadowsInBatch, shadowValue)
 		newData[key] = []byte(shadowValue)
-		newMappings[shadowValue] = originalValue
-	}
-
-	// Update Storage
-	// We delete first to remove stale keys (keys removed from original secret)
-	if err := r.Storage.Delete(ctx, secretID); err != nil {
-		log.Errorw("failed to clear old storage mappings", "error", err)
-	}
-
-	for shadowVal, originalVal := range newMappings {
-		// Parse allowed hosts
-		allowedHosts := []string{"*"}
-		if hostsLabel, ok := secret.Labels[AnnotationHosts]; ok && hostsLabel != "" {
-			// Split by comma and trim spaces
-			parts := strings.Split(hostsLabel, ",")
-			allowedHosts = make([]string, 0, len(parts))
-			for _, p := range parts {
-				if trimmed := strings.TrimSpace(p); trimmed != "" {
-					allowedHosts = append(allowedHosts, trimmed)
-				}
-			}
-		}
-
-		var portSpec PortSpec
-		var err error
-		validPort := false
-		if v, ok := secret.Labels[AnnotationPort]; ok && v != "" {
-			portSpec, err = parsePortSpec(v)
-			if err != nil {
-				log.Errorw("Invalid port specification, treating as wildcard", "error", err, "secret", req.NamespacedName, "label", v)
-			} else {
-				validPort = true
-			}
-		}
-
-		entry := storage.Entry{
-			Value:        originalVal,
-			AllowedHosts: allowedHosts,
-		}
-		if validPort {
-			entry.Port = portSpec.Port
-			entry.Protocol = portSpec.Protocol
-		}
-		if err := r.Storage.Store(ctx, secretID, shadowVal, entry); err != nil {
-			log.Errorw("failed to store mapping", "error", err, "shadow", shadowVal)
-			return ctrl.Result{}, err
-		}
 	}
 
 	// Create or Update Shadow Secret

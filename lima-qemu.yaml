@@ -1,0 +1,104 @@
+# Lima VM configuration for cross-architecture eBPF development.
+#
+# Uses QEMU instead of Virtualization.framework, allowing both ARM64 and
+# AMD64 guests on Apple Silicon. Defaults to the host architecture (ARM64
+# on Apple Silicon) which runs near-native via HVF acceleration.
+#
+# Usage:
+#   limactl start --name=kloak lima-qemu.yaml          # ARM64 (default, fast)
+#   limactl start --name=kloak-amd64 lima-qemu.yaml --arch x86_64  # AMD64 (emulated, slow)
+#
+# Or via Makefile:
+#   make lima-start                    # ARM64 (default)
+#   make lima-start LIMA_ARCH=x86_64   # AMD64
+
+images:
+  - location: "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-amd64.img"
+    arch: "x86_64"
+  - location: "https://cloud-images.ubuntu.com/resolute/current/resolute-server-cloudimg-arm64.img"
+    arch: "aarch64"
+
+# VM resources — keep modest for emulated mode, adjust up for native.
+cpus: 4
+memory: "4GiB"
+disk: "20GiB"
+
+# Mount the project directory
+mounts:
+  - location: "~"
+    writable: true
+  - location: "/tmp/lima"
+    writable: true
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      apt-get update
+
+      # Core eBPF build dependencies
+      apt-get install -y \
+        clang \
+        llvm \
+        libbpf-dev \
+        build-essential \
+        pkg-config \
+        git \
+        curl \
+        docker.io
+
+      # bpftool (best-effort)
+      apt-get install -y linux-tools-common || true
+      apt-get install -y linux-tools-$(uname -r) linux-headers-$(uname -r) 2>/dev/null || \
+        echo "Kernel-specific tools not available for $(uname -r)"
+
+      # Install Go
+      GO_VERSION="1.25.1"
+      ARCH=$(dpkg --print-architecture)
+      if [ ! -d /usr/local/go ]; then
+        echo "Installing Go ${GO_VERSION}..."
+        curl -fsSL "https://golang.org/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" -o /tmp/go.tar.gz
+        tar -C /usr/local -xzf /tmp/go.tar.gz
+        rm /tmp/go.tar.gz
+      fi
+
+      ln -sf /usr/local/go/bin/go /usr/local/bin/go
+      ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
+
+      # Install Helm
+      curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+      echo "=== Installed versions ==="
+      go version
+      clang --version | head -1
+      uname -m
+      echo "=== Provision complete ==="
+
+  # Install K3s
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      if [ ! -f /usr/local/bin/k3s ]; then
+        echo "Installing K3s..."
+        curl -sfL https://get.k3s.io | sh -s - --write-kubeconfig-mode 644 --disable traefik
+      else
+        echo "K3s already installed"
+      fi
+
+hostResolver:
+  enabled: true
+
+ssh:
+  forwardAgent: true
+
+portForwards:
+  - guestPort: 6443
+    hostPort: 6443
+  - guestPort: 30443
+    hostPort: 30443
+
+# QEMU backend — ARM64 uses HVF (near-native), x86_64 uses TCG (emulated).
+vmType: "qemu"
