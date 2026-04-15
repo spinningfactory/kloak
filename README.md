@@ -33,6 +33,49 @@ Kloak transparently intercepts outbound TLS traffic in Kubernetes using eBPF upr
 - **Port-based filtering** -- Secrets annotated with `getkloak.io/port` are restricted to connections on a specific destination port.
 - **Broad runtime support** -- Hooks into OpenSSL, BoringSSL, and Go's native `crypto/tls`. Works with Python, Node.js, Go, Rust, Ruby, PHP, curl, and any OpenSSL-linked runtime.
 
+## Quick Start
+
+### Prerequisites
+
+- Kubernetes cluster (1.28+) with Linux kernel 5.17+
+- [Helm](https://helm.sh/docs/intro/install/) 3.12+
+- `kubectl` configured with cluster access
+
+### Install with Helm
+
+```bash
+helm repo add kloak https://chart.getkloak.io
+helm repo update
+
+helm install kloak kloak/kloak -n kloak-system --create-namespace
+
+kubectl get pods -n kloak-system
+```
+
+### Labels and Annotations
+
+| Key | Type | Scope | Description |
+|-----|------|-------|-------------|
+| `getkloak.io/enabled=true` | Label | Secret, Namespace, Pod | Enables Kloak for the target resource. On namespaces and pods, controls webhook scope. On secrets, triggers shadow secret creation. |
+| `getkloak.io/hosts=host1,host2` | Annotation | Secret | Restricts which destination hosts a secret can be sent to |
+| `getkloak.io/port=443` | Annotation | Secret | Restricts which destination port a secret can be sent to |
+| `getkloak.io/managed=true` | Label | Secret | Marks shadow secrets created by Kloak (do not set manually) |
+
+### Try the Demo
+
+```bash
+# Full demo: creates a Lima VM with K3s, deploys Kloak and sample apps
+./examples/setup-demo.sh
+
+export KUBECONFIG=/tmp/kloak-k3s.yaml
+
+# View logs (should show real secrets in httpbin.org responses)
+kubectl logs -f -l app=demo-python -n kloak-demo -c demo-app
+
+# Cleanup
+./examples/destroy-demo.sh
+```
+
 ## Architecture
 
 Kloak consists of a control plane (controller + webhook) and an eBPF data plane that runs entirely in kernel space.
@@ -186,49 +229,6 @@ Authorization: Bearer kloak:a1b2c3d4-e5f6-7890
 
 # What leaves the node (after eBPF rewrite):
 Authorization: Bearer sk-live-xyz123
-```
-
-## Quick Start
-
-### Prerequisites
-
-- Kubernetes cluster (1.28+) with Linux kernel 5.17+
-- [Helm](https://helm.sh/docs/intro/install/) 3.12+
-- `kubectl` configured with cluster access
-
-### Install with Helm
-
-```bash
-helm repo add kloak https://chart.getkloak.io
-helm repo update
-
-helm install kloak kloak/kloak -n kloak-system --create-namespace
-
-kubectl get pods -n kloak-system
-```
-
-### Labels and Annotations
-
-| Key | Type | Scope | Description |
-|-----|------|-------|-------------|
-| `getkloak.io/enabled=true` | Label | Secret, Namespace, Pod | Enables Kloak for the target resource. On namespaces and pods, controls webhook scope. On secrets, triggers shadow secret creation. |
-| `getkloak.io/hosts=host1,host2` | Annotation | Secret | Restricts which destination hosts a secret can be sent to |
-| `getkloak.io/port=443` | Annotation | Secret | Restricts which destination port a secret can be sent to |
-| `getkloak.io/managed=true` | Label | Secret | Marks shadow secrets created by Kloak (do not set manually) |
-
-### Try the Demo
-
-```bash
-# Full demo: creates a Lima VM with K3s, deploys Kloak and sample apps
-./examples/setup-demo.sh
-
-export KUBECONFIG=/tmp/kloak-k3s.yaml
-
-# View logs (should show real secrets in httpbin.org responses)
-kubectl logs -f -l app=demo-python -n kloak-demo -c demo-app
-
-# Cleanup
-./examples/destroy-demo.sh
 ```
 
 ## Development
