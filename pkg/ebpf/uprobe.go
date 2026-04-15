@@ -617,19 +617,13 @@ func (m *TLSUprobeManager) pushGoTLSOffsets(pid int) {
 	exePath := fmt.Sprintf("/proc/%d/exe", pid)
 
 	// DetectGoTLSOffsets tries DWARF first, then falls back to version-based lookup.
-	version, offsets, err := DetectGoTLSOffsets(exePath)
+	version, offsets, source, err := DetectGoTLSOffsets(exePath)
 	if err != nil {
 		m.log.Errorw("Go TLS offset detection failed — Go secrets will NOT be rewritten", "error", err, "pid", pid)
 		return
 	}
 
-	// Detect if DWARF was available by trying it separately. If DWARF fails,
-	// we're using the version-based fallback which only has FIPS offsets.
-	// Non-FIPS binaries with stripped DWARF will get wrong offsets silently.
-	_, _, dwarfErr := detectGoTLSFromDWARF(exePath)
-	source := "DWARF"
-	if dwarfErr != nil {
-		source = "version-table"
+	if source == "version-table" {
 		m.log.Warnw("Go TLS offsets from version table (DWARF unavailable) — assumes FIPS build; non-FIPS binaries may fail",
 			"pid", pid, "goVersion", version)
 	}

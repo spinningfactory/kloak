@@ -81,15 +81,20 @@ func goTLSOffsetsForArch(entry goTLSOffsetEntry, goarch string) GoTLSOffsets {
 
 // DetectGoTLSOffsets reads a Go binary and returns the struct offsets needed
 // for H extraction. Tries DWARF first, then falls back to version-based lookup.
-func DetectGoTLSOffsets(exePath string) (version string, offsets GoTLSOffsets, err error) {
+// The source return indicates how offsets were obtained ("dwarf" or "version-table").
+func DetectGoTLSOffsets(exePath string) (version string, offsets GoTLSOffsets, source string, err error) {
 	// Try DWARF-based detection first.
 	version, offsets, err = detectGoTLSFromDWARF(exePath)
 	if err == nil {
-		return version, offsets, nil
+		return version, offsets, "dwarf", nil
 	}
 
 	// Fall back to buildinfo version lookup.
-	return detectGoTLSByVersion(exePath)
+	version, offsets, err = detectGoTLSByVersion(exePath)
+	if err != nil {
+		return "", GoTLSOffsets{}, "", err
+	}
+	return version, offsets, "version-table", nil
 }
 
 func detectGoTLSByVersion(exePath string) (string, GoTLSOffsets, error) {
@@ -216,18 +221,21 @@ func detectGoTLSFromDWARF(exePath string) (string, GoTLSOffsets, error) {
 	// The two 64-bit words are in different order on AMD64 vs ARM64.
 	pdBase, foundPD := uint32(0), false
 
+	// H×2 is stored at entry 14 within productTable (each entry is 16 bytes).
+	const h2ProductTableOffset = 224
+
 	// Go 1.24+: GCM.gcmPlatformData → gcmPlatformData.productTable
 	gcmPD, okPD := getField(structFields, "crypto/internal/fips140/aes/gcm.GCM", "gcmPlatformData")
 	pdPT, okPT := getField(structFields, "crypto/internal/fips140/aes/gcm.gcmPlatformData", "productTable")
 	if okPD && okPT {
-		pdBase = gcmPD + pdPT + 224 // H×2 at entry 14 (offset 224 within productTable)
+		pdBase = gcmPD + pdPT + h2ProductTableOffset
 		foundPD = true
 	}
 
 	// Go <1.24: crypto/cipher.gcmAES.productTable
 	if !foundPD {
 		if pt, ok := getField(structFields, "crypto/cipher.gcmAES", "productTable"); ok {
-			pdBase = pt + 224
+			pdBase = pt + h2ProductTableOffset
 			foundPD = true
 		}
 	}
@@ -235,7 +243,7 @@ func detectGoTLSFromDWARF(exePath string) (string, GoTLSOffsets, error) {
 	// Go 1.25+ non-FIPS, hardware AES: crypto/aes.gcmAsm.productTable
 	if !foundPD {
 		if pt, ok := getField(structFields, "crypto/aes.gcmAsm", "productTable"); ok {
-			pdBase = pt + 224
+			pdBase = pt + h2ProductTableOffset
 			foundPD = true
 		}
 	}
@@ -243,7 +251,7 @@ func detectGoTLSFromDWARF(exePath string) (string, GoTLSOffsets, error) {
 	// Go 1.25+ non-FIPS, software AES: crypto/cipher.gcm.productTable
 	if !foundPD {
 		if pt, ok := getField(structFields, "crypto/cipher.gcm", "productTable"); ok {
-			pdBase = pt + 224
+			pdBase = pt + h2ProductTableOffset
 			foundPD = true
 		}
 	}
