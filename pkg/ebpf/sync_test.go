@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -97,7 +98,7 @@ func TestSyncSecrets_BasicSync(t *testing.T) {
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
 
-	if err := syncSecrets(m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -128,7 +129,7 @@ func TestSyncSecrets_MinLength(t *testing.T) {
 			map[string][]byte{"api-key": []byte("kloak:")}),
 	)
 
-	if err := syncSecrets(m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -152,7 +153,7 @@ func TestSyncSecrets_Truncation(t *testing.T) {
 			map[string][]byte{"api-key": []byte(longShadow)}),
 	)
 
-	if err := syncSecrets(m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -178,7 +179,7 @@ func TestSyncSecrets_HostFilter(t *testing.T) {
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
 
-	if err := syncSecrets(m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -208,7 +209,7 @@ func TestSyncSecrets_WildcardHost(t *testing.T) {
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
 
-	if err := syncSecrets(m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -234,7 +235,7 @@ func TestSyncSecrets_StaleEntryPruning(t *testing.T) {
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
-	if err := syncSecrets(m, nil, reader1, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, reader1, testLog()); err != nil {
 		t.Fatalf("first sync failed: %v", err)
 	}
 
@@ -248,7 +249,7 @@ func TestSyncSecrets_StaleEntryPruning(t *testing.T) {
 
 	// Remove the enabled secret (simulate deletion) and sync again with empty client
 	reader2 := newFakeClient()
-	if err := syncSecrets(m, nil, reader2, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, reader2, testLog()); err != nil {
 		t.Fatalf("second sync failed: %v", err)
 	}
 
@@ -268,7 +269,7 @@ func TestSyncSecrets_Update(t *testing.T) {
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
-	if err := syncSecrets(m, nil, reader1, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, reader1, testLog()); err != nil {
 		t.Fatalf("first sync failed: %v", err)
 	}
 
@@ -279,7 +280,7 @@ func TestSyncSecrets_Update(t *testing.T) {
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
-	if err := syncSecrets(m, nil, reader2, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, reader2, testLog()); err != nil {
 		t.Fatalf("second sync failed: %v", err)
 	}
 
@@ -306,7 +307,7 @@ func TestSyncSecrets_FullPrefix(t *testing.T) {
 			map[string][]byte{"api-key": []byte(shadow)}),
 	)
 
-	if err := syncSecrets(m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -342,7 +343,7 @@ func TestSyncSecrets_WatchedHostsSync(t *testing.T) {
 			map[string][]byte{"api-key": []byte("kloak:efgh5678-1234-5678")}),
 	)
 
-	if err := syncSecrets(m, wh, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, wh, reader, testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -373,7 +374,7 @@ func TestSyncSecrets_WatchedHostsPruning(t *testing.T) {
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
-	if err := syncSecrets(m, wh, reader1, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, wh, reader1, testLog()); err != nil {
 		t.Fatalf("first sync failed: %v", err)
 	}
 
@@ -387,7 +388,7 @@ func TestSyncSecrets_WatchedHostsPruning(t *testing.T) {
 
 	// Remove secret and sync again
 	reader2 := newFakeClient()
-	if err := syncSecrets(m, wh, reader2, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, wh, reader2, testLog()); err != nil {
 		t.Fatalf("second sync failed: %v", err)
 	}
 
@@ -400,7 +401,7 @@ func TestSyncSecrets_WatchedHostsPruning(t *testing.T) {
 func TestSyncSecrets_NilReader(t *testing.T) {
 	m := createTestSecretMap(t)
 	// syncSecrets should return nil when reader is nil
-	if err := syncSecrets(m, nil, nil, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, nil, testLog()); err != nil {
 		t.Fatalf("syncSecrets with nil reader should not error: %v", err)
 	}
 }

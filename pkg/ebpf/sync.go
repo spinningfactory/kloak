@@ -16,17 +16,27 @@ import (
 	"github.com/spinningfactory/kloak/pkg/logging"
 )
 
-func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, reader client.Reader, log *zap.SugaredLogger) error {
+func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, reader client.Reader, log *zap.SugaredLogger) error {
 	if reader == nil {
 		return nil
 	}
 
-	ctx := context.Background()
-
-	// List all secrets with the enabled label
+	// List all enabled secrets and all shadow secrets in one pass each
 	var enabledSecrets corev1.SecretList
 	if err := reader.List(ctx, &enabledSecrets, client.MatchingLabels{"getkloak.io/enabled": "true"}); err != nil {
 		return fmt.Errorf("failed to list enabled secrets: %w", err)
+	}
+
+	var shadowSecrets corev1.SecretList
+	if err := reader.List(ctx, &shadowSecrets, client.MatchingLabels{"getkloak.io/managed": "true"}); err != nil {
+		return fmt.Errorf("failed to list shadow secrets: %w", err)
+	}
+
+	// Build shadow lookup map: "namespace/name-kloak" -> *Secret
+	shadowMap := make(map[string]*corev1.Secret, len(shadowSecrets.Items))
+	for i := range shadowSecrets.Items {
+		s := &shadowSecrets.Items[i]
+		shadowMap[s.Namespace+"/"+s.Name] = s
 	}
 
 	// newKeys tracks which keys we upsert so we can prune stale entries afterwards.
@@ -37,10 +47,10 @@ func syncSecrets(secretMap, watchedHostsMap *ebpf.Map, reader client.Reader, log
 	for i := range enabledSecrets.Items {
 		secret := &enabledSecrets.Items[i]
 
-		// Get the corresponding shadow secret
-		var shadowSecret corev1.Secret
+		// Look up the corresponding shadow secret from the pre-built map
 		shadowName := secret.Name + "-kloak"
-		if err := reader.Get(ctx, client.ObjectKey{Name: shadowName, Namespace: secret.Namespace}, &shadowSecret); err != nil {
+		shadowSecret, ok := shadowMap[secret.Namespace+"/"+shadowName]
+		if !ok {
 			logging.Tracew(log, "shadow secret not found, skipping", "secret", secret.Name, "namespace", secret.Namespace)
 			continue
 		}

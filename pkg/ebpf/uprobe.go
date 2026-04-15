@@ -780,7 +780,7 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 	m.log.Infow("Starting eBPF TLS event poller and secret syncer")
 
 	// Trigger an initial sync
-	m.syncSecretsToBPF()
+	m.syncSecretsToBPF(ctx)
 
 	// Periodic re-sync ticker. The initial sync may have found an empty store
 	// (secret reconciler hasn't run yet), so we must keep re-syncing.
@@ -792,7 +792,7 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-syncTicker.C:
-			m.syncSecretsToBPF()
+			m.syncSecretsToBPF(ctx)
 			m.DumpDebugCounters()
 		default:
 		}
@@ -869,8 +869,8 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 
 // syncSecretsToBPF updates the eBPF map with the latest shadow secret values
 // and the watched_hosts map with hostnames from secret entries.
-func (m *TLSUprobeManager) syncSecretsToBPF() {
-	if err := syncSecrets(m.objs.SecretMap, m.objs.WatchedHosts, m.k8sReader, m.log); err != nil {
+func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
+	if err := syncSecrets(ctx, m.objs.SecretMap, m.objs.WatchedHosts, m.k8sReader, m.log); err != nil {
 		m.log.Errorw("failed to sync secrets to BPF map", "error", err)
 	}
 }
