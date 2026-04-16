@@ -587,7 +587,9 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 	// Try shared libraries first, then the main executable.
 	// Statically linked OpenSSL (e.g., Node.js) won't have shared libs
 	// but the main exe contains the version string and uses the same offsets.
-	paths := append(containerLibs, fmt.Sprintf("/proc/%d/exe", pid))
+	paths := make([]string, len(containerLibs)+1)
+	copy(paths, containerLibs)
+	paths[len(containerLibs)] = fmt.Sprintf("/proc/%d/exe", pid)
 
 	for _, libPath := range paths {
 		version, offsets, err := DetectOpenSSLVersion(pid, libPath)
