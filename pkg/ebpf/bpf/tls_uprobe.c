@@ -544,6 +544,7 @@ struct tc_pending_val {
   __u8  active;
   __u8  _pad[3];
   __u32 plaintext_len;      // SSL_write data length (for TLS version detection)
+  __u32 write_seq;          // TCP write_seq at time of tcp_sendmsg — identifies the exact segment
 };
 
 // Holds all large structs and buffers that would otherwise exceed the 512-byte
@@ -2018,11 +2019,19 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
   if (!pending) return 0;
 
+  // Read TCP write_seq to identify the exact segment in tc_egress.
+  // tcp_sendmsg appends data starting at write_seq. The tc_egress program
+  // checks that tcp->seq falls within this range before patching.
+  __u32 wseq = 0;
+  bpf_probe_read_kernel(&wseq, sizeof(wseq),
+                        (void *)sk + offsetof(struct tcp_sock, write_seq));
+
   __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
   w->staged_tc.tgid = tgid;
   w->staged_tc.ssl_ptr = ssl_ptr;
   w->staged_tc.active = 1;
   w->staged_tc.plaintext_len = plaintext_len;
+  w->staged_tc.write_seq = wseq;
   w->staged_tc.patch_count = pending->patch_count;
   if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
     w->staged_tc.patch_count = XOR_MAX_PATCHES;
@@ -2358,6 +2367,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
 
   // Save header fields to locals before helper calls invalidate direct pointers.
   __u16 sport = tcp->source;
+  __u32 pkt_seq = __bpf_ntohl(tcp->seq);
 
   // Read the original (pre-DNAT) destination IP from the socket, not the packet.
   // For cluster services, iptables/kube-proxy DNATs the packet's dst_ip to the
@@ -2413,6 +2423,23 @@ int tc_egress_patch(struct __sk_buff *skb) {
 #endif
     return 0 /* TC_ACT_OK */;
   }
+
+  // TCP sequence check: only patch the segment that contains the password data.
+  // write_seq was captured in the kprobe at the moment the password was queued
+  // into the TCP send buffer. Skip segments from earlier writes (e.g., TLS
+  // Finished, StartupMessage) that share the same connection key.
+  if (pending->write_seq > 0) {
+    __u32 pkt_end = pkt_seq + payload_len;
+    // write_seq points to the START of the password TLS record in the stream.
+    // The segment must contain this offset: pkt_seq <= write_seq < pkt_end.
+    if (pkt_seq > pending->write_seq || pkt_end <= pending->write_seq) {
+#ifdef KLOAK_DEBUG
+      bpf_printk("kloak [3-TC] SEQ-SKIP pkt=%u ws=%u", pkt_seq, pending->write_seq);
+#endif
+      return 0 /* TC_ACT_OK */; // wrong segment — keep tc_pending active
+    }
+  }
+
 #ifdef KLOAK_DEBUG
   bpf_printk("kloak [3-TC] HIT sport=%u cg=%x", __bpf_ntohs(sport), (__u32)key.cgroup_id);
 #endif
