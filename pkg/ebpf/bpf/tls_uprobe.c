@@ -2500,7 +2500,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
       if (bpf_skb_load_bytes(skb, scan_off, hdr, 5) < 0) break;
       if (hdr[0] != 0x17 || hdr[1] != 0x03 || hdr[2] > 0x03) break;
       __u16 rlen = ((__u16)hdr[3] << 8) | (__u16)hdr[4];
-      if (rlen < 24) break;
+      if (rlen < 17) break; // TLS 1.3 minimum: 0 plaintext + 1 content_type + 16 tag
       if (rlen == expected_reclen) {
         payload_off = scan_off;
         record_len = rlen;
