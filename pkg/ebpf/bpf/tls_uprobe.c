@@ -1448,13 +1448,23 @@ int bpf_h_extract(void *ctx) {
   if (!offsets || offsets->ssl_to_wrl == 0)
     return 0;
 
-  // 4-step pointer chase: SSL* → wrl* → enc_ctx* → algctx* → H
+  // Pointer chase: 4-hop (3.2+) or 3-hop (3.0-3.1).
+  // wrl_to_enc_ctx == 0 signals 3-hop (ssl_to_wrl stores enc_write_ctx).
   __u64 wrl_ptr = 0;
-  if (bpf_probe_read_user(&wrl_ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !wrl_ptr)
-    return 0;
-  __u64 ptr = wrl_ptr;
-  if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
-    return 0;
+  __u64 ptr = 0;
+  if (offsets->wrl_to_enc_ctx > 0) {
+    // 4-hop: SSL → wrl → enc_ctx
+    if (bpf_probe_read_user(&wrl_ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !wrl_ptr)
+      return 0;
+    ptr = wrl_ptr;
+    if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
+      return 0;
+  } else {
+    // 3-hop: SSL → enc_write_ctx
+    if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
+      return 0;
+  }
+  // Common tail: enc_ctx → algctx → H
   if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr)
     return 0;
 
@@ -1963,17 +1973,28 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
       bpf_probe_read_user(&go_tls_ver, 2, (void *)(ssl_ptr + go_off->conn_vers_off));
     new_conn.nonce_len = (go_tls_ver >= 0x0304) ? 0 : 8;
   } else {
-    // OpenSSL/BoringSSL: 4-hop pointer chain from SSL* to H.
+    // OpenSSL/BoringSSL pointer chain from SSL* to H.
+    // 4-hop (3.2+): SSL → wrl → enc_ctx → algctx → H
+    // 3-hop (3.0-3.1): SSL → enc_write_ctx → algctx → H
+    // wrl_to_enc_ctx == 0 signals 3-hop mode (ssl_to_wrl stores enc_write_ctx).
     struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &zero);
     if (!offsets || offsets->ssl_to_wrl == 0)
       return 0;
 
     __u64 ptr = 0;
-    if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
-      return 0;
-    wrl_val = ptr;
-    if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
-      return 0;
+    if (offsets->wrl_to_enc_ctx > 0) {
+      // 4-hop: SSL → wrl → enc_ctx
+      if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
+        return 0;
+      wrl_val = ptr;
+      if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
+        return 0;
+    } else {
+      // 3-hop: SSL → enc_write_ctx (ssl_to_wrl stores enc_write_ctx offset)
+      if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
+        return 0;
+    }
+    // Common tail: enc_ctx → algctx → H
     if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr)
       return 0;
     if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0)

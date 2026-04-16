@@ -112,8 +112,13 @@ cat <<EOF
     "PROV_GCM_CTX": ${SIZEOF_PROV_GCM:-null}
   },
   "kloak_config": {
-    "SSLToWRL": ${SSL_TO_WRL:-null},
-    "WRLToEncCtx": ${WRL_TO_ENC_CTX:-null},
+$(if [ "$CHAIN" = "3-hop" ]; then
+    echo "    \"SSLToWRL\": ${SSL_TO_ENC_WRITE_CTX:-null},"
+    echo "    \"WRLToEncCtx\": 0,"
+else
+    echo "    \"SSLToWRL\": ${SSL_TO_WRL:-null},"
+    echo "    \"WRLToEncCtx\": ${WRL_TO_ENC_CTX:-null},"
+fi)
     "EncCtxToAlgctx": ${ENC_CTX_TO_ALGCTX:-null},
     "AlgctxToH": ${ALGCTX_TO_H:-null}
   }
