@@ -1506,7 +1506,7 @@ int bpf_xor_path(void *ctx) {
 
   __u32 mi = sd->xor_current_match;
   if (mi >= sd->xor_match_count || mi >= XOR_MAX_MATCHES)
-    goto finalize;
+    return 0; // No matches to process — bail without touching stale staged_pending.
 
   // Initialize staged_pending on first invocation.
   if (mi == 0) {
@@ -1605,7 +1605,6 @@ next:
     bpf_tail_call(ctx, &prog_array, 1); // Tail-call back to xor_path.
   }
 
-finalize:;
   // All matches processed. Store patches in xor_pending keyed by pid_tgid.
   // The tcp_sendmsg kprobe will bridge this to tc_pending with the per-connection
   // (dst_ip, src_port) key that tc egress can look up from the packet headers.
