@@ -2022,9 +2022,9 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   // Read TCP write_seq to identify the exact segment in tc_egress.
   // tcp_sendmsg appends data starting at write_seq. The tc_egress program
   // checks that tcp->seq falls within this range before patching.
+  // Use BPF_CORE_READ for kernel version portability (tcp_sock layout varies).
   __u32 wseq = 0;
-  bpf_probe_read_kernel(&wseq, sizeof(wseq),
-                        (void *)sk + offsetof(struct tcp_sock, write_seq));
+  BPF_CORE_READ_INTO(&wseq, (struct tcp_sock *)sk, write_seq);
 
   __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
   w->staged_tc.tgid = tgid;
