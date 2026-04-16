@@ -16,6 +16,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
+	"sigs.k8s.io/controller-runtime/pkg/manager"
 
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/ebpf"
@@ -138,20 +139,24 @@ func runController(cmd *cobra.Command, args []string) {
 		}
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
-	// Start eBPF TLS event poller (syncs secrets to BPF map and reads events)
+	// Register eBPF pollers as manager runnables so they start after the
+	// informer cache is synced. Starting them before mgr.Start() would cause
+	// "cache is not started" errors when syncing secrets to the BPF map.
 	if uprobeMgr != nil {
-		go func() {
-			if err := uprobeMgr.PollEvents(ctx); err != nil && ctx.Err() == nil {
-				setupLog.Errorw("eBPF TLS event poller failed", "error", err)
-			}
-		}()
-		go func() {
-			if err := uprobeMgr.PollExecEvents(ctx); err != nil && ctx.Err() == nil {
-				setupLog.Errorw("eBPF process exec event poller failed", "error", err)
-			}
-		}()
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			return uprobeMgr.PollEvents(ctx)
+		})); err != nil {
+			setupLog.Errorw("unable to add eBPF event poller runnable", "error", err)
+			_ = setupLog.Sync()
+			os.Exit(1)
+		}
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			return uprobeMgr.PollExecEvents(ctx)
+		})); err != nil {
+			setupLog.Errorw("unable to add eBPF exec event poller runnable", "error", err)
+			_ = setupLog.Sync()
+			os.Exit(1)
+		}
 	}
 
 	setupLog.Infow("starting manager")
@@ -160,7 +165,6 @@ func runController(cmd *cobra.Command, args []string) {
 	}
 
 	// Cleanup
-	cancel()
 	if uprobeMgr != nil {
 		if err := uprobeMgr.Close(); err != nil {
 			setupLog.Errorw("failed to close uprobe manager", "error", err)

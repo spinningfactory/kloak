@@ -22,6 +22,7 @@ type TLSOffsets struct {
 	WRLToEncCtx    uint32 // wrl* + off → EVP_CIPHER_CTX* (pointer deref)
 	EncCtxToAlgctx uint32 // enc_ctx* + off → algctx/PROV_GCM_CTX* (pointer deref)
 	AlgctxToH      uint32 // algctx* + off → H (16 bytes, direct read)
+	SSLToVersion   uint32 // SSL_CONNECTION* + off → int version (0=unknown, use heuristic)
 }
 
 // opensslOffsetTable maps OpenSSL major.minor version strings to their TLS
@@ -68,7 +69,12 @@ var opensslOffsetTable = map[string]TLSOffsets{
 // The library is accessed via /proc/<pid>/root/<libPath> to reach into
 // the container's overlay filesystem.
 func DetectOpenSSLVersion(pid int, libPath string) (version string, offsets TLSOffsets, err error) {
-	hostPath := fmt.Sprintf("/proc/%d/root%s", pid, libPath)
+	// If libPath is already an absolute host path (e.g., /proc/PID/exe),
+	// use it directly. Otherwise, prefix with /proc/PID/root for container paths.
+	hostPath := libPath
+	if !strings.HasPrefix(libPath, "/proc/") {
+		hostPath = fmt.Sprintf("/proc/%d/root%s", pid, libPath)
+	}
 
 	f, err := elf.Open(hostPath)
 	if err != nil {

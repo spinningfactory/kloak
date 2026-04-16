@@ -579,11 +579,19 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
 }
 
-// pushTLSOffsets detects the OpenSSL version in the container's TLS libraries
-// and pushes struct offsets to the tls_offset_config BPF map. This enables the
-// XOR-patch path for TLS 1.3 AES-GCM connections.
+// pushTLSOffsets detects the OpenSSL version from the container's TLS libraries
+// or the main executable (for statically linked OpenSSL) and pushes struct
+// offsets to the tls_offset_config BPF map. This enables the XOR-patch path
+// for AES-GCM connections.
 func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
-	for _, libPath := range containerLibs {
+	// Try shared libraries first, then the main executable.
+	// Statically linked OpenSSL (e.g., Node.js) won't have shared libs
+	// but the main exe contains the version string and uses the same offsets.
+	paths := make([]string, len(containerLibs)+1)
+	copy(paths, containerLibs)
+	paths[len(containerLibs)] = fmt.Sprintf("/proc/%d/exe", pid)
+
+	for _, libPath := range paths {
 		version, offsets, err := DetectOpenSSLVersion(pid, libPath)
 		if err != nil {
 			m.log.Debugw("OpenSSL version detection skipped", "lib", libPath, "reason", err)
@@ -597,6 +605,7 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 			WRLToEncCtx    uint32
 			EncCtxToAlgctx uint32
 			AlgctxToH      uint32
+			SSLToVersion   uint32
 		}
 		val := bpfTLSOffsets(offsets)
 		if err := m.objs.TlsOffsetConfig.Update(uint32(0), &val, 0); err != nil {

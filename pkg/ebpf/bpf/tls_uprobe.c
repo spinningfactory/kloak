@@ -433,7 +433,7 @@ struct tls_conn_state {
   __u8  h_powers[16][16];    // H^(2^i) for i=0..10 (padded to 16 for bitmask bounds)
   __u16 cipher_type;        // KLOAK_CIPHER_AES_GCM or KLOAK_CIPHER_UNKNOWN
   __u8  h_powers_ready;      // 1 = userspace has pushed precomputed H powers
-  __u8  _pad[1];
+  __u8  nonce_len;           // 0 = TLS 1.3, 8 = TLS 1.2, 0xFF = unknown (use heuristic)
   __u64 wrl_ptr;             // cached first pointer in chain — changes on session recycle
 };
 
@@ -485,6 +485,7 @@ struct tls_offsets {
   __u32 wrl_to_enc_ctx;     // wrl* + off → EVP_CIPHER_CTX* (pointer deref)
   __u32 enc_ctx_to_algctx;  // enc_ctx* + off → algctx/PROV_GCM_CTX* (pointer deref)
   __u32 algctx_to_h;        // algctx* + off → H (16 bytes, direct read)
+  __u32 ssl_to_version;     // SSL_CONNECTION* + off → int version (direct read, 0=unknown)
 };
 
 struct {
@@ -516,6 +517,7 @@ struct go_tls_offsets {
   __u32 aead_iface_off;   // wrapper + off → inner aead interface data_ptr
   __u32 h2_hi_off;        // GCM* + off → high 64 bits of H×2 (byte-swapped, arch-dependent)
   __u32 h2_lo_off;        // GCM* + off → low 64 bits of H×2 (byte-swapped, arch-dependent)
+  __u32 conn_vers_off;    // Conn* + off → uint16 negotiated TLS version (e.g. 0x0303, 0x0304)
 };
 
 struct {
@@ -542,6 +544,7 @@ struct tc_pending_val {
   __u8  active;
   __u8  _pad[3];
   __u32 plaintext_len;      // SSL_write data length (for TLS version detection)
+  __u32 write_seq;          // TCP write_seq at time of tcp_sendmsg — identifies the exact segment
 };
 
 // Holds all large structs and buffers that would otherwise exceed the 512-byte
@@ -1503,7 +1506,7 @@ int bpf_xor_path(void *ctx) {
 
   __u32 mi = sd->xor_current_match;
   if (mi >= sd->xor_match_count || mi >= XOR_MAX_MATCHES)
-    goto finalize;
+    return 0; // No matches to process — bail without touching stale staged_pending.
 
   // Initialize staged_pending on first invocation.
   if (mi == 0) {
@@ -1602,7 +1605,6 @@ next:
     bpf_tail_call(ctx, &prog_array, 1); // Tail-call back to xor_path.
   }
 
-finalize:;
   // All matches processed. Store patches in xor_pending keyed by pid_tgid.
   // The tcp_sendmsg kprobe will bridge this to tc_pending with the per-connection
   // (dst_ip, src_port) key that tc egress can look up from the packet headers.
@@ -1953,6 +1955,13 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     *(__u64 *)&new_conn.ghash_h[8] = __builtin_bswap64(lo);
 
     new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
+
+    // Read negotiated TLS version from Conn.vers for nonce_len determination.
+    // TLS 1.3 (0x0304) has no explicit nonce; TLS 1.2 (0x0303) has 8-byte nonce.
+    __u16 go_tls_ver = 0;
+    if (go_off->conn_vers_off > 0)
+      bpf_probe_read_user(&go_tls_ver, 2, (void *)(ssl_ptr + go_off->conn_vers_off));
+    new_conn.nonce_len = (go_tls_ver >= 0x0304) ? 0 : 8;
   } else {
     // OpenSSL/BoringSSL: 4-hop pointer chain from SSL* to H.
     struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &zero);
@@ -1978,6 +1987,17 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 
     new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
     new_conn.wrl_ptr = wrl_val;
+
+    // Read SSL_CONNECTION.version for nonce_len determination.
+    // ssl_to_version=0 means the offset is unknown → fall back to heuristic.
+    if (offsets->ssl_to_version > 0) {
+      __u32 ssl_ver = 0;
+      bpf_probe_read_user(&ssl_ver, 4, (void *)(ssl_ptr + offsets->ssl_to_version));
+      // OpenSSL stores version as int: TLS1_3_VERSION=0x0304, TLS1_2_VERSION=0x0303
+      new_conn.nonce_len = (ssl_ver >= 0x0304) ? 0 : 8;
+    } else {
+      new_conn.nonce_len = 0xFF; // unknown → tc_egress uses plaintext_len heuristic
+    }
   }
 
   // H extraction succeeded — store connection state (only if H changed).
@@ -1998,11 +2018,19 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
   if (!pending) return 0;
 
+  // Read TCP write_seq to identify the exact segment in tc_egress.
+  // tcp_sendmsg appends data starting at write_seq. The tc_egress program
+  // checks that tcp->seq falls within this range before patching.
+  // Use BPF_CORE_READ for kernel version portability (tcp_sock layout varies).
+  __u32 wseq = 0;
+  BPF_CORE_READ_INTO(&wseq, (struct tcp_sock *)sk, write_seq);
+
   __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
   w->staged_tc.tgid = tgid;
   w->staged_tc.ssl_ptr = ssl_ptr;
   w->staged_tc.active = 1;
   w->staged_tc.plaintext_len = plaintext_len;
+  w->staged_tc.write_seq = wseq;
   w->staged_tc.patch_count = pending->patch_count;
   if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
     w->staged_tc.patch_count = XOR_MAX_PATCHES;
@@ -2338,6 +2366,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
 
   // Save header fields to locals before helper calls invalidate direct pointers.
   __u16 sport = tcp->source;
+  __u32 pkt_seq = __bpf_ntohl(tcp->seq);
 
   // Read the original (pre-DNAT) destination IP from the socket, not the packet.
   // For cluster services, iptables/kube-proxy DNATs the packet's dst_ip to the
@@ -2393,6 +2422,23 @@ int tc_egress_patch(struct __sk_buff *skb) {
 #endif
     return 0 /* TC_ACT_OK */;
   }
+
+  // TCP sequence check: only patch the segment that contains the password data.
+  // write_seq was captured in the kprobe at the moment the password was queued
+  // into the TCP send buffer. Skip segments from earlier writes (e.g., TLS
+  // Finished, StartupMessage) that share the same connection key.
+  if (pending->write_seq > 0) {
+    __u32 pkt_end = pkt_seq + payload_len;
+    // write_seq points to the START of the password TLS record in the stream.
+    // The segment must contain this offset: pkt_seq <= write_seq < pkt_end.
+    if (pkt_seq > pending->write_seq || pkt_end <= pending->write_seq) {
+#ifdef KLOAK_DEBUG
+      bpf_printk("kloak [3-TC] SEQ-SKIP pkt=%u ws=%u", pkt_seq, pending->write_seq);
+#endif
+      return 0 /* TC_ACT_OK */; // wrong segment — keep tc_pending active
+    }
+  }
+
 #ifdef KLOAK_DEBUG
   bpf_printk("kloak [3-TC] HIT sport=%u cg=%x", __bpf_ntohs(sport), (__u32)key.cgroup_id);
 #endif
@@ -2416,15 +2462,54 @@ int tc_egress_patch(struct __sk_buff *skb) {
 
   dbg_inc(DBG_TC_MATCH);
 
-  // Detect TLS version from record_len vs plaintext_len:
-  //   TLS 1.2: record_len = plaintext_len + 8 (nonce) + 16 (tag) = pt + 24
-  //   TLS 1.3: record_len = plaintext_len + 1 (content_type) + 16 (tag) = pt + 17
+  // --- Determine nonce_len from tls_conn_state (authoritative) ---
+  // TLS 1.3 has no explicit nonce (nonce_len=0); TLS 1.2 has 8-byte nonce.
+  // The nonce_len was set during H extraction from the connection struct
+  // (Go Conn.vers or OpenSSL SSL_CONNECTION.version).
+  __u32 nonce_len = 8; // default: TLS 1.2
+  {
+    struct tls_conn_key ck = {};
+    ck.tgid = pending->tgid;
+    ck.ssl_ptr = pending->ssl_ptr;
+    struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &ck);
+    if (conn && conn->nonce_len != 0xFF)
+      nonce_len = conn->nonce_len;
+    else {
+      // Fallback for OpenSSL (nonce_len=0xFF) or missing conn state:
+      // use plaintext_len heuristic (legacy behavior).
+      __u32 pt = pending->plaintext_len;
+      if (pt > 0 && record_len == pt + 17)
+        nonce_len = 0; // TLS 1.3
+    }
+  }
+
+  // --- Scan forward to find the correct TLS record ---
+  // When TCP coalesces multiple TLS records into one segment, the first
+  // record's header may not be the patched one. Use the known nonce_len
+  // and plaintext_len to compute the exact expected record_len.
   __u32 pt_len = pending->plaintext_len;
-  __u32 nonce_len;
-  if (pt_len > 0 && record_len == pt_len + 17)
-    nonce_len = 0;  // TLS 1.3
-  else
-    nonce_len = 8;  // TLS 1.2 (default)
+  __u32 expected_reclen = (nonce_len == 0)
+      ? pt_len + 17   // TLS 1.3: pt + 1 (content_type) + 16 (tag)
+      : pt_len + 24;  // TLS 1.2: pt + 8 (nonce) + 16 (tag)
+
+  if (pt_len > 0 && record_len != expected_reclen) {
+    // First record doesn't match — scan forward through coalesced records.
+    __u32 scan_off = payload_off + 5 + record_len;
+    for (__u32 i = 0; i < 4; i++) {
+      __u8 hdr[5];
+      if (bpf_skb_load_bytes(skb, scan_off, hdr, 5) < 0) break;
+      if (hdr[0] != 0x17 || hdr[1] != 0x03 || hdr[2] > 0x03) break;
+      __u16 rlen = ((__u16)hdr[3] << 8) | (__u16)hdr[4];
+      if (rlen < 17) break; // TLS 1.3 minimum: 0 plaintext + 1 content_type + 16 tag
+      if (rlen == expected_reclen) {
+        payload_off = scan_off;
+        record_len = rlen;
+        break;
+      }
+      scan_off += 5 + rlen;
+    }
+  }
+
   __u32 ct_len = record_len - 16 - nonce_len;
 
   // Copy ALL data from pending to ghash_scratch staging area.
