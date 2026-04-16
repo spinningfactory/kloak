@@ -471,7 +471,7 @@ struct {
   __uint(type, BPF_MAP_TYPE_HASH);
   __uint(max_entries, 4096);
 
-  __type(key, __u64);  // pid_tgid
+  __type(key, __u32);  // tgid (process ID) — cross-thread visible for libuv/Node.js
   __type(value, struct xor_pending_val);
 } xor_pending SEC(".maps");
 
@@ -1615,17 +1615,17 @@ next:
     bpf_tail_call(ctx, &prog_array, 1); // Tail-call back to xor_path.
   }
 
-  // All matches processed. Store patches in xor_pending keyed by pid_tgid.
-  // The tcp_sendmsg kprobe will bridge this to tc_pending with the per-connection
-  // (dst_ip, src_port) key that tc egress can look up from the packet headers.
-  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  // All matches processed. Store patches in xor_pending keyed by tgid (process ID).
+  // Uses tgid instead of pid_tgid so the tcp_sendmsg kprobe can find it even if
+  // the socket write happens on a different thread (e.g., Node.js/libuv).
+  __u32 store_tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
 
   struct ghash_work *wf = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!wf || wf->staged_pending.patch_count == 0)
     return 0;
 
   // ssl_ptr, tgid, active already set during mi=0 initialization.
-  bpf_map_update_elem(&xor_pending, &pid_tgid, &wf->staged_pending, BPF_ANY);
+  bpf_map_update_elem(&xor_pending, &store_tgid, &wf->staged_pending, BPF_ANY);
   // bpf_printk("kloak [1-UPROBE] pid=%u patches=%u", (__u32)pid_tgid, wf->staged_pending.patch_count);
 
   dbg_inc(DBG_XOR_DELTA_DONE);
@@ -1849,8 +1849,9 @@ static int ghash_patch_iter(__u32 p, void *_unused) {
 SEC("kprobe/tcp_sendmsg")
 int bpf_kprobe_tcp_sendmsg(void *ctx) {
   __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u32 tgid = (__u32)(pid_tgid >> 32);
 
-  struct xor_pending_val *pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
+  struct xor_pending_val *pending = bpf_map_lookup_elem(&xor_pending, &tgid);
   if (!pending || pending->patch_count == 0)
     return 0;
 
@@ -1889,11 +1890,10 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   // Save values from xor_pending before helper calls invalidate the pointer.
   __u32 zero = 0;
 
-  pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
+  pending = bpf_map_lookup_elem(&xor_pending, &tgid);
   if (!pending) return 0;
 
   __u64 ssl_ptr = pending->ssl_ptr;
-  __u32 tgid = (__u32)(pid_tgid >> 32);
   __u32 plaintext_len = pending->plaintext_len;
   __u8 chain = pending->chain_type;
 
@@ -2064,7 +2064,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 #endif
 
   // Delete xor_pending — the entry has been bridged to tc_pending.
-  bpf_map_delete_elem(&xor_pending, &pid_tgid);
+  bpf_map_delete_elem(&xor_pending, &tgid);
 
   return 0;
 }
