@@ -605,6 +605,7 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 			WRLToEncCtx    uint32
 			EncCtxToAlgctx uint32
 			AlgctxToH      uint32
+			SSLToVersion   uint32
 		}
 		val := bpfTLSOffsets(offsets)
 		if err := m.objs.TlsOffsetConfig.Update(uint32(0), &val, 0); err != nil {

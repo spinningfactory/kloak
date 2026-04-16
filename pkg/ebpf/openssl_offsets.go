@@ -22,6 +22,7 @@ type TLSOffsets struct {
 	WRLToEncCtx    uint32 // wrl* + off → EVP_CIPHER_CTX* (pointer deref)
 	EncCtxToAlgctx uint32 // enc_ctx* + off → algctx/PROV_GCM_CTX* (pointer deref)
 	AlgctxToH      uint32 // algctx* + off → H (16 bytes, direct read)
+	SSLToVersion   uint32 // SSL_CONNECTION* + off → int version (0=unknown, use heuristic)
 }
 
 // opensslOffsetTable maps OpenSSL major.minor version strings to their TLS
