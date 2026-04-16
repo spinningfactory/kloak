@@ -31,6 +31,7 @@ type GoTLSOffsets struct {
 	AEADIfaceOff uint32 // prefixNonceAEAD.aead offset + 8 (interface data_ptr)
 	H2HiOff      uint32 // GCM + off → high 64 bits of H×2 (byte-swapped)
 	H2LoOff      uint32 // GCM + off → low 64 bits of H×2 (byte-swapped)
+	ConnVersOff  uint32 // Conn + off → uint16 negotiated TLS version (e.g. 0x0303, 0x0304)
 }
 
 // goTLSOffsetTableBase stores architecture-independent offsets plus the
@@ -40,6 +41,7 @@ type goTLSOffsetEntry struct {
 	ConnToCipher uint32
 	AEADIfaceOff uint32
 	PDBase       uint32 // GCM + gcmPlatformData + productTable + 224 (H×2 entry)
+	ConnVersOff  uint32 // Conn.vers offset (uint16 TLS version)
 }
 
 // goTLSOffsetTableBase maps Go major.minor versions to base struct offsets.
@@ -54,8 +56,9 @@ var goTLSOffsetTableBase = map[string]goTLSOffsetEntry{
 	//   H×2 at productTable offset 224 → PDBase = 504 + 0 + 224 = 728
 	//   ConnToCipher = 520 + 32 + 8 = 560
 	//   AEADIfaceOff = 16 + 8 = 24
-	"1.25": {ConnToCipher: 560, AEADIfaceOff: 24, PDBase: 728},
-	"1.26": {ConnToCipher: 560, AEADIfaceOff: 24, PDBase: 728},
+	// Conn.vers is at offset 72 in Go 1.25/1.26 (confirmed via DWARF).
+	"1.25": {ConnToCipher: 560, AEADIfaceOff: 24, PDBase: 728, ConnVersOff: 72},
+	"1.26": {ConnToCipher: 560, AEADIfaceOff: 24, PDBase: 728, ConnVersOff: 72},
 }
 
 // goTLSOffsetsForArch converts a base entry to arch-specific GoTLSOffsets
@@ -67,6 +70,7 @@ func goTLSOffsetsForArch(entry goTLSOffsetEntry, goarch string) GoTLSOffsets {
 	o := GoTLSOffsets{
 		ConnToCipher: entry.ConnToCipher,
 		AEADIfaceOff: entry.AEADIfaceOff,
+		ConnVersOff:  entry.ConnVersOff,
 	}
 	switch goarch {
 	case "amd64":
@@ -252,6 +256,12 @@ func detectGoTLSFromDWARF(exePath string) (string, GoTLSOffsets, error) {
 		}
 	} else {
 		missing = append(missing, "gcmAES.productTable")
+	}
+
+	// 4. ConnVersOff = Conn.vers (uint16 TLS version, e.g. 0x0303 or 0x0304)
+	// Not critical — if missing, tc_egress falls back to plaintext_len heuristic.
+	if versOff, ok := getField(structFields, "crypto/tls.Conn", "vers"); ok {
+		result.ConnVersOff = versOff
 	}
 
 	if len(missing) > 0 {

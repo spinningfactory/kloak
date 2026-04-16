@@ -70,7 +70,7 @@ type watchedHostKey struct {
 // Generate eBPF bindings. The KLOAK_TARGET_ARCH env var (set by Dockerfile or
 // Makefile) controls which __TARGET_ARCH_xxx define is passed to clang.
 // Defaults to arm64 for local development on macOS/Lima.
-//go:generate sh -c "ARCH=${KLOAK_TARGET_ARCH:-arm64}; go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags \"-O2 -g -Wall -Werror -D__TARGET_ARCH_${ARCH}\" tlsuprobe bpf/tls_uprobe.c -- -I../ebpf"
+//go:generate sh -c "ARCH=${KLOAK_TARGET_ARCH:-arm64}; go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags \"-O2 -g -Wall -Werror -DKLOAK_DEBUG -D__TARGET_ARCH_${ARCH}\" tlsuprobe bpf/tls_uprobe.c -- -I../ebpf"
 
 // TLSUprobeManager manages the loading and attaching of eBPF uprobes for TLS interception.
 type TLSUprobeManager struct {
@@ -605,6 +605,7 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 			WRLToEncCtx    uint32
 			EncCtxToAlgctx uint32
 			AlgctxToH      uint32
+			SSLToVersion   uint32
 		}
 		val := bpfTLSOffsets(offsets)
 		if err := m.objs.TlsOffsetConfig.Update(uint32(0), &val, 0); err != nil {
