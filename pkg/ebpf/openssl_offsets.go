@@ -68,7 +68,12 @@ var opensslOffsetTable = map[string]TLSOffsets{
 // The library is accessed via /proc/<pid>/root/<libPath> to reach into
 // the container's overlay filesystem.
 func DetectOpenSSLVersion(pid int, libPath string) (version string, offsets TLSOffsets, err error) {
-	hostPath := fmt.Sprintf("/proc/%d/root%s", pid, libPath)
+	// If libPath is already an absolute host path (e.g., /proc/PID/exe),
+	// use it directly. Otherwise, prefix with /proc/PID/root for container paths.
+	hostPath := libPath
+	if !strings.HasPrefix(libPath, "/proc/") {
+		hostPath = fmt.Sprintf("/proc/%d/root%s", pid, libPath)
+	}
 
 	f, err := elf.Open(hostPath)
 	if err != nil {
