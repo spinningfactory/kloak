@@ -460,7 +460,8 @@ struct xor_pending_val {
   struct xor_patch patches[XOR_MAX_PATCHES];
   __u8  active;
   __u8  chain_type;         // 0=OpenSSL/BoringSSL, CHAIN_GO_TLS=Go crypto/tls
-  __u8  _pad[2];
+  __u8  memory_bio;         // 1=fd resolution failed (memory BIO app like Node.js)
+  __u8  _pad[1];
   __u32 plaintext_len;      // SSL_write data length (for TLS version detection in tc)
 };
 
@@ -488,9 +489,11 @@ struct tls_offsets {
   __u32 ssl_to_version;     // SSL_CONNECTION* + off → int version (direct read, 0=unknown)
 };
 
+// Keyed by TGID (per-process), allowing different OpenSSL versions to coexist
+// on the same node (e.g., Node.js with statically linked 3.5 + curl with system 3.0).
 struct {
-  __uint(type, BPF_MAP_TYPE_ARRAY);
-  __uint(max_entries, 1);
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 4096);
   __type(key, __u32);
   __type(value, struct tls_offsets);
 } tls_offset_config SEC(".maps");
@@ -582,6 +585,9 @@ struct ghash_work {
   __u32 ghash_ct_blocks;       // total ciphertext blocks
   // h_powers_cache moved to separate h_power_entries per-CPU array map
   __u32 ghash_h_power_val;      // power value for h_power_step callback
+  // Connection key + pkt_seq for deferred tag patching (multi-segment records).
+  struct tc_dest_key ghash_conn_key;
+  __u32 ghash_pkt_seq;           // TCP seq of this segment (for tag offset calc)
 };
 
 struct {
@@ -621,6 +627,22 @@ struct {
   __type(key, struct tc_dest_key);
   __type(value, struct tc_pending_val);
 } tc_pending SEC(".maps");
+
+// Deferred GHASH tag delta for TLS records that span multiple TCP segments.
+// When the ciphertext is patched in segment 1 but the auth tag is in a later
+// segment, the precomputed tag correction is stored here and applied when the
+// segment containing the tag arrives.
+struct tc_tag_val {
+  __u8  tag_delta[16];    // precomputed GHASH correction: new_tag = old_tag ^ delta
+  __u32 tag_tcp_seq;      // TCP seq number of the byte where the auth tag starts
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 4096);
+  __type(key, struct tc_dest_key);
+  __type(value, struct tc_tag_val);
+} tc_tag_pending SEC(".maps");
 
 // =============================================================================
 
@@ -1444,9 +1466,16 @@ int bpf_h_extract(void *ctx) {
   if (!ssl_ptr)
     return 0;
 
-  struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &zero);
-  if (!offsets || offsets->ssl_to_wrl == 0)
-    return 0;
+  __u32 h_tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+  struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &h_tgid);
+  if (!offsets || offsets->ssl_to_wrl == 0) {
+    // Fallback: try global default (key=0) for short-lived processes whose
+    // per-tgid entry wasn't pushed in time by the controller.
+    __u32 fallback = 0;
+    offsets = bpf_map_lookup_elem(&tls_offset_config, &fallback);
+    if (!offsets || offsets->ssl_to_wrl == 0)
+      return 0;
+  }
 
   // Pointer chase: 4-hop (3.2+) or 3-hop (3.0-3.1).
   // wrl_to_enc_ctx == 0 signals 3-hop (ssl_to_wrl stores enc_write_ctx).
@@ -1528,6 +1557,7 @@ int bpf_xor_path(void *ctx) {
     wi->staged_pending.active = 1;
     wi->staged_pending.chain_type = sd->chain_type;
     wi->staged_pending.plaintext_len = sd->total_data_len;
+    wi->staged_pending.memory_bio = (sd->xor_fd == 0) ? 1 : 0;
   }
 
   dbg_inc(DBG_XOR_PATH_ENTERED);
@@ -1855,6 +1885,11 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   if (!pending || pending->patch_count == 0)
     return 0;
 
+#ifdef KLOAK_DEBUG
+  bpf_printk("kloak [2-KPROBE] FOUND xor_pending tgid=%u patches=%u ssl=%llx",
+             tgid, pending->patch_count, pending->ssl_ptr);
+#endif
+
   // Read source port from struct sock (first argument of tcp_sendmsg).
   // tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
   void *sk;
@@ -1977,26 +2012,54 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     // 4-hop (3.2+): SSL → wrl → enc_ctx → algctx → H
     // 3-hop (3.0-3.1): SSL → enc_write_ctx → algctx → H
     // wrl_to_enc_ctx == 0 signals 3-hop mode (ssl_to_wrl stores enc_write_ctx).
-    struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &zero);
-    if (!offsets || offsets->ssl_to_wrl == 0)
-      return 0;
+    struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &tgid);
+    if (!offsets || offsets->ssl_to_wrl == 0) {
+      __u32 fallback = 0;
+      offsets = bpf_map_lookup_elem(&tls_offset_config, &fallback);
+      if (!offsets || offsets->ssl_to_wrl == 0) {
+#ifdef KLOAK_DEBUG
+        bpf_printk("kloak [2-KPROBE] H-fail: no offsets");
+#endif
+        return 0;
+      }
+    }
 
     __u64 ptr = 0;
     if (offsets->wrl_to_enc_ctx > 0) {
       // 4-hop: SSL → wrl → enc_ctx
-      if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
+      if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr) {
+#ifdef KLOAK_DEBUG
+        bpf_printk("kloak [2-KPROBE] H-fail: 4hop wrl null ssl=%llx off=%u", ssl_ptr, offsets->ssl_to_wrl);
+#endif
         return 0;
+      }
       wrl_val = ptr;
-      if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
+      if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr) {
+#ifdef KLOAK_DEBUG
+        bpf_printk("kloak [2-KPROBE] H-fail: 4hop enc_ctx null wrl=%llx off=%u", wrl_val, offsets->wrl_to_enc_ctx);
+#endif
         return 0;
+      }
     } else {
       // 3-hop: SSL → enc_write_ctx (ssl_to_wrl stores enc_write_ctx offset)
-      if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
+      if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr) {
+#ifdef KLOAK_DEBUG
+        __u32 ver = 0;
+        bpf_probe_read_user(&ver, 4, (void *)ssl_ptr); // version at offset 0
+        __u64 wbio = 0;
+        bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + 24)); // wbio at offset 24 (Debian 3.0)
+        bpf_printk("kloak [2-KPROBE] H-fail: enc_write_ctx null ssl=%llx off=%u ver=0x%x wbio=%llx", ssl_ptr, offsets->ssl_to_wrl, ver, wbio);
+#endif
         return 0;
+      }
     }
     // Common tail: enc_ctx → algctx → H
-    if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr)
+    if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr) {
+#ifdef KLOAK_DEBUG
+      bpf_printk("kloak [2-KPROBE] H-fail: algctx null");
+#endif
       return 0;
+    }
     if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0)
       return 0;
 
@@ -2036,7 +2099,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w) return 0;
 
-  pending = bpf_map_lookup_elem(&xor_pending, &pid_tgid);
+  pending = bpf_map_lookup_elem(&xor_pending, &tgid);
   if (!pending) return 0;
 
   // Read TCP write_seq to identify the exact segment in tc_egress.
@@ -2046,25 +2109,37 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   __u32 wseq = 0;
   BPF_CORE_READ_INTO(&wseq, (struct tcp_sock *)sk, write_seq);
 
+  __u8 is_membio = pending->memory_bio;
+
   __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
   w->staged_tc.tgid = tgid;
   w->staged_tc.ssl_ptr = ssl_ptr;
   w->staged_tc.active = 1;
   w->staged_tc.plaintext_len = plaintext_len;
-  w->staged_tc.write_seq = wseq;
   w->staged_tc.patch_count = pending->patch_count;
   if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
     w->staged_tc.patch_count = XOR_MAX_PATCHES;
   for (__u32 p = 0; p < XOR_MAX_PATCHES && p < w->staged_tc.patch_count; p++)
     w->staged_tc.patches[p] = pending->patches[p];
 
+  // For memory BIO apps: write_seq from this tcp_sendmsg may not match the
+  // segment that carries the TLS data (SSL_write and writev are decoupled).
+  // Disable seq check so tc_egress matches by TLS header + record validation.
+  // For socket BIO apps: write_seq is always correct (synchronous call chain).
+  w->staged_tc.write_seq = is_membio ? 0 : wseq;
+
   bpf_map_update_elem(&tc_pending, &tdk, &w->staged_tc, BPF_ANY);
 #ifdef KLOAK_DEBUG
-  bpf_printk("kloak [2-KPROBE] sport=%u cg=%x", src_port_h, (__u32)tdk.cgroup_id);
+  bpf_printk("kloak [2-KPROBE] sport=%u cg=%x membio=%u", src_port_h, (__u32)tdk.cgroup_id, is_membio);
 #endif
 
-  // Delete xor_pending — the entry has been bridged to tc_pending.
-  bpf_map_delete_elem(&xor_pending, &tgid);
+  // For socket BIO apps: delete xor_pending — the first kprobe hit is the
+  // correct one (SSL_write → tcp_sendmsg is synchronous).
+  // For memory BIO apps: keep xor_pending alive — multiple tcp_sendmsg calls
+  // may fire before the one carrying the TLS data. tc_egress uses TLS header
+  // validation to skip wrong records.
+  if (!is_membio)
+    bpf_map_delete_elem(&xor_pending, &tgid);
 
   return 0;
 }
@@ -2411,16 +2486,48 @@ int tc_egress_patch(struct __sk_buff *skb) {
   key.src_port = sport;
   key.cgroup_id = bpf_skb_cgroup_id(skb);
 
-  // Check TLS application_data FIRST (cheap, no map lookup).
   __u32 payload_off = l3_off + ip_hdr_len + tcp_hdr_len;
   __u32 payload_len = __bpf_ntohs(ip->tot_len) - ip_hdr_len - tcp_hdr_len;
+
+  // --- Deferred tag patching for multi-segment TLS records ---
+  // When a TLS record spans multiple TCP segments, the ciphertext is patched
+  // in the first segment but the auth tag (last 16 bytes) is in a later one.
+  // Check if this segment contains a deferred tag patch.
+  {
+    struct tc_tag_val *tag = bpf_map_lookup_elem(&tc_tag_pending, &key);
+    if (tag) {
+      __u32 tag_seq = tag->tag_tcp_seq;
+      __u32 pkt_end = pkt_seq + payload_len;
+      // Check if the tag's byte position falls within this segment.
+      if (pkt_seq <= tag_seq && tag_seq + 16 <= pkt_end) {
+        __u32 tag_off = payload_off + (tag_seq - pkt_seq);
+        __u8 old_tag[16], new_tag[16];
+        if (bpf_skb_load_bytes(skb, tag_off, old_tag, 16) >= 0) {
+          for (__u32 i = 0; i < 16; i++)
+            new_tag[i] = old_tag[i] ^ tag->tag_delta[i];
+          bpf_skb_store_bytes(skb, tag_off, new_tag, 16, 0);
+#ifdef KLOAK_DEBUG
+          bpf_printk("kloak [5-TAG-DEFERRED] seq=%u off=%u", tag_seq, tag_off);
+#endif
+        }
+        bpf_map_delete_elem(&tc_tag_pending, &key);
+      }
+      // Whether we patched or not, return — this segment is a continuation,
+      // not a new TLS record. Don't process it further.
+      return 0 /* TC_ACT_OK */;
+    }
+  }
+
+  // Check TLS application_data (cheap, no map lookup).
   if (payload_len < 5)
     return 0 /* TC_ACT_OK */;
 
   __u8 tls_hdr[5];
   if (bpf_skb_load_bytes(skb, payload_off, tls_hdr, 5) < 0)
     return 0 /* TC_ACT_OK */;
+#ifdef KLOAK_DEBUG
   bpf_printk("kloak tc tls_hdr=%x ver=%x%x plen=%u", tls_hdr[0], tls_hdr[1], tls_hdr[2], payload_len);
+#endif
   // Validate TLS application_data record:
   //   byte 0: content type must be 0x17
   //   bytes 1-2: version must be 0x0301..0x0303 (TLS 1.0-1.3)
@@ -2464,24 +2571,11 @@ int tc_egress_patch(struct __sk_buff *skb) {
   bpf_printk("kloak [3-TC] HIT sport=%u cg=%x", __bpf_ntohs(sport), (__u32)key.cgroup_id);
 #endif
 
-  __u32 tls_total = 5 + record_len; // header + body
-
-  // Linearize the skb so the full TLS record is in contiguous memory.
-  // With GSO, the kernel may pass a large packet with non-linear fragments;
-  // bpf_skb_pull_data makes it accessible to bpf_skb_load/store_bytes.
-  // If the record truly spans TCP segments (separate skbs), this can't help
-  // and we fail-secure (shadow goes through).
-  if (payload_len < tls_total) {
-    if (bpf_skb_pull_data(skb, payload_off + tls_total) < 0)
-      return 0 /* TC_ACT_OK */;
-    // After pull, skb->len reflects the linearized data. Re-derive payload_len.
-    // skb->len is the total L3 length. Direct access pointers are invalid after
-    // pull, but bpf_skb_load/store_bytes still work.
-    if (skb->len < payload_off + tls_total)
-      return 0 /* TC_ACT_OK */;
-  }
-
   dbg_inc(DBG_TC_MATCH);
+
+#ifdef KLOAK_DEBUG
+  bpf_printk("kloak [3-TC] DIAG plen=%u rlen=%u skblen=%u po=%u", payload_len, record_len, skb->len, payload_off);
+#endif
 
   // --- Determine nonce_len from tls_conn_state (authoritative) ---
   // TLS 1.3 has no explicit nonce (nonce_len=0); TLS 1.2 has 8-byte nonce.
@@ -2552,15 +2646,15 @@ int tc_egress_patch(struct __sk_buff *skb) {
   w->ghash_tgid = pending->tgid;
   w->ghash_ssl_ptr = pending->ssl_ptr;
   w->ghash_active = 1;
-
-  // Mark inactive instead of deleting. Retransmits on the same connection
-  // would steal a freshly-created entry if we deleted. With active=0, the
-  // retransmit finds the entry but skips it. The kprobe overwrites with
-  // active=1 on the next SSL_write.
-  pending = bpf_map_lookup_elem(&tc_pending, &key);
-  if (pending) pending->active = 0;
+  w->ghash_conn_key = key;
+  w->ghash_pkt_seq = pkt_seq;
 
   // Apply patches. Zero secret_len on failure so GHASH skips unapplied patches.
+  // Track whether any patch was actually applied — only deactivate tc_pending
+  // if at least one patch succeeded. For multi-segment TLS records, the first
+  // segment may have a record too small for the secret; we must NOT consume
+  // tc_pending so the real record's segment can match later.
+  __u32 patches_applied = 0;
   for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++) {
     w = bpf_map_lookup_elem(&ghash_scratch, &zero);
     if (!w) return 0 /* TC_ACT_OK */;
@@ -2586,10 +2680,22 @@ int tc_egress_patch(struct __sk_buff *skb) {
 
     bpf_skb_store_bytes(skb, patch_off, w->ct_buf, patch_len, 0);
     dbg_inc(DBG_TC_PATCHED);
+    patches_applied++;
+  }
+
+  // Only deactivate tc_pending if at least one patch was applied.
+  // If no patches applied (record too small or patch offset beyond segment),
+  // keep tc_pending active so the correct segment can match later.
+  if (patches_applied > 0) {
+    pending = bpf_map_lookup_elem(&tc_pending, &key);
+    if (pending) pending->active = 0;
+  } else {
+    // No patches applied — don't proceed to GHASH (nothing changed).
+    return 0 /* TC_ACT_OK */;
   }
 
 #ifdef KLOAK_DEBUG
-  bpf_printk("kloak [4-PATCH] sport=%u pc=%u ct=%u", __bpf_ntohs(sport), pc, ct_len);
+  bpf_printk("kloak [4-PATCH] sport=%u pc=%u ct=%u applied=%u", __bpf_ntohs(sport), pc, ct_len, patches_applied);
 #endif
 
   // Tail-call to tc GHASH program.
@@ -2626,14 +2732,8 @@ int tc_ghash_update(struct __sk_buff *skb) {
   __u32 payload_off = w->ghash_payload_off;
   __u32 ct_blocks = (ct_len + 15) / 16;
 
-  // Read old tag from skb (kernel memory).
+  // Tag offset within the skb (if the tag is in this segment).
   __u32 tag_offset = payload_off + 5 + nonce_len + ct_len;
-  if (bpf_skb_load_bytes(skb, tag_offset, w->old_tag, 16) < 0)
-    return 0 /* TC_ACT_OK */;
-
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 0 /* TC_ACT_OK */;
 
   __builtin_memset(w->tag_delta, 0, 16);
 
@@ -2656,14 +2756,32 @@ int tc_ghash_update(struct __sk_buff *skb) {
   if (!w)
     return 0 /* TC_ACT_OK */;
 
-  for (__u32 i = 0; i < 16; i++)
-    w->new_tag[i] = w->old_tag[i] ^ w->tag_delta[i];
-
-  bpf_skb_store_bytes(skb, tag_offset, w->new_tag, 16, 0);
-
-  __u32 dsum = 0;
-  for (__u32 di = 0; di < 16; di++) dsum += w->tag_delta[di];
-  bpf_printk("kloak [5-GHASH] tag_off=%u dsum=%u", tag_offset, dsum);
+  // Try to read the old tag from the current segment.
+  if (bpf_skb_load_bytes(skb, tag_offset, w->old_tag, 16) >= 0) {
+    // Tag is in this segment — apply delta inline (common case for socket BIOs
+    // and small TLS records that fit in one segment).
+    for (__u32 i = 0; i < 16; i++)
+      w->new_tag[i] = w->old_tag[i] ^ w->tag_delta[i];
+    bpf_skb_store_bytes(skb, tag_offset, w->new_tag, 16, 0);
+#ifdef KLOAK_DEBUG
+    __u32 dsum = 0;
+    for (__u32 di = 0; di < 16; di++) dsum += w->tag_delta[di];
+    bpf_printk("kloak [5-GHASH] tag_off=%u dsum=%u", tag_offset, dsum);
+#endif
+  } else {
+    // Tag is in a later segment (TLS record spans multiple TCP segments).
+    // Store the precomputed tag delta so tc_egress can apply it when the
+    // segment containing the tag arrives.
+    // tag_tcp_seq = pkt_seq + (tag_offset - payload_off)
+    //             = pkt_seq + 5 + nonce_len + ct_len
+    struct tc_tag_val tv;
+    __builtin_memcpy(tv.tag_delta, w->tag_delta, 16);
+    tv.tag_tcp_seq = w->ghash_pkt_seq + 5 + nonce_len + ct_len;
+    bpf_map_update_elem(&tc_tag_pending, &w->ghash_conn_key, &tv, BPF_ANY);
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [5-GHASH] DEFERRED tag_seq=%u", tv.tag_tcp_seq);
+#endif
+  }
 
   return 0 /* TC_ACT_OK */;
 }

@@ -53,9 +53,11 @@ var opensslOffsetTable = map[string]TLSOffsets{
 	//   SSLToWRL stores enc_write_ctx offset; WRLToEncCtx=0 signals 3-hop to BPF.
 
 	// OpenSSL 3.5.x — SSLToWRL grew due to new fields in SSL_CONNECTION.
-	"3.5": {SSLToWRL: 3208, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328},
+	// SSLToVersion=72: ssl_connection_st.version (after 64-byte embedded ssl_st).
+	"3.5": {SSLToWRL: 3208, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328, SSLToVersion: 72},
 
 	// OpenSSL 3.2.x–3.4.x — identical offsets across these versions.
+	// TODO: verify SSLToVersion for 3.2-3.4 (likely 72, same as 3.5).
 	"3.4": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328},
 	"3.3": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328},
 	"3.2": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328},
@@ -139,6 +141,7 @@ func readOpenSSLVersion(f *elf.File) (string, error) {
 // findVersionInData scans a byte slice for "OpenSSL X.Y.Z" patterns.
 func findVersionInData(data []byte) string {
 	prefix := []byte("OpenSSL ")
+	var best string
 	for i := 0; i+len(prefix)+5 < len(data); i++ {
 		if data[i] != 'O' {
 			continue
@@ -153,12 +156,30 @@ func findVersionInData(data []byte) string {
 			end++
 		}
 		version := string(data[start:end])
-		// Validate: must look like X.Y.Z
+		// Validate: must look like X.Y or X.Y.Z
 		if len(version) >= 3 && version[0] >= '0' && version[0] <= '9' {
-			return version
+			// Prefer more specific versions (X.Y.Z over X.Y) and higher versions.
+			// Binaries may embed multiple version strings (e.g., Node.js bundles
+			// OpenSSL 3.5.5 but also references the system's OpenSSL 3.0).
+			if best == "" || versionBetter(version, best) {
+				best = version
+			}
 		}
 	}
-	return ""
+	return best
+}
+
+// versionBetter returns true if a is a better match than b.
+// Prefers versions with more components (3.5.5 > 3.0) and higher values.
+func versionBetter(a, b string) bool {
+	aParts := strings.SplitN(a, ".", 4)
+	bParts := strings.SplitN(b, ".", 4)
+	// More components = more specific = better
+	if len(aParts) != len(bParts) {
+		return len(aParts) > len(bParts)
+	}
+	// Same specificity: prefer higher version (lexicographic on parts)
+	return a > b
 }
 
 func startsWith(data, prefix []byte) bool {
