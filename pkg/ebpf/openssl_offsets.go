@@ -4,6 +4,7 @@ import (
 	"debug/elf"
 	"encoding/binary"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -27,7 +28,7 @@ type TLSOffsets struct {
 	WRLToEncCtx    uint32 // wrl* → EVP_CIPHER_CTX*. 0 = 3-hop mode (no record layer)
 	EncCtxToAlgctx uint32 // enc_ctx* + off → algctx/PROV_GCM_CTX* (pointer deref)
 	AlgctxToH      uint32 // algctx* + off → H (16 bytes, direct read)
-	SSLToVersion   uint32 // SSL_CONNECTION* + off → int version (0=unknown, use heuristic)
+	SSLToVersion   uint32 // SSL_CONNECTION* + off → int version (0xFFFFFFFF=unknown, use heuristic)
 }
 
 // opensslOffsetTable maps OpenSSL major.minor version strings to their TLS
@@ -57,15 +58,16 @@ var opensslOffsetTable = map[string]TLSOffsets{
 	"3.5": {SSLToWRL: 3208, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328, SSLToVersion: 72},
 
 	// OpenSSL 3.2.x–3.4.x — identical offsets across these versions.
-	// TODO: verify SSLToVersion for 3.2-3.4 (likely 72, same as 3.5).
-	"3.4": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328},
-	"3.3": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328},
-	"3.2": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328},
+	// TODO: verify SSLToVersion for 3.2-3.4 via pahole (likely 72, same as 3.5).
+	"3.4": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0xFFFFFFFF},
+	"3.3": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0xFFFFFFFF},
+	"3.2": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0xFFFFFFFF},
 
 	// OpenSSL 3.0.x–3.1.x — 3-hop chain (no record layer indirection).
 	// SSLToWRL stores enc_write_ctx=2168; WRLToEncCtx=0 signals 3-hop to BPF.
-	"3.1": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328},
-	"3.0": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328},
+	// SSLToVersion=0: ssl_st.version is at offset 0 (verified via pahole on Debian bookworm).
+	"3.1": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0},
+	"3.0": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0},
 }
 
 // DetectOpenSSLVersion reads an OpenSSL/libssl shared library from a
@@ -178,8 +180,15 @@ func versionBetter(a, b string) bool {
 	if len(aParts) != len(bParts) {
 		return len(aParts) > len(bParts)
 	}
-	// Same specificity: prefer higher version (lexicographic on parts)
-	return a > b
+	// Same specificity: compare numerically (handles 3.10 > 3.9)
+	for i := range aParts {
+		ai, _ := strconv.Atoi(aParts[i])
+		bi, _ := strconv.Atoi(bParts[i])
+		if ai != bi {
+			return ai > bi
+		}
+	}
+	return false
 }
 
 func startsWith(data, prefix []byte) bool {

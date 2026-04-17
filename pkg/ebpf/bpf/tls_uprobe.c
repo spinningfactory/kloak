@@ -463,6 +463,7 @@ struct xor_pending_val {
   __u8  memory_bio;         // 1=fd resolution failed (memory BIO app like Node.js)
   __u8  _pad[1];
   __u32 plaintext_len;      // SSL_write data length (for TLS version detection in tc)
+  __u64 created_at;         // bpf_ktime_get_ns() — for TTL-based cleanup (memory BIO)
 };
 
 // Per-thread pending XOR patches, keyed by pid_tgid.
@@ -486,7 +487,7 @@ struct tls_offsets {
   __u32 wrl_to_enc_ctx;     // wrl* + off → EVP_CIPHER_CTX* (pointer deref)
   __u32 enc_ctx_to_algctx;  // enc_ctx* + off → algctx/PROV_GCM_CTX* (pointer deref)
   __u32 algctx_to_h;        // algctx* + off → H (16 bytes, direct read)
-  __u32 ssl_to_version;     // SSL_CONNECTION* + off → int version (direct read, 0=unknown)
+  __u32 ssl_to_version;     // SSL_CONNECTION* + off → int version (0xFFFFFFFF=unknown)
 };
 
 // Keyed by TGID (per-process), allowing different OpenSSL versions to coexist
@@ -1558,6 +1559,7 @@ int bpf_xor_path(void *ctx) {
     wi->staged_pending.chain_type = sd->chain_type;
     wi->staged_pending.plaintext_len = sd->total_data_len;
     wi->staged_pending.memory_bio = (sd->xor_fd == 0) ? 1 : 0;
+    wi->staged_pending.created_at = bpf_ktime_get_ns();
   }
 
   dbg_inc(DBG_XOR_PATH_ENTERED);
@@ -1885,6 +1887,15 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   if (!pending || pending->patch_count == 0)
     return 0;
 
+  // TTL cleanup: for memory BIO apps, xor_pending persists across tcp_sendmsg
+  // calls. Delete stale entries older than 2 seconds to bound kprobe overhead.
+  // 2s is generous — the encrypt→writev gap is typically <10ms.
+  if (pending->memory_bio &&
+      bpf_ktime_get_ns() - pending->created_at > 2000000000ULL) {
+    bpf_map_delete_elem(&xor_pending, &tgid);
+    return 0;
+  }
+
 #ifdef KLOAK_DEBUG
   bpf_printk("kloak [2-KPROBE] FOUND xor_pending tgid=%u patches=%u ssl=%llx",
              tgid, pending->patch_count, pending->ssl_ptr);
@@ -2073,8 +2084,9 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     new_conn.wrl_ptr = wrl_val;
 
     // Read SSL_CONNECTION.version for nonce_len determination.
-    // ssl_to_version=0 means the offset is unknown → fall back to heuristic.
-    if (offsets->ssl_to_version > 0) {
+    // ssl_to_version=0xFFFFFFFF means unknown → fall back to heuristic.
+    // Offset 0 is valid (OpenSSL 3.0 ssl_st.version is at offset 0).
+    if (offsets->ssl_to_version != 0xFFFFFFFF) {
       __u32 ssl_ver = 0;
       bpf_probe_read_user(&ssl_ver, 4, (void *)(ssl_ptr + offsets->ssl_to_version));
       // OpenSSL stores version as int: TLS1_3_VERSION=0x0304, TLS1_2_VERSION=0x0303

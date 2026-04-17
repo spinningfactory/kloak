@@ -259,6 +259,24 @@ func deployCipherClient(t *testing.T, secretName string, client opensslClient) s
 		t.Fatalf("cipher client pod %s not ready: %v", client.name, err)
 	}
 
+	// Debian images install curl at runtime via apt-get. Wait for it to
+	// be available before returning, so callers don't get "curl: not found".
+	if strings.Contains(client.image, "debian") {
+		for {
+			select {
+			case <-ctx.Done():
+				t.Fatalf("curl not available in %s after timeout", client.name)
+			default:
+			}
+			out, _ := kubectl("exec", "-n", testNamespace, client.name,
+				"--", "which", "curl")
+			if strings.Contains(out, "curl") {
+				break
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}
+
 	return client.name
 }
 
