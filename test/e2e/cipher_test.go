@@ -15,14 +15,22 @@ import (
 )
 
 const (
-	echoServerName   = "tls-echo"
-	cipherClientName = "cipher-client"
+	echoServerName = "tls-echo"
 )
 
+// opensslClient defines a curl client image with a specific OpenSSL version
+// for testing different H extraction chains (4-hop for 3.2+, 3-hop for 3.0-3.1).
+type opensslClient struct {
+	name  string // unique pod name suffix
+	image string // container image with curl + specific OpenSSL
+	chain string // "4-hop" or "3-hop" (for test naming)
+}
+
 // TestCipherSuites verifies that kloak correctly rewrites secrets for AES-GCM
-// cipher suites (TLS 1.2 + 1.3) and passes shadow placeholder for non-GCM ciphers.
+// cipher suites (TLS 1.2 + 1.3) across multiple OpenSSL versions, covering
+// both the 4-hop chain (3.2+) and 3-hop chain (3.0-3.1).
 //
-// Uses a persistent curl client pod with kubectl exec for each cipher test,
+// Uses persistent curl client pods with kubectl exec for each cipher test,
 // avoiding the reliability issues of ephemeral per-test pods. The echo server
 // uses Python/OpenSSL for full cipher suite support (including ECDHE-RSA, which
 // Go's stdlib TLS cannot reliably negotiate).
@@ -43,15 +51,15 @@ func TestCipherSuites(t *testing.T) {
 		"api-key": []byte(secretValue),
 	})
 
-	// Deploy a persistent curl client pod with the shadow secret mounted.
-	// The controller's sched_process_exec tracepoint detects kubectl exec'd
-	// processes and attaches uprobes automatically.
-	clientPod := deployCipherClient(t, secretName)
+	// OpenSSL client images: test both the 4-hop (3.2+) and 3-hop (3.0-3.1) chains.
+	// curlimages/curl:latest → Alpine, OpenSSL 3.5.x (4-hop)
+	// debian:bookworm-slim → Debian 12, OpenSSL 3.0.x (3-hop), curl installed at runtime
+	clients := []opensslClient{
+		{name: "cipher-client-3x", image: "curlimages/curl:latest", chain: "4hop"},
+		{name: "cipher-client-30", image: "debian:bookworm-slim", chain: "3hop"},
+	}
 
-	// Wait for the eBPF uprobe to be ready by verifying a default TLS rewrite.
-	waitForUprobeReady(t, clientPod, echoSvcHost, secretValue)
-
-	tests := []struct {
+	ciphers := []struct {
 		name   string
 		tlsMin string // "1.2" or "1.3"
 		tlsMax string
@@ -78,17 +86,23 @@ func TestCipherSuites(t *testing.T) {
 		// - TLS 1.3 ChaCha20: TLS_CHACHA20_POLY1305_SHA256 (expectReal=false)
 	}
 
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			body := execCurl(t, clientPod, echoSvcHost, tc.cipher, tc.tlsMin, tc.tlsMax)
+	for _, client := range clients {
+		t.Run(client.chain, func(t *testing.T) {
+			clientPod := deployCipherClient(t, secretName, client)
+			waitForUprobeReady(t, clientPod, echoSvcHost, secretValue)
 
-			// Verify the echo server responded (not a curl error).
-			if !strings.Contains(body, `"headers"`) {
-				t.Fatalf("echo server did not return valid JSON; output:\n%s", body)
-			}
+			for _, tc := range ciphers {
+				t.Run(tc.name, func(t *testing.T) {
+					body := execCurl(t, clientPod, echoSvcHost, tc.cipher, tc.tlsMin, tc.tlsMax)
 
-			if !strings.Contains(body, secretValue) {
-				t.Errorf("expected real secret in echo response, got:\n%s", body)
+					if !strings.Contains(body, `"headers"`) {
+						t.Fatalf("echo server did not return valid JSON; output:\n%s", body)
+					}
+
+					if !strings.Contains(body, secretValue) {
+						t.Errorf("expected real secret in echo response, got:\n%s", body)
+					}
+				})
 			}
 		})
 	}
@@ -175,31 +189,44 @@ func deployTLSEchoServer(t *testing.T) string {
 // deployCipherClient creates a persistent curl pod with the shadow secret
 // mounted. Tests run curl commands inside this pod via kubectl exec, avoiding
 // the overhead and reliability issues of creating a new pod per cipher test.
-func deployCipherClient(t *testing.T, secretName string) string {
+//
+// For Alpine-based images (curlimages/curl), curl is pre-installed.
+// For Debian-based images, an init container installs curl + ca-certificates.
+func deployCipherClient(t *testing.T, secretName string, client opensslClient) string {
 	t.Helper()
 
 	shadowName := secretName + "-kloak"
 
+	container := corev1.Container{
+		Name:    "client",
+		Image:   client.image,
+		Command: []string{"sleep", "3600"},
+		VolumeMounts: []corev1.VolumeMount{{
+			Name:      "secret",
+			MountPath: "/etc/secrets",
+			ReadOnly:  true,
+		}},
+	}
+
+	var initContainers []corev1.Container
+	// Debian images need curl installed at runtime.
+	if strings.Contains(client.image, "debian") {
+		container.Command = []string{"/bin/sh", "-c",
+			"apt-get update -qq && apt-get install -y -qq curl ca-certificates > /dev/null 2>&1 && sleep 3600"}
+	}
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      cipherClientName,
+			Name:      client.name,
 			Namespace: testNamespace,
 			Labels: map[string]string{
 				"getkloak.io/enabled": "true",
 			},
 		},
 		Spec: corev1.PodSpec{
-			RestartPolicy: corev1.RestartPolicyNever,
-			Containers: []corev1.Container{{
-				Name:    "client",
-				Image:   "curlimages/curl:latest",
-				Command: []string{"sleep", "3600"},
-				VolumeMounts: []corev1.VolumeMount{{
-					Name:      "secret",
-					MountPath: "/etc/secrets",
-					ReadOnly:  true,
-				}},
-			}},
+			RestartPolicy:  corev1.RestartPolicyNever,
+			InitContainers: initContainers,
+			Containers:     []corev1.Container{container},
 			Volumes: []corev1.Volume{{
 				Name: "secret",
 				VolumeSource: corev1.VolumeSource{
@@ -214,20 +241,43 @@ func deployCipherClient(t *testing.T, secretName string) string {
 	_, err := clientset.CoreV1().Pods(testNamespace).Create(
 		context.Background(), pod, metav1.CreateOptions{})
 	if err != nil {
-		t.Fatalf("failed to create cipher client pod: %v", err)
+		t.Fatalf("failed to create cipher client pod %s: %v", client.name, err)
 	}
 	t.Cleanup(func() {
 		_ = clientset.CoreV1().Pods(testNamespace).Delete(
-			context.Background(), cipherClientName, metav1.DeleteOptions{})
+			context.Background(), client.name, metav1.DeleteOptions{})
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	// Debian images take longer to become ready (apt-get install).
+	timeout := 60 * time.Second
+	if strings.Contains(client.image, "debian") {
+		timeout = 120 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
-	if err := waitForPodReady(ctx, testNamespace, cipherClientName); err != nil {
-		t.Fatalf("cipher client pod not ready: %v", err)
+	if err := waitForPodReady(ctx, testNamespace, client.name); err != nil {
+		t.Fatalf("cipher client pod %s not ready: %v", client.name, err)
 	}
 
-	return cipherClientName
+	// Debian images install curl at runtime via apt-get. Wait for it to
+	// be available before returning, so callers don't get "curl: not found".
+	if strings.Contains(client.image, "debian") {
+		for {
+			select {
+			case <-ctx.Done():
+				t.Fatalf("curl not available in %s after timeout", client.name)
+			default:
+			}
+			out, _ := kubectl("exec", "-n", testNamespace, client.name,
+				"--", "which", "curl")
+			if strings.Contains(out, "curl") {
+				break
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}
+
+	return client.name
 }
 
 // waitForUprobeReady polls until the eBPF uprobe successfully rewrites a secret

@@ -584,12 +584,14 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 // offsets to the tls_offset_config BPF map. This enables the XOR-patch path
 // for AES-GCM connections.
 func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
-	// Try shared libraries first, then the main executable.
-	// Statically linked OpenSSL (e.g., Node.js) won't have shared libs
-	// but the main exe contains the version string and uses the same offsets.
-	paths := make([]string, len(containerLibs)+1)
-	copy(paths, containerLibs)
-	paths[len(containerLibs)] = fmt.Sprintf("/proc/%d/exe", pid)
+	// Try the main executable FIRST — if the binary statically links OpenSSL
+	// (e.g., Node.js bundles OpenSSL 3.5), its struct offsets differ from the
+	// system libssl. The main exe's version takes precedence because the
+	// PID-scoped uprobe fires for its SSL_write, not the shared library's.
+	// Fall back to shared libraries for dynamically linked apps.
+	paths := make([]string, 1+len(containerLibs))
+	paths[0] = fmt.Sprintf("/proc/%d/exe", pid)
+	copy(paths[1:], containerLibs)
 
 	for _, libPath := range paths {
 		version, offsets, err := DetectOpenSSLVersion(pid, libPath)
@@ -598,7 +600,9 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 			continue
 		}
 
-		// Push offsets to the BPF config map.
+		// Push offsets to the BPF config map, keyed by TGID.
+		// Per-tgid keying allows different OpenSSL versions to coexist
+		// on the same node (e.g., Node.js 3.5 + curl 3.0).
 		// Must match struct tls_offsets in tls_uprobe.c.
 		type bpfTLSOffsets struct {
 			SSLToWRL       uint32
@@ -608,13 +612,18 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 			SSLToVersion   uint32
 		}
 		val := bpfTLSOffsets(offsets)
-		if err := m.objs.TlsOffsetConfig.Update(uint32(0), &val, 0); err != nil {
-			m.log.Errorw("Failed to push TLS offsets to BPF map", "error", err)
+		tgid := uint32(pid)
+		if err := m.objs.TlsOffsetConfig.Update(tgid, &val, 0); err != nil {
+			m.log.Errorw("Failed to push TLS offsets to BPF map", "error", err, "tgid", tgid)
 			continue
 		}
+		// Also push as global fallback (key=0) for short-lived child processes
+		// whose per-tgid entry may not be pushed in time. The BPF code tries
+		// per-tgid first, then falls back to key=0.
+		_ = m.objs.TlsOffsetConfig.Update(uint32(0), &val, 0)
 
 		m.log.Debugw("Pushed TLS offsets for XOR-patch path",
-			"lib", libPath, "version", version,
+			"lib", libPath, "version", version, "tgid", tgid,
 			"offsets", fmt.Sprintf("%+v", offsets))
 		return // Only need one successful push.
 	}
