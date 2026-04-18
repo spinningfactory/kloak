@@ -38,8 +38,4 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 # ── k3s binary (installed, not started — started at job runtime) ──
 RUN curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_SKIP_ENABLE=true sh -
 
-# Pre-warm Go module cache for faster builds
-COPY go.mod go.sum /tmp/kloak/
-RUN cd /tmp/kloak && go mod download && rm -rf /tmp/kloak
-
 USER runner
