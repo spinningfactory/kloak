@@ -586,9 +586,10 @@ struct ghash_work {
   __u32 ghash_ct_blocks;       // total ciphertext blocks
   // h_powers_cache moved to separate h_power_entries per-CPU array map
   __u32 ghash_h_power_val;      // power value for h_power_step callback
-  // Connection key + pkt_seq for deferred tag patching (multi-segment records).
+  // Connection key + record position for deferred tag patching (multi-segment records).
   struct tc_dest_key ghash_conn_key;
-  __u32 ghash_pkt_seq;           // TCP seq of this segment (for tag offset calc)
+  __u32 ghash_pkt_seq;           // TCP seq of this segment
+  __u32 ghash_record_tcp_off;    // TLS record start offset within TCP payload (0 if first record)
 };
 
 struct {
@@ -2619,6 +2620,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
       ? pt_len + 17   // TLS 1.3: pt + 1 (content_type) + 16 (tag)
       : pt_len + 24;  // TLS 1.2: pt + 8 (nonce) + 16 (tag)
 
+  __u32 tcp_payload_start = payload_off; // save before forward scan
   if (pt_len > 0 && record_len != expected_reclen) {
     // First record doesn't match — scan forward through coalesced records.
     __u32 scan_off = payload_off + 5 + record_len;
@@ -2666,6 +2668,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
   w->ghash_active = 1;
   w->ghash_conn_key = key;
   w->ghash_pkt_seq = pkt_seq;
+  w->ghash_record_tcp_off = payload_off - tcp_payload_start;
 
   // Apply patches. Zero secret_len on failure so GHASH skips unapplied patches.
   // Track whether any patch was actually applied — only deactivate tc_pending
@@ -2790,11 +2793,12 @@ int tc_ghash_update(struct __sk_buff *skb) {
     // Tag is in a later segment (TLS record spans multiple TCP segments).
     // Store the precomputed tag delta so tc_egress can apply it when the
     // segment containing the tag arrives.
-    // tag_tcp_seq = pkt_seq + (tag_offset - payload_off)
-    //             = pkt_seq + 5 + nonce_len + ct_len
+    // tag_tcp_seq = pkt_seq + record_tcp_off + 5 + nonce_len + ct_len
+    // record_tcp_off accounts for forward-scanned records that don't start
+    // at byte 0 of the TCP payload (coalesced TLS records).
     struct tc_tag_val tv;
     __builtin_memcpy(tv.tag_delta, w->tag_delta, 16);
-    tv.tag_tcp_seq = w->ghash_pkt_seq + 5 + nonce_len + ct_len;
+    tv.tag_tcp_seq = w->ghash_pkt_seq + w->ghash_record_tcp_off + 5 + nonce_len + ct_len;
     bpf_map_update_elem(&tc_tag_pending, &w->ghash_conn_key, &tv, BPF_ANY);
 #ifdef KLOAK_DEBUG
     bpf_printk("kloak [5-GHASH] DEFERRED tag_seq=%u", tv.tag_tcp_seq);
