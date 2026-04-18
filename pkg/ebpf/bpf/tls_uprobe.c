@@ -75,7 +75,7 @@ struct secret_value {
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 1024);
+  __uint(max_entries, 4096);
   __uint(map_flags, BPF_F_RDONLY_PROG);
   __type(key, struct secret_key);
   __type(value, struct secret_value);
@@ -364,7 +364,7 @@ struct watched_host_key {
 
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 256);
+  __uint(max_entries, 1024);
   __uint(map_flags, BPF_F_RDONLY_PROG);
   __type(key, struct watched_host_key);
   __type(value, __u8);
@@ -379,7 +379,7 @@ struct {
 // Used by sched_process_exec/exit tracepoints to filter events to tracked containers.
 struct {
   __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 256);
+  __uint(max_entries, 4096);
   __type(key, __u64);  // cgroup id (inode)
   __type(value, __u8); // 1 = tracked
 } tracked_cgroups SEC(".maps");
@@ -466,7 +466,7 @@ struct xor_pending_val {
   __u64 created_at;         // bpf_ktime_get_ns() — for TTL-based cleanup (memory BIO)
 };
 
-// Per-thread pending XOR patches, keyed by pid_tgid.
+// Per-process pending XOR patches, keyed by tgid.
 // Written by the uprobe (xor_path), read by the tcp_sendmsg kprobe which
 // bridges to tc_pending with the per-connection (dst_ip, src_port) key.
 struct {
@@ -2550,7 +2550,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
     return 0 /* TC_ACT_OK */;
 
   __u16 record_len = ((__u16)tls_hdr[3] << 8) | (__u16)tls_hdr[4];
-  if (record_len < 24) // minimum: 8 nonce + 0 payload + 16 tag
+  if (record_len < 17) // minimum: 0 plaintext + 1 content_type + 16 tag (TLS 1.3)
     return 0 /* TC_ACT_OK */;
 
   // Now that we know this is a valid TLS application_data record, look up
@@ -2636,6 +2636,12 @@ int tc_egress_patch(struct __sk_buff *skb) {
       scan_off += 5 + rlen;
     }
   }
+
+  // Ensure record is large enough for the nonce + tag. For TLS 1.2 (nonce_len=8),
+  // minimum is 24; for TLS 1.3 (nonce_len=0), minimum is 17. Without this check,
+  // the subtraction underflows for small records with the wrong nonce_len.
+  if (record_len < 16 + nonce_len)
+    return 0 /* TC_ACT_OK */;
 
   __u32 ct_len = record_len - 16 - nonce_len;
 
