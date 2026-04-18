@@ -159,16 +159,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v6
 
-      - name: Set up Go
-        uses: actions/setup-go@v6
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
+      # Go, Docker, clang, Helm, k3s are pre-installed in the runner image
+      # (ghcr.io/spinningfactory/kloak-runner). See .github/runners/Dockerfile.
 
-      - name: Install Docker
+      - name: Start Docker
         run: |
-          curl -fsSL https://get.docker.com | sudo sh
-          # No systemd in container — start dockerd directly
           sudo dockerd --host=unix:///var/run/docker.sock &
           for i in $(seq 1 30); do
             sudo docker info >/dev/null 2>&1 && break
@@ -176,20 +171,11 @@ jobs:
           done
           sudo docker info >/dev/null 2>&1 || { echo "Docker failed to start"; exit 1; }
 
-      - name: Install clang and bpftool for eBPF
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y clang llvm libbpf-dev
-          KVER="$(uname -r)" && sudo apt-get install -y linux-tools-common "linux-tools-${KVER}" 2>/dev/null || true
-
       - name: Generate eBPF bindings
         run: KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/
 
-      - name: Install k3s
+      - name: Start k3s
         run: |
-          # No systemd in container — install k3s without starting the service,
-          # then run the server directly in the background.
-          curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --disable=traefik --docker" sh -
           sudo k3s server --write-kubeconfig-mode 644 --disable=traefik --docker &
           for i in $(seq 1 30); do
             sudo k3s kubectl get nodes -o name 2>/dev/null | grep -q . && break
@@ -213,9 +199,6 @@ jobs:
           docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
           docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
           # k3s with --docker uses Docker as runtime; images are already available.
-
-      - name: Install Helm
-        uses: azure/setup-helm@v5
 
       - name: Run E2E tests (with eBPF)
         run: go test -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
