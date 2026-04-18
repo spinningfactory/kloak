@@ -168,12 +168,13 @@ jobs:
       - name: Install Docker
         run: |
           curl -fsSL https://get.docker.com | sudo sh
-          sudo systemctl start docker 2>/dev/null || sudo dockerd &
-          # Wait for Docker to be ready
+          # No systemd in container — start dockerd directly
+          sudo dockerd --host=unix:///var/run/docker.sock &
           for i in $(seq 1 30); do
-            docker info >/dev/null 2>&1 && break
+            sudo docker info >/dev/null 2>&1 && break
             sleep 1
           done
+          sudo docker info >/dev/null 2>&1 || { echo "Docker failed to start"; exit 1; }
 
       - name: Install clang and bpftool for eBPF
         run: |
@@ -186,7 +187,10 @@ jobs:
 
       - name: Install k3s
         run: |
-          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --disable=traefik --docker" sh -
+          # No systemd in container — install k3s without starting the service,
+          # then run the server directly in the background.
+          curl -sfL https://get.k3s.io | INSTALL_K3S_SKIP_START=true INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --disable=traefik --docker" sh -
+          sudo k3s server --write-kubeconfig-mode 644 --disable=traefik --docker &
           for i in $(seq 1 30); do
             sudo k3s kubectl get nodes -o name 2>/dev/null | grep -q . && break
             echo "Waiting for k3s node to register ($i/30)..."
