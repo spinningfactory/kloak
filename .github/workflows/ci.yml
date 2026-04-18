@@ -190,7 +190,8 @@ jobs:
 
       - name: Start k3s and import images
         run: |
-          sudo k3s server --write-kubeconfig-mode 644 --disable=traefik &
+          # Use native snapshotter — overlayfs doesn't work nested inside a container.
+          sudo k3s server --write-kubeconfig-mode 644 --disable=traefik --snapshotter=native &
           for i in $(seq 1 30); do
             sudo k3s kubectl get nodes -o name 2>/dev/null | grep -q . && break
             echo "Waiting for k3s node to register ($i/30)..."
