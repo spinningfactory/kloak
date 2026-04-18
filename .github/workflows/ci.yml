@@ -153,7 +153,7 @@ jobs:
 
   e2e:
     name: E2E Tests
-    runs-on: ubuntu-latest
+    runs-on: k3s-ebpf-large
     if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'e2e')
     steps:
       - name: Checkout code
@@ -164,6 +164,16 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+
+      - name: Install Docker
+        run: |
+          curl -fsSL https://get.docker.com | sudo sh
+          sudo systemctl start docker 2>/dev/null || sudo dockerd &
+          # Wait for Docker to be ready
+          for i in $(seq 1 30); do
+            docker info >/dev/null 2>&1 && break
+            sleep 1
+          done
 
       - name: Install clang and bpftool for eBPF
         run: |
@@ -176,8 +186,7 @@ jobs:
 
       - name: Install k3s
         run: |
-          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --disable=traefik" sh -
-          # Wait for node to register before running kubectl wait
+          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --disable=traefik --docker" sh -
           for i in $(seq 1 30); do
             sudo k3s kubectl get nodes -o name 2>/dev/null | grep -q . && break
             echo "Waiting for k3s node to register ($i/30)..."
@@ -199,10 +208,7 @@ jobs:
           docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
           docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
           docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
-          docker save kloak:e2e kloak-demo-go:latest kloak-demo-python:latest \
-            kloak-demo-js:latest kloak-demo-go-boring:latest \
-            kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest \
-            kloak-tls-echo:latest | sudo k3s ctr -n k8s.io images import -
+          # k3s with --docker uses Docker as runtime; images are already available.
 
       - name: Install Helm
         uses: azure/setup-helm@v5
@@ -240,10 +246,3 @@ jobs:
           sudo dmesg | tail -50 2>/dev/null || true
           echo "=== BPF trace_pipe (buffered) ==="
           sudo timeout 2 cat /sys/kernel/tracing/trace_pipe 2>/dev/null | head -100 || true
-
-      - name: Stop k3s
-        if: always()
-        run: |
-          sudo /usr/local/bin/k3s-killall.sh 2>/dev/null || true
-          sudo /usr/local/bin/k3s-uninstall.sh 2>/dev/null || true
-          rm -f ~/.kube/k3s-e2e.yaml
