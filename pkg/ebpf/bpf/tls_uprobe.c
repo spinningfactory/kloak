@@ -2637,6 +2637,12 @@ int tc_egress_patch(struct __sk_buff *skb) {
     }
   }
 
+  // Ensure record is large enough for the nonce + tag. For TLS 1.2 (nonce_len=8),
+  // minimum is 24; for TLS 1.3 (nonce_len=0), minimum is 17. Without this check,
+  // the subtraction underflows for small records with the wrong nonce_len.
+  if (record_len < 16 + nonce_len)
+    return 0 /* TC_ACT_OK */;
+
   __u32 ct_len = record_len - 16 - nonce_len;
 
   // Copy ALL data from pending to ghash_scratch staging area.
