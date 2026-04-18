@@ -164,7 +164,9 @@ jobs:
 
       - name: Start Docker
         run: |
-          sudo dockerd --host=unix:///var/run/docker.sock &
+          # Use vfs storage driver — the runner pod is on overlayfs (Kubernetes),
+          # and nested overlayfs (Docker BuildKit on top) fails with EINVAL.
+          sudo dockerd --storage-driver=vfs --host=unix:///var/run/docker.sock &
           for i in $(seq 1 30); do
             sudo docker info >/dev/null 2>&1 && break
             sleep 1
