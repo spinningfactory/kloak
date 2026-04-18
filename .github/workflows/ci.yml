@@ -164,12 +164,6 @@ jobs:
 
       - name: Start Docker
         run: |
-          # Configure Docker daemon with external DNS before starting.
-          # k3s overwrites /etc/resolv.conf with CoreDNS (10.43.0.10) which
-          # is unreachable from Docker's build network. daemon.json ensures
-          # both containers and BuildKit use external DNS.
-          sudo mkdir -p /etc/docker
-          echo '{"dns": ["8.8.8.8", "8.8.4.4"]}' | sudo tee /etc/docker/daemon.json
           sudo dockerd --host=unix:///var/run/docker.sock &
           for i in $(seq 1 30); do
             sudo docker info >/dev/null 2>&1 && break
@@ -180,9 +174,21 @@ jobs:
       - name: Generate eBPF bindings
         run: KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/
 
-      - name: Start k3s
+      - name: Build images
         run: |
-          sudo k3s server --write-kubeconfig-mode 644 --disable=traefik --docker &
+          # Build BEFORE starting k3s — k3s networking breaks Docker DNS.
+          docker build --build-arg TARGETARCH=amd64 --build-arg COVER=1 -t kloak:e2e .
+          docker build -t kloak-demo-go:latest ./examples/demo-go/
+          docker build -t kloak-demo-python:latest ./examples/demo-python/
+          docker build -t kloak-demo-js:latest ./examples/demo-js/
+          docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
+          docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
+          docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
+          docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
+
+      - name: Start k3s and import images
+        run: |
+          sudo k3s server --write-kubeconfig-mode 644 --disable=traefik &
           for i in $(seq 1 30); do
             sudo k3s kubectl get nodes -o name 2>/dev/null | grep -q . && break
             echo "Waiting for k3s node to register ($i/30)..."
@@ -193,18 +199,10 @@ jobs:
           sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/k3s-e2e.yaml
           sudo chown "$(id -u):$(id -g)" ~/.kube/k3s-e2e.yaml
           chmod 600 ~/.kube/k3s-e2e.yaml
-
-      - name: Build and import images into k3s
-        run: |
-          docker build --build-arg TARGETARCH=amd64 --build-arg COVER=1 -t kloak:e2e .
-          docker build -t kloak-demo-go:latest ./examples/demo-go/
-          docker build -t kloak-demo-python:latest ./examples/demo-python/
-          docker build -t kloak-demo-js:latest ./examples/demo-js/
-          docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
-          docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
-          docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
-          docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
-          # k3s with --docker uses Docker as runtime; images are already available.
+          docker save kloak:e2e kloak-demo-go:latest kloak-demo-python:latest \
+            kloak-demo-js:latest kloak-demo-go-boring:latest \
+            kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest \
+            kloak-tls-echo:latest | sudo k3s ctr -n k8s.io images import -
 
       - name: Run E2E tests (with eBPF)
         run: go test -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
