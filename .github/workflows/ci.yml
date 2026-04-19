@@ -155,6 +155,11 @@ jobs:
     name: E2E Tests
     runs-on: ubuntu-latest
     if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'e2e')
+    permissions:
+      contents: read
+      packages: write
+    env:
+      CACHE_REPO: ghcr.io/${{ github.repository }}/cache
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
@@ -174,6 +179,16 @@ jobs:
       - name: Generate eBPF bindings
         run: KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/
 
+      - name: Login to GHCR (for build cache)
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
       - name: Install k3s
         run: |
           curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --disable=traefik" sh -
@@ -191,14 +206,50 @@ jobs:
 
       - name: Build and import images into k3s
         run: |
-          docker build --build-arg TARGETARCH=amd64 --build-arg COVER=1 -t kloak:e2e .
-          docker build -t kloak-demo-go:latest ./examples/demo-go/
-          docker build -t kloak-demo-python:latest ./examples/demo-python/
-          docker build -t kloak-demo-js:latest ./examples/demo-js/
-          docker build -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
-          docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
-          docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
-          docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
+          # Build with GHCR registry cache. Unchanged layers are pulled from cache
+          # instead of rebuilt. Cache is pushed on every build so it stays warm.
+          CACHE=${{ env.CACHE_REPO }}
+
+          docker buildx build --load \
+            --cache-from type=registry,ref=${CACHE}:kloak \
+            --cache-to type=registry,ref=${CACHE}:kloak,mode=max \
+            --build-arg TARGETARCH=amd64 --build-arg COVER=1 -t kloak:e2e .
+
+          docker buildx build --load \
+            --cache-from type=registry,ref=${CACHE}:demo-go \
+            --cache-to type=registry,ref=${CACHE}:demo-go,mode=max \
+            -t kloak-demo-go:latest ./examples/demo-go/
+
+          docker buildx build --load \
+            --cache-from type=registry,ref=${CACHE}:demo-python \
+            --cache-to type=registry,ref=${CACHE}:demo-python,mode=max \
+            -t kloak-demo-python:latest ./examples/demo-python/
+
+          docker buildx build --load \
+            --cache-from type=registry,ref=${CACHE}:demo-js \
+            --cache-to type=registry,ref=${CACHE}:demo-js,mode=max \
+            -t kloak-demo-js:latest ./examples/demo-js/
+
+          docker buildx build --load \
+            --cache-from type=registry,ref=${CACHE}:demo-go-boring \
+            --cache-to type=registry,ref=${CACHE}:demo-go-boring,mode=max \
+            -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
+
+          docker buildx build --load \
+            --cache-from type=registry,ref=${CACHE}:demo-gnutls \
+            --cache-to type=registry,ref=${CACHE}:demo-gnutls,mode=max \
+            -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
+
+          docker buildx build --load \
+            --cache-from type=registry,ref=${CACHE}:demo-python-raw-tls \
+            --cache-to type=registry,ref=${CACHE}:demo-python-raw-tls,mode=max \
+            -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
+
+          docker buildx build --load \
+            --cache-from type=registry,ref=${CACHE}:tls-echo \
+            --cache-to type=registry,ref=${CACHE}:tls-echo,mode=max \
+            -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
+
           docker save kloak:e2e kloak-demo-go:latest kloak-demo-python:latest \
             kloak-demo-js:latest kloak-demo-go-boring:latest \
             kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest \
