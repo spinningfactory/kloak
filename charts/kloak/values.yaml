@@ -70,7 +70,8 @@ demo:
   namespace: kloak-demo
   image:
     repository: ghcr.io/spinningfactory/kloak-demo-go
-    tag: latest
+    # Empty tag defaults to chart appVersion.
+    tag: ""
     pullPolicy: IfNotPresent
   # Target URL that the demo app sends requests to (must be HTTPS).
   targetURL: "https://httpbin.org/headers"
@@ -84,3 +85,10 @@ demo:
   secretBlocked:
     value: "real-api-key-blocked-67890"
     allowedHost: "example.com"
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi

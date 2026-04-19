@@ -22,7 +22,7 @@ spec:
     spec:
       containers:
         - name: demo
-          image: "{{ .Values.demo.image.repository }}:{{ .Values.demo.image.tag }}"
+          image: "{{ .Values.demo.image.repository }}:{{ .Values.demo.image.tag | default .Chart.AppVersion }}"
           imagePullPolicy: {{ .Values.demo.image.pullPolicy }}
           env:
             - name: SECRET_ALLOWED_FILE
@@ -41,12 +41,7 @@ spec:
               mountPath: "/etc/secrets/blocked"
               readOnly: true
           resources:
-            requests:
-              cpu: 10m
-              memory: 32Mi
-            limits:
-              cpu: 100m
-              memory: 64Mi
+            {{- toYaml .Values.demo.resources | nindent 12 }}
       volumes:
         - name: secret-allowed
           secret:
