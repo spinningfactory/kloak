@@ -51,3 +51,23 @@ certificates:
 coverage:
   enabled: false
   hostPath: /tmp/kloak-coverage
+
+# Optional demo app deployment for validating kloak is working.
+# Enable with: helm install kloak charts/kloak --set demo.enabled=true
+demo:
+  enabled: false
+  image:
+    repository: ghcr.io/spinningfactory/kloak-demo-go
+    tag: latest
+    pullPolicy: IfNotPresent
+  # Target URL that the demo app sends requests to (must be HTTPS).
+  targetURL: "https://httpbin.org/headers"
+  # Interval in seconds between requests.
+  requestInterval: "5"
+  # The secret value to use. This secret will be labeled with
+  # getkloak.io/enabled=true and sent as X-Api-Key header.
+  secret:
+    value: "my-super-secret-api-key-12345"
+    # Host restriction: only allow this secret to be sent to this host.
+    # Set to "" for wildcard (allow all hosts).
+    allowedHost: "httpbin.org"
