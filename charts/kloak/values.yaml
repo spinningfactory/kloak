@@ -54,6 +54,12 @@ coverage:
 
 # Optional demo app deployment for validating kloak is working.
 # Enable with: helm install kloak charts/kloak --set demo.enabled=true
+#
+# Deploys a Go app that sends two secrets to httpbin.org as headers.
+# DNS host filtering (via kube-dns, auto-discovered) verifies that
+# secrets are only rewritten for their allowed hosts:
+#   - "allowed" secret (hosts: httpbin.org) → real value in response
+#   - "blocked" secret (hosts: example.com) → shadow UUID in response
 demo:
   enabled: false
   image:
@@ -64,10 +70,11 @@ demo:
   targetURL: "https://httpbin.org/headers"
   # Interval in seconds between requests.
   requestInterval: "5"
-  # The secret value to use. This secret will be labeled with
-  # getkloak.io/enabled=true and sent as X-Api-Key header.
-  secret:
-    value: "my-super-secret-api-key-12345"
-    # Host restriction: only allow this secret to be sent to this host.
-    # Set to "" for wildcard (allow all hosts).
+  # Allowed secret: host matches targetURL → kloak rewrites with real value.
+  secretAllowed:
+    value: "real-api-key-allowed-12345"
     allowedHost: "httpbin.org"
+  # Blocked secret: host does NOT match targetURL → shadow UUID passes through.
+  secretBlocked:
+    value: "real-api-key-blocked-67890"
+    allowedHost: "example.com"

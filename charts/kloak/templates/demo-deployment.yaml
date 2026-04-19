@@ -26,14 +26,19 @@ spec:
           imagePullPolicy: {{ .Values.demo.image.pullPolicy }}
           env:
             - name: SECRET_ALLOWED_FILE
-              value: "/etc/secrets/api-key"
+              value: "/etc/secrets/allowed/api-key"
+            - name: SECRET_BLOCKED_FILE
+              value: "/etc/secrets/blocked/api-key"
             - name: TARGET_URL
               value: {{ .Values.demo.targetURL | quote }}
             - name: REQUEST_INTERVAL
               value: {{ .Values.demo.requestInterval | quote }}
           volumeMounts:
-            - name: secret-vol
-              mountPath: "/etc/secrets"
+            - name: secret-allowed
+              mountPath: "/etc/secrets/allowed"
+              readOnly: true
+            - name: secret-blocked
+              mountPath: "/etc/secrets/blocked"
               readOnly: true
           resources:
             requests:
@@ -43,7 +48,10 @@ spec:
               cpu: 100m
               memory: 64Mi
       volumes:
-        - name: secret-vol
+        - name: secret-allowed
           secret:
-            secretName: {{ include "kloak.fullname" . }}-demo-secret
+            secretName: {{ include "kloak.fullname" . }}-demo-allowed
+        - name: secret-blocked
+          secret:
+            secretName: {{ include "kloak.fullname" . }}-demo-blocked
 {{- end }}
