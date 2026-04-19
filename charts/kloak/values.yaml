@@ -1,3 +1,6 @@
+# Install: helm install kloak oci://ghcr.io/spinningfactory/kloak/kloak -n kloak-system --create-namespace
+# With demo: helm install kloak oci://ghcr.io/spinningfactory/kloak/kloak -n kloak-system --create-namespace --set demo.enabled=true
+
 image:
   repository: ghcr.io/spinningfactory/kloak
   tag: dev
