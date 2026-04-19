@@ -62,6 +62,9 @@ coverage:
 #   - "blocked" secret (hosts: example.com) → shadow UUID in response
 demo:
   enabled: false
+  # Namespace for the demo app. Created automatically with the
+  # getkloak.io/enabled label so the webhook intercepts pods in it.
+  namespace: kloak-demo
   image:
     repository: ghcr.io/spinningfactory/kloak-demo-go
     tag: latest

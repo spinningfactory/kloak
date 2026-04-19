@@ -3,7 +3,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "kloak.fullname" . }}-demo
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ .Values.demo.namespace }}
   labels:
     {{- include "kloak.labels" . | nindent 4 }}
     app.kubernetes.io/component: demo
