@@ -23,6 +23,10 @@ func loadSecret(envVar, defaultValue string) string {
 }
 
 func main() {
+	// Load secrets
+	keyAllowed := loadSecret("SECRET_ALLOWED_FILE", "")
+	keyBlocked := loadSecret("SECRET_BLOCKED_FILE", "")
+
 	targetURL := os.Getenv("TARGET_URL")
 	if targetURL == "" {
 		targetURL = "https://httpbin.org/headers"
@@ -39,18 +43,7 @@ func main() {
 	fmt.Println(strings.Repeat("=", 60))
 	fmt.Println("Kloak Demo (Go): Host Restriction Feature")
 	fmt.Println(strings.Repeat("=", 60))
-	fmt.Printf("Target URL: %s\n", targetURL)
-
-	// Brief delay for Kloak controller to attach uprobes and sync BPF maps.
-	fmt.Println("Waiting 10s for Kloak controller to sync...")
-	time.Sleep(10 * time.Second)
-
-	// Load secrets AFTER the delay so the shadow values are read (not cached
-	// before kloak attaches). The app sees kloak: UUIDs; kloak rewrites the
-	// allowed secret in-kernel and blocks the restricted one.
-	keyAllowed := loadSecret("SECRET_ALLOWED_FILE", "")
-	keyBlocked := loadSecret("SECRET_BLOCKED_FILE", "")
-
+	fmt.Printf("Target URL: %s\n\n", targetURL)
 	fmt.Println("Secrets (as seen by the app - these are UUIDs if Kloak is working):")
 	fmt.Printf("  Secret Allowed (httpbin.org): %s...\n", limitLen(keyAllowed, 30))
 	fmt.Printf("  Secret Blocked (example.com): %s...\n\n", limitLen(keyBlocked, 30))
@@ -58,6 +51,10 @@ func main() {
 	fmt.Println("  - X-Secret-Allowed: Should show ORIGINAL value in response")
 	fmt.Println("  - X-Secret-Blocked: Should show UUID in response (not replaced)")
 	fmt.Println(strings.Repeat("=", 60))
+
+	// Brief delay for watched_hosts BPF map to be populated before first DNS query.
+	fmt.Println("Waiting 10s for Kloak controller to sync...")
+	time.Sleep(10 * time.Second)
 
 	client := &http.Client{
 		Timeout: 10 * time.Second,
