@@ -1,0 +1,10 @@
+{{- if .Values.demo.enabled }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.demo.namespace }}
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+    app.kubernetes.io/component: demo
+    getkloak.io/enabled: "true"
+{{- end }}
