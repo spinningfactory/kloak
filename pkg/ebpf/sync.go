@@ -308,3 +308,169 @@ func syncWatchedHosts(watchedHostsMap *ebpf.Map, newHosts map[watchedHostKey]str
 		}
 	}
 }
+
+// syncPodSecrets syncs BPF maps for just the kloak-enabled secrets mounted by
+// a specific pod. Reads each secret directly via the API client (bypasses the
+// informer cache). Does not prune — only adds/updates entries.
+func syncPodSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, reader client.Reader, pod *corev1.Pod, log *zap.SugaredLogger) error {
+	if reader == nil || pod == nil {
+		return nil
+	}
+
+	// Collect secret names from the pod's volumes. The webhook rewrites
+	// volumes to use shadow secrets (-kloak suffix). We need both the
+	// original (for labels/hosts) and the shadow (for kloak: values).
+	for _, vol := range pod.Spec.Volumes {
+		if vol.Secret == nil {
+			continue
+		}
+		secretName := vol.Secret.SecretName
+
+		// Determine original and shadow names. The webhook rewrites
+		// "my-secret" → "my-secret-kloak". If the mounted name ends
+		// with -kloak, the original is the name without the suffix.
+		var originalName, shadowName string
+		if strings.HasSuffix(secretName, "-kloak") {
+			shadowName = secretName
+			originalName = strings.TrimSuffix(secretName, "-kloak")
+		} else {
+			// Not a kloak-managed volume — skip.
+			continue
+		}
+
+		// Read the original secret (has labels with host restrictions)
+		var original corev1.Secret
+		if err := reader.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: originalName}, &original); err != nil {
+			logging.Tracew(log, "original secret not found for pod sync", "secret", originalName, "pod", pod.Name)
+			continue
+		}
+
+		// Must be kloak-enabled
+		if original.Labels["getkloak.io/enabled"] != "true" {
+			continue
+		}
+
+		// Read the shadow secret (has kloak: UUID values)
+		var shadow corev1.Secret
+		if err := reader.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: shadowName}, &shadow); err != nil {
+			logging.Tracew(log, "shadow secret not found for pod sync", "secret", shadowName, "pod", pod.Name)
+			continue
+		}
+
+		// Parse host restriction from original secret's labels
+		var allowedHost string
+		if hostsLabel, ok := original.Labels["getkloak.io/hosts"]; ok && hostsLabel != "" {
+			parts := strings.Split(hostsLabel, ",")
+			for _, p := range parts {
+				if trimmed := strings.TrimSpace(p); trimmed != "" && trimmed != "*" {
+					allowedHost = trimmed
+					break
+				}
+			}
+		}
+
+		// Parse port restriction
+		var port uint16
+		var protocol uint8
+		if portLabel, ok := original.Labels["getkloak.io/port"]; ok && portLabel != "" {
+			ps, err := parseSyncPortSpec(portLabel)
+			if err == nil {
+				port = ps.port
+				protocol = ps.protocol
+			}
+		}
+
+		// Sync each key in the secret to the BPF map
+		for key, realBytes := range original.Data {
+			shadowBytes, ok := shadow.Data[key]
+			if !ok {
+				continue
+			}
+
+			shadowPrefix := string(shadowBytes)
+			realValue := string(realBytes)
+
+			if len(shadowPrefix) < 8 {
+				continue
+			}
+
+			var bpfKey secretKey
+			copy(bpfKey.Prefix[:], []byte(shadowPrefix)[:8])
+
+			var val secretValue
+			val.Len = uint32(len(realValue))
+			if val.Len > 128 {
+				val.Len = 128
+			}
+			copy(val.RealSecret[:], []byte(realValue)[:val.Len])
+
+			prefixLen := len(shadowPrefix)
+			if prefixLen > 42 {
+				prefixLen = 42
+			}
+			val.PrefixLen = uint32(prefixLen)
+			copy(val.FullPrefix[:], []byte(shadowPrefix)[:prefixLen])
+
+			if allowedHost != "" {
+				host := allowedHost
+				if len(host) > len(val.AllowedHost) {
+					host = host[:len(val.AllowedHost)]
+				}
+				val.HostLen = uint32(len(host))
+				copy(val.AllowedHost[:], host)
+
+				// Add to watched_hosts so DNS responses for this host are captured
+				if watchedHostsMap != nil {
+					var whk watchedHostKey
+					copy(whk.Host[:], host)
+					whVal := uint8(1)
+					_ = watchedHostsMap.Update(&whk, &whVal, 0)
+				}
+			}
+
+			val.Port = port
+			val.Protocol = protocol
+
+			if err := secretMap.Update(&bpfKey, &val, 0); err != nil {
+				log.Errorw("failed to sync pod secret to BPF map", "error", err, "secret", originalName, "key", key)
+			} else {
+				logging.Tracew(log, "synced pod secret to BPF map", "secret", originalName, "key", key, "hostLen", val.HostLen, "pod", pod.Name)
+			}
+
+			// Also sync Huffman variant
+			huffShadow := hpack.AppendHuffmanString(nil, shadowPrefix)
+			huffReal := hpack.AppendHuffmanString(nil, realValue)
+			if len(huffShadow) >= 8 && len(huffReal) > 0 {
+				for len(huffReal) < len(huffShadow) {
+					huffReal = append(huffReal, 0xff)
+				}
+				var huffKey secretKey
+				copy(huffKey.Prefix[:], huffShadow[:8])
+
+				var huffVal secretValue
+				huffLen := len(huffReal)
+				if huffLen > 128 {
+					huffLen = 128
+				}
+				huffVal.Len = uint32(huffLen)
+				copy(huffVal.RealSecret[:], huffReal[:huffLen])
+				huffVal.HostLen = val.HostLen
+				huffVal.AllowedHost = val.AllowedHost
+				huffVal.Port = val.Port
+				huffVal.Protocol = val.Protocol
+				huffPrefixLen := len(huffShadow)
+				if huffPrefixLen > 42 {
+					huffPrefixLen = 42
+				}
+				huffVal.PrefixLen = uint32(huffPrefixLen)
+				copy(huffVal.FullPrefix[:], huffShadow[:huffPrefixLen])
+
+				_ = secretMap.Update(&huffKey, &huffVal, 0)
+			}
+		}
+
+		log.Infow("synced pod secret for uprobe attachment", "original", originalName, "shadow", shadowName, "host", allowedHost, "pod", pod.Name)
+	}
+
+	return nil
+}

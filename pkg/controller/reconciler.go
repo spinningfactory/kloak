@@ -160,13 +160,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	r.podKeyToUID[req.String()] = string(pod.UID)
 	r.mu.Unlock()
 
-	// Force a secret sync before attaching uprobes to a newly discovered pod.
-	// On fresh deploy, the periodic sync may not have run yet, leaving
-	// secret_map entries with host_len=0 (wildcard). Without this, the first
-	// TLS write bypasses host filtering. Only sync for new pods — retries
-	// (libssl not loaded yet) don't need another sync.
+	// Sync this pod's kloak secrets to BPF maps before attaching uprobes.
+	// Reads the secrets directly via the API client (not the informer cache)
+	// to ensure secret_map and watched_hosts have correct host restrictions
+	// before the first TLS write. Only for new pods — retries don't need it.
 	if isNewPod && len(needsAttach) > 0 && r.UprobeManager != nil {
-		r.UprobeManager.SyncSecrets(ctx)
+		r.UprobeManager.SyncPodSecrets(ctx, pod)
 	}
 
 	// Attach uprobes outside the lock — this involves filesystem I/O.

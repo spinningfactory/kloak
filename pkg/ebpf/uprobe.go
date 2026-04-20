@@ -21,6 +21,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 
+	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/spinningfactory/kloak/pkg/logging"
@@ -906,13 +907,27 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 }
 
 // SyncSecrets forces an immediate sync of secrets to BPF maps.
-// Called by the reconciler before attaching uprobes to ensure secret_map
-// and watched_hosts are populated before the first TLS write.
 // Thread-safe: serialized with the periodic sync ticker.
 func (m *TLSUprobeManager) SyncSecrets(ctx context.Context) {
 	m.syncMu.Lock()
 	defer m.syncMu.Unlock()
 	m.syncSecretsToBPF(ctx)
+}
+
+// SyncPodSecrets ensures BPF maps are populated for the secrets mounted by a
+// specific pod. Reads each kloak-enabled secret and its shadow directly via the
+// API client (not the informer cache), syncs them to secret_map with correct
+// host restrictions, and adds hostnames to watched_hosts.
+//
+// Called by the pod reconciler before attaching uprobes. This avoids the race
+// where the periodic sync hasn't run yet and the BPF maps lack host filters.
+func (m *TLSUprobeManager) SyncPodSecrets(ctx context.Context, pod *corev1.Pod) {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+
+	if err := syncPodSecrets(ctx, m.objs.SecretMap, m.objs.WatchedHosts, m.k8sReader, pod, m.log); err != nil {
+		m.log.Errorw("failed to sync pod secrets to BPF maps", "error", err, "pod", pod.Name)
+	}
 }
 
 // debugCounterNames maps index to human-readable name (must match C enum).
