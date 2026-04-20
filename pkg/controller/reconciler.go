@@ -124,11 +124,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// attachUprobesToCgroup does blocking filesystem I/O and must not run
 	// while the lock is held to avoid blocking other reconcile goroutines.
 	var needsAttach []uint64
+	isNewPod := false
 
 	r.mu.Lock()
 	existingCgroups := r.trackedPods[string(pod.UID)]
 	if existingCgroups == nil {
 		existingCgroups = make(map[uint64]bool)
+		isNewPod = true
 	}
 
 	// Collect cgroups that need uprobe attachment:
@@ -157,6 +159,15 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	r.trackedPods[string(pod.UID)] = existingCgroups
 	r.podKeyToUID[req.String()] = string(pod.UID)
 	r.mu.Unlock()
+
+	// Force a secret sync before attaching uprobes to a newly discovered pod.
+	// On fresh deploy, the periodic sync may not have run yet, leaving
+	// secret_map entries with host_len=0 (wildcard). Without this, the first
+	// TLS write bypasses host filtering. Only sync for new pods — retries
+	// (libssl not loaded yet) don't need another sync.
+	if isNewPod && len(needsAttach) > 0 && r.UprobeManager != nil {
+		r.UprobeManager.SyncSecrets(ctx)
+	}
 
 	// Attach uprobes outside the lock — this involves filesystem I/O.
 	for _, cgroupID := range needsAttach {
