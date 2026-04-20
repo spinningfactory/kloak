@@ -95,9 +95,6 @@ type TLSUprobeManager struct {
 	tcAttached sync.Map // uint64 (netns inode) -> *tcAttachEntry
 	// cgroupToNetns maps cgroup ID → netns inode for cleanup on UntrackCgroup.
 	cgroupToNetns sync.Map // uint64 (cgroup ID) -> uint64 (netns inode)
-
-	// syncMu serializes BPF secret_map + watched_hosts sync operations.
-	syncMu sync.Mutex
 }
 
 // tcAttachEntry holds an open fd to a network namespace to prevent inode reuse.
@@ -805,9 +802,7 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 	m.log.Infow("Starting eBPF TLS event poller and secret syncer")
 
 	// Trigger an initial sync
-	m.syncMu.Lock()
 	m.syncSecretsToBPF(ctx)
-	m.syncMu.Unlock()
 
 	// Periodic re-sync ticker. The initial sync may have found an empty store
 	// (secret reconciler hasn't run yet), so we must keep re-syncing.
@@ -819,9 +814,7 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-syncTicker.C:
-			m.syncMu.Lock()
 			m.syncSecretsToBPF(ctx)
-			m.syncMu.Unlock()
 			m.DumpDebugCounters()
 		default:
 		}
@@ -898,21 +891,10 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 
 // syncSecretsToBPF updates the eBPF map with the latest shadow secret values
 // and the watched_hosts map with hostnames from secret entries.
-// Must be called with syncMu held.
 func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 	if err := syncSecrets(ctx, m.objs.SecretMap, m.objs.WatchedHosts, m.k8sReader, m.log); err != nil {
 		m.log.Errorw("failed to sync secrets to BPF map", "error", err)
 	}
-}
-
-// SyncSecrets forces an immediate sync of secrets to BPF maps.
-// Called by the reconciler before attaching uprobes to ensure secret_map
-// and watched_hosts are populated before the first TLS write.
-// Thread-safe: serialized with the periodic sync ticker.
-func (m *TLSUprobeManager) SyncSecrets(ctx context.Context) {
-	m.syncMu.Lock()
-	defer m.syncMu.Unlock()
-	m.syncSecretsToBPF(ctx)
 }
 
 // debugCounterNames maps index to human-readable name (must match C enum).
