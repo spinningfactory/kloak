@@ -85,12 +85,25 @@ func TestSecretValidation_AcceptsValidSecret(t *testing.T) {
 	err := tryCreateEnabledSecret(t, "test-val-happy",
 		map[string][]byte{"api-key": []byte(strings.Repeat("a", 32))},
 		map[string]string{
-			"getkloak.io/hosts": "api.example.com,*.internal.example.com",
+			"getkloak.io/hosts": "api.example.com,internal.example.com",
 			"getkloak.io/port":  "443/tcp",
 		})
 	if err != nil {
 		t.Fatalf("expected valid secret to be admitted, got: %v", err)
 	}
+}
+
+// TestSecretValidation_RejectsWildcardSubdomain documents that `*.example.com`
+// style glob patterns are NOT supported: the BPF host filter does exact byte
+// comparison (helpers.h:hosts_match), so a literal `*.example.com` in the map
+// would never match a real hostname on the wire. Only the single-character
+// literal `*` is treated as a wildcard (= "skip host filter"). If we ever
+// add true glob matching in BPF, relax this check.
+func TestSecretValidation_RejectsWildcardSubdomain(t *testing.T) {
+	err := tryCreateEnabledSecret(t, "test-val-wildcard-subdomain",
+		map[string][]byte{"api-key": []byte("valid-8byte-or-more")},
+		map[string]string{"getkloak.io/hosts": "*.example.com"})
+	assertAdmissionRejected(t, err, "not a valid DNS name")
 }
 
 func TestSecretValidation_AcceptsBoundaryLengths(t *testing.T) {

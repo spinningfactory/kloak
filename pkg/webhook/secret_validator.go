@@ -128,7 +128,12 @@ func validateSecretData(data map[string][]byte, stringData map[string]string) er
 // validateHostsLabel parses the getkloak.io/hosts CSV and checks each entry:
 //   - non-empty after trimming
 //   - ≤ maxHostLen bytes (BPF MAX_HOST_LEN - 1)
-//   - literal "*" (wildcard) or a valid RFC 1123 DNS subdomain
+//   - literal "*" (wildcard = no host filter) or a valid RFC 1123 DNS subdomain
+//
+// Glob patterns like "*.example.com" are rejected: the BPF host filter does
+// exact byte comparison (helpers.h: hosts_match), so such a literal would
+// never match a real hostname on the wire. Supporting globs requires BPF
+// changes — do not relax this check without updating the runtime.
 func validateHostsLabel(hosts string) error {
 	if hosts == "" {
 		return nil
