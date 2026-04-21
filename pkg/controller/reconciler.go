@@ -254,7 +254,7 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (cg
 		attached := false
 		attachedPid := 0
 		for _, pid := range pids {
-			if err := r.UprobeManager.AttachTLS(pid); err != nil {
+			if err := r.UprobeManager.AttachTLS(pid, cgroupID); err != nil {
 				logging.Tracew(r.Log, "could not attach TLS uprobes to pid", "pid", pid, "container", status.Name, "err", err)
 			} else {
 				r.Log.Infow("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
