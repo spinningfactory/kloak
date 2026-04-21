@@ -63,6 +63,9 @@ func runWebhook(cmd *cobra.Command, args []string) {
 	hookServer.Register("/mutate-pods", &webhook.Admission{
 		Handler: webhookpkg.NewHandler(mgr.GetClient(), setupLog),
 	})
+	hookServer.Register("/validate-secrets", &webhook.Admission{
+		Handler: webhookpkg.NewSecretValidator(setupLog),
+	})
 
 	// Add health checks
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {

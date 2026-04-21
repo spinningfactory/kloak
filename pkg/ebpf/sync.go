@@ -67,6 +67,18 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, read
 			}
 		}
 
+		// The BPF filter treats host_len >= MAX_HOST_LEN (64) as "no filter"
+		// (tls_uprobe.c: `val_host_len < MAX_HOST_LEN`). If we synced a too-long
+		// host, the filter would be bypassed and the secret rewritten on every
+		// destination. Skip sync instead — app sends the shadow placeholder,
+		// real value stays protected in-kernel.
+		if len(allowedHost) >= len(secretValue{}.AllowedHost) {
+			log.Errorw("allowed host exceeds maximum length, skipping sync (secret will not be rewritten)",
+				"secret", secret.Name, "namespace", secret.Namespace,
+				"hostLen", len(allowedHost), "max", len(secretValue{}.AllowedHost)-1)
+			continue
+		}
+
 		// Parse port spec from the secret's labels
 		var port uint16
 		var protocol uint8
@@ -120,18 +132,15 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, read
 			val.PrefixLen = uint32(prefixLen)
 			copy(val.FullPrefix[:], []byte(shadowPrefix)[:prefixLen])
 
-			// Set allowed host for host-based filtering
+			// Set allowed host for host-based filtering.
+			// allowedHost is guaranteed < MAX_HOST_LEN (validated above).
 			if allowedHost != "" {
-				host := allowedHost
-				if len(host) > len(val.AllowedHost) {
-					host = host[:len(val.AllowedHost)]
-				}
-				val.HostLen = uint32(len(host))
-				copy(val.AllowedHost[:], host)
+				val.HostLen = uint32(len(allowedHost))
+				copy(val.AllowedHost[:], allowedHost)
 
 				// Track this hostname for the watched_hosts map
 				var whk watchedHostKey
-				copy(whk.Host[:], host)
+				copy(whk.Host[:], allowedHost)
 				newHosts[whk] = struct{}{}
 			}
 			// HostLen == 0 means wildcard (allow all hosts)
