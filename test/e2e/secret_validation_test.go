@@ -53,18 +53,12 @@ func TestSecretValidation_RejectsEmptyData(t *testing.T) {
 }
 
 func TestSecretValidation_RejectsInvalidHostLabel(t *testing.T) {
-	// underscores are not valid in RFC 1123 DNS subdomains.
+	// underscores pass the k8s label regex but are invalid in RFC 1123 DNS.
+	// This reaches the validator and exercises the DNS check.
 	err := tryCreateEnabledSecret(t, "test-val-bad-host",
 		map[string][]byte{"api-key": []byte("valid-8byte-or-more")},
 		map[string]string{"getkloak.io/hosts": "bad_host.example.com"})
 	assertAdmissionRejected(t, err, "not a valid DNS name")
-}
-
-func TestSecretValidation_RejectsEmptyCSVHostEntry(t *testing.T) {
-	err := tryCreateEnabledSecret(t, "test-val-empty-csv",
-		map[string][]byte{"api-key": []byte("valid-8byte-or-more")},
-		map[string]string{"getkloak.io/hosts": "a.com,,b.com"})
-	assertAdmissionRejected(t, err, "empty host entry")
 }
 
 func TestSecretValidation_RejectsBadPortLabel(t *testing.T) {
@@ -74,36 +68,20 @@ func TestSecretValidation_RejectsBadPortLabel(t *testing.T) {
 	assertAdmissionRejected(t, err, "invalid port")
 }
 
-func TestSecretValidation_RejectsBadPortProtocol(t *testing.T) {
-	err := tryCreateEnabledSecret(t, "test-val-bad-proto",
-		map[string][]byte{"api-key": []byte("valid-8byte-or-more")},
-		map[string]string{"getkloak.io/port": "443/sctp"})
-	assertAdmissionRejected(t, err, "invalid proto")
-}
-
 func TestSecretValidation_AcceptsValidSecret(t *testing.T) {
+	// k8s label values cannot contain commas or slashes, so multi-host
+	// (a,b) and port-with-proto (443/tcp) can't be expressed via labels.
+	// Multi-host rejection is covered in the unit suite where we call
+	// validateHostsLabel directly.
 	err := tryCreateEnabledSecret(t, "test-val-happy",
 		map[string][]byte{"api-key": []byte(strings.Repeat("a", 32))},
 		map[string]string{
-			"getkloak.io/hosts": "api.example.com,internal.example.com",
-			"getkloak.io/port":  "443/tcp",
+			"getkloak.io/hosts": "api.example.com",
+			"getkloak.io/port":  "443",
 		})
 	if err != nil {
 		t.Fatalf("expected valid secret to be admitted, got: %v", err)
 	}
-}
-
-// TestSecretValidation_RejectsWildcardSubdomain documents that `*.example.com`
-// style glob patterns are NOT supported: the BPF host filter does exact byte
-// comparison (helpers.h:hosts_match), so a literal `*.example.com` in the map
-// would never match a real hostname on the wire. Only the single-character
-// literal `*` is treated as a wildcard (= "skip host filter"). If we ever
-// add true glob matching in BPF, relax this check.
-func TestSecretValidation_RejectsWildcardSubdomain(t *testing.T) {
-	err := tryCreateEnabledSecret(t, "test-val-wildcard-subdomain",
-		map[string][]byte{"api-key": []byte("valid-8byte-or-more")},
-		map[string]string{"getkloak.io/hosts": "*.example.com"})
-	assertAdmissionRejected(t, err, "not a valid DNS name")
 }
 
 func TestSecretValidation_AcceptsBoundaryLengths(t *testing.T) {

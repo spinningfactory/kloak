@@ -55,15 +55,14 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, read
 			continue
 		}
 
-		// Parse allowed hosts from the secret's labels
+		// Parse the allowed host from the secret's label. The admission webhook
+		// (pkg/webhook/secret_validator.go) enforces one host per secret and
+		// rejects comma-separated lists — multi-host is not yet supported by
+		// the BPF data plane. "*" means "no filter", same as an empty value.
 		var allowedHost string
-		if hostsLabel, ok := secret.Labels["getkloak.io/hosts"]; ok && hostsLabel != "" {
-			parts := strings.Split(hostsLabel, ",")
-			for _, p := range parts {
-				if trimmed := strings.TrimSpace(p); trimmed != "" && trimmed != "*" {
-					allowedHost = trimmed
-					break // eBPF map supports one host per entry
-				}
+		if hostsLabel, ok := secret.Labels["getkloak.io/hosts"]; ok {
+			if trimmed := strings.TrimSpace(hostsLabel); trimmed != "" && trimmed != "*" {
+				allowedHost = trimmed
 			}
 		}
 

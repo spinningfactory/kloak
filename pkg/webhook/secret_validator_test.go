@@ -22,13 +22,13 @@ func TestValidateHostsLabel(t *testing.T) {
 	}{
 		{"empty", "", ""},
 		{"single valid", "example.com", ""},
-		{"multiple valid", "a.example.com,b.example.com", ""},
 		{"wildcard", "*", ""},
-		{"wildcard with valid", "*,api.example.com", ""},
-		{"whitespace tolerated", " api.example.com , b.com ", ""},
+		{"whitespace tolerated", "  api.example.com  ", ""},
 		{"exactly 63 bytes", strings.Repeat("a", 63), ""},
 		{"exactly 64 bytes rejected", strings.Repeat("a", 64), "exceeds max length"},
-		{"empty CSV entry", "a.com,,b.com", "empty host entry"},
+		{"multiple hosts rejected", "a.example.com,b.example.com", "multiple hosts are not supported"},
+		{"csv with wildcard rejected", "*,api.example.com", "multiple hosts are not supported"},
+		{"trailing comma rejected", "a.com,", "multiple hosts are not supported"},
 		{"invalid DNS chars", "bad_host.com", "not a valid DNS name"},
 		{"invalid leading dash", "-bad.com", "not a valid DNS name"},
 	}

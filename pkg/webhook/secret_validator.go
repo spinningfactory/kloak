@@ -125,33 +125,41 @@ func validateSecretData(data map[string][]byte, stringData map[string]string) er
 	return nil
 }
 
-// validateHostsLabel parses the getkloak.io/hosts CSV and checks each entry:
-//   - non-empty after trimming
-//   - ≤ maxHostLen bytes (BPF MAX_HOST_LEN - 1)
-//   - literal "*" (wildcard = no host filter) or a valid RFC 1123 DNS subdomain
+// validateHostsLabel validates the single hostname in the getkloak.io/hosts
+// label. Today only one host per secret is supported by the BPF data plane;
+// multi-host support was present in an earlier version but broke during a
+// rewrite and has not been restored. When it comes back, the CSV rejection
+// below should be relaxed.
 //
-// Glob patterns like "*.example.com" are rejected: the BPF host filter does
-// exact byte comparison (helpers.h: hosts_match), so such a literal would
-// never match a real hostname on the wire. Supporting globs requires BPF
-// changes — do not relax this check without updating the runtime.
+// Accepted forms:
+//   - "" — no host filter (allow any destination)
+//   - "*" — explicit wildcard (same as empty)
+//   - a single RFC 1123 DNS subdomain, ≤ maxHostLen bytes
+//
+// Note: k8s label values already restrict chars to [A-Za-z0-9._-] and length
+// to 63, so a comma would normally be rejected at the API layer before this
+// validator runs. We still check here to give a clear error message if the
+// label source ever changes (e.g. annotation-based config) and to document
+// intent to the next reader.
 func validateHostsLabel(hosts string) error {
 	if hosts == "" {
 		return nil
 	}
-	for _, p := range strings.Split(hosts, ",") {
-		h := strings.TrimSpace(p)
-		if h == "" {
-			return fmt.Errorf("empty host entry in CSV")
-		}
-		if h == "*" {
-			continue
-		}
-		if len(h) > maxHostLen {
-			return fmt.Errorf("host %q exceeds max length %d bytes", h, maxHostLen)
-		}
-		if errs := validation.IsDNS1123Subdomain(h); len(errs) != 0 {
-			return fmt.Errorf("host %q is not a valid DNS name: %s", h, strings.Join(errs, "; "))
-		}
+	if strings.Contains(hosts, ",") {
+		return fmt.Errorf("multiple hosts are not supported yet — specify a single hostname (or '*' for any)")
+	}
+	h := strings.TrimSpace(hosts)
+	if h == "" {
+		return fmt.Errorf("empty host value")
+	}
+	if h == "*" {
+		return nil
+	}
+	if len(h) > maxHostLen {
+		return fmt.Errorf("host %q exceeds max length %d bytes", h, maxHostLen)
+	}
+	if errs := validation.IsDNS1123Subdomain(h); len(errs) != 0 {
+		return fmt.Errorf("host %q is not a valid DNS name: %s", h, strings.Join(errs, "; "))
 	}
 	return nil
 }
