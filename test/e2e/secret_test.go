@@ -28,30 +28,16 @@ func TestShadowSecretMultipleKeys(t *testing.T) {
 }
 
 func TestShadowSecretLengthMatching(t *testing.T) {
+	// Values span the supported BPF range: min key size (8) to max rewrite (128).
+	// Anything outside [8, 128] is rejected by the validating webhook — see
+	// TestSecretValidation_RejectsShortData / TestSecretValidation_RejectsLongData.
 	data := map[string][]byte{
 		"short":  []byte("abcdefgh"),
 		"medium": []byte("this-is-a-medium-length-secret-value-here!x"),
-		"long":   []byte(strings.Repeat("x", 200)),
+		"long":   []byte(strings.Repeat("x", 128)),
 	}
 	createEnabledSecret(t, "test-shadow-lengths", data, nil)
 	assertShadowSecret(t, "test-shadow-lengths", data)
-}
-
-func TestShadowSecretLengthTooShort(t *testing.T) {
-	data := map[string][]byte{
-		"short": []byte("abcdefg"),
-	}
-	createEnabledSecret(t, "test-shadow-lengths", data, nil)
-
-	// Poll briefly and verify no shadow is created.
-	// Use a short timeout — if the shadow doesn't appear in 10s, it won't.
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	err := waitForSecret(ctx, testNamespace, "test-no-shadow-kloak")
-	if err == nil {
-		t.Fatal("shadow secret should NOT exist for non-enabled secret")
-	}
-	// Expected: timeout (no shadow created) — that's the passing case
 }
 
 func TestShadowSecretUpdate(t *testing.T) {
