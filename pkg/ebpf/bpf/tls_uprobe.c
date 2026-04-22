@@ -1492,8 +1492,18 @@ int bpf_h_extract(void *ctx) {
   struct task_struct *h_task = (struct task_struct *)bpf_get_current_task();
   bk.exe_inode = BPF_CORE_READ(h_task, mm, exe_file, f_inode, i_ino);
   struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
-  if (!offsets || offsets->ssl_to_wrl == 0)
-    return 0;
+  if (!offsets || offsets->ssl_to_wrl == 0) {
+    // Per-cgroup fallback: short-lived processes (curl spawned via
+    // `kubectl exec`, apt-get children, etc.) can fire SSL_write before
+    // the controller's push runs for their specific inode. Every binary
+    // in a cgroup shares the same libssl.so (the container's rootfs), so
+    // the fallback entry at (cgroup_id, 0) carries valid offsets for any
+    // OpenSSL process in this container.
+    bk.exe_inode = 0;
+    offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
+    if (!offsets || offsets->ssl_to_wrl == 0)
+      return 0;
+  }
 
   // Pointer chase: 4-hop (3.2+) or 3-hop (3.0-3.1).
   // wrl_to_enc_ctx == 0 signals 3-hop (ssl_to_wrl stores enc_write_ctx).
@@ -2089,12 +2099,17 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     bk.exe_inode = BPF_CORE_READ(ssl_task, mm, exe_file, f_inode, i_ino);
     struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
     if (!offsets || offsets->ssl_to_wrl == 0) {
+      // Per-cgroup fallback — see h_extract commentary for why this is safe.
+      bk.exe_inode = 0;
+      offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
+      if (!offsets || offsets->ssl_to_wrl == 0) {
 #ifdef KLOAK_DEBUG
-      bpf_printk("kloak [2-KPROBE] H-fail: no offsets cgid=%llx ino=%llu",
-                 bk.cgroup_id, bk.exe_inode);
+        bpf_printk("kloak [2-KPROBE] H-fail: no offsets cgid=%llx",
+                   bk.cgroup_id);
 #endif
-      dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
-      return 0;
+        dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
+        return 0;
+      }
     }
 
     __u64 ptr = 0;

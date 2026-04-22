@@ -676,6 +676,15 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, cgroupID uint64, containerLib
 			continue
 		}
 
+		// Per-cgroup fallback entry — short-lived processes spawned into this
+		// cgroup (curl via `kubectl exec`, apt-get helpers, etc.) can fire
+		// SSL_write before our push runs for their specific inode. Every
+		// binary in a cgroup shares the same libssl.so through the container
+		// rootfs, so one offset set is valid for all of them. The BPF kprobe
+		// tries the per-inode entry first and falls back to (cgroup, 0).
+		fallbackKey := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: 0}
+		_ = m.objs.TlsOffsetConfig.Update(&fallbackKey, &val, 0)
+
 		m.log.Debugw("Pushed TLS offsets for XOR-patch path",
 			"lib", libPath, "version", version,
 			"pid", pid, "cgroupID", cgroupID, "exeInode", exeInode,
