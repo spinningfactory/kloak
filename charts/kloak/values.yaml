@@ -1,3 +1,6 @@
+# Install: helm install kloak oci://ghcr.io/spinningfactory/kloak/kloak -n kloak-system --create-namespace
+# With demo: helm install kloak oci://ghcr.io/spinningfactory/kloak/kloak -n kloak-system --create-namespace --set demo.enabled=true
+
 image:
   repository: ghcr.io/spinningfactory/kloak
   tag: dev
@@ -51,3 +54,41 @@ certificates:
 coverage:
   enabled: false
   hostPath: /tmp/kloak-coverage
+
+# Optional demo app deployment for validating kloak is working.
+# Enable with: helm install kloak charts/kloak --set demo.enabled=true
+#
+# Deploys a Go app that sends two secrets to httpbin.org as headers.
+# DNS host filtering (via kube-dns, auto-discovered) verifies that
+# secrets are only rewritten for their allowed hosts:
+#   - "allowed" secret (hosts: httpbin.org) → real value in response
+#   - "blocked" secret (hosts: example.com) → shadow UUID in response
+demo:
+  enabled: false
+  # Namespace for the demo app. Created automatically with the
+  # getkloak.io/enabled label so the webhook intercepts pods in it.
+  namespace: kloak-demo
+  image:
+    repository: ghcr.io/spinningfactory/kloak-demo-go
+    # Empty tag defaults to chart appVersion.
+    tag: ""
+    pullPolicy: IfNotPresent
+  # Target URL that the demo app sends requests to (must be HTTPS).
+  targetURL: "https://httpbin.org/headers"
+  # Interval in seconds between requests.
+  requestInterval: "5"
+  # Allowed secret: host matches targetURL → kloak rewrites with real value.
+  secretAllowed:
+    value: "real-api-key-allowed-12345"
+    allowedHost: "httpbin.org"
+  # Blocked secret: host does NOT match targetURL → shadow UUID passes through.
+  secretBlocked:
+    value: "real-api-key-blocked-67890"
+    allowedHost: "example.com"
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi

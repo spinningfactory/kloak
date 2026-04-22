@@ -23,6 +23,7 @@ import (
 
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/spinningfactory/kloak/pkg/cgroups"
 	"github.com/spinningfactory/kloak/pkg/logging"
 )
 
@@ -108,45 +109,59 @@ type tcAttachEntry struct {
 // cgroup tracking.
 func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log *zap.SugaredLogger) error {
 	// Find the kubepods cgroup directory. Strategy:
-	// 1. Try well-known direct paths
-	// 2. Walk the cgroup tree
-	// 3. Derive from the controller's own cgroup path (/proc/self/cgroup)
-	//    since the controller runs under kubepods
-	candidates := []string{
-		filepath.Join(cgroupRoot, "kubepods.slice"),
-		filepath.Join(cgroupRoot, "kubepods"),
-	}
+	// 1. Derive from the controller's own cgroup path (/proc/self/cgroup)
+	//    since the controller runs under kubepods — most reliable because
+	//    the ancestor is guaranteed to be on our task's cgroup chain.
+	// 2. Fall back to well-known direct paths.
+	// 3. Walk the cgroup tree.
+	// Matching is fuzzy: any path component whose name contains "kubepods"
+	// is accepted, which covers the vanilla "kubepods.slice" / "kubepods"
+	// as well as kind's "kubelet-kubepods.slice" layout.
+	var candidates []string
 
-	// Walk the tree to handle nested cgroups (k3d/Docker)
-	_ = filepath.WalkDir(cgroupRoot, func(path string, d os.DirEntry, err error) error {
-		if err != nil || !d.IsDir() {
-			return nil
-		}
-		name := d.Name()
-		if name == "kubepods" || name == "kubepods.slice" {
-			candidates = append([]string{path}, candidates...)
-			return filepath.SkipAll
-		}
-		return nil
-	})
-
-	// Derive from controller's own cgroup — the controller itself runs
-	// under kubepods, so we can find it from /proc/self/cgroup
+	// Derive from controller's own cgroup. The controller itself runs under
+	// kubepods, so scanning its cgroup path upward for a kubepods-named
+	// component yields a usable ancestor that's guaranteed to be on our
+	// task's hierarchy.
 	if selfCgroup, err := os.ReadFile("/proc/self/cgroup"); err == nil {
 		for _, line := range strings.Split(string(selfCgroup), "\n") {
 			parts := strings.SplitN(line, ":", 3)
 			if len(parts) == 3 && parts[0] == "0" {
-				// Find the kubepods ancestor in the path
 				cgPath := parts[2]
-				for _, marker := range []string{"/kubepods.slice", "/kubepods"} {
-					if idx := strings.Index(cgPath, marker); idx >= 0 {
-						ancestorPath := filepath.Join(cgroupRoot, cgPath[:idx+len(marker)])
-						candidates = append([]string{ancestorPath}, candidates...)
+				// Walk left-to-right through segments; pick the first
+				// (shallowest) segment whose name contains "kubepods".
+				segments := strings.Split(cgPath, "/")
+				var acc []string
+				for _, seg := range segments {
+					acc = append(acc, seg)
+					if strings.Contains(seg, "kubepods") {
+						candidates = append(candidates,
+							filepath.Join(cgroupRoot, strings.Join(acc, "/")))
+						break
 					}
 				}
 			}
 		}
 	}
+
+	// Well-known direct paths (vanilla k8s, k3s).
+	candidates = append(candidates,
+		filepath.Join(cgroupRoot, "kubepods.slice"),
+		filepath.Join(cgroupRoot, "kubepods"),
+	)
+
+	// Walk the tree as a last resort (nested cgroups on k3d/Docker etc.).
+	// Match by substring so kind's "kubelet-kubepods.slice" is found.
+	_ = filepath.WalkDir(cgroupRoot, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.IsDir() {
+			return nil
+		}
+		if strings.Contains(d.Name(), "kubepods") {
+			candidates = append(candidates, path)
+			return filepath.SkipDir
+		}
+		return nil
+	})
 
 	for _, path := range candidates {
 		f, err := os.Open(path)
@@ -413,11 +428,10 @@ func (m *TLSUprobeManager) TrackTGID(tgid uint32) error {
 	return m.objs.TrackedTgids.Update(tgid, &val, 0)
 }
 
-// UntrackTGID removes a process TGID from the tracked_tgids map
-// and cleans up any per-TGID Go TLS offset config.
+// UntrackTGID removes a process TGID from the tracked_tgids map.
+// go_tls_offset_config is keyed by cgroup_id, not tgid, and is cleaned up
+// via UntrackCgroup when the container is removed.
 func (m *TLSUprobeManager) UntrackTGID(tgid uint32) error {
-	// Clean up Go TLS offsets (best-effort, ignore not-found).
-	_ = m.objs.GoTlsOffsetConfig.Delete(tgid)
 	return m.objs.TrackedTgids.Delete(tgid)
 }
 
@@ -478,6 +492,39 @@ func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 		}
 	}
 
+	// Remove TLS offset entries belonging to this cgroup. Both go_tls_offset_config
+	// and tls_offset_config are keyed by (cgroup_id, exe_inode) via the shared
+	// tls_binary_key struct — iterate each and delete keys whose cgroup_id
+	// matches. Best-effort: failures here only leak map entries.
+	{
+		var k tlsuprobeTlsBinaryKey
+		var v tlsuprobeGoTlsOffsets
+		var stale []tlsuprobeTlsBinaryKey
+		iter := m.objs.GoTlsOffsetConfig.Iterate()
+		for iter.Next(&k, &v) {
+			if k.CgroupId == cgroupID {
+				stale = append(stale, k)
+			}
+		}
+		for i := range stale {
+			_ = m.objs.GoTlsOffsetConfig.Delete(&stale[i])
+		}
+	}
+	{
+		var k tlsuprobeTlsBinaryKey
+		var v tlsuprobeTlsOffsets
+		var stale []tlsuprobeTlsBinaryKey
+		iter := m.objs.TlsOffsetConfig.Iterate()
+		for iter.Next(&k, &v) {
+			if k.CgroupId == cgroupID {
+				stale = append(stale, k)
+			}
+		}
+		for i := range stale {
+			_ = m.objs.TlsOffsetConfig.Delete(&stale[i])
+		}
+	}
+
 	return m.objs.TrackedCgroups.Delete(cgroupID)
 }
 
@@ -485,7 +532,7 @@ func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 // container. The uprobes fire for ALL processes in the container (same overlay
 // mount = same inode). The BPF cgroup filter restricts interception to tracked
 // containers only.
-func (m *TLSUprobeManager) AttachTLS(pid int) error {
+func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 	exePath := fmt.Sprintf("/proc/%d/exe", pid)
 
 	// Register the process for DNS/connect tracking.
@@ -514,7 +561,9 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 
 		// Push Go-specific struct offsets for H extraction and attach tc egress
 		// for ciphertext patching. Both are required for the XOR-patch path.
-		m.pushGoTLSOffsets(pid)
+		// Key by cgroup_id, not PID — the BPF kprobe sees root-NS PIDs and
+		// can't look up by our local-NS PID in nested deployments (kind/k3d).
+		m.pushGoTLSOffsets(pid, cgroupID)
 		if err := m.attachTCEgress(pid); err != nil {
 			m.log.Errorw("Failed to attach tc egress for Go TLS — secrets will not be rewritten", "error", err, "pid", pid)
 		}
@@ -562,7 +611,7 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 		// Try to detect the OpenSSL version and push struct offsets for the
 		// XOR-patch path. Non-fatal: if detection fails, the XOR path simply
 		// won't activate and the shadow secret is sent as-is (fail-secure).
-		m.pushTLSOffsets(pid, containerLibs)
+		m.pushTLSOffsets(pid, cgroupID, containerLibs)
 
 		// Attach tc egress to the container's eth0 for kernel-only ciphertext
 		// patching. Required for secret rewriting.
@@ -581,16 +630,27 @@ func (m *TLSUprobeManager) AttachTLS(pid int) error {
 
 // pushTLSOffsets detects the OpenSSL version from the container's TLS libraries
 // or the main executable (for statically linked OpenSSL) and pushes struct
-// offsets to the tls_offset_config BPF map. This enables the XOR-patch path
-// for AES-GCM connections.
-func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
+// offsets to the tls_offset_config BPF map, keyed by (cgroup_id, exe_inode).
+// See the tls_binary_key commentary in tls_uprobe.c for why the composite key.
+func (m *TLSUprobeManager) pushTLSOffsets(pid int, cgroupID uint64, containerLibs []string) {
+	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+
+	// Resolve the exe's inode — stat follows the /proc/<pid>/exe symlink to
+	// the actual on-disk binary.
+	var st syscall.Stat_t
+	if err := syscall.Stat(exePath, &st); err != nil {
+		m.log.Errorw("Failed to stat exe for TLS offset push", "error", err, "pid", pid)
+		return
+	}
+	exeInode := st.Ino
+
 	// Try the main executable FIRST — if the binary statically links OpenSSL
 	// (e.g., Node.js bundles OpenSSL 3.5), its struct offsets differ from the
 	// system libssl. The main exe's version takes precedence because the
 	// PID-scoped uprobe fires for its SSL_write, not the shared library's.
 	// Fall back to shared libraries for dynamically linked apps.
 	paths := make([]string, 1+len(containerLibs))
-	paths[0] = fmt.Sprintf("/proc/%d/exe", pid)
+	paths[0] = exePath
 	copy(paths[1:], containerLibs)
 
 	for _, libPath := range paths {
@@ -600,9 +660,6 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 			continue
 		}
 
-		// Push offsets to the BPF config map, keyed by TGID.
-		// Per-tgid keying allows different OpenSSL versions to coexist
-		// on the same node (e.g., Node.js 3.5 + curl 3.0).
 		// Must match struct tls_offsets in tls_uprobe.c.
 		type bpfTLSOffsets struct {
 			SSLToWRL       uint32
@@ -612,27 +669,44 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, containerLibs []string) {
 			SSLToVersion   uint32
 		}
 		val := bpfTLSOffsets(offsets)
-		tgid := uint32(pid)
-		if err := m.objs.TlsOffsetConfig.Update(tgid, &val, 0); err != nil {
-			m.log.Errorw("Failed to push TLS offsets to BPF map", "error", err, "tgid", tgid)
+		key := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: exeInode}
+		if err := m.objs.TlsOffsetConfig.Update(&key, &val, 0); err != nil {
+			m.log.Errorw("Failed to push TLS offsets to BPF map",
+				"error", err, "pid", pid, "cgroupID", cgroupID, "exeInode", exeInode)
 			continue
 		}
-		// Also push as global fallback (key=0) for short-lived child processes
-		// whose per-tgid entry may not be pushed in time. The BPF code tries
-		// per-tgid first, then falls back to key=0.
-		_ = m.objs.TlsOffsetConfig.Update(uint32(0), &val, 0)
+
+		// Per-cgroup fallback entry — short-lived processes spawned into this
+		// cgroup (curl via `kubectl exec`, apt-get helpers, etc.) can fire
+		// SSL_write before our push runs for their specific inode. Every
+		// binary in a cgroup shares the same libssl.so through the container
+		// rootfs, so one offset set is valid for all of them. The BPF kprobe
+		// tries the per-inode entry first and falls back to (cgroup, 0).
+		fallbackKey := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: 0}
+		_ = m.objs.TlsOffsetConfig.Update(&fallbackKey, &val, 0)
 
 		m.log.Debugw("Pushed TLS offsets for XOR-patch path",
-			"lib", libPath, "version", version, "tgid", tgid,
+			"lib", libPath, "version", version,
+			"pid", pid, "cgroupID", cgroupID, "exeInode", exeInode,
 			"offsets", fmt.Sprintf("%+v", offsets))
 		return // Only need one successful push.
 	}
 }
 
 // pushGoTLSOffsets detects Go struct offsets from the binary's DWARF or
-// buildinfo and pushes them to the go_tls_offset_config BPF map (per-TGID).
-func (m *TLSUprobeManager) pushGoTLSOffsets(pid int) {
+// buildinfo and pushes them to the go_tls_offset_config BPF map, keyed by
+// (cgroup_id, exe_inode). See goTLSKey for why this composite key is used.
+func (m *TLSUprobeManager) pushGoTLSOffsets(pid int, cgroupID uint64) {
 	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+
+	// Resolve the exe's inode — stat follows the /proc/<pid>/exe symlink to
+	// the actual on-disk binary.
+	var st syscall.Stat_t
+	if err := syscall.Stat(exePath, &st); err != nil {
+		m.log.Errorw("Failed to stat exe for Go TLS offset push", "error", err, "pid", pid)
+		return
+	}
+	exeInode := st.Ino
 
 	// DetectGoTLSOffsets tries DWARF first, then falls back to version-based lookup.
 	version, offsets, err := DetectGoTLSOffsets(exePath)
@@ -642,21 +716,21 @@ func (m *TLSUprobeManager) pushGoTLSOffsets(pid int) {
 	}
 
 	m.log.Debugw("Detected Go TLS offsets",
-		"pid", pid, "goVersion", version,
+		"pid", pid, "cgroupID", cgroupID, "exeInode", exeInode, "goVersion", version,
 		"connToCipher", offsets.ConnToCipher,
 		"aeadIfaceOff", offsets.AEADIfaceOff,
 		"h2HiOff", offsets.H2HiOff,
 		"h2LoOff", offsets.H2LoOff)
 
-	// Get TGID for the per-process BPF map key.
-	tgid := uint32(pid) // PID == TGID for the main thread
-	if err := m.objs.GoTlsOffsetConfig.Update(tgid, &offsets, 0); err != nil {
-		m.log.Errorw("Failed to push Go TLS offsets to BPF map", "error", err, "pid", pid)
+	key := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: exeInode}
+	if err := m.objs.GoTlsOffsetConfig.Update(&key, &offsets, 0); err != nil {
+		m.log.Errorw("Failed to push Go TLS offsets to BPF map",
+			"error", err, "pid", pid, "cgroupID", cgroupID, "exeInode", exeInode)
 		return
 	}
 
 	m.log.Debugw("Pushed Go TLS offsets for XOR-patch path",
-		"pid", pid, "goVersion", version)
+		"pid", pid, "cgroupID", cgroupID, "exeInode", exeInode, "goVersion", version)
 }
 
 // findContainerTLSLibraries scans common library directories in the container's
@@ -777,21 +851,38 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 			// sched_process_exec fires for ALL kubepods containers; without this
 			// guard, AttachTLS would attach tc egress to non-kloak pods and
 			// corrupt their outbound TLS (wrong H key → bad GHASH tag).
-			if _, ok := m.cgroupPaths.Load(event.CgroupID); !ok {
+			pathVal, ok := m.cgroupPaths.Load(event.CgroupID)
+			if !ok {
 				m.log.Debugw("exec in untracked cgroup, skipping", "tgid", event.Tgid, "cgroupID", event.CgroupID)
 				continue
 			}
-			logging.Tracew(m.log, "detected exec in tracked container, attaching uprobes", "tgid", event.Tgid, "cgroupID", event.CgroupID)
-			if err := m.AttachTLS(int(event.Tgid)); err != nil {
-				// libssl may not be loaded yet (e.g. Python hasn't imported ssl).
-				// Retry after a delay to catch lazy-loaded libraries.
-				m.log.Debugw("first attach attempt failed, scheduling retry", "tgid", event.Tgid, "err", err)
-				go func(tgid uint32) {
-					time.Sleep(2 * time.Second)
-					if err := m.AttachTLS(int(tgid)); err != nil {
-						m.log.Debugw("retry attach also failed", "tgid", tgid, "err", err)
-					}
-				}(event.Tgid)
+			cgroupPath, _ := pathVal.(string)
+
+			// event.Tgid is the root-NS PID — on nested deployments (kind,
+			// k3d) the controller's /proc is in a child namespace and can't
+			// open /proc/<root-NS-pid>/exe. Resolve current PIDs via
+			// cgroup.procs (which lists PIDs in the controller's own NS),
+			// then let AttachTLS pick up whichever ones load TLS symbols.
+			pids, err := cgroups.ReadCgroupProcs(cgroupPath)
+			if err != nil {
+				m.log.Debugw("failed reading cgroup.procs on exec", "error", err, "cgroup", event.CgroupID)
+				continue
+			}
+			logging.Tracew(m.log, "detected exec in tracked container, attaching uprobes",
+				"rootNsTgid", event.Tgid, "cgroupID", event.CgroupID, "localPids", pids)
+			for _, p := range pids {
+				pid := p
+				if err := m.AttachTLS(pid, event.CgroupID); err != nil {
+					// libssl may not be loaded yet (e.g. Python hasn't imported ssl).
+					// Retry after a delay to catch lazy-loaded libraries.
+					m.log.Debugw("first attach attempt failed, scheduling retry", "pid", pid, "err", err)
+					go func(p int, cg uint64) {
+						time.Sleep(2 * time.Second)
+						if err := m.AttachTLS(p, cg); err != nil {
+							m.log.Debugw("retry attach also failed", "pid", p, "err", err)
+						}
+					}(pid, event.CgroupID)
+				}
 			}
 		}
 	}
@@ -897,7 +988,8 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 	}
 }
 
-// debugCounterNames maps index to human-readable name (must match C enum).
+// debugCounterNames maps index to human-readable name (must match C enum in
+// pkg/ebpf/bpf/tls_uprobe.c — DBG_* constants).
 var debugCounterNames = []string{
 	"kprobe_entry", "kprobe_tracked", "kprobe_dport53", "kprobe_dport0",
 	"kprobe_dport_other", "kprobe_iov_ok", "kretprobe_entry", "kretprobe_ret_small",
@@ -909,8 +1001,7 @@ var debugCounterNames = []string{
 	"xor_conn_check", "xor_conn_hit", "xor_prescan_match", "xor_tailcall",
 	"xor_path_entered", "xor_secret_found", "xor_delta_done",
 	"tc_entry", "tc_match", "tc_patched",
-	"tc_skip_reclen", "tc_skip_load", "tc_skip_store", "tc_skip_nontls",
-	"tc_no_tail", "tc_empty", "tc_no_entry",
+	"kprobe_bridge", "kprobe_bridge_no_entry", "kprobe_bridge_h_fail",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

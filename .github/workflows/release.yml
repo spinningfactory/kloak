@@ -66,6 +66,16 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      - name: Build and push demo-go image
+        uses: docker/build-push-action@v7
+        with:
+          context: ./examples/demo-go
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/${{ github.repository }}-demo-go:${{ needs.validate.outputs.version }}
+            ghcr.io/${{ github.repository }}-demo-go:latest
+
   helm:
     name: Publish Helm Chart
     runs-on: ubuntu-latest
