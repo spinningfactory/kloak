@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -125,7 +126,7 @@ func validateSecretData(data map[string][]byte, stringData map[string]string) er
 	return nil
 }
 
-// validateHostsLabel validates the single hostname in the getkloak.io/hosts
+// validateHostsLabel validates the single host or IP in the getkloak.io/hosts
 // label. Today only one host per secret is supported by the BPF data plane;
 // multi-host support was present in an earlier version but broke during a
 // rewrite and has not been restored. When it comes back, the CSV rejection
@@ -135,6 +136,7 @@ func validateSecretData(data map[string][]byte, stringData map[string]string) er
 //   - "" — no host filter (allow any destination)
 //   - "*" — explicit wildcard (same as empty)
 //   - a single RFC 1123 DNS subdomain, ≤ maxHostLen bytes
+//   - an IPv4 or IPv6 address
 //
 // Note: k8s label values already restrict chars to [A-Za-z0-9._-] and length
 // to 63, so a comma would normally be rejected at the API layer before this
@@ -146,7 +148,7 @@ func validateHostsLabel(hosts string) error {
 		return nil
 	}
 	if strings.Contains(hosts, ",") {
-		return fmt.Errorf("multiple hosts are not supported yet — specify a single hostname (or '*' for any)")
+		return fmt.Errorf("multiple hosts are not supported yet — specify a single hostname, IP, or '*' for any")
 	}
 	h := strings.TrimSpace(hosts)
 	if h == "" {
@@ -157,6 +159,9 @@ func validateHostsLabel(hosts string) error {
 	}
 	if len(h) > maxHostLen {
 		return fmt.Errorf("host %q exceeds max length %d bytes", h, maxHostLen)
+	}
+	if net.ParseIP(h) != nil {
+		return nil
 	}
 	if errs := validation.IsDNS1123Subdomain(h); len(errs) != 0 {
 		return fmt.Errorf("host %q is not a valid DNS name: %s", h, strings.Join(errs, "; "))

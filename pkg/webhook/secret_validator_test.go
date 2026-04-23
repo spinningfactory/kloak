@@ -31,6 +31,11 @@ func TestValidateHostsLabel(t *testing.T) {
 		{"trailing comma rejected", "a.com,", "multiple hosts are not supported"},
 		{"invalid DNS chars", "bad_host.com", "not a valid DNS name"},
 		{"invalid leading dash", "-bad.com", "not a valid DNS name"},
+		{"ipv4 address", "192.168.1.1", ""},
+		{"ipv4 private range", "10.0.0.1", ""},
+		{"ipv6 address", "2001:db8::1", ""},
+		{"ipv6 loopback", "::1", ""},
+		{"ipv4 loopback", "127.0.0.1", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -164,6 +169,18 @@ func TestSecretValidator_Handle(t *testing.T) {
 		{
 			name:      "enabled with valid labels and data",
 			labels:    map[string]string{LabelEnabled: "true", LabelHosts: "api.example.com", LabelPort: "443/tcp"},
+			data:      validData,
+			wantAllow: true,
+		},
+		{
+			name:      "enabled with ipv4 host accepted",
+			labels:    map[string]string{LabelEnabled: "true", LabelHosts: "192.168.1.1", LabelPort: "443/tcp"},
+			data:      validData,
+			wantAllow: true,
+		},
+		{
+			name:      "enabled with ipv6 host accepted",
+			labels:    map[string]string{LabelEnabled: "true", LabelHosts: "2001:db8::1", LabelPort: "443/tcp"},
 			data:      validData,
 			wantAllow: true,
 		},
