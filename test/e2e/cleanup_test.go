@@ -10,7 +10,7 @@ import (
 
 func TestSecretDeletionCascade(t *testing.T) {
 	data := map[string][]byte{"key": []byte("cascade-delete-test-val")}
-	createEnabledSecret(t, "test-cascade", data, nil)
+	createEnabledSecret(t, "test-cascade", data, nil, nil)
 	assertShadowSecret(t, "test-cascade", data)
 
 	// Delete the original secret
@@ -29,7 +29,7 @@ func TestSecretDeletionCascade(t *testing.T) {
 
 func TestPodDeletion(t *testing.T) {
 	data := map[string][]byte{"key": []byte("pod-delete-test-value!")}
-	createEnabledSecret(t, "test-pod-del", data, nil)
+	createEnabledSecret(t, "test-pod-del", data, nil, nil)
 	assertShadowSecret(t, "test-pod-del", data)
 
 	createPodWithSecretVolume(t, "test-pod-del-pod", "test-pod-del")

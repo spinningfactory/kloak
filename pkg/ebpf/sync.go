@@ -56,14 +56,15 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, read
 			continue
 		}
 
-		// Parse the allowed host from the secret's label. The admission webhook
-		// (pkg/webhook/secret_validator.go) enforces one host per secret and
-		// rejects comma-separated lists — multi-host is not yet supported by
-		// the BPF data plane. "*" means "no filter", same as an empty value.
+		// Parse the allowed host from the secret's annotation. The admission
+		// webhook (pkg/webhook/secret_validator.go) enforces one host per
+		// secret and rejects comma-separated lists — multi-host is not yet
+		// supported by the BPF data plane. "*" means "no filter", same as an
+		// empty value.
 		var allowedHost string
 		var allowedIP net.IP
-		if hostsLabel, ok := secret.Labels["getkloak.io/hosts"]; ok {
-			if trimmed := strings.TrimSpace(hostsLabel); trimmed != "" && trimmed != "*" {
+		if hostsAnnotation, ok := secret.Annotations["getkloak.io/hosts"]; ok {
+			if trimmed := strings.TrimSpace(hostsAnnotation); trimmed != "" && trimmed != "*" {
 				allowedHost = trimmed
 
 				ip := net.ParseIP(trimmed)
@@ -86,11 +87,11 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, read
 			continue
 		}
 
-		// Parse port spec from the secret's labels
+		// Parse port spec from the secret's annotation
 		var port uint16
 		var protocol uint8
-		if portLabel, ok := secret.Labels["getkloak.io/port"]; ok && portLabel != "" {
-			ps, err := parseSyncPortSpec(portLabel)
+		if portAnnotation, ok := secret.Annotations["getkloak.io/port"]; ok && portAnnotation != "" {
+			ps, err := parseSyncPortSpec(portAnnotation)
 			if err != nil {
 				log.Errorw("Invalid port specification, treating as wildcard", "error", err, "secret", secret.Name)
 			} else {

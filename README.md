@@ -192,9 +192,9 @@ sequenceDiagram
 
 ## How It Works
 
-### 1. Label Your Secrets
+### 1. Label and Annotate Your Secrets
 
-Add `getkloak.io/enabled=true` to any Kubernetes Secret. Kloak generates a shadow secret with `kloak:<UUID>` placeholders that are length-matched to the original values.
+Add `getkloak.io/enabled=true` as a label to enable Kloak. Use annotations for host and port filtering. Kloak generates a shadow secret with `kloak:<UUID>` placeholders that are length-matched to the original values.
 
 ```yaml
 apiVersion: v1

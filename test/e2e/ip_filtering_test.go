@@ -41,12 +41,12 @@ func TestEBPFIPFiltering(t *testing.T) {
 	blockedData := map[string][]byte{"api-key": []byte("REAL-IP-BLOCKED-KEY-67890")}
 
 	// Secret allowed: hosts matches echo server's ClusterIP
-	createEnabledSecret(t, "secret-allowed", allowedData, map[string]string{
+	createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{
 		"getkloak.io/hosts": echoClusterIP,
 	})
 
 	// Secret blocked: hosts is a fake IP that will never match
-	createEnabledSecret(t, "secret-blocked", blockedData, map[string]string{
+	createEnabledSecret(t, "secret-blocked", blockedData, nil, map[string]string{
 		"getkloak.io/hosts": "1.2.3.4",
 	})
 
