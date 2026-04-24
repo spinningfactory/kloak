@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -102,17 +102,79 @@ jobs:
       - name: Run tests
         run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/pkg/ebpf|/pkg/cgroups')
 
-      # Coverage artifact skipped to save storage quota.
-      # The e2e job merges coverage separately.
+      - name: Upload unit coverage
+        uses: actions/upload-artifact@v5
+        with:
+          name: unit-coverage
+          path: coverage.out
+          retention-days: 1
 
-  # Coverage report and badge jobs disabled — artifact uploads removed to save
-  # storage quota. Re-enable when storage is available.
-  # coverage:
-  #   name: Coverage Report
-  #   ...
-  # coverage-badge:
-  #   name: Coverage Badge
-  #   ...
+  # Coverage Report runs on pull requests and comments a diff summary.
+  # Depends on e2e so it can work against the merged unit + e2e profile.
+  coverage:
+    name: Coverage Report
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    needs: [e2e]
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    steps:
+      - uses: fgrosse/go-coverage-report@v1.3.0
+        with:
+          coverage-artifact-name: combined-coverage
+          coverage-file-name: combined-coverage.out
+
+  # Coverage Badge runs on push-to-main and commits the updated badge to README.
+  coverage-badge:
+    name: Coverage Badge
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: [e2e]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Download combined coverage
+        uses: actions/download-artifact@v5
+        with:
+          name: combined-coverage
+          path: /tmp/combined-coverage
+
+      - name: Prepare coverage for badge
+        run: |
+          go tool cover -func=/tmp/combined-coverage/combined-coverage.out -o=coverage.out
+
+      - name: Update coverage badge
+        uses: tj-actions/coverage-badge-go@v3
+        with:
+          filename: coverage.out
+
+      - name: Verify changed files
+        uses: tj-actions/verify-changed-files@v16
+        id: verify-changed-files
+        with:
+          files: README.md
+
+      - name: Commit coverage badge
+        if: steps.verify-changed-files.outputs.files_changed == 'true'
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add README.md
+          git commit -m "chore: update coverage badge"
+          git push
 
   docker:
     name: Docker Build & Push
@@ -164,7 +226,7 @@ jobs:
   e2e:
     name: E2E Tests
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'e2e')
+    needs: [build, test]
     permissions:
       contents: read
       packages: write
@@ -272,6 +334,63 @@ jobs:
         run: go test -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
           KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
+
+      - name: Collect e2e coverage
+        if: always()
+        env:
+          KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
+        run: |
+          mkdir -p /tmp/e2e-covdata
+          # Wait for the controller pod to fully terminate so the Go coverage
+          # runtime can flush covcounters to the hostPath volume on clean exit.
+          # Helm uninstall from test teardown triggers the shutdown.
+          kubectl wait --for=delete pod -l app.kubernetes.io/component=controller \
+            -n kloak-system --timeout=30s 2>/dev/null || true
+          # k3s runs directly on the runner, so covdata lives at /tmp/kloak-coverage
+          # on the host filesystem (values-e2e.yaml's coverage.hostPath).
+          sudo cp -r /tmp/kloak-coverage/. /tmp/e2e-covdata/ 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" /tmp/e2e-covdata || true
+          echo "E2E coverage files:"
+          ls -la /tmp/e2e-covdata/ 2>/dev/null || echo "No coverage files collected"
+
+      - name: Download unit coverage
+        if: always()
+        uses: actions/download-artifact@v5
+        with:
+          name: unit-coverage
+          path: /tmp/unit-coverage
+
+      - name: Merge unit and e2e coverage
+        if: always()
+        run: |
+          # Convert e2e covdata (binary) to Go text format.
+          if ls /tmp/e2e-covdata/covcounters.* 1>/dev/null 2>&1; then
+            go tool covdata textfmt -i=/tmp/e2e-covdata -o=/tmp/e2e-coverage.out
+            echo "E2E coverage converted to text format"
+          else
+            echo "No e2e coverage data found, using unit coverage only"
+          fi
+
+          # Start with unit coverage (has the mode line), append all e2e lines.
+          # Drop the generated eBPF bindings — they have no source on the runner,
+          # so the coverage reporter can't resolve them.
+          cp /tmp/unit-coverage/coverage.out /tmp/combined-coverage.out
+          if [ -f /tmp/e2e-coverage.out ]; then
+            tail -n +2 /tmp/e2e-coverage.out | grep -v 'tlsuprobe_bpf' >> /tmp/combined-coverage.out
+            echo "Combined unit + e2e coverage (all packages)"
+          fi
+
+          echo "=== Combined coverage summary ==="
+          go tool cover -func=/tmp/combined-coverage.out | tail -1
+
+      - name: Upload combined coverage
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: combined-coverage
+          path: /tmp/combined-coverage.out
+          retention-days: 1
+          if-no-files-found: ignore
 
       - name: Collect logs and BPF debug info on failure
         if: failure()
