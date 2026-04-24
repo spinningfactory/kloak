@@ -3,6 +3,7 @@ package ebpf
 import (
 	"context"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 
@@ -55,14 +56,22 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, read
 			continue
 		}
 
-		// Parse the allowed host from the secret's label. The admission webhook
-		// (pkg/webhook/secret_validator.go) enforces one host per secret and
-		// rejects comma-separated lists — multi-host is not yet supported by
-		// the BPF data plane. "*" means "no filter", same as an empty value.
+		// Parse the allowed host from the secret's annotation. The admission
+		// webhook (pkg/webhook/secret_validator.go) enforces one host per
+		// secret and rejects comma-separated lists — multi-host is not yet
+		// supported by the BPF data plane. "*" means "no filter", same as an
+		// empty value.
 		var allowedHost string
-		if hostsLabel, ok := secret.Labels["getkloak.io/hosts"]; ok {
-			if trimmed := strings.TrimSpace(hostsLabel); trimmed != "" && trimmed != "*" {
+		var allowedIP net.IP
+		if hostsAnnotation, ok := secret.Annotations["getkloak.io/hosts"]; ok {
+			if trimmed := strings.TrimSpace(hostsAnnotation); trimmed != "" && trimmed != "*" {
 				allowedHost = trimmed
+
+				ip := net.ParseIP(trimmed)
+				if ip != nil {
+					allowedIP = ip
+					allowedHost = ""
+				}
 			}
 		}
 
@@ -78,11 +87,11 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, read
 			continue
 		}
 
-		// Parse port spec from the secret's labels
+		// Parse port spec from the secret's annotation
 		var port uint16
 		var protocol uint8
-		if portLabel, ok := secret.Labels["getkloak.io/port"]; ok && portLabel != "" {
-			ps, err := parseSyncPortSpec(portLabel)
+		if portAnnotation, ok := secret.Annotations["getkloak.io/port"]; ok && portAnnotation != "" {
+			ps, err := parseSyncPortSpec(portAnnotation)
 			if err != nil {
 				log.Errorw("Invalid port specification, treating as wildcard", "error", err, "secret", secret.Name)
 			} else {
@@ -131,18 +140,24 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, read
 			val.PrefixLen = uint32(prefixLen)
 			copy(val.FullPrefix[:], []byte(shadowPrefix)[:prefixLen])
 
-			// Set allowed host for host-based filtering.
-			// allowedHost is guaranteed < MAX_HOST_LEN (validated above).
-			if allowedHost != "" {
+			// Set allowed host/IP for filtering
+			switch {
+			case allowedHost != "":
 				val.HostLen = uint32(len(allowedHost))
 				copy(val.AllowedHost[:], allowedHost)
+				val.IpLen = 0 // Host-based filtering
 
 				// Track this hostname for the watched_hosts map
 				var whk watchedHostKey
 				copy(whk.Host[:], allowedHost)
 				newHosts[whk] = struct{}{}
+			case allowedIP != nil:
+				copy(val.AllowedIp[:], allowedIP.To16())
+				val.IpLen = 16 // Mark as IP-based filtering with valid IP
+			default:
+				// HostLen == 0 and IpLen == 0 means wildcard (allow all hosts/IPs)
+				val.IpLen = 0
 			}
-			// HostLen == 0 means wildcard (allow all hosts)
 
 			// Set allowed port for port-based filtering
 			// Port == 0 means wildcard (allow all ports)
@@ -189,6 +204,8 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, read
 					copy(huffVal.RealSecret[:], huffReal[:huffLen])
 					huffVal.HostLen = val.HostLen
 					huffVal.AllowedHost = val.AllowedHost
+					huffVal.IpLen = val.IpLen
+					copy(huffVal.AllowedIp[:], val.AllowedIp[:])
 					huffVal.Port = val.Port
 					huffVal.Protocol = val.Protocol
 					huffPrefixLen := len(huffShadow)

@@ -13,7 +13,7 @@ func TestShadowSecretCreation(t *testing.T) {
 	data := map[string][]byte{
 		"api-key": []byte("MY-SECRET-VALUE-12345"),
 	}
-	createEnabledSecret(t, "test-shadow-create", data, nil)
+	createEnabledSecret(t, "test-shadow-create", data, nil, nil)
 	assertShadowSecret(t, "test-shadow-create", data)
 }
 
@@ -23,7 +23,7 @@ func TestShadowSecretMultipleKeys(t *testing.T) {
 		"password": []byte("super-secret-password-123"),
 		"token":    []byte("tok_live_abcdefghijklmnop"),
 	}
-	createEnabledSecret(t, "test-shadow-multi", data, nil)
+	createEnabledSecret(t, "test-shadow-multi", data, nil, nil)
 	assertShadowSecret(t, "test-shadow-multi", data)
 }
 
@@ -36,7 +36,7 @@ func TestShadowSecretLengthMatching(t *testing.T) {
 		"medium": []byte("this-is-a-medium-length-secret-value-here!x"),
 		"long":   []byte(strings.Repeat("x", 128)),
 	}
-	createEnabledSecret(t, "test-shadow-lengths", data, nil)
+	createEnabledSecret(t, "test-shadow-lengths", data, nil, nil)
 	assertShadowSecret(t, "test-shadow-lengths", data)
 }
 
@@ -44,7 +44,7 @@ func TestShadowSecretUpdate(t *testing.T) {
 	data := map[string][]byte{
 		"key": []byte("original-value-here!"),
 	}
-	createEnabledSecret(t, "test-shadow-update", data, nil)
+	createEnabledSecret(t, "test-shadow-update", data, nil, nil)
 	assertShadowSecret(t, "test-shadow-update", data)
 
 	// Update the secret
@@ -69,7 +69,7 @@ func TestShadowSecretDisable(t *testing.T) {
 	data := map[string][]byte{
 		"key": []byte("will-be-disabled-soon"),
 	}
-	createEnabledSecret(t, "test-shadow-disable", data, nil)
+	createEnabledSecret(t, "test-shadow-disable", data, nil, nil)
 	assertShadowSecret(t, "test-shadow-disable", data)
 
 	// Remove the enabled label

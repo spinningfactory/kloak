@@ -33,11 +33,11 @@ func TestEBPFRawTLSPortFiltering(t *testing.T) {
 
 	// Secret names must match the deployment manifest volume references
 	// (secret-allowed, secret-blocked) — not custom names.
-	createEnabledSecret(t, "secret-allowed", allowedData, map[string]string{
+	createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{
 		"getkloak.io/hosts": echoHostFQDN,
 		"getkloak.io/port":  echoPort,
 	})
-	createEnabledSecret(t, "secret-blocked", blockedData, map[string]string{
+	createEnabledSecret(t, "secret-blocked", blockedData, nil, map[string]string{
 		"getkloak.io/hosts": echoHostFQDN,
 		"getkloak.io/port":  wrongPort,
 	})

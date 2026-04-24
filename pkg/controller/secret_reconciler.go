@@ -24,10 +24,10 @@ const (
 	// AnnotationSecretEnabled is the label/annotation to enable Kloak secret replication.
 	AnnotationSecretEnabled = "getkloak.io/enabled"
 
-	// AnnotationPort is the label/annotation to specify an allowed port for a secret.
+	// AnnotationPort is the annotation to specify an allowed port for a secret.
 	AnnotationPort = "getkloak.io/port"
 
-	// AnnotationHosts is the label/annotation to specify allowed hosts for a secret.
+	// AnnotationHosts is the annotation to specify allowed hosts for a secret.
 	AnnotationHosts = "getkloak.io/hosts"
 
 	// ShadowSecretSuffix is the suffix appended to the name of the shadow secret.

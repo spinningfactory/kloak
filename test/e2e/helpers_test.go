@@ -154,9 +154,9 @@ func waitForDaemonSetReady(ctx context.Context, namespace, name string) error {
 }
 
 // createEnabledSecret creates a secret with getkloak.io/enabled=true and registers cleanup.
-func createEnabledSecret(t *testing.T, name string, data map[string][]byte, extraLabels map[string]string) {
+func createEnabledSecret(t *testing.T, name string, data map[string][]byte, extraLabels map[string]string, extraAnnotations map[string]string) {
 	t.Helper()
-	if err := tryCreateEnabledSecret(t, name, data, extraLabels); err != nil {
+	if err := tryCreateEnabledSecret(t, name, data, extraLabels, extraAnnotations); err != nil {
 		t.Fatalf("failed to create secret %s: %v", name, err)
 	}
 }
@@ -165,17 +165,22 @@ func createEnabledSecret(t *testing.T, name string, data map[string][]byte, extr
 // the API error (if any) instead of calling t.Fatalf. Use this to assert that
 // the validating webhook rejects an invalid configuration. Cleanup is
 // registered regardless of outcome so transient creations still get removed.
-func tryCreateEnabledSecret(t *testing.T, name string, data map[string][]byte, extraLabels map[string]string) error {
+func tryCreateEnabledSecret(t *testing.T, name string, data map[string][]byte, extraLabels map[string]string, extraAnnotations map[string]string) error {
 	t.Helper()
 	labels := map[string]string{"getkloak.io/enabled": "true"}
 	for k, v := range extraLabels {
 		labels[k] = v
 	}
+	annotations := map[string]string{}
+	for k, v := range extraAnnotations {
+		annotations[k] = v
+	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: testNamespace,
-			Labels:    labels,
+			Name:        name,
+			Namespace:   testNamespace,
+			Labels:      labels,
+			Annotations: annotations,
 		},
 		Data: data,
 	}

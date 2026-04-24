@@ -3,6 +3,7 @@ package webhook
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -15,10 +16,10 @@ import (
 )
 
 const (
-	// LabelHosts is the CSV list of hostnames a secret may be sent to.
-	LabelHosts = "getkloak.io/hosts"
-	// LabelPort restricts a secret to a specific port (or port/proto).
-	LabelPort = "getkloak.io/port"
+	// AnnotationHosts is the hostname/IP a secret may be sent to.
+	AnnotationHosts = "getkloak.io/hosts"
+	// AnnotationPort restricts a secret to a specific port (or port/proto).
+	AnnotationPort = "getkloak.io/port"
 
 	// maxHostLen mirrors MAX_HOST_LEN in pkg/ebpf/bpf/tls_uprobe.c.
 	// The BPF filter compares with `host_len < MAX_HOST_LEN`, so a host
@@ -68,16 +69,16 @@ func (v *SecretValidator) Handle(ctx context.Context, req admission.Request) adm
 		return admission.Allowed("not kloak-enabled")
 	}
 
-	if err := validateHostsLabel(secret.Labels[LabelHosts]); err != nil {
-		v.log.Warnw("rejecting secret: invalid hosts label",
+	if err := validateHostsLabel(secret.Annotations[AnnotationHosts]); err != nil {
+		v.log.Warnw("rejecting secret: invalid hosts annotation",
 			"namespace", secret.Namespace, "name", secret.Name, "error", err)
-		return admission.Denied(fmt.Sprintf("kloak: invalid %s label: %v", LabelHosts, err))
+		return admission.Denied(fmt.Sprintf("kloak: invalid %s annotation: %v", AnnotationHosts, err))
 	}
 
-	if err := validatePortLabel(secret.Labels[LabelPort]); err != nil {
-		v.log.Warnw("rejecting secret: invalid port label",
+	if err := validatePortLabel(secret.Annotations[AnnotationPort]); err != nil {
+		v.log.Warnw("rejecting secret: invalid port annotation",
 			"namespace", secret.Namespace, "name", secret.Name, "error", err)
-		return admission.Denied(fmt.Sprintf("kloak: invalid %s label: %v", LabelPort, err))
+		return admission.Denied(fmt.Sprintf("kloak: invalid %s annotation: %v", AnnotationPort, err))
 	}
 
 	if err := validateSecretData(secret.Data, secret.StringData); err != nil {
@@ -125,28 +126,23 @@ func validateSecretData(data map[string][]byte, stringData map[string]string) er
 	return nil
 }
 
-// validateHostsLabel validates the single hostname in the getkloak.io/hosts
-// label. Today only one host per secret is supported by the BPF data plane;
-// multi-host support was present in an earlier version but broke during a
-// rewrite and has not been restored. When it comes back, the CSV rejection
+// validateHostsLabel validates the single host or IP in the getkloak.io/hosts
+// annotation. Today only one host per secret is supported by the BPF data
+// plane; multi-host support was present in an earlier version but broke during
+// a rewrite and has not been restored. When it comes back, the CSV rejection
 // below should be relaxed.
 //
 // Accepted forms:
 //   - "" — no host filter (allow any destination)
 //   - "*" — explicit wildcard (same as empty)
 //   - a single RFC 1123 DNS subdomain, ≤ maxHostLen bytes
-//
-// Note: k8s label values already restrict chars to [A-Za-z0-9._-] and length
-// to 63, so a comma would normally be rejected at the API layer before this
-// validator runs. We still check here to give a clear error message if the
-// label source ever changes (e.g. annotation-based config) and to document
-// intent to the next reader.
+//   - an IPv4 or IPv6 address
 func validateHostsLabel(hosts string) error {
 	if hosts == "" {
 		return nil
 	}
 	if strings.Contains(hosts, ",") {
-		return fmt.Errorf("multiple hosts are not supported yet — specify a single hostname (or '*' for any)")
+		return fmt.Errorf("multiple hosts are not supported yet — specify a single hostname, IP, or '*' for any")
 	}
 	h := strings.TrimSpace(hosts)
 	if h == "" {
@@ -157,6 +153,9 @@ func validateHostsLabel(hosts string) error {
 	}
 	if len(h) > maxHostLen {
 		return fmt.Errorf("host %q exceeds max length %d bytes", h, maxHostLen)
+	}
+	if net.ParseIP(h) != nil {
+		return nil
 	}
 	if errs := validation.IsDNS1123Subdomain(h); len(errs) != 0 {
 		return fmt.Errorf("host %q is not a valid DNS name: %s", h, strings.Join(errs, "; "))

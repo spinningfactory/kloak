@@ -44,7 +44,7 @@ func TestCipherSuites(t *testing.T) {
 	// Create kloak-enabled secret targeting the echo server's FQDN.
 	createEnabledSecret(t, secretName, map[string][]byte{
 		"api-key": []byte(secretValue),
-	}, map[string]string{
+	}, nil, map[string]string{
 		"getkloak.io/hosts": echoSvcHost,
 	})
 	assertShadowSecret(t, secretName, map[string][]byte{

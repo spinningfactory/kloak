@@ -211,7 +211,8 @@ deploy_demo() {
     kubectl create secret generic secret-allowed \
         --from-literal=api-key="REAL-ALLOWED-KEY-12345" \
         -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | \
-        kubectl label -f - getkloak.io/enabled="true" getkloak.io/hosts="httpbin.org" --local -o yaml | \
+        kubectl label -f - getkloak.io/enabled="true" --local -o yaml | \
+        kubectl annotate -f - getkloak.io/hosts="httpbin.org" --local -o yaml | \
         kubectl apply -f -
     
     # Create SECRET for raw TLS demo: Allowed for tls.kloak-demo (short FQDN fits MAX_HOST_LEN=32)
@@ -219,7 +220,8 @@ deploy_demo() {
     kubectl create secret generic secret-rawtls-allowed \
         --from-literal=api-key="REAL-ALLOWED-KEY-12345" \
         -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | \
-        kubectl label -f - getkloak.io/enabled="true" getkloak.io/hosts="tls.kloak-demo.svc.cluster.local" --local -o yaml | \
+        kubectl label -f - getkloak.io/enabled="true" --local -o yaml | \
+        kubectl annotate -f - getkloak.io/hosts="tls.kloak-demo.svc.cluster.local" --local -o yaml | \
         kubectl apply -f -
 
     # Create SECRET for raw TLS demo: Blocked (only allowed for example.com)
@@ -227,7 +229,8 @@ deploy_demo() {
     kubectl create secret generic secret-rawtls-blocked \
         --from-literal=api-key="REAL-BLOCKED-KEY-67890" \
         -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | \
-        kubectl label -f - getkloak.io/enabled="true" getkloak.io/hosts="example.com" --local -o yaml | \
+        kubectl label -f - getkloak.io/enabled="true" --local -o yaml | \
+        kubectl annotate -f - getkloak.io/hosts="example.com" --local -o yaml | \
         kubectl apply -f -
 
     # Create SECRET 2: Blocked for httpbin.org (only allowed for example.com)
@@ -235,7 +238,8 @@ deploy_demo() {
     kubectl create secret generic secret-blocked \
         --from-literal=api-key="REAL-BLOCKED-KEY-67890" \
         -n "$DEMO_NAMESPACE" --dry-run=client -o yaml | \
-        kubectl label -f - getkloak.io/enabled="true" getkloak.io/hosts="example.com" --local -o yaml | \
+        kubectl label -f - getkloak.io/enabled="true" --local -o yaml | \
+        kubectl annotate -f - getkloak.io/hosts="example.com" --local -o yaml | \
         kubectl apply -f -
     
     # Wait a moment for cleanup

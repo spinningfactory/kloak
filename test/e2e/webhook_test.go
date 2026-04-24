@@ -13,7 +13,7 @@ import (
 
 func TestWebhookVolumeRewrite(t *testing.T) {
 	secretData := map[string][]byte{"api-key": []byte("webhook-test-secret-val")}
-	createEnabledSecret(t, "test-wh-rewrite", secretData, nil)
+	createEnabledSecret(t, "test-wh-rewrite", secretData, nil, nil)
 	assertShadowSecret(t, "test-wh-rewrite", secretData)
 
 	createPodWithSecretVolume(t, "test-wh-rewrite-pod", "test-wh-rewrite")
@@ -45,7 +45,7 @@ func TestWebhookVolumeRewrite(t *testing.T) {
 
 func TestWebhookAnnotationInjection(t *testing.T) {
 	secretData := map[string][]byte{"key": []byte("annotation-inject-val!")}
-	createEnabledSecret(t, "test-wh-annot", secretData, nil)
+	createEnabledSecret(t, "test-wh-annot", secretData, nil, nil)
 	assertShadowSecret(t, "test-wh-annot", secretData)
 
 	// Create pod WITHOUT the label — namespace label should trigger webhook
@@ -81,7 +81,7 @@ func TestWebhookNonEnabledSecretUntouched(t *testing.T) {
 	enabledData := map[string][]byte{"key": []byte("enabled-secret-value!")}
 	plainData := map[string][]byte{"key": []byte("plain-secret-value!!")}
 
-	createEnabledSecret(t, "test-wh-enabled", enabledData, nil)
+	createEnabledSecret(t, "test-wh-enabled", enabledData, nil, nil)
 	createPlainSecret(t, "test-wh-plain", plainData)
 	assertShadowSecret(t, "test-wh-enabled", enabledData)
 
@@ -123,7 +123,7 @@ func TestWebhookNonEnabledSecretUntouched(t *testing.T) {
 
 func TestWebhookMountedContent(t *testing.T) {
 	secretData := map[string][]byte{"api-key": []byte("REAL-SECRET-DO-NOT-LEAK")}
-	createEnabledSecret(t, "test-wh-content", secretData, nil)
+	createEnabledSecret(t, "test-wh-content", secretData, nil, nil)
 	assertShadowSecret(t, "test-wh-content", secretData)
 
 	// Create a pod that cats the mounted secret and exits
