@@ -107,7 +107,10 @@ jobs:
         with:
           name: unit-coverage
           path: coverage.out
-          retention-days: 1
+          # 7 days so a single-job re-run of e2e (or coverage) within a week
+          # still finds the artifact. 1 day was too tight — the e2e job often
+          # gets re-run after a data-plane flake, hours or days later.
+          retention-days: 7
 
   # Coverage Report runs on pull requests and comments a diff summary.
   # Depends on e2e so it can work against the merged unit + e2e profile.
@@ -354,7 +357,11 @@ jobs:
           ls -la /tmp/e2e-covdata/ 2>/dev/null || echo "No coverage files collected"
 
       - name: Download unit coverage
+        # `continue-on-error` so a re-run of just this job after the artifact
+        # has been GC'd doesn't fail the whole workflow — we'll fall back to
+        # e2e-only coverage in the merge step below.
         if: always()
+        continue-on-error: true
         uses: actions/download-artifact@v5
         with:
           name: unit-coverage
@@ -368,20 +375,34 @@ jobs:
             go tool covdata textfmt -i=/tmp/e2e-covdata -o=/tmp/e2e-coverage.out
             echo "E2E coverage converted to text format"
           else
-            echo "No e2e coverage data found, using unit coverage only"
+            echo "No e2e coverage data found"
           fi
 
-          # Start with unit coverage (has the mode line), append all e2e lines.
+          # Build the combined profile. Each profile starts with a `mode:` line
+          # plus per-line records. We pick whichever inputs exist.
           # Drop the generated eBPF bindings — they have no source on the runner,
           # so the coverage reporter can't resolve them.
-          cp /tmp/unit-coverage/coverage.out /tmp/combined-coverage.out
-          if [ -f /tmp/e2e-coverage.out ]; then
-            tail -n +2 /tmp/e2e-coverage.out | grep -v 'tlsuprobe_bpf' >> /tmp/combined-coverage.out
-            echo "Combined unit + e2e coverage (all packages)"
+          UNIT=/tmp/unit-coverage/coverage.out
+          E2E=/tmp/e2e-coverage.out
+          OUT=/tmp/combined-coverage.out
+
+          if [ -f "$UNIT" ] && [ -f "$E2E" ]; then
+            cp "$UNIT" "$OUT"
+            tail -n +2 "$E2E" | grep -v 'tlsuprobe_bpf' >> "$OUT"
+            echo "Combined unit + e2e coverage"
+          elif [ -f "$UNIT" ]; then
+            cp "$UNIT" "$OUT"
+            echo "Unit coverage only (no e2e data)"
+          elif [ -f "$E2E" ]; then
+            grep -v 'tlsuprobe_bpf' "$E2E" > "$OUT"
+            echo "E2E coverage only (no unit artifact — likely a single-job re-run after retention)"
+          else
+            echo "No coverage data available; producing empty profile"
+            echo "mode: atomic" > "$OUT"
           fi
 
           echo "=== Combined coverage summary ==="
-          go tool cover -func=/tmp/combined-coverage.out | tail -1
+          go tool cover -func="$OUT" | tail -1
 
       - name: Upload combined coverage
         if: always()
@@ -389,7 +410,7 @@ jobs:
         with:
           name: combined-coverage
           path: /tmp/combined-coverage.out
-          retention-days: 1
+          retention-days: 7
           if-no-files-found: ignore
 
       - name: Collect logs and BPF debug info on failure
