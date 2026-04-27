@@ -135,8 +135,12 @@ func teardown() {
 	// Delete test namespace (cascade deletes all resources in it)
 	_ = clientset.CoreV1().Namespaces().Delete(context.Background(), testNamespace, metav1.DeleteOptions{})
 	// Remove kloak deployment unless we skipped install.
+	// --wait blocks until the controller pod is deleted, so the Go coverage
+	// runtime has time to flush covcounters to the hostPath volume on clean
+	// SIGTERM. Without it, helm returns immediately and the next CI step
+	// races kubelet's SIGKILL.
 	if os.Getenv("E2E_SKIP_INSTALL") == "" {
-		_, _ = helm("uninstall", "kloak", "-n", kloakNamespace)
+		_, _ = helm("uninstall", "kloak", "-n", kloakNamespace, "--wait", "--timeout", "90s")
 	}
 }
 

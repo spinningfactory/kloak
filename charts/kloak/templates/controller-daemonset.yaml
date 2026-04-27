@@ -19,6 +19,12 @@ spec:
     spec:
       serviceAccountName: kloak-controller
       hostPID: true
+      # 60s gives the controller-runtime manager time to finish its shutdown
+      # path (uprobe detach, BPF program close) on SIGTERM, so Go's coverage
+      # runtime can flush covcounters before kubelet SIGKILLs the pod. The
+      # default 30s was racing the cleanup and producing covmeta-only
+      # artifacts in CI.
+      terminationGracePeriodSeconds: 60
       initContainers:
         - name: mount-tracefs
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
