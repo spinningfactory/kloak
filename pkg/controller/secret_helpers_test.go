@@ -70,8 +70,8 @@ func TestCheckCollisionsWithMap(t *testing.T) {
 	t.Run("prefix used by excluded + different secret → collision", func(t *testing.T) {
 		m := map[string]map[string]struct{}{
 			prefix: {
-				"ns/secret-a":      {},
-				"ns/secret-other":  {},
+				"ns/secret-a":     {},
+				"ns/secret-other": {},
 			},
 		}
 		if !checkCollisionsWithMap(newShadow, "ns/secret-a", m) {
