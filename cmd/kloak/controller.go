@@ -181,9 +181,12 @@ func runController(cmd *cobra.Command, args []string) {
 	}
 
 	if uprobeMgr != nil {
+		setupLog.Infow("closing uprobe manager")
+		closeStart := time.Now()
 		if err := uprobeMgr.Close(); err != nil {
 			setupLog.Errorw("failed to close uprobe manager", "error", err)
 		}
+		setupLog.Infow("uprobe manager closed", "duration", time.Since(closeStart).String())
 	}
 	setupLog.Infow("controller exited cleanly")
 	_ = setupLog.Sync()

@@ -789,13 +789,17 @@ func isTLSLibrary(name string) bool {
 // Close releases all links and the eBPF manager.
 func (m *TLSUprobeManager) Close() error {
 	var errs []error
+	t0 := time.Now()
+	linkCount := len(m.links)
 	for _, l := range m.links {
 		if err := l.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
 	m.links = nil
+	m.log.Infow("closed BPF links", "count", linkCount, "duration", time.Since(t0).String())
 
+	t1 := time.Now()
 	if m.reader != nil {
 		if err := m.reader.Close(); err != nil {
 			errs = append(errs, err)
@@ -806,11 +810,16 @@ func (m *TLSUprobeManager) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	m.log.Infow("closed ringbuf readers", "duration", time.Since(t1).String())
+
+	t2 := time.Now()
 	if m.objs != nil {
 		if err := m.objs.Close(); err != nil {
 			errs = append(errs, err)
 		}
 	}
+	m.log.Infow("closed BPF objects", "duration", time.Since(t2).String())
+
 	if len(errs) > 0 {
 		return fmt.Errorf("errors closing uprobe manager: %v", errs)
 	}
