@@ -38,8 +38,17 @@ func TestIsPrefixUsed(t *testing.T) {
 }
 
 func TestCheckCollisionsWithMap(t *testing.T) {
-	const prefix = "kloak:AB" // must be exactly ShadowPrefixLen bytes
+	const prefix = "kloak:AB" // sized to match the current ShadowPrefixLen (8)
 	const newShadow = prefix + "12345xyz"
+
+	// Guard: checkCollisionsWithMap slices [:ShadowPrefixLen] off newShadow,
+	// so the test inputs must agree with the constant. If ShadowPrefixLen
+	// ever changes, the test should fail loudly here rather than panic
+	// inside the function under test.
+	if len(prefix) != ShadowPrefixLen {
+		t.Fatalf("test prefix length %d must match ShadowPrefixLen %d — update both",
+			len(prefix), ShadowPrefixLen)
+	}
 
 	t.Run("no entry for prefix", func(t *testing.T) {
 		m := map[string]map[string]struct{}{}
