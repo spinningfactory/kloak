@@ -38,10 +38,10 @@ func TestSetup_DevModeEnablesDebug(t *testing.T) {
 
 func TestSetup_LevelMatrix(t *testing.T) {
 	cases := []struct {
-		env         string
-		minEnabled  zapcore.Level
-		debugOff    bool
-		traceOn     bool
+		env        string
+		minEnabled zapcore.Level
+		debugOff   bool
+		traceOn    bool
 	}{
 		{env: "trace", minEnabled: TraceLevel, traceOn: true},
 		{env: "debug", minEnabled: zapcore.DebugLevel},
