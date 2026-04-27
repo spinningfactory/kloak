@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"reflect"
 	"testing"
 
 	"go.uber.org/zap"
@@ -37,35 +38,46 @@ func TestSetup_DevModeEnablesDebug(t *testing.T) {
 }
 
 func TestSetup_LevelMatrix(t *testing.T) {
+	// Each case asserts both an enabled boundary (the lowest level the logger
+	// should accept) and a disabled boundary (the level just below that should
+	// be filtered). Trace is split out because it sits below Debug.
 	cases := []struct {
-		env        string
-		minEnabled zapcore.Level
-		debugOff   bool
-		traceOn    bool
+		env             string
+		dev             string // KLOAK_LOG_DEV value
+		enabledAt       zapcore.Level
+		disabledBelow   zapcore.Level // any level strictly below this must be off
+		hasDisabledEdge bool
 	}{
-		{env: "trace", minEnabled: TraceLevel, traceOn: true},
-		{env: "debug", minEnabled: zapcore.DebugLevel},
-		{env: "info", minEnabled: zapcore.InfoLevel, debugOff: true},
-		{env: "warn", minEnabled: zapcore.WarnLevel, debugOff: true},
-		{env: "error", minEnabled: zapcore.ErrorLevel, debugOff: true},
-		// Unmarshal failure on an unknown level — Setup keeps the config's default.
-		{env: "garbage", minEnabled: zapcore.InfoLevel, debugOff: true},
+		// Production mode (KLOAK_LOG_DEV unset / "false")
+		{env: "trace", dev: "", enabledAt: TraceLevel /* nothing below trace to test */},
+		{env: "debug", dev: "", enabledAt: zapcore.DebugLevel, disabledBelow: TraceLevel, hasDisabledEdge: true},
+		{env: "info", dev: "", enabledAt: zapcore.InfoLevel, disabledBelow: zapcore.DebugLevel, hasDisabledEdge: true},
+		{env: "warn", dev: "", enabledAt: zapcore.WarnLevel, disabledBelow: zapcore.InfoLevel, hasDisabledEdge: true},
+		{env: "error", dev: "", enabledAt: zapcore.ErrorLevel, disabledBelow: zapcore.WarnLevel, hasDisabledEdge: true},
+		// Garbage value: UnmarshalText fails, Setup keeps config's default (Info for production).
+		{env: "garbage", dev: "", enabledAt: zapcore.InfoLevel, disabledBelow: zapcore.DebugLevel, hasDisabledEdge: true},
+
+		// Development mode interactions: KLOAK_LOG_DEV=true switches the base
+		// config but the level override still applies on top.
+		{env: "trace", dev: "true", enabledAt: TraceLevel},
+		{env: "info", dev: "true", enabledAt: zapcore.InfoLevel, disabledBelow: zapcore.DebugLevel, hasDisabledEdge: true},
+		{env: "error", dev: "true", enabledAt: zapcore.ErrorLevel, disabledBelow: zapcore.WarnLevel, hasDisabledEdge: true},
+		// Dev mode with no level override defaults to Debug (development config default).
+		{env: "", dev: "true", enabledAt: zapcore.DebugLevel, disabledBelow: TraceLevel, hasDisabledEdge: true},
 	}
 	for _, tc := range cases {
-		t.Run(tc.env, func(t *testing.T) {
-			t.Setenv("KLOAK_LOG_DEV", "")
+		name := tc.env + "/dev=" + tc.dev
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("KLOAK_LOG_DEV", tc.dev)
 			t.Setenv("KLOAK_LOG_LEVEL", tc.env)
 
 			got := Setup()
 			core := got.Desugar().Core()
-			if !core.Enabled(tc.minEnabled) {
-				t.Errorf("expected %s to be enabled at level %s", tc.env, tc.minEnabled)
+			if !core.Enabled(tc.enabledAt) {
+				t.Errorf("expected level %s to be enabled (env=%q dev=%q)", tc.enabledAt, tc.env, tc.dev)
 			}
-			if tc.debugOff && core.Enabled(zapcore.DebugLevel) {
-				t.Errorf("Debug should be disabled at level %s", tc.env)
-			}
-			if tc.traceOn && !core.Enabled(TraceLevel) {
-				t.Errorf("Trace should be enabled at level %s", tc.env)
+			if tc.hasDisabledEdge && core.Enabled(tc.disabledBelow) {
+				t.Errorf("expected level %s to be disabled (env=%q dev=%q)", tc.disabledBelow, tc.env, tc.dev)
 			}
 		})
 	}
@@ -124,22 +136,40 @@ func TestSweetenFields(t *testing.T) {
 	cases := []struct {
 		name string
 		in   []interface{}
-		want int
+		want []zap.Field
 	}{
-		{"empty", nil, 0},
-		{"even pair", []interface{}{"k1", "v1"}, 1},
-		{"two pairs", []interface{}{"k1", 1, "k2", 2}, 2},
+		// sweetenFields returns make([]zap.Field, 0, n/2) — a non-nil, length-0
+		// slice — even for empty/odd inputs, so use []zap.Field{} (not nil).
+		{"empty", nil, []zap.Field{}},
+		{"even pair", []interface{}{"k1", "v1"}, []zap.Field{zap.Any("k1", "v1")}},
+		{"two pairs",
+			[]interface{}{"k1", 1, "k2", 2},
+			[]zap.Field{zap.Any("k1", 1), zap.Any("k2", 2)}},
 		// Trailing odd element is dropped by the i+=2 bound.
-		{"odd dangling element", []interface{}{"k1", "v1", "dangling"}, 1},
-		{"single element", []interface{}{"x"}, 0},
-		// Non-string keys silently become "".
-		{"non-string key tolerated", []interface{}{42, "v"}, 1},
+		{"odd dangling element",
+			[]interface{}{"k1", "v1", "dangling"},
+			[]zap.Field{zap.Any("k1", "v1")}},
+		{"single element", []interface{}{"x"}, []zap.Field{}},
+		// Non-string keys silently become "" — the type assertion fails and the
+		// zero value is used. The value still propagates correctly.
+		{"non-string key becomes empty string",
+			[]interface{}{42, "v"},
+			[]zap.Field{zap.Any("", "v")}},
+		// Mixed value types — proves the int / string / interface paths in
+		// zap.Field encoding are all preserved.
+		{"mixed types",
+			[]interface{}{"int_key", 7, "str_key", "s", "iface_key", []byte{1, 2}},
+			[]zap.Field{
+				zap.Any("int_key", 7),
+				zap.Any("str_key", "s"),
+				zap.Any("iface_key", []byte{1, 2}),
+			}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			got := sweetenFields(tc.in)
-			if len(got) != tc.want {
-				t.Errorf("expected %d fields, got %d (%v)", tc.want, len(got), got)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("got  %#v\nwant %#v", got, tc.want)
 			}
 		})
 	}
