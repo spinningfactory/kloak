@@ -1544,14 +1544,24 @@ int bpf_h_extract(void *ctx) {
   // The struct is 276 bytes but we only write 18 bytes — the rest is zero from stack init.
   struct tls_conn_state new_conn;
   __builtin_memset(&new_conn, 0, sizeof(new_conn));
-  if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0)
+  if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0) {
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [H-EXTRACT] H-fail: H read failed ptr=%llx off=%u",
+               ptr, offsets->algctx_to_h);
+#endif
     return 0;
+  }
 
   // OpenSSL stores H as two u64 in native (little-endian) byte order.
   // GHASH expects big-endian byte order. Byte-swap each 8-byte half.
   __u64 *h64 = (__u64 *)new_conn.ghash_h;
-  if (h64[0] == 0 && h64[1] == 0)
+  if (h64[0] == 0 && h64[1] == 0) {
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [H-EXTRACT] H-fail: H zero ptr=%llx off=%u",
+               ptr, offsets->algctx_to_h);
+#endif
     return 0;
+  }
   h64[0] = __builtin_bswap64(h64[0]);
   h64[1] = __builtin_bswap64(h64[1]);
 
@@ -2171,12 +2181,24 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 #endif
       return 0;
     }
-    if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0)
+    if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0) {
+#ifdef KLOAK_DEBUG
+      bpf_printk("kloak [2-KPROBE] H-fail: H read failed ptr=%llx off=%u",
+                 ptr, offsets->algctx_to_h);
+#endif
+      dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
       return 0;
+    }
 
     __u64 *h64 = (__u64 *)new_conn.ghash_h;
-    if (h64[0] == 0 && h64[1] == 0)
+    if (h64[0] == 0 && h64[1] == 0) {
+#ifdef KLOAK_DEBUG
+      bpf_printk("kloak [2-KPROBE] H-fail: H zero ptr=%llx off=%u",
+                 ptr, offsets->algctx_to_h);
+#endif
+      dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
       return 0;
+    }
     h64[0] = __builtin_bswap64(h64[0]);
     h64[1] = __builtin_bswap64(h64[1]);
 
