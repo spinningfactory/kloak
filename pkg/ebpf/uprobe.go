@@ -791,8 +791,15 @@ func (m *TLSUprobeManager) Close() error {
 	var errs []error
 	t0 := time.Now()
 	linkCount := len(m.links)
-	for _, l := range m.links {
-		if err := l.Close(); err != nil {
+	m.log.Infow("Close: starting link close loop", "count", linkCount)
+	for i, l := range m.links {
+		linkStart := time.Now()
+		err := l.Close()
+		dur := time.Since(linkStart)
+		if dur > 100*time.Millisecond || err != nil {
+			m.log.Infow("Close: slow/failed link", "i", i, "type", fmt.Sprintf("%T", l), "duration", dur.String(), "err", err)
+		}
+		if err != nil {
 			errs = append(errs, err)
 		}
 	}
