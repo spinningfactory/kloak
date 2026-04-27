@@ -421,21 +421,31 @@ jobs:
 
           # Build the combined profile. Each profile starts with a `mode:` line
           # plus per-line records. We pick whichever inputs exist.
-          # Drop the generated eBPF bindings — they have no source on the runner,
-          # so the coverage reporter can't resolve them.
+          # Drop the generated eBPF bindings (tlsuprobe_bpfel.go /
+          # tlsuprobe_bpfeb.go) from BOTH halves — they're only on disk on
+          # nodes that ran `go generate`, and downstream jobs that read the
+          # profile (Coverage Badge runs `go tool cover -func` against the
+          # whole file) will fail otherwise. Apply the filter to the unit
+          # half too, since pkg/ebpf is now in unit coverage.
           UNIT=/tmp/unit-coverage/coverage.out
           E2E=/tmp/e2e-coverage.out
           OUT=/tmp/combined-coverage.out
 
+          # head -1 keeps the `mode:` line; the filter trims subsequent lines.
+          strip_generated() { grep -v 'tlsuprobe_bpf'; }
+
           if [ -f "$UNIT" ] && [ -f "$E2E" ]; then
-            cp "$UNIT" "$OUT"
-            tail -n +2 "$E2E" | grep -v 'tlsuprobe_bpf' >> "$OUT"
+            head -1 "$UNIT" > "$OUT"
+            tail -n +2 "$UNIT" | strip_generated >> "$OUT"
+            tail -n +2 "$E2E"  | strip_generated >> "$OUT"
             echo "Combined unit + e2e coverage"
           elif [ -f "$UNIT" ]; then
-            cp "$UNIT" "$OUT"
+            head -1 "$UNIT" > "$OUT"
+            tail -n +2 "$UNIT" | strip_generated >> "$OUT"
             echo "Unit coverage only (no e2e data)"
           elif [ -f "$E2E" ]; then
-            grep -v 'tlsuprobe_bpf' "$E2E" > "$OUT"
+            head -1 "$E2E" > "$OUT"
+            tail -n +2 "$E2E" | strip_generated >> "$OUT"
             echo "E2E coverage only (no unit artifact — likely a single-job re-run after retention)"
           else
             echo "No coverage data available; producing empty profile"
