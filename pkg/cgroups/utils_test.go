@@ -35,42 +35,14 @@ func TestFindContainerCgroupPath_ContainerdSystemdLayouts(t *testing.T) {
 	const containerID = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	podUnderscored := strings.ReplaceAll(podUID, "-", "_")
 
-	cases := []struct {
-		name      string
-		qos       string
-		layoutFmt string // %s = qos
-	}{
-		{"burstable", "burstable", "kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod%s.slice/cri-containerd-%s.scope"},
-		{"besteffort", "besteffort", "kubepods.slice/kubepods-besteffort.slice/kubepods-besteffort-pod%s.slice/cri-containerd-%s.scope"},
-		{"guaranteed", "guaranteed", "kubepods.slice/kubepods-guaranteed.slice/kubepods-guaranteed-pod%s.slice/cri-containerd-%s.scope"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, qos := range []string{"burstable", "besteffort", "guaranteed"} {
+		t.Run(qos, func(t *testing.T) {
 			root := t.TempDir()
-			// e.g. kubepods-burstable-pod<UID_with_underscores>.slice/cri-containerd-<CID>.scope
-			rel := strings.NewReplacer(
-				"%s/", podUnderscored+"/", // pod placeholder (first %s)
-			).Replace(tc.layoutFmt)
-			// Re-do the substitution properly via fmt.Sprintf-style.
-			// Easier: assemble manually.
-			var subdir string
-			switch tc.qos {
-			case "burstable":
-				subdir = filepath.Join("kubepods.slice", "kubepods-burstable.slice",
-					"kubepods-burstable-pod"+podUnderscored+".slice",
-					"cri-containerd-"+containerID+".scope")
-			case "besteffort":
-				subdir = filepath.Join("kubepods.slice", "kubepods-besteffort.slice",
-					"kubepods-besteffort-pod"+podUnderscored+".slice",
-					"cri-containerd-"+containerID+".scope")
-			case "guaranteed":
-				subdir = filepath.Join("kubepods.slice", "kubepods-guaranteed.slice",
-					"kubepods-guaranteed-pod"+podUnderscored+".slice",
-					"cri-containerd-"+containerID+".scope")
-			}
-			_ = rel
-			full := filepath.Join(root, subdir)
+
+			qosSlice := "kubepods-" + qos + ".slice"
+			podSlice := "kubepods-" + qos + "-pod" + podUnderscored + ".slice"
+			containerScope := "cri-containerd-" + containerID + ".scope"
+			full := filepath.Join(root, "kubepods.slice", qosSlice, podSlice, containerScope)
 			mkdirAll(t, full)
 
 			got, err := FindContainerCgroupPath(root, podUID, containerID)
