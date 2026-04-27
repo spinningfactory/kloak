@@ -3,7 +3,12 @@ image:
   tag: e2e
   pullPolicy: Never
 log:
-  level: debug
+  # Trace-level so flake post-mortems on the e2e job can see the BPF debug
+  # counters (xor_conn_check, xor_secret_found, kprobe_bridge, tc_patched)
+  # and per-secret sync detail. Without this, info/debug hides the data-plane
+  # signals needed to distinguish "uprobe never fired" from "fallback miss"
+  # from "tag patch miss".
+  level: trace
   dev: true
 coverage:
   enabled: true
