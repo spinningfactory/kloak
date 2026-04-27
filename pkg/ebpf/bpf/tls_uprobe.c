@@ -1546,7 +1546,7 @@ int bpf_h_extract(void *ctx) {
   __builtin_memset(&new_conn, 0, sizeof(new_conn));
   if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0) {
 #ifdef KLOAK_DEBUG
-    bpf_printk("kloak [H-EXTRACT] H-fail: read failed ptr=%llx off=%u",
+    bpf_printk("kloak [H-EXTRACT] H-fail: H read failed ptr=%llx off=%u",
                ptr, offsets->algctx_to_h);
 #endif
     return 0;
@@ -2186,6 +2186,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
       bpf_printk("kloak [2-KPROBE] H-fail: H read failed ptr=%llx off=%u",
                  ptr, offsets->algctx_to_h);
 #endif
+      dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
       return 0;
     }
 
@@ -2195,6 +2196,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
       bpf_printk("kloak [2-KPROBE] H-fail: H zero ptr=%llx off=%u",
                  ptr, offsets->algctx_to_h);
 #endif
+      dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
       return 0;
     }
     h64[0] = __builtin_bswap64(h64[0]);
