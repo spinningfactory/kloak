@@ -292,10 +292,14 @@ jobs:
           # instead of rebuilt. Cache is pushed on every build so it stays warm.
           CACHE=${{ env.CACHE_REPO }}
 
+          # BPF_DEBUG=1 compiles the bpf_printk markers in pkg/ebpf/bpf/tls_uprobe.c.
+          # Their output streams to /sys/kernel/tracing/trace_pipe and is captured
+          # by the "Start BPF trace capture" step below.
           docker buildx build --load \
             --cache-from type=registry,ref=${CACHE}:kloak \
             --cache-to type=registry,ref=${CACHE}:kloak,mode=max \
-            --build-arg TARGETARCH=amd64 --build-arg COVER=1 -t kloak:e2e .
+            --build-arg TARGETARCH=amd64 --build-arg COVER=1 --build-arg BPF_DEBUG=1 \
+            -t kloak:e2e .
 
           docker buildx build --load \
             --cache-from type=registry,ref=${CACHE}:demo-go \
@@ -340,10 +344,40 @@ jobs:
       - name: Install Helm
         uses: azure/setup-helm@v5
 
+      - name: Start BPF trace capture
+        # bpf_printk in pkg/ebpf/bpf/tls_uprobe.c (compiled with BPF_DEBUG=1
+        # above) streams to /sys/kernel/tracing/trace_pipe — a kernel ring
+        # buffer that drains as it's read. We start a backgrounded reader
+        # before the test so the full data-plane trace is available on
+        # failure (the buffer otherwise rolls over within seconds).
+        run: |
+          sudo touch /tmp/bpf-trace.log
+          sudo chmod 666 /tmp/bpf-trace.log
+          sudo nohup sh -c 'cat /sys/kernel/tracing/trace_pipe > /tmp/bpf-trace.log 2>&1' >/dev/null 2>&1 &
+          echo $! | sudo tee /tmp/bpf-trace.pid >/dev/null
+          # Give the reader a moment to attach to the pipe.
+          sleep 1
+          ls -la /tmp/bpf-trace.log
+
       - name: Run E2E tests (with eBPF)
         run: go test -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
           KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
+
+      - name: Stop BPF trace capture
+        if: always()
+        run: |
+          PID=$(cat /tmp/bpf-trace.pid 2>/dev/null) || true
+          if [ -n "$PID" ]; then
+            sudo kill "$PID" 2>/dev/null || true
+          fi
+          # The reader is a child of nohup'd sh; its `cat` may outlive the
+          # shell. Sweep up by name as a safety net.
+          sudo pkill -f "cat /sys/kernel/tracing/trace_pipe" 2>/dev/null || true
+          # Make readable for the failure-collection step.
+          sudo chmod 666 /tmp/bpf-trace.log 2>/dev/null || true
+          echo "BPF trace size:"
+          ls -la /tmp/bpf-trace.log 2>/dev/null || true
 
       - name: Collect e2e coverage
         if: always()
@@ -425,14 +459,18 @@ jobs:
         env:
           KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
         run: |
+          # At trace level the controller emits the per-5s debug counter dump
+          # plus per-secret sync details, which fills 200 lines in a few
+          # seconds. 5000 keeps roughly 10+ minutes of context — enough to
+          # span the test that actually flaked plus its setup.
           echo "=== Kloak Controller Logs ==="
-          kubectl logs -n kloak-system -l app.kubernetes.io/component=controller --tail=200 2>/dev/null || true
+          kubectl logs -n kloak-system -l app.kubernetes.io/component=controller --tail=5000 2>/dev/null || true
           echo "=== Kloak Webhook Logs ==="
-          kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook --tail=100 2>/dev/null || true
+          kubectl logs -n kloak-system -l app.kubernetes.io/component=webhook --tail=500 2>/dev/null || true
           echo "=== Demo App Logs ==="
           for app in demo-go demo-python demo-js demo-go-boring demo-python-raw-tls; do
             echo "--- $app ---"
-            kubectl logs -n kloak-e2e -l app=$app --tail=50 2>/dev/null || true
+            kubectl logs -n kloak-e2e -l app=$app --tail=200 2>/dev/null || true
           done
           echo "=== All Pods ==="
           kubectl get pods -A 2>/dev/null || true
@@ -446,8 +484,24 @@ jobs:
           sudo bpftool map list 2>/dev/null || true
           echo "=== Kernel dmesg (last 50 lines) ==="
           sudo dmesg | tail -50 2>/dev/null || true
-          echo "=== BPF trace_pipe (buffered) ==="
-          sudo timeout 2 cat /sys/kernel/tracing/trace_pipe 2>/dev/null | head -100 || true
+          # Captured trace_pipe output for the whole run. Filter to kloak's
+          # bpf_printk lines and tail so the workflow log stays readable;
+          # the full file is uploaded as an artifact below.
+          echo "=== BPF trace (kloak-only, last 500 lines) ==="
+          if [ -s /tmp/bpf-trace.log ]; then
+            grep -F kloak /tmp/bpf-trace.log | tail -500 || true
+          else
+            echo "(no trace captured)"
+          fi
+
+      - name: Upload BPF trace
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: bpf-trace
+          path: /tmp/bpf-trace.log
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Stop k3s
         if: always()
