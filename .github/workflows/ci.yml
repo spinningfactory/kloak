@@ -100,7 +100,14 @@ jobs:
         run: make test-bpf-helpers
 
       - name: Run tests
-        run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/pkg/ebpf|/pkg/cgroups')
+        # Include pkg/ebpf (Linux-tagged BPF tests self-skip via t.Skipf when
+        # eBPF resources aren't available on the runner) and pkg/cgroups (its
+        # utils.go is pure parsing + the cgroup_linux/cgroup_other split takes
+        # care of platform deps). Exclude:
+        #   - test/e2e — separate job
+        #   - cmd/      — entrypoint wiring; coverage merges via the e2e binary
+        #   - tools/    — CLI utilities, coverage isn't meaningful
+        run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/tools/')
 
       - name: Upload unit coverage
         uses: actions/upload-artifact@v5
