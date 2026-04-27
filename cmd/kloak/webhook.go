@@ -85,4 +85,6 @@ func runWebhook(cmd *cobra.Command, args []string) {
 		_ = setupLog.Sync()
 		os.Exit(1)
 	}
+
+	flushCoverageCounters(setupLog)
 }

@@ -170,6 +170,14 @@ func runController(cmd *cobra.Command, args []string) {
 			setupLog.Errorw("failed to close uprobe manager", "error", err)
 		}
 	}
+
+	// Flush coverage counters explicitly when GOCOVERDIR is set. Go's
+	// at-exit hook for `-cover` builds is unreliable on SIGTERM in
+	// containerized environments — the e2e CI was capturing covmeta but
+	// never covcounters, so pkg/ebpf runtime code showed as 0 % covered.
+	// runtime/coverage.WriteCountersDir is a no-op when the binary wasn't
+	// built with -cover, so this is safe in production.
+	flushCoverageCounters(setupLog)
 }
 
 // discoverTrustedDNSServers returns the list of trusted DNS server IPs.

@@ -107,7 +107,14 @@ jobs:
         #   - test/e2e — separate job
         #   - cmd/      — entrypoint wiring; coverage merges via the e2e binary
         #   - tools/    — CLI utilities, coverage isn't meaningful
-        run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/tools/')
+        # Then strip the bpf2go-generated tlsuprobe_bpf{el,eb}.go from the
+        # profile so it doesn't inflate denominators or break downstream
+        # `go tool cover -func` on jobs that don't run `go generate`.
+        run: |
+          go test -v -race -coverprofile=coverage.raw $(go list ./... | grep -v -E '/test/e2e|/cmd/|/tools/')
+          head -1 coverage.raw > coverage.out
+          tail -n +2 coverage.raw | grep -v 'tlsuprobe_bpf' >> coverage.out
+          rm -f coverage.raw
 
       - name: Upload unit coverage
         uses: actions/upload-artifact@v5
