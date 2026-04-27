@@ -787,13 +787,41 @@ func isTLSLibrary(name string) bool {
 }
 
 // Close releases all links and the eBPF manager.
+//
+// Each link.Close on a uprobe is a kernel syscall that takes ~50-100 ms,
+// and m.links accumulates one entry per uprobe attachment over the
+// daemonset's lifetime. On a long-running cluster with churning pods this
+// reaches into the thousands; closing serially blows past kubelet's
+// terminationGracePeriodSeconds and the pod is SIGKILL'd before the Go
+// runtime gets to flush exit hooks (which lost us the e2e covcounters
+// flush, among other things). Close concurrently with a bounded worker
+// pool so wall time stays inside the grace period regardless of how
+// long the controller has been running.
 func (m *TLSUprobeManager) Close() error {
 	var errs []error
-	for _, l := range m.links {
-		if err := l.Close(); err != nil {
-			errs = append(errs, err)
-		}
+	var errsMu sync.Mutex
+
+	const closeWorkers = 64
+	jobs := make(chan link.Link, closeWorkers)
+	var wg sync.WaitGroup
+	for w := 0; w < closeWorkers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for l := range jobs {
+				if err := l.Close(); err != nil {
+					errsMu.Lock()
+					errs = append(errs, err)
+					errsMu.Unlock()
+				}
+			}
+		}()
 	}
+	for _, l := range m.links {
+		jobs <- l
+	}
+	close(jobs)
+	wg.Wait()
 	m.links = nil
 
 	if m.reader != nil {
