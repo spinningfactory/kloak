@@ -385,46 +385,17 @@ jobs:
           KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
         run: |
           mkdir -p /tmp/e2e-covdata
-          # Force a covcounters flush via a two-SIGTERM dance:
-          #
-          #   1. Trigger SIGTERM #1 by `helm uninstall` — kubelet sees the
-          #      DaemonSet deletion and sends SIGTERM to the pod. (We run
-          #      this here unconditionally; the e2e teardown also runs it,
-          #      but if the test process panicked — e.g. the suite's
-          #      15-minute timer fired during a 4hop flake — teardown is
-          #      skipped and we have to do it ourselves.)
-          #
-          #   2. Capture the controller pod name BEFORE its container exits.
-          #
-          #   3. Send SIGTERM #2 via `kubectl exec ... kill -TERM 1`.
-          #      controller-runtime's signal handler maps the first SIGTERM
-          #      to ctx cancellation and the second to os.Exit(1), which
-          #      runs Go's runtime exit hooks — including the
-          #      runtime/coverage hook that writes covcounters — regardless
-          #      of how far the in-flight cleanup has progressed.
-          #
-          # Without step 3, the long uprobeMgr.Close path can outlast
-          # kubelet's grace period and the pod is SIGKILL'd before the hook
-          # fires. CI-only; production code stays unaware.
+          # Run helm uninstall here unconditionally — the e2e teardown does
+          # it too, but if the test process panicked (e.g. the suite's
+          # 15-minute timer fired during a 4hop flake) teardown is skipped
+          # and we'd be left with a running pod and no covcounters.
           helm uninstall kloak -n kloak-system --ignore-not-found 2>&1 || true
-          POD=$(kubectl get pods -n kloak-system \
-            -l app.kubernetes.io/component=controller \
-            -o jsonpath='{.items[0].metadata.name}' 2>/dev/null || true)
-          if [ -n "$POD" ]; then
-            # Brief wait so SIGTERM #1 lands and controller-runtime's
-            # signal handler advances past the first `<-c`. Without this
-            # the second signal could race the first into the same channel
-            # slot and only one cancel happens.
-            sleep 1
-            echo "Sending SIGTERM #2 to $POD/controller (PID 1) for coverage flush"
-            kubectl exec -n kloak-system "$POD" -c controller -- kill -TERM 1 2>&1 || true
-          else
-            echo "No controller pod found — skipping force flush"
-          fi
-          # Wait for the controller pod to fully terminate so the Go coverage
-          # runtime can flush covcounters to the hostPath volume on clean exit.
-          # 90s covers the 60s pod terminationGracePeriodSeconds plus uprobe
-          # detach / BPF close time.
+          # Wait for the controller pod to fully terminate. The kloak
+          # binary's `flushCoverage` (cmd/kloak/coverage_flush_cover.go,
+          # compiled in via -tags cover when COVER=1) writes covcounters
+          # before main returns, so any clean exit produces a usable
+          # profile. 90s covers the 60s pod terminationGracePeriodSeconds
+          # plus uprobe detach / BPF close time.
           kubectl wait --for=delete pod -l app.kubernetes.io/component=controller \
             -n kloak-system --timeout=90s 2>/dev/null || true
           # k3s runs directly on the runner, so covdata lives at /tmp/kloak-coverage

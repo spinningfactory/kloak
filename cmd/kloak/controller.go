@@ -185,6 +185,7 @@ func runController(cmd *cobra.Command, args []string) {
 			setupLog.Errorw("failed to close uprobe manager", "error", err)
 		}
 	}
+	flushCoverage()
 	setupLog.Infow("controller exited cleanly")
 	_ = setupLog.Sync()
 }
