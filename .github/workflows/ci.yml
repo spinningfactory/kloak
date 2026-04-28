@@ -157,7 +157,7 @@ jobs:
           cache: true
 
       - name: Download combined coverage
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: combined-coverage
           path: /tmp/combined-coverage
@@ -411,7 +411,7 @@ jobs:
         # e2e-only coverage in the merge step below.
         if: always()
         continue-on-error: true
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: unit-coverage
           path: /tmp/unit-coverage
