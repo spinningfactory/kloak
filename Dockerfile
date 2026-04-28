@@ -42,11 +42,16 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       -target bpfeb -c bpf/tls_uprobe.c -o tlsuprobe_bpfeb.o
 
 # Cross-compile Go binary for the target platform (no CGO, pure Go).
-# When COVER=1, build with -cover for integration test coverage collection.
+# When COVER=1, build with `-cover` for integration test coverage and
+# `-tags cover` to pull in cmd/kloak/coverage_flush_cover.go, which
+# explicitly flushes covcounters at shutdown via runtime/coverage.
+# Production builds (COVER=0) leave that file out — the no-op default in
+# coverage_flush.go is used and the binary contains no runtime/coverage
+# import.
 ARG COVER=0
 RUN if [ "$COVER" = "1" ]; then \
       CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-        go build -cover -covermode=atomic -o /kloak ./cmd/kloak; \
+        go build -cover -covermode=atomic -tags cover -o /kloak ./cmd/kloak; \
     else \
       CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
         go build -o /kloak ./cmd/kloak; \

@@ -385,13 +385,17 @@ jobs:
           KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
         run: |
           mkdir -p /tmp/e2e-covdata
-          # Wait for the controller pod to fully terminate so the Go coverage
-          # runtime can flush covcounters to the hostPath volume on clean exit.
-          # The e2e teardown runs `helm uninstall --wait`, which already blocks
-          # until the pod is gone — the wait here is a belt-and-suspenders for
-          # rerun scenarios where teardown didn't run. 90s matches the helm
-          # timeout and covers the 60s pod terminationGracePeriodSeconds plus
-          # the time kloak's shutdown path takes (uprobe detach, BPF close).
+          # Run helm uninstall here unconditionally — the e2e teardown does
+          # it too, but if the test process panicked (e.g. the suite's
+          # 15-minute timer fired during a 4hop flake) teardown is skipped
+          # and we'd be left with a running pod and no covcounters.
+          helm uninstall kloak -n kloak-system --ignore-not-found 2>&1 || true
+          # Wait for the controller pod to fully terminate. The kloak
+          # binary's `flushCoverage` (cmd/kloak/coverage_flush_cover.go,
+          # compiled in via -tags cover when COVER=1) writes covcounters
+          # before main returns, so any clean exit produces a usable
+          # profile. 90s covers the 60s pod terminationGracePeriodSeconds
+          # plus uprobe detach / BPF close time.
           kubectl wait --for=delete pod -l app.kubernetes.io/component=controller \
             -n kloak-system --timeout=90s 2>/dev/null || true
           # k3s runs directly on the runner, so covdata lives at /tmp/kloak-coverage

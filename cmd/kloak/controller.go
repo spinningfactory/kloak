@@ -180,6 +180,12 @@ func runController(cmd *cobra.Command, args []string) {
 		setupLog.Errorw("problem running manager", "error", startErr)
 	}
 
+	// Flush coverage BEFORE Close: if Close hangs (e.g. a slow link
+	// detach pushes us past kubelet's grace period), we still capture
+	// coverage of everything up to shutdown. flushCoverage is a no-op
+	// in production builds (gated by `//go:build cover`).
+	flushCoverage()
+
 	if uprobeMgr != nil {
 		if err := uprobeMgr.Close(); err != nil {
 			setupLog.Errorw("failed to close uprobe manager", "error", err)
