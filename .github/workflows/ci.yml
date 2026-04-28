@@ -110,7 +110,7 @@ jobs:
         run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/tools/')
 
       - name: Upload unit coverage
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: unit-coverage
           path: coverage.out
@@ -465,7 +465,7 @@ jobs:
 
       - name: Upload combined coverage
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: combined-coverage
           path: /tmp/combined-coverage.out
@@ -514,7 +514,7 @@ jobs:
 
       - name: Upload BPF trace
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: bpf-trace
           path: /tmp/bpf-trace.log
