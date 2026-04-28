@@ -798,13 +798,21 @@ func isTLSLibrary(name string) bool {
 // pool so wall time stays inside the grace period regardless of how
 // long the controller has been running.
 func (m *TLSUprobeManager) Close() error {
+	t0 := time.Now()
+	linkCount := len(m.links)
 	var errs []error
 	var errsMu sync.Mutex
 
-	const closeWorkers = 64
-	jobs := make(chan link.Link, closeWorkers)
+	// Cap workers at the number of links — no point spinning up 64
+	// goroutines just to close 5 tracepoints at startup teardown.
+	const maxWorkers = 64
+	workers := maxWorkers
+	if linkCount < workers {
+		workers = linkCount
+	}
+	jobs := make(chan link.Link, workers)
 	var wg sync.WaitGroup
-	for w := 0; w < closeWorkers; w++ {
+	for w := 0; w < workers; w++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -839,6 +847,7 @@ func (m *TLSUprobeManager) Close() error {
 			errs = append(errs, err)
 		}
 	}
+	m.log.Infow("Close: done", "links", linkCount, "duration", time.Since(t0).String())
 	if len(errs) > 0 {
 		return fmt.Errorf("errors closing uprobe manager: %v", errs)
 	}
