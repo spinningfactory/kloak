@@ -22,7 +22,7 @@ func createTestSecretMap(t *testing.T) *ciliumebpf.Map {
 	m, err := ciliumebpf.NewMap(&ciliumebpf.MapSpec{
 		Type:       ciliumebpf.Hash,
 		KeySize:    8,   // SECRET_KEY_LEN
-		ValueSize:  216, // sizeof(secret_value) with padding
+		ValueSize:  272, // sizeof(secret_value) with padding (including IP filtering fields)
 		MaxEntries: 64,
 	})
 	if err != nil {
@@ -59,16 +59,21 @@ func newFakeClient(objs ...client.Object) client.Client {
 }
 
 // enabledSecret creates an enabled secret with the given data keys/values.
-func enabledSecret(name, ns string, data map[string][]byte, labels map[string]string) *corev1.Secret {
+func enabledSecret(name, ns string, data map[string][]byte, labels map[string]string, annotations map[string]string) *corev1.Secret {
 	l := map[string]string{"getkloak.io/enabled": "true"}
 	for k, v := range labels {
 		l[k] = v
 	}
+	a := map[string]string{}
+	for k, v := range annotations {
+		a[k] = v
+	}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: ns,
-			Labels:    l,
+			Name:        name,
+			Namespace:   ns,
+			Labels:      l,
+			Annotations: a,
 		},
 		Data: data,
 	}
@@ -93,7 +98,7 @@ func TestSyncSecrets_BasicSync(t *testing.T) {
 	m := createTestSecretMap(t)
 	reader := newFakeClient(
 		enabledSecret("my-secret", "default",
-			map[string][]byte{"api-key": []byte("my-real-secret-value!")}, nil),
+			map[string][]byte{"api-key": []byte("my-real-secret-value!")}, nil, nil),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
@@ -124,7 +129,7 @@ func TestSyncSecrets_MinLength(t *testing.T) {
 	// Shadow value "kloak:" is 6 bytes, below 8-byte minimum
 	reader := newFakeClient(
 		enabledSecret("my-secret", "default",
-			map[string][]byte{"api-key": []byte("short")}, nil),
+			map[string][]byte{"api-key": []byte("short")}, nil, nil),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:")}),
 	)
@@ -148,7 +153,7 @@ func TestSyncSecrets_Truncation(t *testing.T) {
 	longShadow := "kloak:abcd1234-5678-9abc-def0-123456789abc" + strings.Repeat(" ", 158)
 	reader := newFakeClient(
 		enabledSecret("my-secret", "default",
-			map[string][]byte{"api-key": []byte(longValue)}, nil),
+			map[string][]byte{"api-key": []byte(longValue)}, nil, nil),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte(longShadow)}),
 	)
@@ -174,7 +179,7 @@ func TestSyncSecrets_HostFilter(t *testing.T) {
 	reader := newFakeClient(
 		enabledSecret("my-secret", "default",
 			map[string][]byte{"api-key": []byte("my-real-secret-value!")},
-			map[string]string{"getkloak.io/hosts": "api.stripe.com"}),
+			nil, map[string]string{"getkloak.io/hosts": "api.stripe.com"}),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
@@ -204,7 +209,7 @@ func TestSyncSecrets_WildcardHost(t *testing.T) {
 	reader := newFakeClient(
 		enabledSecret("my-secret", "default",
 			map[string][]byte{"api-key": []byte("my-real-secret-value!")},
-			map[string]string{"getkloak.io/hosts": "*"}),
+			nil, map[string]string{"getkloak.io/hosts": "*"}),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
@@ -231,7 +236,7 @@ func TestSyncSecrets_StaleEntryPruning(t *testing.T) {
 	// First sync: add a secret
 	reader1 := newFakeClient(
 		enabledSecret("my-secret", "default",
-			map[string][]byte{"api-key": []byte("my-real-secret-value!")}, nil),
+			map[string][]byte{"api-key": []byte("my-real-secret-value!")}, nil, nil),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
@@ -265,7 +270,7 @@ func TestSyncSecrets_Update(t *testing.T) {
 	// Initial value
 	reader1 := newFakeClient(
 		enabledSecret("my-secret", "default",
-			map[string][]byte{"api-key": []byte("old-secret-value-here")}, nil),
+			map[string][]byte{"api-key": []byte("old-secret-value-here")}, nil, nil),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
@@ -276,7 +281,7 @@ func TestSyncSecrets_Update(t *testing.T) {
 	// Update value (same shadow, different real value)
 	reader2 := newFakeClient(
 		enabledSecret("my-secret", "default",
-			map[string][]byte{"api-key": []byte("new-secret-value-here")}, nil),
+			map[string][]byte{"api-key": []byte("new-secret-value-here")}, nil, nil),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
@@ -302,7 +307,7 @@ func TestSyncSecrets_FullPrefix(t *testing.T) {
 	shadow := "kloak:abcd1234-5678-9abc-def0-123456789abc"
 	reader := newFakeClient(
 		enabledSecret("my-secret", "default",
-			map[string][]byte{"api-key": []byte(shadow)}, nil),
+			map[string][]byte{"api-key": []byte(shadow)}, nil, nil),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte(shadow)}),
 	)
@@ -333,12 +338,12 @@ func TestSyncSecrets_WatchedHostsSync(t *testing.T) {
 	reader := newFakeClient(
 		enabledSecret("secret1", "default",
 			map[string][]byte{"api-key": []byte("my-real-secret-value!")},
-			map[string]string{"getkloak.io/hosts": "api.stripe.com"}),
+			nil, map[string]string{"getkloak.io/hosts": "api.stripe.com"}),
 		shadowSecret("secret1-kloak", "default", "secret1",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 		enabledSecret("secret2", "default",
 			map[string][]byte{"api-key": []byte("another-secret-value!")},
-			map[string]string{"getkloak.io/hosts": "api.github.com"}),
+			nil, map[string]string{"getkloak.io/hosts": "api.github.com"}),
 		shadowSecret("secret2-kloak", "default", "secret2",
 			map[string][]byte{"api-key": []byte("kloak:efgh5678-1234-5678")}),
 	)
@@ -370,7 +375,7 @@ func TestSyncSecrets_WatchedHostsPruning(t *testing.T) {
 	reader1 := newFakeClient(
 		enabledSecret("my-secret", "default",
 			map[string][]byte{"api-key": []byte("my-real-secret-value!")},
-			map[string]string{"getkloak.io/hosts": "api.stripe.com"}),
+			nil, map[string]string{"getkloak.io/hosts": "api.stripe.com"}),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
@@ -395,6 +400,89 @@ func TestSyncSecrets_WatchedHostsPruning(t *testing.T) {
 	// Host should be pruned
 	if err := wh.Lookup(&key, &val); err == nil {
 		t.Error("stale host should have been pruned from watched_hosts map")
+	}
+}
+
+func TestSyncSecrets_IPFilter(t *testing.T) {
+	m := createTestSecretMap(t)
+	reader := newFakeClient(
+		enabledSecret("my-secret", "default",
+			map[string][]byte{"api-key": []byte("my-real-secret-value!")},
+			nil, map[string]string{"getkloak.io/hosts": "192.168.1.1"}),
+		shadowSecret("my-secret-kloak", "default", "my-secret",
+			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
+	)
+
+	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
+		t.Fatalf("syncSecrets failed: %v", err)
+	}
+
+	var key secretKey
+	copy(key.Prefix[:], []byte("kloak:ab"))
+	var val secretValue
+	if err := m.Lookup(&key, &val); err != nil {
+		t.Fatalf("secret not found in map: %v", err)
+	}
+
+	// IP filtering should be active (IpLen == 16)
+	if val.IpLen != 16 {
+		t.Errorf("expected ipLen=16 for IP filter, got %d", val.IpLen)
+	}
+
+	// HostLen should be 0 since we're using IP filter
+	if val.HostLen != 0 {
+		t.Errorf("expected hostLen=0 for IP filter, got %d", val.HostLen)
+	}
+
+	// Verify the IP is stored correctly (IPv4-mapped-IPv6: ::ffff:192.168.1.1)
+	// 192.168.1.1 in big-endian: 0xC0A80101
+	// IPv4-mapped-IPv6: ::ffff:0:C0A80101
+	expectedIP := []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0xc0, 0xa8, 0x01, 0x01}
+	gotIP := val.AllowedIp[:16]
+	for i := 0; i < 16; i++ {
+		if gotIP[i] != expectedIP[i] {
+			t.Errorf("expected IP byte %d to be 0x%02x, got 0x%02x", i, expectedIP[i], gotIP[i])
+		}
+	}
+}
+
+func TestSyncSecrets_IPv6Filter(t *testing.T) {
+	m := createTestSecretMap(t)
+	reader := newFakeClient(
+		enabledSecret("my-secret", "default",
+			map[string][]byte{"api-key": []byte("my-real-secret-value!")},
+			nil, map[string]string{"getkloak.io/hosts": "2001:db8::1"}),
+		shadowSecret("my-secret-kloak", "default", "my-secret",
+			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
+	)
+
+	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
+		t.Fatalf("syncSecrets failed: %v", err)
+	}
+
+	var key secretKey
+	copy(key.Prefix[:], []byte("kloak:ab"))
+	var val secretValue
+	if err := m.Lookup(&key, &val); err != nil {
+		t.Fatalf("secret not found in map: %v", err)
+	}
+
+	if val.IpLen != 16 {
+		t.Errorf("expected ipLen=16 for IP filter, got %d", val.IpLen)
+	}
+
+	if val.HostLen != 0 {
+		t.Errorf("expected hostLen=0 for IP filter, got %d", val.HostLen)
+	}
+
+	// Verify the IPv6 is stored correctly
+	// 2001:db8::1 -> 2001 0db8 0000 0000 0000 0000 0000 0001
+	expectedIP := []byte{0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01}
+	gotIP := val.AllowedIp[:16]
+	for i := 0; i < 16; i++ {
+		if gotIP[i] != expectedIP[i] {
+			t.Errorf("expected IP byte %d to be 0x%02x, got 0x%02x", i, expectedIP[i], gotIP[i])
+		}
 	}
 }
 

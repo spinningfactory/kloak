@@ -12,8 +12,8 @@
 <div align="center">
 
 [![CI](https://github.com/spinningfactory/kloak/actions/workflows/ci.yml/badge.svg)](https://github.com/spinningfactory/kloak/actions/workflows/ci.yml)
-![Coverage](https://img.shields.io/badge/Coverage-80.8%25-brightgreen)
-[![Go Version](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)](https://go.dev/)
+![Coverage](https://img.shields.io/badge/Coverage-77.1%25-brightgreen)
+[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](https://go.dev/)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.28+-326CE5?logo=kubernetes)](https://kubernetes.io/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
@@ -29,7 +29,7 @@ Kloak transparently intercepts outbound TLS traffic in Kubernetes using eBPF upr
 - **Secret isolation** -- Applications only see hashed shadow values (`kloak:<UUID>`). Real secrets exist solely in eBPF maps and are injected in-kernel at TLS write time.
 - **Zero overhead** -- eBPF uprobes operate in kernel space with negligible latency impact. No userspace proxy or sidecar in the data path.
 - **Kubernetes native** -- Works with standard Kubernetes Secrets. Enable with a single label.
-- **DNS-verified host filtering** -- Secrets annotated with `getkloak.io/hosts` are only sent to destinations verified through the DNS resolution chain, preventing exfiltration to unauthorized servers.
+- **Host and IP filtering** -- Secrets annotated with `getkloak.io/hosts` are only sent to specific destination hostnames or IP addresses, preventing exfiltration to unauthorized servers.
 - **Port-based filtering** -- Secrets annotated with `getkloak.io/port` are restricted to connections on a specific destination port.
 - **Broad runtime support** -- Hooks into OpenSSL, BoringSSL, and Go's native `crypto/tls`. Works with Python, Node.js, Go, Rust, Ruby, PHP, curl, and any OpenSSL-linked runtime.
 
@@ -57,7 +57,7 @@ kubectl get pods -n kloak-system
 | Key | Type | Scope | Description |
 |-----|------|-------|-------------|
 | `getkloak.io/enabled=true` | Label | Secret, Namespace, Pod | Enables Kloak for the target resource. On namespaces and pods, controls webhook scope. On secrets, triggers shadow secret creation. |
-| `getkloak.io/hosts=host1,host2` | Annotation | Secret | Restricts which destination hosts a secret can be sent to |
+| `getkloak.io/hosts=host` | Annotation | Secret | Restricts which destination host or IP address a secret can be sent to (single value only) |
 | `getkloak.io/port=443` | Annotation | Secret | Restricts which destination port a secret can be sent to |
 | `getkloak.io/managed=true` | Label | Secret | Marks shadow secrets created by Kloak (do not set manually) |
 
@@ -192,9 +192,9 @@ sequenceDiagram
 
 ## How It Works
 
-### 1. Label Your Secrets
+### 1. Label and Annotate Your Secrets
 
-Add `getkloak.io/enabled=true` to any Kubernetes Secret. Kloak generates a shadow secret with `kloak:<UUID>` placeholders that are length-matched to the original values.
+Add `getkloak.io/enabled=true` as a label to enable Kloak. Use annotations for host and port filtering. Kloak generates a shadow secret with `kloak:<UUID>` placeholders that are length-matched to the original values.
 
 ```yaml
 apiVersion: v1

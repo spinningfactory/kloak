@@ -5,6 +5,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
@@ -62,9 +63,16 @@ func runController(cmd *cobra.Command, args []string) {
 
 	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath)
 
+	// 30 s is well under the daemonset's 60 s terminationGracePeriodSeconds,
+	// leaving headroom for our own cleanup (uprobe/link Close) and any final
+	// log flush before kubelet's SIGKILL. Without this the manager defaults
+	// to 30 s anyway, but pinning it documents the budget and makes it
+	// obvious where to tune if shutdown ever pushes past the grace period.
+	gracefulShutdown := 30 * time.Second
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		HealthProbeBindAddress: controllerProbeAddr,
+		Scheme:                  scheme,
+		HealthProbeBindAddress:  controllerProbeAddr,
+		GracefulShutdownTimeout: &gracefulShutdown,
 	})
 	if err != nil {
 		setupLog.Errorw("unable to start manager", "error", err)
@@ -78,9 +86,9 @@ func runController(cmd *cobra.Command, args []string) {
 	if enableEBPF {
 		uprobeMgr, err = ebpf.NewTLSUprobeManager(mgr.GetClient(), cgroupPath, setupLog)
 		if err != nil {
-			setupLog.Errorw("failed to initialize eBPF uprobe manager — sleeping to preserve logs", "error", err)
+			setupLog.Errorw("failed to initialize eBPF uprobe manager", "error", err)
 			_ = setupLog.Sync()
-			select {} // Block forever so the container doesn't restart and logs are preserved.
+			os.Exit(1)
 		}
 		setupLog.Infow("eBPF TLS uprobes enabled")
 	} else {
@@ -160,16 +168,31 @@ func runController(cmd *cobra.Command, args []string) {
 	}
 
 	setupLog.Infow("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Errorw("problem running manager", "error", err)
+	signalCtx := ctrl.SetupSignalHandler()
+	startErr := mgr.Start(signalCtx)
+	// Past mgr.Start: signalCtx is done, manager has already given runnables
+	// up to GracefulShutdownTimeout to return. Log the trigger so the cause
+	// (signal vs runnable error) is unambiguous in post-mortem CI logs.
+	if signalCtx.Err() != nil {
+		setupLog.Infow("shutdown signal received, draining")
+	}
+	if startErr != nil {
+		setupLog.Errorw("problem running manager", "error", startErr)
 	}
 
-	// Cleanup
+	// Flush coverage BEFORE Close: if Close hangs (e.g. a slow link
+	// detach pushes us past kubelet's grace period), we still capture
+	// coverage of everything up to shutdown. flushCoverage is a no-op
+	// in production builds (gated by `//go:build cover`).
+	flushCoverage()
+
 	if uprobeMgr != nil {
 		if err := uprobeMgr.Close(); err != nil {
 			setupLog.Errorw("failed to close uprobe manager", "error", err)
 		}
 	}
+	setupLog.Infow("controller exited cleanly")
+	_ = setupLog.Sync()
 }
 
 // discoverTrustedDNSServers returns the list of trusted DNS server IPs.

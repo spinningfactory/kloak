@@ -40,7 +40,7 @@ func TestDNSWhitelist(t *testing.T) {
 	// Create kloak-enabled secret with host filter targeting the echo server.
 	createEnabledSecret(t, secretName, map[string][]byte{
 		"api-key": []byte(secretValue),
-	}, map[string]string{
+	}, nil, map[string]string{
 		"getkloak.io/hosts": echoSvcHost,
 	})
 	assertShadowSecret(t, secretName, map[string][]byte{

@@ -55,7 +55,7 @@ provision:
         echo "Kernel-specific tools not available for $(uname -r)"
 
       # Install Go
-      GO_VERSION="1.25.1"
+      GO_VERSION="1.26.2"
       ARCH=$(dpkg --print-architecture)
       if [ ! -d /usr/local/go ]; then
         echo "Installing Go ${GO_VERSION}..."

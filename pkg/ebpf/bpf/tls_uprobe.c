@@ -67,6 +67,8 @@ struct secret_value {
   char real_secret[SECRET_MAX_LEN];
   __u32 host_len;                      // 0 = wildcard (allow all hosts)
   char allowed_host[MAX_HOST_LEN];     // e.g. "httpbin.org"
+  __u32 ip_len;                        // 0 = no IP filter, 16 = IPv4-mapped-IPv6
+  char allowed_ip[16];                 // IPv4-mapped-IPv6 address
   __u16 port;                          // 0 = wildcard, otherwise port number (host byte order)
   __u8 protocol;                       // IPPROTO_TCP (6) = TCP, IPPROTO_UDP (17) = UDP
   __u32 prefix_len;                    // actual prefix length (8..42)
@@ -97,12 +99,14 @@ struct scratch_buf {
   __u32 xor_match_count;   // total matches found by pre-scan
   __u32 xor_current_match; // index of the next match to process
   struct {
-    __u32 pos;                    // byte offset of kloak: prefix in data[]
-    struct secret_key key;        // 8-byte key prefix
-  } xor_matches[XOR_MAX_MATCHES];
-  char host_value[MAX_HOST_LEN]; // host from DNS chain
-  __u16 dest_port;      // destination port in host byte order
-  char data[MAX_DATA_SIZE];
+     __u32 pos;                    // byte offset of kloak: prefix in data[]
+     struct secret_key key;        // 8-byte key prefix
+   } xor_matches[XOR_MAX_MATCHES];
+   char host_value[MAX_HOST_LEN]; // host from DNS chain
+   __u16 dest_port;      // destination port in host byte order
+   char ip_value[16];    // destination IP (IPv4-mapped-IPv6)
+   __u32 ip_len;         // 0 = no IP, 16 = IPv4-mapped-IPv6
+   char data[MAX_DATA_SIZE];
 };
 
 struct {
@@ -1294,6 +1298,8 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
   scratch_data->xor_fd = 0;
   __builtin_memset(scratch_data->host_value, 0, MAX_HOST_LEN);
   scratch_data->dest_port = 0;
+  __builtin_memset(scratch_data->ip_value, 0, 16);
+  scratch_data->ip_len = 0;
 
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
@@ -1361,6 +1367,9 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     if (!civ) { dbg_inc(DBG_RESOLVE_NO_CONN); return; }
     // Store destination port (network byte order from connect)
     scratch_data->dest_port = __bpf_ntohs(civ->port);
+    // Store destination IP for filtering
+    __builtin_memcpy(scratch_data->ip_value, civ->ip, 16);
+    scratch_data->ip_len = 16;
     struct dns_ip_key dik;
     __builtin_memset(&dik, 0, sizeof(dik));
     __builtin_memcpy(dik.ip, civ->ip, 16);
@@ -1382,13 +1391,14 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
     struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
     if (!civ)
       continue;
-    // Store destination port (network byte order from connect)
-    scratch_data->dest_port = __bpf_ntohs(civ->port);
     struct dns_ip_key dik;
     __builtin_memset(&dik, 0, sizeof(dik));
     __builtin_memcpy(dik.ip, civ->ip, 16);
     struct dns_ip_val *div = bpf_map_lookup_elem(&dns_ip_map, &dik);
     if (div && !dns_entry_expired(div) && div->host_len > 0 && div->host_len <= MAX_HOST_LEN) {
+      scratch_data->dest_port = __bpf_ntohs(civ->port);
+      __builtin_memcpy(scratch_data->ip_value, civ->ip, 16);
+      scratch_data->ip_len = 16;
       __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
       scratch_data->host_value_len = div->host_len;
       scratch_data->xor_fd = try_fd;
@@ -1397,6 +1407,10 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
       return;
     }
   }
+  // Reset stale IP/port from the last loop iteration — no verified host was found.
+  scratch_data->dest_port = 0;
+  scratch_data->ip_len = 0;
+  __builtin_memset(scratch_data->ip_value, 0, 16);
   dbg_inc(DBG_RESOLVE_NO_FD);
 }
 
@@ -1531,14 +1545,24 @@ int bpf_h_extract(void *ctx) {
   // The struct is 276 bytes but we only write 18 bytes — the rest is zero from stack init.
   struct tls_conn_state new_conn;
   __builtin_memset(&new_conn, 0, sizeof(new_conn));
-  if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0)
+  if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0) {
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [H-EXTRACT] H-fail: H read failed ptr=%llx off=%u",
+               ptr, offsets->algctx_to_h);
+#endif
     return 0;
+  }
 
   // OpenSSL stores H as two u64 in native (little-endian) byte order.
   // GHASH expects big-endian byte order. Byte-swap each 8-byte half.
   __u64 *h64 = (__u64 *)new_conn.ghash_h;
-  if (h64[0] == 0 && h64[1] == 0)
+  if (h64[0] == 0 && h64[1] == 0) {
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [H-EXTRACT] H-fail: H zero ptr=%llx off=%u",
+               ptr, offsets->algctx_to_h);
+#endif
     return 0;
+  }
   h64[0] = __builtin_bswap64(h64[0]);
   h64[1] = __builtin_bswap64(h64[1]);
 
@@ -1606,20 +1630,29 @@ int bpf_xor_path(void *ctx) {
   if (!val || val->len == 0 || val->len > SECRET_MAX_LEN)
     goto next; // Skip this match.
 
-  // Host filtering: val is fresh, re-lookup sd for host_value.
   __u32 val_len = val->len;
   __u32 val_host_len = val->host_len;
+  __u32 val_ip_len = val->ip_len;
   __u16 val_port = val->port;
-  if (val_host_len > 0 || val_port > 0) {
-    // Single lookup for both host and port filtering.
-    sd = bpf_map_lookup_elem(&scratch, &zero);
-    if (!sd) return 0;
+  // Save allowed_host before any map lookup that could invalidate val.
+  const char *val_allowed_host = val->allowed_host;
+
+  if (val_host_len > 0 || val_ip_len == 16 || val_port > 0) {
+    __u32 sd_ip_len = sd->ip_len;
 
     // Host filtering
     if (val_host_len > 0 && val_host_len < MAX_HOST_LEN) {
       if (sd_host_len == 0)
         goto next;
-      if (!hosts_match(sd->host_value, val->allowed_host))
+      if (!hosts_match(sd->host_value, val_allowed_host))
+        goto next;
+    }
+
+    // IP filtering - val_ip_len == 0 means no IP filter, otherwise check exact match
+    if (val_ip_len == 16) {
+      if (sd_ip_len != 16)
+        goto next;
+      if (__builtin_memcmp(sd->ip_value, val->allowed_ip, 16) != 0)
         goto next;
     }
 
@@ -2149,12 +2182,24 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 #endif
       return 0;
     }
-    if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0)
+    if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0) {
+#ifdef KLOAK_DEBUG
+      bpf_printk("kloak [2-KPROBE] H-fail: H read failed ptr=%llx off=%u",
+                 ptr, offsets->algctx_to_h);
+#endif
+      dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
       return 0;
+    }
 
     __u64 *h64 = (__u64 *)new_conn.ghash_h;
-    if (h64[0] == 0 && h64[1] == 0)
+    if (h64[0] == 0 && h64[1] == 0) {
+#ifdef KLOAK_DEBUG
+      bpf_printk("kloak [2-KPROBE] H-fail: H zero ptr=%llx off=%u",
+                 ptr, offsets->algctx_to_h);
+#endif
+      dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
       return 0;
+    }
     h64[0] = __builtin_bswap64(h64[0]);
     h64[1] = __builtin_bswap64(h64[1]);
 

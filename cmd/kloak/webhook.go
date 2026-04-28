@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -43,9 +44,11 @@ func runWebhook(cmd *cobra.Command, args []string) {
 
 	setupLog.Infow("Starting Kloak webhook")
 
+	gracefulShutdown := 30 * time.Second
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 webhookScheme,
-		HealthProbeBindAddress: webhookProbeAddr,
+		Scheme:                  webhookScheme,
+		HealthProbeBindAddress:  webhookProbeAddr,
+		GracefulShutdownTimeout: &gracefulShutdown,
 		WebhookServer: webhook.NewServer(webhook.Options{
 			Port:    9443,
 			CertDir: webhookCertDir,
@@ -80,9 +83,17 @@ func runWebhook(cmd *cobra.Command, args []string) {
 	}
 
 	setupLog.Infow("starting webhook server")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
-		setupLog.Errorw("problem running manager", "error", err)
+	signalCtx := ctrl.SetupSignalHandler()
+	startErr := mgr.Start(signalCtx)
+	if signalCtx.Err() != nil {
+		setupLog.Infow("shutdown signal received, draining")
+	}
+	if startErr != nil {
+		setupLog.Errorw("problem running manager", "error", startErr)
 		_ = setupLog.Sync()
 		os.Exit(1)
 	}
+	flushCoverage()
+	setupLog.Infow("webhook exited cleanly")
+	_ = setupLog.Sync()
 }

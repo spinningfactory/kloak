@@ -1,7 +1,7 @@
 # eBPF + Go build stage.
 # Runs on the BUILD platform (host arch) regardless of target platform.
 # Cross-compiles both eBPF objects and Go binary for the target.
-FROM --platform=$BUILDPLATFORM golang:1.25 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
 
 WORKDIR /app
 
@@ -17,8 +17,12 @@ COPY . .
 # Generate eBPF Go wrappers (bpf2go runs on host arch, targets BPF bytecode).
 # Then overwrite .o files with direct clang (bpf2go's strip corrupts them).
 # Map TARGETARCH (amd64, arm64) to kernel arch defines.
+# When BPF_DEBUG=1, define KLOAK_DEBUG so the in-kernel bpf_printk markers in
+# tls_uprobe.c are compiled in. Their output streams to
+# /sys/kernel/tracing/trace_pipe and is captured by the e2e job.
 ARG TARGETARCH
 ARG TARGETOS
+ARG BPF_DEBUG=0
 RUN if [ "$TARGETARCH" = "amd64" ]; then \
       ARCH_DEFINE=__TARGET_ARCH_x86; \
       export KLOAK_TARGET_ARCH=x86; \
@@ -26,18 +30,28 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
       ARCH_DEFINE=__TARGET_ARCH_${TARGETARCH}; \
       export KLOAK_TARGET_ARCH=${TARGETARCH}; \
     fi && \
+    if [ "$BPF_DEBUG" = "1" ]; then \
+      DEBUG_DEFINE=-DKLOAK_DEBUG; \
+    else \
+      DEBUG_DEFINE=; \
+    fi && \
     cd pkg/ebpf && go generate && \
-    clang -O2 -g -Wall -Werror -D${ARCH_DEFINE} \
+    clang -O2 -g -Wall -Werror -D${ARCH_DEFINE} ${DEBUG_DEFINE} \
       -target bpfel -c bpf/tls_uprobe.c -o tlsuprobe_bpfel.o && \
-    clang -O2 -g -Wall -Werror -D${ARCH_DEFINE} \
+    clang -O2 -g -Wall -Werror -D${ARCH_DEFINE} ${DEBUG_DEFINE} \
       -target bpfeb -c bpf/tls_uprobe.c -o tlsuprobe_bpfeb.o
 
 # Cross-compile Go binary for the target platform (no CGO, pure Go).
-# When COVER=1, build with -cover for integration test coverage collection.
+# When COVER=1, build with `-cover` for integration test coverage and
+# `-tags cover` to pull in cmd/kloak/coverage_flush_cover.go, which
+# explicitly flushes covcounters at shutdown via runtime/coverage.
+# Production builds (COVER=0) leave that file out — the no-op default in
+# coverage_flush.go is used and the binary contains no runtime/coverage
+# import.
 ARG COVER=0
 RUN if [ "$COVER" = "1" ]; then \
       CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-        go build -cover -covermode=atomic -o /kloak ./cmd/kloak; \
+        go build -cover -covermode=atomic -tags cover -o /kloak ./cmd/kloak; \
     else \
       CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
         go build -o /kloak ./cmd/kloak; \

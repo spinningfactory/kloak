@@ -117,10 +117,10 @@ func TestEBPFRawTLSHostFiltering(t *testing.T) {
 	allowedData := map[string][]byte{"api-key": []byte("REAL-ALLOWED-KEY-12345")}
 	blockedData := map[string][]byte{"api-key": []byte("REAL-BLOCKED-KEY-67890")}
 
-	createEnabledSecret(t, "secret-allowed", allowedData, map[string]string{
+	createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{
 		"getkloak.io/hosts": echoHostFQDN,
 	})
-	createEnabledSecret(t, "secret-blocked", blockedData, map[string]string{
+	createEnabledSecret(t, "secret-blocked", blockedData, nil, map[string]string{
 		"getkloak.io/hosts": "example.com",
 	})
 
@@ -176,10 +176,10 @@ func TestEBPFSecretRewrite(t *testing.T) {
 	allowedData := map[string][]byte{"api-key": []byte("REAL-ALLOWED-KEY-12345")}
 	blockedData := map[string][]byte{"api-key": []byte("REAL-BLOCKED-KEY-67890")}
 
-	createEnabledSecret(t, "secret-allowed", allowedData, map[string]string{
+	createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{
 		"getkloak.io/hosts": "httpbin.org",
 	})
-	createEnabledSecret(t, "secret-blocked", blockedData, map[string]string{
+	createEnabledSecret(t, "secret-blocked", blockedData, nil, map[string]string{
 		"getkloak.io/hosts": "example.com",
 	})
 
@@ -275,10 +275,10 @@ func TestEBPFSecretLengths(t *testing.T) {
 			allowedData := map[string][]byte{"api-key": []byte(tc.allowed)}
 			blockedData := map[string][]byte{"api-key": []byte(tc.blocked)}
 
-			createEnabledSecret(t, "secret-allowed", allowedData, map[string]string{
+			createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{
 				"getkloak.io/hosts": echoHostFQDN,
 			})
-			createEnabledSecret(t, "secret-blocked", blockedData, map[string]string{
+			createEnabledSecret(t, "secret-blocked", blockedData, nil, map[string]string{
 				"getkloak.io/hosts": "example.com",
 			})
 
