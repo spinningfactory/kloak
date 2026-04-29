@@ -121,9 +121,17 @@ jobs:
 
   # Coverage Report runs on pull requests and comments a diff summary.
   # Depends on e2e so it can work against the merged unit + e2e profile.
+  #
+  # Skipped for pull requests originating from forks: GitHub strips
+  # `pull-requests: write` from the GITHUB_TOKEN of fork PRs as a security
+  # measure, regardless of the `permissions:` block below. The action
+  # successfully downloads coverage and computes the diff but fails at the
+  # final `gh pr comment` step with "Resource not accessible by integration
+  # (addComment)" — turning a clean PR red for an issue the contributor
+  # cannot fix. Same-repo PRs and pushes still get the coverage comment.
   coverage:
     name: Coverage Report
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
     runs-on: ubuntu-latest
     needs: [e2e]
     permissions:
