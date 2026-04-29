@@ -290,6 +290,14 @@ jobs:
         run: |
           # Build with GHCR registry cache. Unchanged layers are pulled from cache
           # instead of rebuilt. Cache is pushed on every build so it stays warm.
+          #
+          # ignore-error=true on every --cache-to is required so PRs from forks
+          # don't fail the whole build at the cache push step. GitHub strips
+          # `packages: write` from the GITHUB_TOKEN of fork PRs as a security
+          # measure, which makes the registry push return 403 Forbidden. The
+          # build itself succeeds regardless; ignore-error lets buildx log the
+          # 403 and continue. Same-repo PRs and pushes still warm the cache
+          # normally because their tokens carry the write scope.
           CACHE=${{ env.CACHE_REPO }}
 
           # BPF_DEBUG=1 compiles the bpf_printk markers in pkg/ebpf/bpf/tls_uprobe.c.
@@ -297,43 +305,43 @@ jobs:
           # by the "Start BPF trace capture" step below.
           docker buildx build --load \
             --cache-from type=registry,ref=${CACHE}:kloak \
-            --cache-to type=registry,ref=${CACHE}:kloak,mode=max \
+            --cache-to type=registry,ref=${CACHE}:kloak,mode=max,ignore-error=true \
             --build-arg TARGETARCH=amd64 --build-arg COVER=1 --build-arg BPF_DEBUG=1 \
             -t kloak:e2e .
 
           docker buildx build --load \
             --cache-from type=registry,ref=${CACHE}:demo-go \
-            --cache-to type=registry,ref=${CACHE}:demo-go,mode=max \
+            --cache-to type=registry,ref=${CACHE}:demo-go,mode=max,ignore-error=true \
             -t kloak-demo-go:latest ./examples/demo-go/
 
           docker buildx build --load \
             --cache-from type=registry,ref=${CACHE}:demo-python \
-            --cache-to type=registry,ref=${CACHE}:demo-python,mode=max \
+            --cache-to type=registry,ref=${CACHE}:demo-python,mode=max,ignore-error=true \
             -t kloak-demo-python:latest ./examples/demo-python/
 
           docker buildx build --load \
             --cache-from type=registry,ref=${CACHE}:demo-js \
-            --cache-to type=registry,ref=${CACHE}:demo-js,mode=max \
+            --cache-to type=registry,ref=${CACHE}:demo-js,mode=max,ignore-error=true \
             -t kloak-demo-js:latest ./examples/demo-js/
 
           docker buildx build --load \
             --cache-from type=registry,ref=${CACHE}:demo-go-boring \
-            --cache-to type=registry,ref=${CACHE}:demo-go-boring,mode=max \
+            --cache-to type=registry,ref=${CACHE}:demo-go-boring,mode=max,ignore-error=true \
             -t kloak-demo-go-boring:latest ./examples/demo-go-boring/
 
           docker buildx build --load \
             --cache-from type=registry,ref=${CACHE}:demo-gnutls \
-            --cache-to type=registry,ref=${CACHE}:demo-gnutls,mode=max \
+            --cache-to type=registry,ref=${CACHE}:demo-gnutls,mode=max,ignore-error=true \
             -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
 
           docker buildx build --load \
             --cache-from type=registry,ref=${CACHE}:demo-python-raw-tls \
-            --cache-to type=registry,ref=${CACHE}:demo-python-raw-tls,mode=max \
+            --cache-to type=registry,ref=${CACHE}:demo-python-raw-tls,mode=max,ignore-error=true \
             -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
 
           docker buildx build --load \
             --cache-from type=registry,ref=${CACHE}:tls-echo \
-            --cache-to type=registry,ref=${CACHE}:tls-echo,mode=max \
+            --cache-to type=registry,ref=${CACHE}:tls-echo,mode=max,ignore-error=true \
             -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
 
           docker save kloak:e2e kloak-demo-go:latest kloak-demo-python:latest \
