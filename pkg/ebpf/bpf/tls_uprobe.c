@@ -465,9 +465,23 @@ struct xor_pending_val {
   __u8  active;
   __u8  chain_type;         // 0=OpenSSL/BoringSSL, CHAIN_GO_TLS=Go crypto/tls
   __u8  memory_bio;         // 1=fd resolution failed (memory BIO app like Node.js)
-  __u8  _pad[1];
+  __u8  h_valid;            // 1 if ghash_h was populated at uprobe time (OpenSSL/BoringSSL only)
   __u32 plaintext_len;      // SSL_write data length (for TLS version detection in tc)
   __u64 created_at;         // bpf_ktime_get_ns() — for TTL-based cleanup (memory BIO)
+
+  // GHASH H captured at SSL_write uprobe time (where SSL is provably alive).
+  // For OpenSSL/BoringSSL the kprobe used to walk SSL→wrl→enc_ctx→algctx→H
+  // every tcp_sendmsg, but memory-BIO apps (Python, Node.js) decouple SSL_write
+  // from the actual socket send, leaving a window for the SSL pointer to be
+  // freed and the heap memory reused — producing stale chain reads (e.g.
+  // SSL+3208 returning ASCII bytes from a CA-name buffer). Capturing H while
+  // OpenSSL itself just dereferenced ssl_ptr eliminates that window. Only
+  // populated for chain_type != CHAIN_GO_TLS — the Go path's H derivation is
+  // a different shape (H×2 from productTable) and stays in the kprobe.
+  __u8  ghash_h[16];
+  __u16 cipher_type;        // KLOAK_CIPHER_AES_GCM if h_valid=1, else KLOAK_CIPHER_UNKNOWN
+  __u8  nonce_len;          // 0=TLS 1.3, 8=TLS 1.2, 0xFF=unknown
+  __u8  _pad[5];            // align tail
 };
 
 // Per-process pending XOR patches, keyed by tgid.
@@ -1611,6 +1625,25 @@ int bpf_xor_path(void *ctx) {
     wi->staged_pending.plaintext_len = sd->total_data_len;
     wi->staged_pending.memory_bio = (sd->xor_fd == 0) ? 1 : 0;
     wi->staged_pending.created_at = bpf_ktime_get_ns();
+
+    // For OpenSSL/BoringSSL, h_extract just populated tls_conn_state (we
+    // were tail-called from there). Carry H through xor_pending so the
+    // tcp_sendmsg kprobe doesn't have to re-walk SSL→…→H — that walk
+    // races SSL_free for memory-BIO apps (Python, Node.js). Go's H
+    // extraction is shaped differently (H×2 → halve) and stays in the
+    // kprobe; leave Go's pending->h_valid at 0 so kprobe runs its path.
+    if (sd->chain_type != CHAIN_GO_TLS) {
+      struct tls_conn_key ck = {};
+      ck.tgid = wi->staged_pending.tgid;
+      ck.ssl_ptr = sd->ssl_ptr;
+      struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &ck);
+      if (conn && conn->cipher_type == KLOAK_CIPHER_AES_GCM) {
+        __builtin_memcpy(wi->staged_pending.ghash_h, conn->ghash_h, 16);
+        wi->staged_pending.cipher_type = conn->cipher_type;
+        wi->staged_pending.nonce_len = conn->nonce_len;
+        wi->staged_pending.h_valid = 1;
+      }
+    }
   }
 
   dbg_inc(DBG_XOR_PATH_ENTERED);
@@ -2010,7 +2043,6 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   // without being able to recompute the GHASH tag, causing "bad record MAC".
   struct tls_conn_state new_conn;
   __builtin_memset(&new_conn, 0, sizeof(new_conn));
-  __u64 wrl_val = 0;
 
   if (chain == CHAIN_GO_TLS) {
     // Go crypto/tls: H×2 stored at productTable offset 224 (entry 14).
@@ -2121,101 +2153,28 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
       bpf_probe_read_user(&go_tls_ver, 2, (void *)(ssl_ptr + go_off->conn_vers_off));
     new_conn.nonce_len = (go_tls_ver >= 0x0304) ? 0 : 8;
   } else {
-    // OpenSSL/BoringSSL pointer chain from SSL* to H.
-    // 4-hop (3.2+): SSL → wrl → enc_ctx → algctx → H
-    // 3-hop (3.0-3.1): SSL → enc_write_ctx → algctx → H
-    // wrl_to_enc_ctx == 0 signals 3-hop mode (ssl_to_wrl stores enc_write_ctx).
-    // Look up offsets by (cgroup_id, exe_inode) — see tls_binary_key rationale.
-    struct tls_binary_key bk = {};
-    bk.cgroup_id = bpf_get_current_cgroup_id();
-    struct task_struct *ssl_task = (struct task_struct *)bpf_get_current_task();
-    bk.exe_inode = BPF_CORE_READ(ssl_task, mm, exe_file, f_inode, i_ino);
-    struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
-    if (!offsets || offsets->ssl_to_wrl == 0) {
-      // Per-cgroup fallback — see h_extract commentary for why this is safe.
-      bk.exe_inode = 0;
-      offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
-      if (!offsets || offsets->ssl_to_wrl == 0) {
+    // OpenSSL/BoringSSL: H was extracted at SSL_write uprobe time by
+    // bpf_h_extract (where SSL is provably alive — OpenSSL itself just
+    // dereferenced it). xor_path carried the value through pending->ghash_h
+    // so we don't have to re-walk SSL→…→H here, where ssl_ptr can be stale
+    // for memory-BIO apps (Python, Node.js) that decouple SSL_write from
+    // the actual socket send.
+    //
+    // If pending->h_valid is 0, h_extract failed (cipher not yet keyed,
+    // typically the very first SSL_write before handshake completes). Skip
+    // patching this segment — subsequent SSL_writes will succeed.
+    if (!pending->h_valid || pending->cipher_type != KLOAK_CIPHER_AES_GCM) {
 #ifdef KLOAK_DEBUG
-        bpf_printk("kloak [2-KPROBE] H-fail: no offsets cgid=%llx",
-                   bk.cgroup_id);
-#endif
-        dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
-        return 0;
-      }
-    }
-
-    __u64 ptr = 0;
-    if (offsets->wrl_to_enc_ctx > 0) {
-      // 4-hop: SSL → wrl → enc_ctx
-      if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr) {
-#ifdef KLOAK_DEBUG
-        bpf_printk("kloak [2-KPROBE] H-fail: 4hop wrl null ssl=%llx off=%u", ssl_ptr, offsets->ssl_to_wrl);
-#endif
-        return 0;
-      }
-      wrl_val = ptr;
-      if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr) {
-#ifdef KLOAK_DEBUG
-        bpf_printk("kloak [2-KPROBE] H-fail: 4hop enc_ctx null wrl=%llx off=%u", wrl_val, offsets->wrl_to_enc_ctx);
-#endif
-        return 0;
-      }
-    } else {
-      // 3-hop: SSL → enc_write_ctx (ssl_to_wrl stores enc_write_ctx offset)
-      if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr) {
-#ifdef KLOAK_DEBUG
-        __u32 ver = 0;
-        bpf_probe_read_user(&ver, 4, (void *)ssl_ptr); // version at offset 0
-        __u64 wbio = 0;
-        bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + 24)); // wbio at offset 24 (Debian 3.0)
-        bpf_printk("kloak [2-KPROBE] H-fail: enc_write_ctx null ssl=%llx off=%u ver=0x%x wbio=%llx", ssl_ptr, offsets->ssl_to_wrl, ver, wbio);
-#endif
-        return 0;
-      }
-    }
-    // Common tail: enc_ctx → algctx → H
-    if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr) {
-#ifdef KLOAK_DEBUG
-      bpf_printk("kloak [2-KPROBE] H-fail: algctx null");
-#endif
-      return 0;
-    }
-    if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0) {
-#ifdef KLOAK_DEBUG
-      bpf_printk("kloak [2-KPROBE] H-fail: H read failed ptr=%llx off=%u",
-                 ptr, offsets->algctx_to_h);
+      bpf_printk("kloak [2-KPROBE] H-fail: no uprobe-time H ssl=%llx", ssl_ptr);
 #endif
       dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
       return 0;
     }
-
-    __u64 *h64 = (__u64 *)new_conn.ghash_h;
-    if (h64[0] == 0 && h64[1] == 0) {
-#ifdef KLOAK_DEBUG
-      bpf_printk("kloak [2-KPROBE] H-fail: H zero ptr=%llx off=%u",
-                 ptr, offsets->algctx_to_h);
-#endif
-      dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
-      return 0;
-    }
-    h64[0] = __builtin_bswap64(h64[0]);
-    h64[1] = __builtin_bswap64(h64[1]);
-
-    new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
-    new_conn.wrl_ptr = wrl_val;
-
-    // Read SSL_CONNECTION.version for nonce_len determination.
-    // ssl_to_version=0xFFFFFFFF means unknown → fall back to heuristic.
-    // Offset 0 is valid (OpenSSL 3.0 ssl_st.version is at offset 0).
-    if (offsets->ssl_to_version != 0xFFFFFFFF) {
-      __u32 ssl_ver = 0;
-      bpf_probe_read_user(&ssl_ver, 4, (void *)(ssl_ptr + offsets->ssl_to_version));
-      // OpenSSL stores version as int: TLS1_3_VERSION=0x0304, TLS1_2_VERSION=0x0303
-      new_conn.nonce_len = (ssl_ver >= 0x0304) ? 0 : 8;
-    } else {
-      new_conn.nonce_len = 0xFF; // unknown → tc_egress uses plaintext_len heuristic
-    }
+    __builtin_memcpy(new_conn.ghash_h, pending->ghash_h, 16);
+    new_conn.cipher_type = pending->cipher_type;
+    new_conn.nonce_len = pending->nonce_len;
+    // h_extract already cached wrl_ptr in tls_conn_state on the original
+    // walk; the existing tls_conn_state entry has it.
   }
 
   // H extraction succeeded — store connection state (only if H changed).
@@ -2477,9 +2436,13 @@ int bpf_uprobe_ssl_write(void *ctx) {
     bpf_loop(num_chunks, prescan_chunk, &pctx, 0);
   }
 
-  // Go directly to xor_path. H extraction is deferred to the tcp_sendmsg
-  // kprobe where the TLS handshake has completed and H is available.
-  bpf_tail_call(ctx, &prog_array, 1);
+  // Tail-call h_extract first (index 2). It walks SSL→wrl→enc_ctx→algctx→H
+  // while SSL is provably alive (OpenSSL itself just dereferenced ssl_ptr to
+  // start encrypting), populates tls_conn_state, then tail-calls xor_path.
+  // On extraction failure (cipher not yet keyed, e.g. before handshake
+  // completes) h_extract returns without tail-calling — we skip patching this
+  // SSL_write rather than capture a stale chain at tcp_sendmsg time.
+  bpf_tail_call(ctx, &prog_array, 2);
 
   return 0;
 }
