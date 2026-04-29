@@ -671,25 +671,34 @@ const (
 func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []string) bool {
 	cipherInitSymbols := []string{"EVP_CipherInit_ex2", "EVP_CipherInit_ex"}
 	attached := false
+	libcryptoFound := false
 
 	for _, containerPath := range containerLibs {
 		base := filepath.Base(containerPath)
 		if !strings.HasPrefix(base, "libcrypto.so") {
 			continue
 		}
+		libcryptoFound = true
 		hostPath := fmt.Sprintf("/proc/%d/root%s", pid, containerPath)
 		libEx, err := link.OpenExecutable(hostPath)
 		if err != nil {
+			m.log.Debugw("Failed to open libcrypto for cipher_init attach",
+				"pid", pid, "lib", containerPath, "error", err)
 			continue
 		}
+		var lastEntryErr, lastRetErr error
+		var triedSymbols []string
 		for _, sym := range cipherInitSymbols {
+			triedSymbols = append(triedSymbols, sym)
 			up, errEntry := libEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit, nil)
 			if errEntry != nil {
+				lastEntryErr = errEntry
 				continue
 			}
 			ret, errRet := libEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit, nil)
 			if errRet != nil {
 				_ = up.Close()
+				lastRetErr = errRet
 				continue
 			}
 			m.links = append(m.links, up, ret)
@@ -701,6 +710,18 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []st
 			// twice if we attached both. Stop at the first that resolves.
 			break
 		}
+		if !attached {
+			m.log.Debugw("No EVP_CipherInit symbol attached for libcrypto",
+				"pid", pid, "lib", containerPath,
+				"tried", triedSymbols,
+				"lastEntryErr", lastEntryErr,
+				"lastRetErr", lastRetErr)
+		}
+	}
+
+	if !libcryptoFound {
+		m.log.Debugw("No libcrypto.so found in containerLibs — staying on KPROBE_WALK",
+			"pid", pid, "containerLibs", containerLibs)
 	}
 
 	return attached
