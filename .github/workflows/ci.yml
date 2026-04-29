@@ -110,7 +110,7 @@ jobs:
         run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/tools/')
 
       - name: Upload unit coverage
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: unit-coverage
           path: coverage.out
@@ -157,7 +157,7 @@ jobs:
           cache: true
 
       - name: Download combined coverage
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: combined-coverage
           path: /tmp/combined-coverage
@@ -172,7 +172,7 @@ jobs:
           filename: coverage.out
 
       - name: Verify changed files
-        uses: tj-actions/verify-changed-files@v16
+        uses: tj-actions/verify-changed-files@v20
         id: verify-changed-files
         with:
           files: README.md
@@ -411,7 +411,7 @@ jobs:
         # e2e-only coverage in the merge step below.
         if: always()
         continue-on-error: true
-        uses: actions/download-artifact@v5
+        uses: actions/download-artifact@v8
         with:
           name: unit-coverage
           path: /tmp/unit-coverage
@@ -465,7 +465,7 @@ jobs:
 
       - name: Upload combined coverage
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: combined-coverage
           path: /tmp/combined-coverage.out
@@ -514,7 +514,7 @@ jobs:
 
       - name: Upload BPF trace
         if: always()
-        uses: actions/upload-artifact@v5
+        uses: actions/upload-artifact@v7
         with:
           name: bpf-trace
           path: /tmp/bpf-trace.log
