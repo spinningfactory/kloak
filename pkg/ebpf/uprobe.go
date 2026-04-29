@@ -434,6 +434,10 @@ func (m *TLSUprobeManager) TrackTGID(tgid uint32) error {
 // go_tls_offset_config is keyed by cgroup_id, not tgid, and is cleaned up
 // via UntrackCgroup when the container is removed.
 func (m *TLSUprobeManager) UntrackTGID(tgid uint32) error {
+	// Best-effort: delete the strategy entry so it doesn't accumulate. Either
+	// map may legitimately have no entry (BoringSSL/static binaries never had
+	// strategy=LIBCRYPTO_HOOK), so ignore not-found errors.
+	_ = m.objs.TlsStrategy.Delete(&tgid)
 	return m.objs.TrackedTgids.Delete(tgid)
 }
 
@@ -615,6 +619,25 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 		// won't activate and the shadow secret is sent as-is (fail-secure).
 		m.pushTLSOffsets(pid, cgroupID, containerLibs)
 
+		// Attach the libcrypto EVP_CipherInit_ex hooks for the libcrypto-hook
+		// H-extraction strategy. If libcrypto.so is found and at least one of
+		// EVP_CipherInit_ex2 / EVP_CipherInit_ex resolves, write
+		// tls_strategy[tgid] = STRATEGY_LIBCRYPTO_HOOK so SSL_write routes
+		// through h_extract → cache lookup. Otherwise (BoringSSL, statically
+		// linked) leave strategy at 0 (default) — process stays on the legacy
+		// kprobe-walks-chain path that's been on main since launch.
+		if m.attachLibcryptoCipherInit(pid, containerLibs) {
+			tgid := uint32(pid)
+			strategyVal := uint8(strategyLibcryptoHook)
+			if err := m.objs.TlsStrategy.Update(&tgid, &strategyVal, 0); err != nil {
+				m.log.Errorw("Failed to set tls_strategy for libcrypto hook",
+					"error", err, "pid", pid)
+			} else {
+				m.log.Debugw("Process on libcrypto-hook H-extraction path",
+					"pid", pid)
+			}
+		}
+
 		// Attach tc egress to the container's eth0 for kernel-only ciphertext
 		// patching. Required for secret rewriting.
 		if err := m.attachTCEgress(pid); err != nil {
@@ -628,6 +651,59 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 		return nil
 	}
 	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
+}
+
+// Strategy values must match #defines in pkg/ebpf/bpf/tls_uprobe.c.
+const (
+	strategyKprobeWalk    uint8 = 0
+	strategyLibcryptoHook uint8 = 1
+)
+
+// attachLibcryptoCipherInit attaches the EVP_CipherInit_ex entry+uretprobe
+// pair to libcrypto.so for the given pid. Returns true if at least one library
+// was successfully hooked, in which case the caller should mark the process
+// as STRATEGY_LIBCRYPTO_HOOK.
+//
+// Tries EVP_CipherInit_ex2 first (OpenSSL 3.0+), then EVP_CipherInit_ex
+// (1.1+). BoringSSL doesn't expose either via libcrypto and routes AES-GCM
+// through EVP_AEAD_CTX_new — those processes will simply have no library
+// to attach to here and stay on STRATEGY_KPROBE_WALK.
+func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []string) bool {
+	cipherInitSymbols := []string{"EVP_CipherInit_ex2", "EVP_CipherInit_ex"}
+	attached := false
+
+	for _, containerPath := range containerLibs {
+		base := filepath.Base(containerPath)
+		if !strings.HasPrefix(base, "libcrypto.so") {
+			continue
+		}
+		hostPath := fmt.Sprintf("/proc/%d/root%s", pid, containerPath)
+		libEx, err := link.OpenExecutable(hostPath)
+		if err != nil {
+			continue
+		}
+		for _, sym := range cipherInitSymbols {
+			up, errEntry := libEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit, nil)
+			if errEntry != nil {
+				continue
+			}
+			ret, errRet := libEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit, nil)
+			if errRet != nil {
+				_ = up.Close()
+				continue
+			}
+			m.links = append(m.links, up, ret)
+			m.log.Debugw("Attached EVP_CipherInit hooks",
+				"pid", pid, "symbol", sym, "lib", containerPath)
+			attached = true
+			// We only need one of _ex2 or _ex per libcrypto — the older symbol
+			// in OpenSSL 3.x is a wrapper around the newer one and would fire
+			// twice if we attached both. Stop at the first that resolves.
+			break
+		}
+	}
+
+	return attached
 }
 
 // pushTLSOffsets detects the OpenSSL version from the container's TLS libraries
@@ -1041,6 +1117,9 @@ var debugCounterNames = []string{
 	"xor_path_entered", "xor_secret_found", "xor_delta_done",
 	"tc_entry", "tc_match", "tc_patched",
 	"kprobe_bridge", "kprobe_bridge_no_entry", "kprobe_bridge_h_fail",
+	"evp_init_entry", "evp_init_h_ok", "evp_init_h_zero", "evp_init_chain_fail",
+	"h_extract_cache_hit", "h_extract_cache_miss",
+	"kprobe_bridge_from_pending", "kprobe_walk_legacy",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.
