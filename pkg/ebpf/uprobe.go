@@ -628,7 +628,7 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 		// kprobe-walks-chain path that's been on main since launch.
 		if m.attachLibcryptoCipherInit(pid, containerLibs) {
 			tgid := uint32(pid)
-			strategyVal := uint8(strategyLibcryptoHook)
+			strategyVal := strategyLibcryptoHook
 			if err := m.objs.TlsStrategy.Update(&tgid, &strategyVal, 0); err != nil {
 				m.log.Errorw("Failed to set tls_strategy for libcrypto hook",
 					"error", err, "pid", pid)
