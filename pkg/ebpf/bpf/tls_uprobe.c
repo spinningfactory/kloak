@@ -1585,6 +1585,21 @@ int bpf_h_extract(void *ctx) {
   new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
   new_conn.wrl_ptr = wrl_ptr;
 
+  // Read SSL_CONNECTION.version so tc_egress knows the TLS record shape
+  // (TLS 1.2 has an 8-byte explicit nonce; TLS 1.3 has none). Without this,
+  // nonce_len stays 0 and tc_egress mis-parses TLS 1.2 records — corrupting
+  // ciphertext at the wrong offset and tripping AEAD on the receiver.
+  // ssl_to_version=0xFFFFFFFF means we couldn't determine the offset (BoringSSL,
+  // older OpenSSL minor versions) → use 0xFF "unknown" so tc_egress falls back
+  // to its plaintext_len heuristic.
+  if (offsets->ssl_to_version != 0xFFFFFFFF) {
+    __u32 ssl_ver = 0;
+    bpf_probe_read_user(&ssl_ver, 4, (void *)(ssl_ptr + offsets->ssl_to_version));
+    new_conn.nonce_len = (ssl_ver >= 0x0304) ? 0 : 8;
+  } else {
+    new_conn.nonce_len = 0xFF;
+  }
+
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
   struct tls_conn_key ck;
