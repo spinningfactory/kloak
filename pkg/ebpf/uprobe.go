@@ -660,14 +660,31 @@ const (
 )
 
 // attachLibcryptoCipherInit attaches the EVP_CipherInit_ex entry+uretprobe
-// pair to libcrypto.so for the given pid. Returns true if at least one library
-// was successfully hooked, in which case the caller should mark the process
-// as STRATEGY_LIBCRYPTO_HOOK.
+// pair so the libcrypto-hook H-extraction path activates for this process.
+// Returns true if any attach point succeeded, in which case the caller marks
+// the process as STRATEGY_LIBCRYPTO_HOOK.
 //
-// Tries EVP_CipherInit_ex2 first (OpenSSL 3.0+), then EVP_CipherInit_ex
-// (1.1+). BoringSSL doesn't expose either via libcrypto and routes AES-GCM
-// through EVP_AEAD_CTX_new — those processes will simply have no library
-// to attach to here and stay on STRATEGY_KPROBE_WALK.
+// Tries two attach points:
+//
+//  1. The main executable (/proc/<pid>/exe), PID-scoped. This catches apps
+//     that statically link OpenSSL into the binary — most notably Node.js,
+//     which bundles OpenSSL 3.x inside the `node` ELF and exports
+//     EVP_CipherInit_ex / _ex2 directly. PID-scoped because the exe is
+//     unique per container and we don't want the hook firing for unrelated
+//     copies on the host.
+//
+//  2. Each libcrypto.so found in containerLibs, system-wide. This catches
+//     apps that dynamically link to system libcrypto (curl, python, ruby,
+//     ...). System-wide because the BPF cgroup filter narrows it to tracked
+//     containers and one attach covers every process linking the same .so
+//     copy.
+//
+// Order matters only for log clarity — both attach points fire independently
+// and double-attach for the same EVP_CIPHER_CTX is idempotent at the cache.
+//
+// BoringSSL apps that don't expose EVP_CipherInit_ex anywhere (rare in
+// practice — Node.js publishes as OpenSSL despite the historical "uses
+// BoringSSL" reputation) stay on STRATEGY_KPROBE_WALK.
 func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []string) bool {
 	// OpenSSL 3.x exposes two independent cipher-init entry points:
 	//   - EVP_CipherInit_ex  (1.1+ compat): calls evp_cipher_init_internal directly
@@ -678,8 +695,40 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []st
 	// safe because the cache write is idempotent for the same EVP_CIPHER_CTX *.
 	cipherInitSymbols := []string{"EVP_CipherInit_ex", "EVP_CipherInit_ex2"}
 	attached := false
-	libcryptoFound := false
 
+	// 1. Main executable, PID-scoped — for statically-linked OpenSSL (Node.js).
+	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+	if exeEx, err := link.OpenExecutable(exePath); err == nil {
+		exeAttached := false
+		for _, sym := range cipherInitSymbols {
+			up, errEntry := exeEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit,
+				&link.UprobeOptions{PID: pid})
+			if errEntry != nil {
+				continue
+			}
+			ret, errRet := exeEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit,
+				&link.UprobeOptions{PID: pid})
+			if errRet != nil {
+				_ = up.Close()
+				continue
+			}
+			m.links = append(m.links, up, ret)
+			m.log.Debugw("Attached EVP_CipherInit hooks (main exe, PID-scoped)",
+				"pid", pid, "symbol", sym)
+			attached = true
+			exeAttached = true
+		}
+		if !exeAttached {
+			m.log.Debugw("Main exe has no EVP_CipherInit symbols — likely dynamically links libcrypto",
+				"pid", pid)
+		}
+	} else {
+		m.log.Debugw("Failed to open main exe for cipher_init attach",
+			"pid", pid, "error", err)
+	}
+
+	// 2. libcrypto.so libraries, system-wide — for dynamically-linked apps.
+	libcryptoFound := false
 	for _, containerPath := range containerLibs {
 		base := filepath.Base(containerPath)
 		if !strings.HasPrefix(base, "libcrypto.so") {
@@ -709,7 +758,7 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []st
 				continue
 			}
 			m.links = append(m.links, up, ret)
-			m.log.Debugw("Attached EVP_CipherInit hooks",
+			m.log.Debugw("Attached EVP_CipherInit hooks (libcrypto.so, system-wide)",
 				"pid", pid, "symbol", sym, "lib", containerPath)
 			attached = true
 			libAttached = true
@@ -720,8 +769,8 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []st
 		}
 	}
 
-	if !libcryptoFound {
-		m.log.Debugw("No libcrypto.so found in containerLibs — staying on KPROBE_WALK",
+	if !attached && !libcryptoFound {
+		m.log.Debugw("No libcrypto.so and no exe symbols — staying on KPROBE_WALK",
 			"pid", pid, "containerLibs", containerLibs)
 	}
 
