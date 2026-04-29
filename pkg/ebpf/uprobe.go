@@ -669,7 +669,14 @@ const (
 // through EVP_AEAD_CTX_new — those processes will simply have no library
 // to attach to here and stay on STRATEGY_KPROBE_WALK.
 func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []string) bool {
-	cipherInitSymbols := []string{"EVP_CipherInit_ex2", "EVP_CipherInit_ex"}
+	// OpenSSL 3.x exposes two independent cipher-init entry points:
+	//   - EVP_CipherInit_ex  (1.1+ compat): calls evp_cipher_init_internal directly
+	//   - EVP_CipherInit_ex2 (3.0+):        calls evp_cipher_init_internal directly
+	// Neither wraps the other. OpenSSL's own TLS layer (t1_enc.c, tls13_enc.c)
+	// uses EVP_CipherInit_ex when keying the per-record cipher; new application
+	// code may use _ex2. Hooking both catches any caller path. Double-attach is
+	// safe because the cache write is idempotent for the same EVP_CIPHER_CTX *.
+	cipherInitSymbols := []string{"EVP_CipherInit_ex", "EVP_CipherInit_ex2"}
 	attached := false
 	libcryptoFound := false
 
@@ -686,36 +693,30 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []st
 				"pid", pid, "lib", containerPath, "error", err)
 			continue
 		}
-		var lastEntryErr, lastRetErr error
-		var triedSymbols []string
+		libAttached := false
 		for _, sym := range cipherInitSymbols {
-			triedSymbols = append(triedSymbols, sym)
 			up, errEntry := libEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit, nil)
 			if errEntry != nil {
-				lastEntryErr = errEntry
+				m.log.Debugw("EVP_CipherInit entry uprobe attach failed",
+					"pid", pid, "symbol", sym, "lib", containerPath, "error", errEntry)
 				continue
 			}
 			ret, errRet := libEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit, nil)
 			if errRet != nil {
 				_ = up.Close()
-				lastRetErr = errRet
+				m.log.Debugw("EVP_CipherInit uretprobe attach failed",
+					"pid", pid, "symbol", sym, "lib", containerPath, "error", errRet)
 				continue
 			}
 			m.links = append(m.links, up, ret)
 			m.log.Debugw("Attached EVP_CipherInit hooks",
 				"pid", pid, "symbol", sym, "lib", containerPath)
 			attached = true
-			// We only need one of _ex2 or _ex per libcrypto — the older symbol
-			// in OpenSSL 3.x is a wrapper around the newer one and would fire
-			// twice if we attached both. Stop at the first that resolves.
-			break
+			libAttached = true
 		}
-		if !attached {
+		if !libAttached {
 			m.log.Debugw("No EVP_CipherInit symbol attached for libcrypto",
-				"pid", pid, "lib", containerPath,
-				"tried", triedSymbols,
-				"lastEntryErr", lastEntryErr,
-				"lastRetErr", lastRetErr)
+				"pid", pid, "lib", containerPath, "tried", cipherInitSymbols)
 		}
 	}
 
