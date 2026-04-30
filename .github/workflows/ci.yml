@@ -144,25 +144,27 @@ jobs:
           coverage-artifact-name: combined-coverage
           coverage-file-name: combined-coverage.out
 
-  # Coverage Badge runs on push-to-main and commits the updated badge to README.
+  # Coverage Badge updates a public gist that the README references via a
+  # shields.io endpoint URL. This avoids committing to main on every push,
+  # so branch protection on main can stay strict (no bypass required for
+  # github-actions[bot]).
+  #
+  # Setup (one-time):
+  #   - GIST_ID: hardcoded below — public gist owned by a maintainer.
+  #   - GIST_TOKEN: repo secret, classic PAT with `gist` scope only.
+  #     The PAT is tied to the gist owner. If that user leaves the org,
+  #     the badge updates stop until a replacement PAT is configured.
   coverage-badge:
     name: Coverage Badge
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     needs: [e2e]
-    permissions:
-      contents: write
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
-
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
           go-version: ${{ env.GO_VERSION }}
-          cache: true
+          cache: false
 
       - name: Download combined coverage
         uses: actions/download-artifact@v8
@@ -170,29 +172,31 @@ jobs:
           name: combined-coverage
           path: /tmp/combined-coverage
 
-      - name: Prepare coverage for badge
+      - name: Extract coverage percentage
+        id: coverage
         run: |
-          go tool cover -func=/tmp/combined-coverage/combined-coverage.out -o=coverage.out
+          # `go tool cover -func` final line: "total: (statements) <pct>%"
+          PCT=$(go tool cover -func=/tmp/combined-coverage/combined-coverage.out \
+                | tail -1 | awk '{print $NF}' | sed 's/%//')
+          # Color thresholds match shields.io conventions.
+          if   awk "BEGIN{exit !($PCT >= 85)}"; then COLOR=brightgreen
+          elif awk "BEGIN{exit !($PCT >= 70)}"; then COLOR=green
+          elif awk "BEGIN{exit !($PCT >= 50)}"; then COLOR=yellow
+          else                                       COLOR=red
+          fi
+          echo "Coverage ${PCT}% (${COLOR})"
+          echo "pct=${PCT}" >> "$GITHUB_OUTPUT"
+          echo "color=${COLOR}" >> "$GITHUB_OUTPUT"
 
-      - name: Update coverage badge
-        uses: tj-actions/coverage-badge-go@v3
+      - name: Update coverage gist
+        uses: schneegans/dynamic-badges-action@v1.7.0
         with:
-          filename: coverage.out
-
-      - name: Verify changed files
-        uses: tj-actions/verify-changed-files@v20
-        id: verify-changed-files
-        with:
-          files: README.md
-
-      - name: Commit coverage badge
-        if: steps.verify-changed-files.outputs.files_changed == 'true'
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add README.md
-          git commit -m "chore: update coverage badge"
-          git push
+          auth: ${{ secrets.GIST_TOKEN }}
+          gistID: 2d4be46e60ee478d5703d8b009dbd6e9
+          filename: kloak-coverage.json
+          label: coverage
+          message: ${{ steps.coverage.outputs.pct }}%
+          color: ${{ steps.coverage.outputs.color }}
 
   docker:
     name: Docker Build & Push
