@@ -160,6 +160,14 @@ jobs:
     runs-on: ubuntu-latest
     needs: [e2e]
     steps:
+      # `go tool cover -func` resolves the package paths in the coverage
+      # profile (e.g. github.com/spinningfactory/kloak/cmd/kloak/main.go:9)
+      # against go.mod, so the source tree must be present. Without checkout
+      # the command fails with "go.mod file not found" and PCT becomes empty,
+      # which falls through to color=red regardless of the real coverage.
+      - name: Checkout code
+        uses: actions/checkout@v6
+
       - name: Set up Go
         uses: actions/setup-go@v6
         with:
@@ -175,9 +183,14 @@ jobs:
       - name: Extract coverage percentage
         id: coverage
         run: |
+          set -euo pipefail
           # `go tool cover -func` final line: "total: (statements) <pct>%"
           PCT=$(go tool cover -func=/tmp/combined-coverage/combined-coverage.out \
                 | tail -1 | awk '{print $NF}' | sed 's/%//')
+          if [ -z "$PCT" ]; then
+            echo "::error::could not extract coverage percentage from combined-coverage.out"
+            exit 1
+          fi
           # Color thresholds match shields.io conventions.
           if   awk "BEGIN{exit !($PCT >= 85)}"; then COLOR=brightgreen
           elif awk "BEGIN{exit !($PCT >= 70)}"; then COLOR=green
