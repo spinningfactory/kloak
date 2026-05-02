@@ -38,7 +38,10 @@ func FindContainerCgroupPath(cgroupRoot, podUID, containerID string) (string, er
 			fmt.Sprintf("pod%s", podUID), containerID),
 		filepath.Join(cgroupRoot, "kubepods", "guaranteed",
 			fmt.Sprintf("pod%s", podUID), containerID),
-		// pod-level fallback
+		// containerd cgroupfs driver — Guaranteed QoS pods sit directly under
+		// kubepods/pod<UID>/ with no QoS subdirectory (Talos, kubeadm cgroupfs).
+		filepath.Join(cgroupRoot, "kubepods", "pod"+podUID, containerID),
+		// pod-level fallback (last resort — returns pod cgroup, not container cgroup)
 		filepath.Join(cgroupRoot, "kubepods", "pod"+podUID),
 	}
 

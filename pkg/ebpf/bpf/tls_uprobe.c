@@ -190,6 +190,14 @@ enum {
   DBG_KPROBE_BRIDGE,          // kprobe successfully bridged xor_pending → tc_pending
   DBG_KPROBE_BRIDGE_NO_ENTRY, // kprobe found no xor_pending entry
   DBG_KPROBE_BRIDGE_H_FAIL,   // kprobe H extraction failed (no tc_pending written)
+  DBG_EVP_INIT_ENTRY,         // EVP_CipherInit_ex entry uprobe fired (cipher init started)
+  DBG_EVP_INIT_H_OK,          // EVP_CipherInit_ex uretprobe extracted non-zero H
+  DBG_EVP_INIT_H_ZERO,        // EVP_CipherInit_ex uretprobe found zero H (non-GCM cipher)
+  DBG_EVP_INIT_CHAIN_FAIL,    // EVP_CipherInit_ex uretprobe failed at evp_ctx → algctx hop
+  DBG_H_EXTRACT_CACHE_HIT,    // bpf_h_extract found H in evp_h_cache
+  DBG_H_EXTRACT_CACHE_MISS,   // bpf_h_extract walked SSL→wrl→enc_ctx but cache had no entry
+  DBG_KPROBE_BRIDGE_FROM_PENDING, // kprobe used H carried via xor_pending (libcrypto-hook hot path)
+  DBG_KPROBE_WALK_LEGACY,     // kprobe walked SSL→wrl→enc_ctx→algctx→H (BoringSSL/cold-start path)
   DBG_MAX,
 };
 
@@ -346,6 +354,58 @@ struct {
   __type(value, struct connect_pending_val);
 } connect_pending SEC(".maps");
 
+// Scratch for EVP_CipherInit_ex enter→return correlation: stash arg0
+// (EVP_CIPHER_CTX *) so the uretprobe can read H from it after OpenSSL has
+// finished setting up the cipher state.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 1024);
+  __type(key, __u64);   // pid_tgid
+  __type(value, __u64); // EVP_CIPHER_CTX *
+} evp_init_scratch SEC(".maps");
+
+// Cached GHASH H per (tgid, EVP_CIPHER_CTX *), populated by the uretprobe
+// on EVP_CipherInit_ex. SSL_write uprobe walks SSL→wrl→enc_ctx and looks
+// H up by the enc_ctx pointer — eliminates the dependency on lazy
+// initialization of wrl→enc_ctx in libssl 3.5+.
+struct evp_h_key {
+  __u32 tgid;
+  __u32 _pad;
+  __u64 evp_ctx_ptr;
+};
+struct evp_h_val {
+  __u8  ghash_h[16];
+  __u16 cipher_type;        // KLOAK_CIPHER_AES_GCM (set on success)
+  __u8  nonce_len;          // 0xFF — actual nonce_len comes from SSL_CONNECTION.version
+  __u8  _pad[5];
+};
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 4096);
+  __type(key, struct evp_h_key);
+  __type(value, struct evp_h_val);
+} evp_h_cache SEC(".maps");
+
+// Per-process H-extraction strategy. Written by the controller when the
+// libcrypto EVP_CipherInit_ex uretprobe attaches successfully for a pid.
+// Read in bpf_uprobe_ssl_write to choose between the cache-lookup path
+// (LIBCRYPTO_HOOK) and the legacy kprobe-walk path (default 0).
+//   0 = STRATEGY_KPROBE_WALK    — BoringSSL, static binaries, OpenSSL where
+//                                 the libcrypto attach failed. Pre-existing
+//                                 SSL_write→xor_path→kprobe-walks-chain flow.
+//   1 = STRATEGY_LIBCRYPTO_HOOK — OpenSSL where libcrypto.so was found and
+//                                 EVP_CipherInit_ex hooks are in place.
+//                                 SSL_write→h_extract(cache)→xor_path→kprobe
+//                                 reads H from xor_pending.
+#define STRATEGY_KPROBE_WALK    0
+#define STRATEGY_LIBCRYPTO_HOOK 1
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 4096);
+  __type(key, __u32);   // tgid
+  __type(value, __u8);  // strategy
+} tls_strategy SEC(".maps");
+
 // Per-CPU scratch buffer for DNS packet parsing.
 // Also carries tgid/pkt_len for the tail-called dns_parse_packet program.
 struct dns_scratch_buf {
@@ -465,9 +525,17 @@ struct xor_pending_val {
   __u8  active;
   __u8  chain_type;         // 0=OpenSSL/BoringSSL, CHAIN_GO_TLS=Go crypto/tls
   __u8  memory_bio;         // 1=fd resolution failed (memory BIO app like Node.js)
-  __u8  _pad[1];
+  __u8  h_valid;            // 1 if ghash_h was populated at uprobe time (libcrypto-hook path)
   __u32 plaintext_len;      // SSL_write data length (for TLS version detection in tc)
   __u64 created_at;         // bpf_ktime_get_ns() — for TTL-based cleanup (memory BIO)
+  // GHASH H carried from uprobe to kprobe when the libcrypto cipher-init hook
+  // populated evp_h_cache and bpf_h_extract found a hit. h_valid=0 means the
+  // process is on STRATEGY_KPROBE_WALK (BoringSSL, statically-linked, or
+  // libcrypto attach failed) and the kprobe must walk SSL→…→H itself.
+  __u8  ghash_h[16];
+  __u16 cipher_type;        // KLOAK_CIPHER_AES_GCM if h_valid=1, else KLOAK_CIPHER_UNKNOWN
+  __u8  nonce_len;          // 0=TLS 1.3, 8=TLS 1.2, 0xFF=unknown
+  __u8  _pad[5];
 };
 
 // Per-process pending XOR patches, keyed by tgid.
@@ -1483,9 +1551,105 @@ static int prescan_chunk(__u32 chunk_idx, void *ctx) {
 // Has its own verifier budget and 512-byte stack (separate from the entry uprobe).
 
 // =============================================================================
-// H extraction — tail-called on first SSL_write per connection.
-// Follows 4-step pointer chain: SSL* → wrl* → enc_ctx* → algctx* → H
-// Stores H in tls_conn_state. Next SSL_write uses cached state → xor_path.
+// libcrypto EVP_CipherInit_ex hooks — capture H at the canonical moment
+// OpenSSL keys the cipher. Cached by (tgid, EVP_CIPHER_CTX *), looked up
+// later by bpf_h_extract during SSL_write. Eliminates the dependency on
+// libssl 3.5+'s lazy wrl→enc_ctx initialization, since by the time the
+// uretprobe fires, OpenSSL has fully set up the EVP_CIPHER_CTX.
+// =============================================================================
+
+SEC("uprobe/evp_cipher_init")
+int bpf_uprobe_evp_cipher_init(void *ctx) {
+  __u64 cgroup_id = bpf_get_current_cgroup_id();
+  if (!bpf_map_lookup_elem(&tracked_cgroups, &cgroup_id))
+    return 0;
+
+  __u64 evp_ctx_ptr = 0;
+#if defined(bpf_target_x86)
+  bpf_probe_read_kernel(&evp_ctx_ptr, sizeof(evp_ctx_ptr), (char *)ctx + 112); // RDI
+#elif defined(bpf_target_arm64)
+  bpf_probe_read_kernel(&evp_ctx_ptr, sizeof(evp_ctx_ptr), (char *)ctx + 0);   // X0
+#else
+  return 0;
+#endif
+  if (!evp_ctx_ptr)
+    return 0;
+
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  bpf_map_update_elem(&evp_init_scratch, &pid_tgid, &evp_ctx_ptr, BPF_ANY);
+  dbg_inc(DBG_EVP_INIT_ENTRY);
+  return 0;
+}
+
+SEC("uretprobe/evp_cipher_init")
+int bpf_uretprobe_evp_cipher_init(void *ctx) {
+  __u64 pid_tgid = bpf_get_current_pid_tgid();
+  __u64 *evp_ctx_p = bpf_map_lookup_elem(&evp_init_scratch, &pid_tgid);
+  if (!evp_ctx_p)
+    return 0;
+  __u64 evp_ctx_ptr = *evp_ctx_p;
+  bpf_map_delete_elem(&evp_init_scratch, &pid_tgid);
+
+  // Look up offsets — we need enc_ctx_to_algctx + algctx_to_h. The EVP_CIPHER_CTX
+  // layout is the same internal struct that the kprobe walks through to today,
+  // so the existing offsets table covers it.
+  struct tls_binary_key bk = {};
+  bk.cgroup_id = bpf_get_current_cgroup_id();
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+  bk.exe_inode = BPF_CORE_READ(task, mm, exe_file, f_inode, i_ino);
+  struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
+  if (!offsets || offsets->enc_ctx_to_algctx == 0) {
+    bk.exe_inode = 0;
+    offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
+    if (!offsets || offsets->enc_ctx_to_algctx == 0) {
+      dbg_inc(DBG_EVP_INIT_CHAIN_FAIL);
+      return 0;
+    }
+  }
+
+  // Walk EVP_CIPHER_CTX → algctx → H.
+  __u64 algctx = 0;
+  if (bpf_probe_read_user(&algctx, 8,
+                          (void *)(evp_ctx_ptr + offsets->enc_ctx_to_algctx)) < 0 ||
+      !algctx) {
+    dbg_inc(DBG_EVP_INIT_CHAIN_FAIL);
+    return 0;
+  }
+
+  struct evp_h_val val;
+  __builtin_memset(&val, 0, sizeof(val));
+  if (bpf_probe_read_user(val.ghash_h, 16,
+                          (void *)(algctx + offsets->algctx_to_h)) < 0) {
+    dbg_inc(DBG_EVP_INIT_CHAIN_FAIL);
+    return 0;
+  }
+
+  // Filter non-GCM ciphers: their EVP_CIPHER_CTX has zeros at the algctx→H offset.
+  __u64 *h64 = (__u64 *)val.ghash_h;
+  if (h64[0] == 0 && h64[1] == 0) {
+    dbg_inc(DBG_EVP_INIT_H_ZERO);
+    return 0;
+  }
+  // OpenSSL stores H in native (little-endian) byte order; GHASH wants big-endian.
+  h64[0] = __builtin_bswap64(h64[0]);
+  h64[1] = __builtin_bswap64(h64[1]);
+
+  val.cipher_type = KLOAK_CIPHER_AES_GCM;
+  val.nonce_len = 0xFF; // actual nonce_len is determined per-connection in h_extract.
+
+  __u32 tgid = (__u32)(pid_tgid >> 32);
+  struct evp_h_key key = {};
+  key.tgid = tgid;
+  key.evp_ctx_ptr = evp_ctx_ptr;
+  bpf_map_update_elem(&evp_h_cache, &key, &val, BPF_ANY);
+  dbg_inc(DBG_EVP_INIT_H_OK);
+  return 0;
+}
+
+// =============================================================================
+// H extraction — tail-called on first SSL_write per connection (libcrypto-hook
+// path only; STRATEGY_KPROBE_WALK skips this and goes straight to xor_path).
+// Walks SSL → wrl → enc_ctx and looks up cached H by enc_ctx pointer.
 // =============================================================================
 
 SEC("uprobe/h_extract")
@@ -1499,92 +1663,80 @@ int bpf_h_extract(void *ctx) {
   if (!ssl_ptr)
     return 0;
 
-  // Look up OpenSSL offsets by (cgroup_id, exe_inode). See tls_binary_key
-  // commentary near the map decl for why we don't use tgid.
   struct tls_binary_key bk = {};
   bk.cgroup_id = bpf_get_current_cgroup_id();
   struct task_struct *h_task = (struct task_struct *)bpf_get_current_task();
   bk.exe_inode = BPF_CORE_READ(h_task, mm, exe_file, f_inode, i_ino);
   struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
   if (!offsets || offsets->ssl_to_wrl == 0) {
-    // Per-cgroup fallback: short-lived processes (curl spawned via
-    // `kubectl exec`, apt-get children, etc.) can fire SSL_write before
-    // the controller's push runs for their specific inode. Every binary
-    // in a cgroup shares the same libssl.so (the container's rootfs), so
-    // the fallback entry at (cgroup_id, 0) carries valid offsets for any
-    // OpenSSL process in this container.
     bk.exe_inode = 0;
     offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
-    if (!offsets || offsets->ssl_to_wrl == 0)
+    if (!offsets || offsets->ssl_to_wrl == 0) {
+      dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
       return 0;
+    }
   }
 
-  // Pointer chase: 4-hop (3.2+) or 3-hop (3.0-3.1).
-  // wrl_to_enc_ctx == 0 signals 3-hop (ssl_to_wrl stores enc_write_ctx).
-  __u64 wrl_ptr = 0;
-  __u64 ptr = 0;
+  // Walk SSL → wrl → enc_ctx (no further). H is read at cipher-init time
+  // by bpf_uretprobe_evp_cipher_init and looked up here by enc_ctx pointer.
+  __u64 enc_ctx = 0;
   if (offsets->wrl_to_enc_ctx > 0) {
-    // 4-hop: SSL → wrl → enc_ctx
-    if (bpf_probe_read_user(&wrl_ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !wrl_ptr)
+    __u64 wrl = 0;
+    if (bpf_probe_read_user(&wrl, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !wrl) {
+      dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
       return 0;
-    ptr = wrl_ptr;
-    if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr)
+    }
+    if (bpf_probe_read_user(&enc_ctx, 8, (void *)(wrl + offsets->wrl_to_enc_ctx)) < 0 || !enc_ctx) {
+      dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
       return 0;
+    }
   } else {
-    // 3-hop: SSL → enc_write_ctx
-    if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr)
+    if (bpf_probe_read_user(&enc_ctx, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !enc_ctx) {
+      dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
       return 0;
+    }
   }
-  // Common tail: enc_ctx → algctx → H
-  if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr)
-    return 0;
-
-  // Read H directly into a stack-allocated tls_conn_state.
-  // Only set ghash_h + cipher_type (rest stays zero).
-  // The struct is 276 bytes but we only write 18 bytes — the rest is zero from stack init.
-  struct tls_conn_state new_conn;
-  __builtin_memset(&new_conn, 0, sizeof(new_conn));
-  if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0) {
-#ifdef KLOAK_DEBUG
-    bpf_printk("kloak [H-EXTRACT] H-fail: H read failed ptr=%llx off=%u",
-               ptr, offsets->algctx_to_h);
-#endif
-    return 0;
-  }
-
-  // OpenSSL stores H as two u64 in native (little-endian) byte order.
-  // GHASH expects big-endian byte order. Byte-swap each 8-byte half.
-  __u64 *h64 = (__u64 *)new_conn.ghash_h;
-  if (h64[0] == 0 && h64[1] == 0) {
-#ifdef KLOAK_DEBUG
-    bpf_printk("kloak [H-EXTRACT] H-fail: H zero ptr=%llx off=%u",
-               ptr, offsets->algctx_to_h);
-#endif
-    return 0;
-  }
-  h64[0] = __builtin_bswap64(h64[0]);
-  h64[1] = __builtin_bswap64(h64[1]);
-
-  // Successful H extraction implies AES-GCM (only GCM contexts have a valid H key).
-  // Non-GCM ciphers (CBC, ChaCha20) don't have a GCM128_CONTEXT, so the pointer
-  // chain fails or H is all-zeros — both caught above.
-  new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
-  new_conn.wrl_ptr = wrl_ptr;
 
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
+  struct evp_h_key key = {};
+  key.tgid = tgid;
+  key.evp_ctx_ptr = enc_ctx;
+  struct evp_h_val *cached = bpf_map_lookup_elem(&evp_h_cache, &key);
+  if (!cached) {
+    // Either the handshake completed before kloak's libcrypto attach
+    // (cold start), or this enc_ctx was rebuilt from a different code
+    // path. SSL_write goes through unmodified for this call.
+    dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
+    return 0;
+  }
+
+  // Determine nonce_len from SSL_CONNECTION.version (per-connection, not
+  // per-EVP_CIPHER_CTX). 0xFFFFFFFF means we don't have a known offset
+  // for this libssl version → fall back to plaintext_len heuristic in tc.
+  __u8 nonce_len = 0xFF;
+  if (offsets->ssl_to_version != 0xFFFFFFFF) {
+    __u32 ssl_ver = 0;
+    bpf_probe_read_user(&ssl_ver, 4, (void *)(ssl_ptr + offsets->ssl_to_version));
+    nonce_len = (ssl_ver >= 0x0304) ? 0 : 8;
+  }
+
+  struct tls_conn_state new_conn;
+  __builtin_memset(&new_conn, 0, sizeof(new_conn));
+  __builtin_memcpy(new_conn.ghash_h, cached->ghash_h, 16);
+  new_conn.cipher_type = cached->cipher_type;
+  new_conn.nonce_len = nonce_len;
+
   struct tls_conn_key ck;
   __builtin_memset(&ck, 0, sizeof(ck));
   ck.tgid = tgid;
   ck.ssl_ptr = ssl_ptr;
   bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_ANY);
 
+  dbg_inc(DBG_H_EXTRACT_CACHE_HIT);
   dbg_inc(DBG_XOR_CONN_HIT);
 
-  // Chain to xor_path to do the rewrite on this same SSL_write call.
-  // scratch_buf already has the pre-scanned match position from the entry uprobe.
   bpf_tail_call(ctx, &prog_array, 1);
-
   return 0;
 }
 
@@ -1611,6 +1763,24 @@ int bpf_xor_path(void *ctx) {
     wi->staged_pending.plaintext_len = sd->total_data_len;
     wi->staged_pending.memory_bio = (sd->xor_fd == 0) ? 1 : 0;
     wi->staged_pending.created_at = bpf_ktime_get_ns();
+
+    // For OpenSSL/BoringSSL, if h_extract just populated tls_conn_state
+    // (libcrypto-hook path), carry H through xor_pending so the kprobe
+    // doesn't need to re-walk the chain. h_valid stays 0 if tls_conn_state
+    // has no entry — kprobe will fall back to its own chain walk.
+    // Go's H derivation is shaped differently and stays in the kprobe.
+    if (sd->chain_type != CHAIN_GO_TLS) {
+      struct tls_conn_key ck = {};
+      ck.tgid = wi->staged_pending.tgid;
+      ck.ssl_ptr = sd->ssl_ptr;
+      struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &ck);
+      if (conn && conn->cipher_type == KLOAK_CIPHER_AES_GCM) {
+        __builtin_memcpy(wi->staged_pending.ghash_h, conn->ghash_h, 16);
+        wi->staged_pending.cipher_type = conn->cipher_type;
+        wi->staged_pending.nonce_len = conn->nonce_len;
+        wi->staged_pending.h_valid = 1;
+      }
+    }
   }
 
   dbg_inc(DBG_XOR_PATH_ENTERED);
@@ -2120,19 +2290,28 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     if (go_off->conn_vers_off > 0)
       bpf_probe_read_user(&go_tls_ver, 2, (void *)(ssl_ptr + go_off->conn_vers_off));
     new_conn.nonce_len = (go_tls_ver >= 0x0304) ? 0 : 8;
+  } else if (pending->h_valid && pending->cipher_type == KLOAK_CIPHER_AES_GCM) {
+    // Libcrypto-hook hot path: H was captured at EVP_CipherInit_ex time and
+    // carried through xor_pending. No chain walk needed. (h_extract already
+    // looked up evp_h_cache and tls_conn_state has the same H — but we copy
+    // from pending here so the kprobe doesn't depend on tls_conn_state still
+    // being there for the same (tgid, ssl_ptr).)
+    __builtin_memcpy(new_conn.ghash_h, pending->ghash_h, 16);
+    new_conn.cipher_type = pending->cipher_type;
+    new_conn.nonce_len = pending->nonce_len;
+    dbg_inc(DBG_KPROBE_BRIDGE_FROM_PENDING);
   } else {
-    // OpenSSL/BoringSSL pointer chain from SSL* to H.
-    // 4-hop (3.2+): SSL → wrl → enc_ctx → algctx → H
-    // 3-hop (3.0-3.1): SSL → enc_write_ctx → algctx → H
-    // wrl_to_enc_ctx == 0 signals 3-hop mode (ssl_to_wrl stores enc_write_ctx).
-    // Look up offsets by (cgroup_id, exe_inode) — see tls_binary_key rationale.
+    // STRATEGY_KPROBE_WALK path (BoringSSL, statically-linked OpenSSL, or
+    // OpenSSL where libcrypto attach failed / cipher_init fired before
+    // kloak attached). Walk SSL → wrl → enc_ctx → algctx → H exactly as on
+    // main today. This is the same code that has been shipping; no changes.
+    dbg_inc(DBG_KPROBE_WALK_LEGACY);
     struct tls_binary_key bk = {};
     bk.cgroup_id = bpf_get_current_cgroup_id();
     struct task_struct *ssl_task = (struct task_struct *)bpf_get_current_task();
     bk.exe_inode = BPF_CORE_READ(ssl_task, mm, exe_file, f_inode, i_ino);
     struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
     if (!offsets || offsets->ssl_to_wrl == 0) {
-      // Per-cgroup fallback — see h_extract commentary for why this is safe.
       bk.exe_inode = 0;
       offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
       if (!offsets || offsets->ssl_to_wrl == 0) {
@@ -2147,7 +2326,6 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 
     __u64 ptr = 0;
     if (offsets->wrl_to_enc_ctx > 0) {
-      // 4-hop: SSL → wrl → enc_ctx
       if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr) {
 #ifdef KLOAK_DEBUG
         bpf_printk("kloak [2-KPROBE] H-fail: 4hop wrl null ssl=%llx off=%u", ssl_ptr, offsets->ssl_to_wrl);
@@ -2162,19 +2340,17 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
         return 0;
       }
     } else {
-      // 3-hop: SSL → enc_write_ctx (ssl_to_wrl stores enc_write_ctx offset)
       if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr) {
 #ifdef KLOAK_DEBUG
         __u32 ver = 0;
-        bpf_probe_read_user(&ver, 4, (void *)ssl_ptr); // version at offset 0
+        bpf_probe_read_user(&ver, 4, (void *)ssl_ptr);
         __u64 wbio = 0;
-        bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + 24)); // wbio at offset 24 (Debian 3.0)
+        bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + 24));
         bpf_printk("kloak [2-KPROBE] H-fail: enc_write_ctx null ssl=%llx off=%u ver=0x%x wbio=%llx", ssl_ptr, offsets->ssl_to_wrl, ver, wbio);
 #endif
         return 0;
       }
     }
-    // Common tail: enc_ctx → algctx → H
     if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->enc_ctx_to_algctx)) < 0 || !ptr) {
 #ifdef KLOAK_DEBUG
       bpf_printk("kloak [2-KPROBE] H-fail: algctx null");
@@ -2205,16 +2381,12 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
     new_conn.wrl_ptr = wrl_val;
 
-    // Read SSL_CONNECTION.version for nonce_len determination.
-    // ssl_to_version=0xFFFFFFFF means unknown → fall back to heuristic.
-    // Offset 0 is valid (OpenSSL 3.0 ssl_st.version is at offset 0).
     if (offsets->ssl_to_version != 0xFFFFFFFF) {
       __u32 ssl_ver = 0;
       bpf_probe_read_user(&ssl_ver, 4, (void *)(ssl_ptr + offsets->ssl_to_version));
-      // OpenSSL stores version as int: TLS1_3_VERSION=0x0304, TLS1_2_VERSION=0x0303
       new_conn.nonce_len = (ssl_ver >= 0x0304) ? 0 : 8;
     } else {
-      new_conn.nonce_len = 0xFF; // unknown → tc_egress uses plaintext_len heuristic
+      new_conn.nonce_len = 0xFF;
     }
   }
 
@@ -2477,9 +2649,19 @@ int bpf_uprobe_ssl_write(void *ctx) {
     bpf_loop(num_chunks, prescan_chunk, &pctx, 0);
   }
 
-  // Go directly to xor_path. H extraction is deferred to the tcp_sendmsg
-  // kprobe where the TLS handshake has completed and H is available.
-  bpf_tail_call(ctx, &prog_array, 1);
+  // Route by per-process H-extraction strategy. STRATEGY_LIBCRYPTO_HOOK
+  // (set by the controller when EVP_CipherInit_ex hooks attached for this
+  // pid's libcrypto.so) goes through h_extract → cache lookup → xor_path.
+  // STRATEGY_KPROBE_WALK (default — BoringSSL, statically-linked, or
+  // libcrypto attach failed) goes straight to xor_path; the tcp_sendmsg
+  // kprobe then walks SSL→…→H itself, exactly as on main today.
+  __u32 cur_tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+  __u8 *strat = bpf_map_lookup_elem(&tls_strategy, &cur_tgid);
+  if (strat && *strat == STRATEGY_LIBCRYPTO_HOOK) {
+    bpf_tail_call(ctx, &prog_array, 2);
+  } else {
+    bpf_tail_call(ctx, &prog_array, 1);
+  }
 
   return 0;
 }
