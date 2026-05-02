@@ -12,7 +12,7 @@
 <div align="center">
 
 [![CI](https://github.com/spinningfactory/kloak/actions/workflows/ci.yml/badge.svg)](https://github.com/spinningfactory/kloak/actions/workflows/ci.yml)
-![Coverage](https://img.shields.io/badge/Coverage-77.1%25-brightgreen)
+[![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/dhiaayachi/2d4be46e60ee478d5703d8b009dbd6e9/raw/kloak-coverage.json)](https://gist.github.com/dhiaayachi/2d4be46e60ee478d5703d8b009dbd6e9)
 [![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?logo=go)](https://go.dev/)
 [![Kubernetes](https://img.shields.io/badge/Kubernetes-1.28+-326CE5?logo=kubernetes)](https://kubernetes.io/)
 [![License](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)

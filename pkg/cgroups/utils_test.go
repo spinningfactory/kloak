@@ -79,6 +79,25 @@ func TestFindContainerCgroupPath_CgroupfsLayout(t *testing.T) {
 	}
 }
 
+func TestFindContainerCgroupPath_CgroupfsGuaranteedDirect(t *testing.T) {
+	// Talos / kubeadm cgroupfs: Guaranteed QoS pods are placed directly under
+	// kubepods/pod<UID>/<containerID> with no QoS subdirectory.
+	const podUID = "abcd1234-5678-9abc-def0-fedcba987654"
+	const containerID = "deadbeefdeadbeefdeadbeefdeadbeef"
+
+	root := t.TempDir()
+	full := filepath.Join(root, "kubepods", "pod"+podUID, containerID)
+	mkdirAll(t, full)
+
+	got, err := FindContainerCgroupPath(root, podUID, containerID)
+	if err != nil {
+		t.Fatalf("FindContainerCgroupPath: %v", err)
+	}
+	if got != full {
+		t.Errorf("got  %q\nwant %q", got, full)
+	}
+}
+
 func TestFindContainerCgroupPath_PodLevelFallback(t *testing.T) {
 	const podUID = "11111111-2222-3333-4444-555555555555"
 	const containerID = "any-cid"
