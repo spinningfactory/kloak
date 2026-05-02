@@ -194,16 +194,48 @@ func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log *zap.Sug
 	return fmt.Errorf("kubepods cgroup not found in %s", cgroupRoot)
 }
 
+// parseBPFLogLevel maps a string from the KLOAK_BPF_LOG_LEVEL env var (or the
+// helm value log.ebpfLevel) to the corresponding ebpf.LogLevel. Empty / "off"
+// / "disabled" returns 0, which suppresses proactive verifier-log buffer
+// allocation; cilium/ebpf still retries with branch-level logging on verifier
+// rejection so failures remain debuggable. Comma-separated values are OR'd
+// together (e.g. "branch,stats").
+func parseBPFLogLevel(s string) ebpf.LogLevel {
+	if s == "" {
+		return 0
+	}
+	var lvl ebpf.LogLevel
+	for _, part := range strings.Split(s, ",") {
+		switch strings.ToLower(strings.TrimSpace(part)) {
+		case "", "off", "disabled", "none":
+			// no-op
+		case "branch":
+			lvl |= ebpf.LogLevelBranch
+		case "instruction", "instructions":
+			lvl |= ebpf.LogLevelInstruction
+		case "stats":
+			lvl |= ebpf.LogLevelStats
+		}
+	}
+	return lvl
+}
+
 // NewTLSUprobeManager initializes a new uprobe manager.
 func NewTLSUprobeManager(k8sReader client.Reader, cgroupRoot string, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
 	log = log.Named("ebpf-uprobe")
 
 	objs := &tlsuprobeObjects{}
+	// Verifier-log level for BPF program loads. Defaults to disabled (0) so the
+	// 1 MB-per-program log buffers aren't allocated proactively. cilium/ebpf
+	// still retries with LogLevelBranch automatically on verifier failure, so
+	// the diagnostic remains available on the only path that needs it.
+	// Set KLOAK_BPF_LOG_LEVEL=branch / instruction / stats to opt in.
+	progOpts := ebpf.ProgramOptions{
+		LogSizeStart: 1 << 20, // 1 MB
+		LogLevel:     parseBPFLogLevel(os.Getenv("KLOAK_BPF_LOG_LEVEL")),
+	}
 	if err := loadTlsuprobeObjects(objs, &ebpf.CollectionOptions{
-		Programs: ebpf.ProgramOptions{
-			LogSizeStart: 1 << 20, // 1 MB
-			LogLevel:     ebpf.LogLevelBranch,
-		},
+		Programs: progOpts,
 	}); err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {
