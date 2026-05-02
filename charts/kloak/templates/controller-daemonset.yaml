@@ -60,6 +60,8 @@ spec:
               value: {{ .Values.log.level | quote }}
             - name: KLOAK_LOG_DEV
               value: {{ .Values.log.dev | quote }}
+            - name: KLOAK_BPF_LOG_LEVEL
+              value: {{ .Values.log.ebpfLevel | default "" | quote }}
             {{- if .Values.coverage.enabled }}
             - name: GOCOVERDIR
               value: /coverage

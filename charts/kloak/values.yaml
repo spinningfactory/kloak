@@ -13,6 +13,14 @@ log:
   level: info
   # Development mode: human-readable console output with colors
   dev: false
+  # Verifier-log level for BPF program loads. Empty / disabled keeps the
+  # 1 MB-per-program log buffer from being allocated proactively at startup
+  # (cilium/ebpf still retries with branch logging on verifier failure, so
+  # diagnostics remain available on the only path that needs them). Setting
+  # this to "branch" / "instruction" / "stats" — or a comma-separated
+  # combination — opts into proactive logging during program load. Useful
+  # for offline complexity analysis; not recommended in production.
+  ebpfLevel: ""
 
 controller:
   ebpf:
