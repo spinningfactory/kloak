@@ -434,6 +434,10 @@ func (m *TLSUprobeManager) TrackTGID(tgid uint32) error {
 // go_tls_offset_config is keyed by cgroup_id, not tgid, and is cleaned up
 // via UntrackCgroup when the container is removed.
 func (m *TLSUprobeManager) UntrackTGID(tgid uint32) error {
+	// Best-effort: delete the strategy entry so it doesn't accumulate. Either
+	// map may legitimately have no entry (BoringSSL/static binaries never had
+	// strategy=LIBCRYPTO_HOOK), so ignore not-found errors.
+	_ = m.objs.TlsStrategy.Delete(&tgid)
 	return m.objs.TrackedTgids.Delete(tgid)
 }
 
@@ -615,6 +619,25 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 		// won't activate and the shadow secret is sent as-is (fail-secure).
 		m.pushTLSOffsets(pid, cgroupID, containerLibs)
 
+		// Attach the libcrypto EVP_CipherInit_ex hooks for the libcrypto-hook
+		// H-extraction strategy. If libcrypto.so is found and at least one of
+		// EVP_CipherInit_ex2 / EVP_CipherInit_ex resolves, write
+		// tls_strategy[tgid] = STRATEGY_LIBCRYPTO_HOOK so SSL_write routes
+		// through h_extract → cache lookup. Otherwise (BoringSSL, statically
+		// linked) leave strategy at 0 (default) — process stays on the legacy
+		// kprobe-walks-chain path that's been on main since launch.
+		if m.attachLibcryptoCipherInit(pid, containerLibs) {
+			tgid := uint32(pid)
+			strategyVal := strategyLibcryptoHook
+			if err := m.objs.TlsStrategy.Update(&tgid, &strategyVal, 0); err != nil {
+				m.log.Errorw("Failed to set tls_strategy for libcrypto hook",
+					"error", err, "pid", pid)
+			} else {
+				m.log.Debugw("Process on libcrypto-hook H-extraction path",
+					"pid", pid)
+			}
+		}
+
 		// Attach tc egress to the container's eth0 for kernel-only ciphertext
 		// patching. Required for secret rewriting.
 		if err := m.attachTCEgress(pid); err != nil {
@@ -628,6 +651,130 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 		return nil
 	}
 	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
+}
+
+// Strategy values must match #defines in pkg/ebpf/bpf/tls_uprobe.c.
+const (
+	strategyKprobeWalk    uint8 = 0
+	strategyLibcryptoHook uint8 = 1
+)
+
+// attachLibcryptoCipherInit attaches the EVP_CipherInit_ex entry+uretprobe
+// pair so the libcrypto-hook H-extraction path activates for this process.
+// Returns true if any attach point succeeded, in which case the caller marks
+// the process as STRATEGY_LIBCRYPTO_HOOK.
+//
+// Tries two attach points:
+//
+//  1. The main executable (/proc/<pid>/exe), PID-scoped. This catches apps
+//     that statically link OpenSSL into the binary — most notably Node.js,
+//     which bundles OpenSSL 3.x inside the `node` ELF and exports
+//     EVP_CipherInit_ex / _ex2 directly. PID-scoped because the exe is
+//     unique per container and we don't want the hook firing for unrelated
+//     copies on the host.
+//
+//  2. Each libcrypto.so found in containerLibs, system-wide. This catches
+//     apps that dynamically link to system libcrypto (curl, python, ruby,
+//     ...). System-wide because the BPF cgroup filter narrows it to tracked
+//     containers and one attach covers every process linking the same .so
+//     copy.
+//
+// Order matters only for log clarity — both attach points fire independently
+// and double-attach for the same EVP_CIPHER_CTX is idempotent at the cache.
+//
+// BoringSSL apps that don't expose EVP_CipherInit_ex anywhere (rare in
+// practice — Node.js publishes as OpenSSL despite the historical "uses
+// BoringSSL" reputation) stay on STRATEGY_KPROBE_WALK.
+func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []string) bool {
+	// OpenSSL 3.x exposes two independent cipher-init entry points:
+	//   - EVP_CipherInit_ex  (1.1+ compat): calls evp_cipher_init_internal directly
+	//   - EVP_CipherInit_ex2 (3.0+):        calls evp_cipher_init_internal directly
+	// Neither wraps the other. OpenSSL's own TLS layer (t1_enc.c, tls13_enc.c)
+	// uses EVP_CipherInit_ex when keying the per-record cipher; new application
+	// code may use _ex2. Hooking both catches any caller path. Double-attach is
+	// safe because the cache write is idempotent for the same EVP_CIPHER_CTX *.
+	cipherInitSymbols := []string{"EVP_CipherInit_ex", "EVP_CipherInit_ex2"}
+	attached := false
+
+	// 1. Main executable, PID-scoped — for statically-linked OpenSSL (Node.js).
+	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+	if exeEx, err := link.OpenExecutable(exePath); err == nil {
+		exeAttached := false
+		for _, sym := range cipherInitSymbols {
+			up, errEntry := exeEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit,
+				&link.UprobeOptions{PID: pid})
+			if errEntry != nil {
+				continue
+			}
+			ret, errRet := exeEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit,
+				&link.UprobeOptions{PID: pid})
+			if errRet != nil {
+				_ = up.Close()
+				continue
+			}
+			m.links = append(m.links, up, ret)
+			m.log.Debugw("Attached EVP_CipherInit hooks (main exe, PID-scoped)",
+				"pid", pid, "symbol", sym)
+			attached = true
+			exeAttached = true
+		}
+		if !exeAttached {
+			m.log.Debugw("Main exe has no EVP_CipherInit symbols — likely dynamically links libcrypto",
+				"pid", pid)
+		}
+	} else {
+		m.log.Debugw("Failed to open main exe for cipher_init attach",
+			"pid", pid, "error", err)
+	}
+
+	// 2. libcrypto.so libraries, system-wide — for dynamically-linked apps.
+	libcryptoFound := false
+	for _, containerPath := range containerLibs {
+		base := filepath.Base(containerPath)
+		if !strings.HasPrefix(base, "libcrypto.so") {
+			continue
+		}
+		libcryptoFound = true
+		hostPath := fmt.Sprintf("/proc/%d/root%s", pid, containerPath)
+		libEx, err := link.OpenExecutable(hostPath)
+		if err != nil {
+			m.log.Debugw("Failed to open libcrypto for cipher_init attach",
+				"pid", pid, "lib", containerPath, "error", err)
+			continue
+		}
+		libAttached := false
+		for _, sym := range cipherInitSymbols {
+			up, errEntry := libEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit, nil)
+			if errEntry != nil {
+				m.log.Debugw("EVP_CipherInit entry uprobe attach failed",
+					"pid", pid, "symbol", sym, "lib", containerPath, "error", errEntry)
+				continue
+			}
+			ret, errRet := libEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit, nil)
+			if errRet != nil {
+				_ = up.Close()
+				m.log.Debugw("EVP_CipherInit uretprobe attach failed",
+					"pid", pid, "symbol", sym, "lib", containerPath, "error", errRet)
+				continue
+			}
+			m.links = append(m.links, up, ret)
+			m.log.Debugw("Attached EVP_CipherInit hooks (libcrypto.so, system-wide)",
+				"pid", pid, "symbol", sym, "lib", containerPath)
+			attached = true
+			libAttached = true
+		}
+		if !libAttached {
+			m.log.Debugw("No EVP_CipherInit symbol attached for libcrypto",
+				"pid", pid, "lib", containerPath, "tried", cipherInitSymbols)
+		}
+	}
+
+	if !attached && !libcryptoFound {
+		m.log.Debugw("No libcrypto.so and no exe symbols — staying on KPROBE_WALK",
+			"pid", pid, "containerLibs", containerLibs)
+	}
+
+	return attached
 }
 
 // pushTLSOffsets detects the OpenSSL version from the container's TLS libraries
@@ -1041,6 +1188,9 @@ var debugCounterNames = []string{
 	"xor_path_entered", "xor_secret_found", "xor_delta_done",
 	"tc_entry", "tc_match", "tc_patched",
 	"kprobe_bridge", "kprobe_bridge_no_entry", "kprobe_bridge_h_fail",
+	"evp_init_entry", "evp_init_h_ok", "evp_init_h_zero", "evp_init_chain_fail",
+	"h_extract_cache_hit", "h_extract_cache_miss",
+	"kprobe_bridge_from_pending", "kprobe_walk_legacy",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.
