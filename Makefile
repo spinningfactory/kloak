@@ -2,7 +2,8 @@
         e2e-k3s e2e-k3s-setup e2e-k3s-run e2e-k3s-cleanup \
         clean deps docker-build generate-ebpf generate-vmlinux run help \
         lima-start lima-stop lima-delete lima-shell lima-exec lima-check \
-        lima-k3d-ensure lima-k3d-shell lima-k3d-e2e-setup lima-k3d-e2e-run lima-k3d-e2e lima-k3d-stop lima-k3d-delete
+        lima-k3d-ensure lima-k3d-shell lima-k3d-e2e-setup lima-k3d-e2e-run lima-k3d-e2e lima-k3d-stop lima-k3d-delete \
+        go-tls-fixtures go-tls-discover
 
 # Go parameters
 GOCMD=go
@@ -74,6 +75,21 @@ test-linux: lima-ensure
 test-bpf-helpers:
 	gcc -Wall -Werror -o /tmp/helpers_test pkg/ebpf/bpf/helpers_test.c
 	/tmp/helpers_test
+
+# Build a tiny Go binary against every supported Go version × arch using
+# Docker. Outputs ELF fixtures to pkg/ebpf/testdata/go-tls-fixtures/.
+# Used by the table-driven DWARF test in pkg/ebpf/go_tls_offsets_test.go.
+# Containers spin once per (version, arch) — never per test invocation.
+# Override versions with: GO_VERSIONS="1.23 1.24" make go-tls-fixtures
+go-tls-fixtures:
+	tools/go-tls-offsets/build-fixtures.sh
+
+# Run the existing tools/go-tls-offsets discovery tool against every
+# fixture from `make go-tls-fixtures`, writing JSON results to
+# tools/go-tls-offsets/results/. The JSONs are the canonical reference
+# the in-tree test asserts against. Depends on go-tls-fixtures.
+go-tls-discover: go-tls-fixtures
+	tools/go-tls-offsets/discover-all.sh
 
 # E2E cluster and image configuration
 E2E_CLUSTER=kloak-e2e
