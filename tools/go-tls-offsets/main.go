@@ -35,6 +35,7 @@ type OffsetResult struct {
 	AEADIfaceOff uint32 `json:"aead_iface_off"` // prefixNonceAEAD.aead + 8
 	H2HiOff      uint32 `json:"h2_hi_off"`      // GCM + off → high 64 bits of H×2
 	H2LoOff      uint32 `json:"h2_lo_off"`      // GCM + off → low 64 bits of H×2
+	ConnVersOff  uint32 `json:"conn_vers_off"`  // Conn.vers (uint16 TLS version)
 	Notes        string `json:"notes,omitempty"`
 
 	// Raw offsets for debugging (not used by BPF).
@@ -155,6 +156,15 @@ func main() {
 		missing = append(missing, "prefixNonceAEAD.aead or xorNonceAEAD.aead")
 	}
 
+	// ConnVersOff = Conn.vers (uint16 — negotiated TLS version, e.g. 0x0303).
+	// Not strictly required by the data plane (tc_egress falls back to a
+	// plaintext_len heuristic when 0xFFFFFFFF), but the table carries it for
+	// determinism. Emit only if DWARF has it.
+	if versOff, ok := getField(structs, "crypto/tls.Conn", "vers"); ok {
+		result.ConnVersOff = versOff
+		fmt.Fprintf(os.Stderr, "ConnVersOff = %d (Conn.vers)\n", versOff)
+	}
+
 	// 3. H×2 word offsets from productTable.
 	// gcmAesInit stores H×2 (H doubled in GF(2^128)) at productTable offset 224.
 	// The two 64-bit words have architecture-dependent order:
@@ -171,12 +181,22 @@ func main() {
 		fmt.Fprintf(os.Stderr, "PDBase = GCM.gcmPlatformData(%d) + productTable(%d) + 224 = %d\n", gcmPD, pdPT, pdBase)
 	}
 
-	// Go <1.24: crypto/cipher.gcmAES.productTable
+	// Go <1.24: the GCM struct lives in crypto/cipher. Its name varies:
+	//   Go 1.20–1.23: crypto/cipher.gcm
+	//   (some compile paths in older versions also expose: gcmAES,
+	//    gcmAESCBC, gcmAsm — left here for forward-compat.)
 	if !foundPD {
-		if pt, ok := getField(structs, "crypto/cipher.gcmAES", "productTable"); ok {
-			pdBase = pt + 224
-			foundPD = true
-			fmt.Fprintf(os.Stderr, "PDBase = gcmAES.productTable(%d) + 224 = %d\n", pt, pdBase)
+		for _, sn := range []string{
+			"crypto/cipher.gcm",
+			"crypto/cipher.gcmAES",
+			"crypto/cipher.gcmAsm",
+		} {
+			if pt, ok := getField(structs, sn, "productTable"); ok {
+				pdBase = pt + 224
+				foundPD = true
+				fmt.Fprintf(os.Stderr, "PDBase = %s.productTable(%d) + 224 = %d\n", sn, pt, pdBase)
+				break
+			}
 		}
 	}
 
@@ -229,7 +249,11 @@ func isTargetStruct(name string) bool {
 		"crypto/tls.halfConn",
 		"crypto/tls.prefixNonceAEAD",
 		"crypto/tls.xorNonceAEAD",
+		// Go 1.20–1.23: GCM struct in crypto/cipher.
+		"crypto/cipher.gcm",
 		"crypto/cipher.gcmAES",
+		"crypto/cipher.gcmAsm",
+		// Go 1.24+: GCM struct moved into the FIPS 140 module.
 		"crypto/internal/fips140/aes/gcm.GCMForSSH",
 		"crypto/internal/fips140/aes/gcm.GCM",
 		"crypto/internal/fips140/aes/gcm.gcmAES",
