@@ -18,8 +18,11 @@
 #   GO_VERSIONS="1.21 1.22" tools/go-tls-offsets/build-fixtures.sh  # explicit list (skips discovery)
 #   GO_ARCHES="amd64" tools/go-tls-offsets/build-fixtures.sh        # one arch
 #
-# Requirements: Docker with buildx, qemu-user-static for cross-arch builds,
-# curl + jq for upstream version discovery (only when GO_VERSIONS is unset).
+# Requirements: Docker (plain `docker run`, no buildx needed) plus the Go
+# toolchain inside the official `golang:<v>` images. Cross-arch builds use
+# Go's GOARCH env var rather than running the resulting binaries, so qemu
+# is not required either. curl + jq are needed only for upstream version
+# discovery (when GO_VERSIONS is unset).
 
 set -euo pipefail
 
