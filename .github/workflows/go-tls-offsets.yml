@@ -1,0 +1,91 @@
+name: Go TLS Offset Discovery
+
+# On-demand discovery workflow. Run this when:
+#   - Adding support for a new Go version (after Go N.N+1 ships).
+#   - Verifying offset stability across a Go patch release.
+#   - Investigating a discrepancy reported by TestGoTLSOffsets_AgainstReferenceJSON.
+#
+# Each matrix cell builds the fixture against `golang:<version>` and runs
+# the discovery tool, producing one JSON per (version, arch). Results are
+# uploaded as artifacts; a maintainer downloads + diffs against the
+# committed `tools/go-tls-offsets/results/` files and commits any updates.
+#
+# Mirrors the on-demand `openssl-offsets.yml` pattern. Containers spin
+# once per matrix cell, in parallel — never per test.
+
+on:
+  workflow_dispatch:
+    inputs:
+      go_min_version:
+        description: 'Lowest Go major.minor to discover (e.g. 1.20). Defaults to 1.20.'
+        required: false
+        default: '1.20'
+
+jobs:
+  discover:
+    name: Discover Go ${{ matrix.go }} on ${{ matrix.platform }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux/amd64, linux/arm64]
+        # Pinned list mirrors tools/go-tls-offsets/build-fixtures.sh defaults.
+        # Keep in sync; the build-fixtures script auto-discovers from go.dev,
+        # but a workflow matrix can't dynamically resolve at parse time. The
+        # nightly `go-versions-nightly.yml` workflow (PR 3) detects new
+        # versions and opens an auto-PR that updates this list.
+        go: ["1.20", "1.21", "1.22", "1.23", "1.24", "1.25", "1.26"]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Compute arch label
+        id: arch
+        run: |
+          case "${{ matrix.platform }}" in
+            linux/amd64) echo "arch=amd64" >> "$GITHUB_OUTPUT" ;;
+            linux/arm64) echo "arch=arm64" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Build discovery image
+        run: |
+          docker buildx build \
+            --platform ${{ matrix.platform }} \
+            --build-arg GO_VERSION=${{ matrix.go }} \
+            --load \
+            -t go-tls-offsets:${{ matrix.go }}-${{ steps.arch.outputs.arch }} \
+            tools/go-tls-offsets/
+
+      - name: Run discovery
+        run: |
+          mkdir -p out
+          docker run --rm --platform ${{ matrix.platform }} \
+            go-tls-offsets:${{ matrix.go }}-${{ steps.arch.outputs.arch }} \
+            > out/go-${{ matrix.go }}-${{ steps.arch.outputs.arch }}.json
+          echo "=== discovered ==="
+          cat out/go-${{ matrix.go }}-${{ steps.arch.outputs.arch }}.json
+
+      - name: Diff against committed JSON
+        run: |
+          existing=tools/go-tls-offsets/results/go-${{ matrix.go }}-${{ steps.arch.outputs.arch }}.json
+          new=out/go-${{ matrix.go }}-${{ steps.arch.outputs.arch }}.json
+          if [ ! -f "$existing" ]; then
+            echo "::warning::no committed reference for Go ${{ matrix.go }} ${{ steps.arch.outputs.arch }} — first-time discovery"
+            exit 0
+          fi
+          # Normalize via jq so whitespace/key-order differences don't trip the diff.
+          if ! diff <(jq -S . "$existing") <(jq -S . "$new"); then
+            echo "::warning::offsets drifted for Go ${{ matrix.go }} ${{ steps.arch.outputs.arch }} — review the artifact"
+          fi
+
+      - name: Upload result
+        uses: actions/upload-artifact@v7
+        with:
+          name: go-tls-offsets-${{ matrix.go }}-${{ steps.arch.outputs.arch }}
+          path: out/go-${{ matrix.go }}-${{ steps.arch.outputs.arch }}.json
+          retention-days: 30
