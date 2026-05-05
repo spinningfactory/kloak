@@ -33,6 +33,11 @@ kubeconfig
 # Generated kernel headers (the arch-specific vmlinux_*.h files ARE committed)
 pkg/ebpf/vmlinux.h
 pkg/ebpf/bpf/vmlinux.h
+
+# Go-TLS offset fixtures: large ELF binaries built per Go version × arch
+# via `make go-tls-fixtures`. Reference JSONs in tools/go-tls-offsets/results/
+# ARE committed; the binaries themselves are regenerable and too large.
+pkg/ebpf/testdata/go-tls-fixtures/*.elf
 .claude/worktrees/
 kloak
 lima-k3d.yaml

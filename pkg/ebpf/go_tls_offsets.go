@@ -228,11 +228,18 @@ func detectGoTLSFromDWARF(exePath string) (string, GoTLSOffsets, error) {
 		foundPD = true
 	}
 
-	// Go <1.24: crypto/cipher.gcmAES.productTable
+	// Go <1.24: GCM struct in crypto/cipher. Name varies across versions.
 	if !foundPD {
-		if pt, ok := getField(structFields, "crypto/cipher.gcmAES", "productTable"); ok {
-			pdBase = pt + 224
-			foundPD = true
+		for _, sn := range []string{
+			"crypto/cipher.gcm",
+			"crypto/cipher.gcmAES",
+			"crypto/cipher.gcmAsm",
+		} {
+			if pt, ok := getField(structFields, sn, "productTable"); ok {
+				pdBase = pt + 224
+				foundPD = true
+				break
+			}
 		}
 	}
 
@@ -286,8 +293,17 @@ func isGoTLSTargetStruct(name string) bool {
 		"crypto/tls.halfConn",
 		"crypto/tls.prefixNonceAEAD",
 		"crypto/tls.xorNonceAEAD",
+		// Go 1.20–1.23: GCM struct in crypto/cipher (name varies).
+		"crypto/cipher.gcm",
 		"crypto/cipher.gcmAES",
+		"crypto/cipher.gcmAsm",
+		// Go 1.24+: moved into the FIPS 140 module. Include the SSH and
+		// internal AES variants for parity with tools/go-tls-offsets/main.go;
+		// they don't appear in current upstream Go but a future minor or a
+		// specific build configuration could expose them.
 		"crypto/internal/fips140/aes/gcm.GCM",
+		"crypto/internal/fips140/aes/gcm.GCMForSSH",
+		"crypto/internal/fips140/aes/gcm.gcmAES",
 		"crypto/internal/fips140/aes/gcm.gcmPlatformData",
 	}
 	for _, t := range targets {
