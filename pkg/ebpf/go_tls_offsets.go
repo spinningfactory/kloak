@@ -51,15 +51,17 @@ type goTLSOffsetEntry struct {
 // pkg/ebpf/go_tls_offsets_test.go asserts this table matches them).
 //
 // Two distinct shapes:
-//   Go 1.20–1.23: GCM struct is `crypto/cipher.gcm` (size 288, productTable
-//                 at offset 32 → PDBase = 32 + 224 = 256).
-//   Go 1.24+:     GCM moved into `crypto/internal/fips140/aes/gcm.GCM` with
-//                 a gcmPlatformData wrapper (gcmPlatformData=504,
-//                 productTable=0 → PDBase = 504 + 0 + 224 = 728).
+//
+//	Go 1.20–1.23: GCM struct is `crypto/cipher.gcm` (size 288, productTable
+//	              at offset 32 → PDBase = 32 + 224 = 256).
+//	Go 1.24+:     GCM moved into `crypto/internal/fips140/aes/gcm.GCM` with
+//	              a gcmPlatformData wrapper (gcmPlatformData=504,
+//	              productTable=0 → PDBase = 504 + 0 + 224 = 728).
 //
 // To regenerate / extend (a new Go release ships):
-//   make go-tls-discover    (Docker; rebuilds fixtures + JSONs)
-//   then mirror the JSON values into a new entry below.
+//
+//	make go-tls-discover    (Docker; rebuilds fixtures + JSONs)
+//	then mirror the JSON values into a new entry below.
 var goTLSOffsetTableBase = map[string]goTLSOffsetEntry{
 	// Go 1.20–1.23: crypto/cipher.gcm (PDBase = 32 + 224 = 256).
 	"1.20": {ConnToCipher: 552, AEADIfaceOff: 24, PDBase: 256, ConnVersOff: 64},
