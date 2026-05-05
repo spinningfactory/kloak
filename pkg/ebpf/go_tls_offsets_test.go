@@ -139,9 +139,10 @@ func TestGoTLSOffsets_AgainstReferenceJSON(t *testing.T) {
 				t.Fatalf("reference JSON %s has notes=%q (the discovery tool reported missing offsets); regenerate via `make go-tls-discover`", base, ref.Notes)
 			}
 
-			entry, ok := goTLSOffsetTableBase[version]
+			majorMinor := extractGoMajorMinor(version)
+			entry, ok := goTLSOffsetTableBase[majorMinor]
 			if !ok {
-				t.Fatalf("goTLSOffsetTableBase has no entry for Go %s — add it from %s", version, base)
+				t.Fatalf("goTLSOffsetTableBase has no entry for Go %s — add it from %s", majorMinor, base)
 			}
 			got := goTLSOffsetsForArch(entry, arch)
 
@@ -192,9 +193,10 @@ func TestGoTLSOffsets_AgainstFixtureDWARF(t *testing.T) {
 				t.Fatalf("detectGoTLSFromDWARF(%s): %v", base, err)
 			}
 
-			entry, ok := goTLSOffsetTableBase[version]
+			majorMinor := extractGoMajorMinor(version)
+			entry, ok := goTLSOffsetTableBase[majorMinor]
 			if !ok {
-				t.Fatalf("goTLSOffsetTableBase has no entry for Go %s", version)
+				t.Fatalf("goTLSOffsetTableBase has no entry for Go %s", majorMinor)
 			}
 			tableOffsets := goTLSOffsetsForArch(entry, arch)
 
