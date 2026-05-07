@@ -17,12 +17,6 @@ GOGENERATE=$(GOCMD) generate
 BINARY_NAME=kloak
 WEBHOOK_BINARY=kloak-webhook
 
-# Proto generation
-.PHONY: proto
-proto:
-	buf generate
-
-
 # Build directories
 BUILD_DIR=bin
 CMD_DIR=cmd
