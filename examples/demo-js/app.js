@@ -78,6 +78,17 @@ async function main() {
   );
   console.log("=".repeat(60));
 
+  // Brief delay for kloak controller to attach uprobes before the first
+  // TLS connection. Node's https.globalAgent defaults to keepAlive=true
+  // (and we send Connection: keep-alive explicitly below), so all
+  // subsequent requests reuse the very first connection's SSL_CTX. If
+  // we lose the attach race against that first connection, every later
+  // request misses the rewrite — observable in CI as the kprobe_walk
+  // counter staying frozen while the demo cycles 100+ requests.
+  // Mirrors examples/demo-go/main.go:55-57.
+  console.log("Waiting 10s for Kloak controller to sync...");
+  await new Promise((r) => setTimeout(r, 10000));
+
   let requestCount = 0;
   while (true) {
     requestCount++;
