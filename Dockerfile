@@ -49,12 +49,21 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
 # coverage_flush.go is used and the binary contains no runtime/coverage
 # import.
 ARG COVER=0
+# VERSION is the release tag baked into the binary so `kloak version`
+# can report it. release.yml sets this from the git tag; local builds
+# leave it as the default and the binary advertises itself as "dev".
+# The commit hash is auto-discovered via runtime/debug.ReadBuildInfo,
+# so no extra build-arg is needed for that.
+ARG VERSION=dev
 RUN if [ "$COVER" = "1" ]; then \
       CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-        go build -cover -covermode=atomic -tags cover -o /kloak ./cmd/kloak; \
+        go build -cover -covermode=atomic -tags cover \
+          -ldflags "-X main.version=${VERSION}" \
+          -o /kloak ./cmd/kloak; \
     else \
       CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} \
-        go build -o /kloak ./cmd/kloak; \
+        go build -ldflags "-X main.version=${VERSION}" \
+          -o /kloak ./cmd/kloak; \
     fi
 
 # Runtime stage — uses the target platform.
