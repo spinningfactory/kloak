@@ -62,6 +62,37 @@ func controllerLogs() string {
 	return out
 }
 
+// pollDemoLogs polls `kubectl logs -l <appLabel>` every pollInterval
+// until match(out) returns true or ctx expires. On expiry the most
+// recent tail and the kloak controller logs are tagged onto t.Fatalf
+// for postmortem; failTag identifies which subtest fired (e.g. "js"
+// vs "demo-python-raw-tls") so a cascade is debuggable.
+//
+// Returns the final log output so the caller can run negative
+// assertions on it (e.g. blocked-secret leakage).
+//
+// `--tail=500` matches the per-cycle log volume of the slowest demo
+// (js, REQUEST_INTERVAL=1s) — gives ~70-100 cycles of headroom before
+// the marker the caller is looking for can scroll out of the window.
+func pollDemoLogs(t *testing.T, ctx context.Context, appLabel, failTag, failMsg string, match func(string) bool) string {
+	t.Helper()
+	var out string
+	for {
+		select {
+		case <-ctx.Done():
+			t.Logf("=== %s final logs ===\n%s", failTag, out)
+			t.Logf("=== Controller logs ===\n%s", controllerLogs())
+			t.Fatalf("[%s] %s", failTag, failMsg)
+		default:
+		}
+		out, _ = kubectl("logs", "-n", testNamespace, "-l", appLabel, "--tail=500")
+		if match(out) {
+			return out
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
 // ebpfRewriteTest describes a single eBPF rewrite test case for a specific runtime.
 type ebpfRewriteTest struct {
 	name           string
@@ -141,24 +172,14 @@ func TestEBPFRawTLSHostFiltering(t *testing.T) {
 		t.Fatalf("demo-python-raw-tls not ready: %v", err)
 	}
 
-	// Poll app logs for the real secret value
-	pollCtx, pollCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	// Same flake class as TestEBPFSecretRewrite — bumped to 180s + 500-line
+	// tail for parity with `runEBPFRewriteTest`. This test was at the same
+	// 95s edge in recent CI cascades.
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer pollCancel()
-	var out string
-	for {
-		select {
-		case <-pollCtx.Done():
-			t.Logf("=== demo-python-raw-tls final logs ===\n%s", out)
-			t.Logf("=== Controller logs ===\n%s", controllerLogs())
-			t.Fatalf("timed out waiting for allowed secret in raw TLS demo logs")
-		default:
-		}
-		out, _ = kubectl("logs", "-n", testNamespace, "-l", "app=demo-python-raw-tls", "--tail=200")
-		if strings.Contains(out, "REAL-ALLOWED-KEY-12345") {
-			break
-		}
-		time.Sleep(pollInterval)
-	}
+	out := pollDemoLogs(t, pollCtx, "app=demo-python-raw-tls", "demo-python-raw-tls",
+		"timed out waiting for allowed secret in raw TLS demo logs",
+		func(s string) bool { return strings.Contains(s, "REAL-ALLOWED-KEY-12345") })
 	t.Logf("=== demo-python-raw-tls logs ===\n%s", out)
 
 	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {
@@ -233,39 +254,17 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 	//   budget; the original 90s sat exactly at the failure edge for JS
 	//   on stressed runners.
 	//
-	// `--tail=500` (was 200) gives ~70-100 request cycles of headroom
-	// before the marker we're looking for can scroll out — generous even
-	// for js (REQUEST_INTERVAL=1s) on a slow runner.
-	var out string
-	pollLogsFor := func(ctx context.Context, match func(string) bool, failMsg string) {
-		t.Helper()
-		for {
-			select {
-			case <-ctx.Done():
-				t.Logf("=== %s final logs ===\n%s", tc.name, out)
-				t.Logf("=== Controller logs ===\n%s", controllerLogs())
-				t.Fatalf("[%s] %s", tc.name, failMsg)
-			default:
-			}
-			out, _ = kubectl("logs", "-n", testNamespace, "-l", tc.appLabel, "--tail=500")
-			if match(out) {
-				return
-			}
-			time.Sleep(pollInterval)
-		}
-	}
-
 	demoActiveCtx, demoActiveCancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer demoActiveCancel()
-	pollLogsFor(demoActiveCtx,
-		func(s string) bool { return strings.Count(s, "Request #") >= 2 },
-		"demo runtime never reached its second request — image, network, or scheduling problem (not an eBPF rewrite issue)")
+	pollDemoLogs(t, demoActiveCtx, tc.appLabel, tc.name,
+		"demo runtime never reached its second request — image, network, or scheduling problem (not an eBPF rewrite issue)",
+		func(s string) bool { return strings.Count(s, "Request #") >= 2 })
 
 	pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer pollCancel()
-	pollLogsFor(pollCtx,
-		func(s string) bool { return strings.Contains(s, "REAL-ALLOWED-KEY-12345") },
-		"timed out waiting for allowed secret in app logs (demo runtime is healthy — uprobe path failed to rewrite)")
+	out := pollDemoLogs(t, pollCtx, tc.appLabel, tc.name,
+		"timed out waiting for allowed secret in app logs (demo runtime is healthy — uprobe path failed to rewrite)",
+		func(s string) bool { return strings.Contains(s, "REAL-ALLOWED-KEY-12345") })
 	t.Logf("=== %s demo app logs ===\n%s", tc.name, out)
 
 	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {
