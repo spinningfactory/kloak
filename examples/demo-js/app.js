@@ -85,7 +85,7 @@ async function main() {
   // we lose the attach race against that first connection, every later
   // request misses the rewrite — observable in CI as the kprobe_walk
   // counter staying frozen while the demo cycles 100+ requests.
-  // Mirrors examples/demo-go/main.go:55-57.
+  // Mirrors the startup delay in examples/demo-go/main.go.
   console.log("Waiting 10s for Kloak controller to sync...");
   await new Promise((r) => setTimeout(r, 10000));
 
