@@ -213,18 +213,49 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 		t.Fatalf("%s not ready: %v", tc.deploymentName, err)
 	}
 
-	// Poll app logs for the real secret value (definitive per-app check).
-	// This replaces the old arbitrary sleep — we poll until the app has
-	// made at least one request and the eBPF rewrite is visible in output.
-	pollCtx, pollCancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer pollCancel()
+	// Two-phase wait. The 90s single-budget approach was flaky on slow CI
+	// runners because it conflated three distinct delays (Node.js cold-
+	// start / TLS module init, DNS+RTT to httpbin.org, and the uprobe
+	// attach race) into one ceiling. Splitting them gives a clearer signal
+	// when something does break:
+	//
+	//   Phase 1 — wait until the demo has issued at least two requests
+	//   ("Request #2" appears in logs). All three demos use the same
+	//   `--- Request #N ---` prefix. Two requests means the runtime is
+	//   alive and the uprobe-attach race window has closed at least once,
+	//   so any subsequent rewrite failure points at the eBPF path rather
+	//   than at startup. 120s budget covers Node.js cold-start + first
+	//   public-internet RTT under load.
+	//
+	//   Phase 2 — poll for the rewritten secret in the demo logs. 180s
+	//   budget; the original 90s sat exactly at the failure edge for JS
+	//   on stressed runners.
+	demoActiveCtx, demoActiveCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer demoActiveCancel()
 	var out string
+	for {
+		select {
+		case <-demoActiveCtx.Done():
+			t.Logf("=== %s final logs ===\n%s", tc.name, out)
+			t.Logf("=== Controller logs ===\n%s", controllerLogs())
+			t.Fatalf("[%s] demo runtime never reached its second request — image, network, or scheduling problem (not an eBPF rewrite issue)", tc.name)
+		default:
+		}
+		out, _ = kubectl("logs", "-n", testNamespace, "-l", tc.appLabel, "--tail=200")
+		if strings.Contains(out, "Request #2") {
+			break
+		}
+		time.Sleep(pollInterval)
+	}
+
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer pollCancel()
 	for {
 		select {
 		case <-pollCtx.Done():
 			t.Logf("=== %s final logs ===\n%s", tc.name, out)
 			t.Logf("=== Controller logs ===\n%s", controllerLogs())
-			t.Fatalf("[%s] timed out waiting for allowed secret in app logs", tc.name)
+			t.Fatalf("[%s] timed out waiting for allowed secret in app logs (demo runtime is healthy — uprobe path failed to rewrite)", tc.name)
 		default:
 		}
 		out, _ = kubectl("logs", "-n", testNamespace, "-l", tc.appLabel, "--tail=200")
