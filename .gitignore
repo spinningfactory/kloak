@@ -39,7 +39,9 @@ pkg/ebpf/bpf/vmlinux.h
 # ARE committed; the binaries themselves are regenerable and too large.
 pkg/ebpf/testdata/go-tls-fixtures/*.elf
 .claude/worktrees/
-kloak
+# Anchor to repo root: bare `kloak` would match `cmd/kloak/` too and
+# block new files there from being added to git.
+/kloak
 lima-k3d.yaml
 sec.yml
 test.yml

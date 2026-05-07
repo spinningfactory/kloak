@@ -17,6 +17,13 @@ GOGENERATE=$(GOCMD) generate
 BINARY_NAME=kloak
 WEBHOOK_BINARY=kloak-webhook
 
+# Release tag baked into the binary for `kloak version`. `git describe
+# --tags --always --dirty` gives `v0.1.0` exactly on tag, `v0.1.0-3-gabc1234-dirty`
+# between tags with uncommitted changes, and falls back to the short
+# commit when no tags exist. CI release builds override VERSION explicitly.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS = -ldflags "-X main.version=$(VERSION)"
+
 # Build directories
 BUILD_DIR=bin
 CMD_DIR=cmd
@@ -48,14 +55,14 @@ build: deps $(BUILD_DIR)/$(BINARY_NAME)
 
 $(BUILD_DIR)/$(BINARY_NAME): $(GO_SOURCES)
 	@mkdir -p $(BUILD_DIR)
-	$(GOBUILD) -o $(BUILD_DIR)/$(BINARY_NAME) ./$(CMD_DIR)/kloak
+	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./$(CMD_DIR)/kloak
 
 # Build for Linux (cross-compile or via Lima)
 build-linux: lima-ensure
 	@if [ "$$(uname)" = "Linux" ]; then \
-		GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak; \
+		GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak; \
 	else \
-		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go build -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak"; \
+		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak"; \
 	fi
 
 test: deps
