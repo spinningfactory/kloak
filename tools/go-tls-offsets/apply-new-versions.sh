@@ -76,7 +76,10 @@ for v in "${NEW_VERSIONS[@]}"; do
       continue
     fi
     # Append `, "$v"` just before the closing `]` on every `go: [...]` line.
-    sed -E -i.bak "/^[[:space:]]*go: \[/ s/\]/, \"$v\"]/" "$yml"
+    # Second substitution collapses `[, "$v"` → `["$v"` so the result stays
+    # valid YAML when the matrix is empty (`go: []` → `go: ["$v"]`); with a
+    # non-empty matrix the second sub matches nothing and is a no-op.
+    sed -E -i.bak "/^[[:space:]]*go: \[/ { s/\]/, \"$v\"]/; s/\[[[:space:]]*, /[/; }" "$yml"
     rm -f "$yml.bak"
     echo "==> Appended Go $v to matrix in $yml"
   done
