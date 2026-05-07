@@ -219,10 +219,12 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 	// attach race) into one ceiling. Splitting them gives a clearer signal
 	// when something does break:
 	//
-	//   Phase 1 — wait until the demo has issued at least two requests
-	//   ("Request #2" appears in logs). All three demos use the same
-	//   `--- Request #N ---` prefix. Two requests means the runtime is
-	//   alive and the uprobe-attach race window has closed at least once,
+	//   Phase 1 — wait until the demo has issued at least two requests.
+	//   All three demos use the same `--- Request #N ---` prefix; counting
+	//   occurrences (rather than matching `Request #2` literally) stays
+	//   correct after `Request #1` scrolls out of the kubectl --tail
+	//   window on long phase-1 waits. Two requests means the runtime is
+	//   alive AND the uprobe-attach race window has closed at least once,
 	//   so any subsequent rewrite failure points at the eBPF path rather
 	//   than at startup. 120s budget covers Node.js cold-start + first
 	//   public-internet RTT under load.
@@ -230,40 +232,40 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 	//   Phase 2 — poll for the rewritten secret in the demo logs. 180s
 	//   budget; the original 90s sat exactly at the failure edge for JS
 	//   on stressed runners.
+	//
+	// `--tail=500` (was 200) gives ~70-100 request cycles of headroom
+	// before the marker we're looking for can scroll out — generous even
+	// for js (REQUEST_INTERVAL=1s) on a slow runner.
+	var out string
+	pollLogsFor := func(ctx context.Context, match func(string) bool, failMsg string) {
+		t.Helper()
+		for {
+			select {
+			case <-ctx.Done():
+				t.Logf("=== %s final logs ===\n%s", tc.name, out)
+				t.Logf("=== Controller logs ===\n%s", controllerLogs())
+				t.Fatalf("[%s] %s", tc.name, failMsg)
+			default:
+			}
+			out, _ = kubectl("logs", "-n", testNamespace, "-l", tc.appLabel, "--tail=500")
+			if match(out) {
+				return
+			}
+			time.Sleep(pollInterval)
+		}
+	}
+
 	demoActiveCtx, demoActiveCancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer demoActiveCancel()
-	var out string
-	for {
-		select {
-		case <-demoActiveCtx.Done():
-			t.Logf("=== %s final logs ===\n%s", tc.name, out)
-			t.Logf("=== Controller logs ===\n%s", controllerLogs())
-			t.Fatalf("[%s] demo runtime never reached its second request — image, network, or scheduling problem (not an eBPF rewrite issue)", tc.name)
-		default:
-		}
-		out, _ = kubectl("logs", "-n", testNamespace, "-l", tc.appLabel, "--tail=200")
-		if strings.Contains(out, "Request #2") {
-			break
-		}
-		time.Sleep(pollInterval)
-	}
+	pollLogsFor(demoActiveCtx,
+		func(s string) bool { return strings.Count(s, "Request #") >= 2 },
+		"demo runtime never reached its second request — image, network, or scheduling problem (not an eBPF rewrite issue)")
 
 	pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer pollCancel()
-	for {
-		select {
-		case <-pollCtx.Done():
-			t.Logf("=== %s final logs ===\n%s", tc.name, out)
-			t.Logf("=== Controller logs ===\n%s", controllerLogs())
-			t.Fatalf("[%s] timed out waiting for allowed secret in app logs (demo runtime is healthy — uprobe path failed to rewrite)", tc.name)
-		default:
-		}
-		out, _ = kubectl("logs", "-n", testNamespace, "-l", tc.appLabel, "--tail=200")
-		if strings.Contains(out, "REAL-ALLOWED-KEY-12345") {
-			break
-		}
-		time.Sleep(pollInterval)
-	}
+	pollLogsFor(pollCtx,
+		func(s string) bool { return strings.Contains(s, "REAL-ALLOWED-KEY-12345") },
+		"timed out waiting for allowed secret in app logs (demo runtime is healthy — uprobe path failed to rewrite)")
 	t.Logf("=== %s demo app logs ===\n%s", tc.name, out)
 
 	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {
