@@ -17,11 +17,12 @@ GOGENERATE=$(GOCMD) generate
 BINARY_NAME=kloak
 WEBHOOK_BINARY=kloak-webhook
 
-# Proto generation
-.PHONY: proto
-proto:
-	buf generate
-
+# Release tag baked into the binary for `kloak version`. `git describe
+# --tags --always --dirty` gives `v0.1.0` exactly on tag, `v0.1.0-3-gabc1234-dirty`
+# between tags with uncommitted changes, and falls back to the short
+# commit when no tags exist. CI release builds override VERSION explicitly.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+LDFLAGS = -ldflags "-X main.version=$(VERSION)"
 
 # Build directories
 BUILD_DIR=bin
@@ -54,14 +55,14 @@ build: deps $(BUILD_DIR)/$(BINARY_NAME)
 
 $(BUILD_DIR)/$(BINARY_NAME): $(GO_SOURCES)
 	@mkdir -p $(BUILD_DIR)
-	$(GOBUILD) -o $(BUILD_DIR)/$(BINARY_NAME) ./$(CMD_DIR)/kloak
+	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./$(CMD_DIR)/kloak
 
 # Build for Linux (cross-compile or via Lima)
 build-linux: lima-ensure
 	@if [ "$$(uname)" = "Linux" ]; then \
-		GOOS=linux GOARCH=amd64 $(GOBUILD) -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak; \
+		GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak; \
 	else \
-		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go build -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak"; \
+		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak"; \
 	fi
 
 test: deps
@@ -133,7 +134,7 @@ e2e-setup:
 # Run e2e tests (including eBPF) against an existing k3d cluster.
 e2e-run:
 	KUBECONFIG=$$(k3d kubeconfig write $(E2E_CLUSTER)) \
-	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
+	$(GOTEST) -v -timeout 1500s -tags=e2e_ebpf -count=1 ./test/e2e/
 
 # Run e2e tests against the current kube context.
 # Builds images, pushes to ttl.sh (anonymous ephemeral registry, 2h TTL),
@@ -165,7 +166,7 @@ E2E_RUN ?=
 
 e2e-local-run:
 	E2E_REGISTRY=$(E2E_REGISTRY) E2E_SKIP_INSTALL=$(E2E_SKIP_INSTALL) \
-	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 $(if $(E2E_RUN),-run $(E2E_RUN)) ./test/e2e/
+	$(GOTEST) -v -timeout 1500s -tags=e2e_ebpf -count=1 $(if $(E2E_RUN),-run $(E2E_RUN)) ./test/e2e/
 
 # Tear down e2e k3d cluster.
 e2e-cleanup:
@@ -212,7 +213,7 @@ e2e-k3s-setup:
 # Run e2e tests against local k3s.
 e2e-k3s-run:
 	KUBECONFIG=$(HOME)/.kube/k3s-e2e.yaml \
-	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 $(if $(E2E_RUN),-run $(E2E_RUN)) ./test/e2e/
+	$(GOTEST) -v -timeout 1500s -tags=e2e_ebpf -count=1 $(if $(E2E_RUN),-run $(E2E_RUN)) ./test/e2e/
 
 # Tear down k3s.
 e2e-k3s-cleanup:

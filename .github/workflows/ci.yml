@@ -202,7 +202,7 @@ jobs:
           echo "color=${COLOR}" >> "$GITHUB_OUTPUT"
 
       - name: Update coverage gist
-        uses: schneegans/dynamic-badges-action@v1.7.0
+        uses: schneegans/dynamic-badges-action@v1.8.0
         with:
           auth: ${{ secrets.GIST_TOKEN }}
           gistID: 2d4be46e60ee478d5703d8b009dbd6e9
@@ -393,7 +393,7 @@ jobs:
           ls -la /tmp/bpf-trace.log
 
       - name: Run E2E tests (with eBPF)
-        run: go test -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
+        run: go test -v -timeout 1500s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
           KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
 

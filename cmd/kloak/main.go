@@ -17,6 +17,12 @@ API key management without exposing secrets in plain text.`,
 func init() {
 	rootCmd.AddCommand(controllerCmd)
 	rootCmd.AddCommand(webhookCmd)
+	rootCmd.AddCommand(versionCmd)
+
+	// Wire `kloak --version` to the same multi-line output as `kloak version`
+	// instead of Cobra's default one-liner, so the two surfaces stay in sync.
+	rootCmd.Version = version
+	rootCmd.SetVersionTemplate(versionString())
 }
 
 func main() {

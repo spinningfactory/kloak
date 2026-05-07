@@ -63,6 +63,11 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository }}:${{ needs.validate.outputs.version }}
             ghcr.io/${{ github.repository }}:latest
+          # Re-prefix with `v` so the on-binary version exactly matches
+          # the pushed git tag (validate strips the `v` for image tags
+          # but the binary should advertise the canonical tag form).
+          build-args: |
+            VERSION=v${{ needs.validate.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
