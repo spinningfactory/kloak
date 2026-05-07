@@ -62,6 +62,37 @@ func controllerLogs() string {
 	return out
 }
 
+// pollDemoLogs polls `kubectl logs -l <appLabel>` every pollInterval
+// until match(out) returns true or ctx expires. On expiry the most
+// recent tail and the kloak controller logs are tagged onto t.Fatalf
+// for postmortem; failTag identifies which subtest fired (e.g. "js"
+// vs "demo-python-raw-tls") so a cascade is debuggable.
+//
+// Returns the final log output so the caller can run negative
+// assertions on it (e.g. blocked-secret leakage).
+//
+// `--tail=500` matches the per-cycle log volume of the slowest demo
+// (js, REQUEST_INTERVAL=1s) — gives ~70-100 cycles of headroom before
+// the marker the caller is looking for can scroll out of the window.
+func pollDemoLogs(t *testing.T, ctx context.Context, appLabel, failTag, failMsg string, match func(string) bool) string {
+	t.Helper()
+	var out string
+	for {
+		select {
+		case <-ctx.Done():
+			t.Logf("=== %s final logs ===\n%s", failTag, out)
+			t.Logf("=== Controller logs ===\n%s", controllerLogs())
+			t.Fatalf("[%s] %s", failTag, failMsg)
+		default:
+		}
+		out, _ = kubectl("logs", "-n", testNamespace, "-l", appLabel, "--tail=500")
+		if match(out) {
+			return out
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
 // ebpfRewriteTest describes a single eBPF rewrite test case for a specific runtime.
 type ebpfRewriteTest struct {
 	name           string
@@ -141,24 +172,14 @@ func TestEBPFRawTLSHostFiltering(t *testing.T) {
 		t.Fatalf("demo-python-raw-tls not ready: %v", err)
 	}
 
-	// Poll app logs for the real secret value
-	pollCtx, pollCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	// Same flake class as TestEBPFSecretRewrite — bumped to 180s + 500-line
+	// tail for parity with `runEBPFRewriteTest`. This test was at the same
+	// 95s edge in recent CI cascades.
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer pollCancel()
-	var out string
-	for {
-		select {
-		case <-pollCtx.Done():
-			t.Logf("=== demo-python-raw-tls final logs ===\n%s", out)
-			t.Logf("=== Controller logs ===\n%s", controllerLogs())
-			t.Fatalf("timed out waiting for allowed secret in raw TLS demo logs")
-		default:
-		}
-		out, _ = kubectl("logs", "-n", testNamespace, "-l", "app=demo-python-raw-tls", "--tail=200")
-		if strings.Contains(out, "REAL-ALLOWED-KEY-12345") {
-			break
-		}
-		time.Sleep(pollInterval)
-	}
+	out := pollDemoLogs(t, pollCtx, "app=demo-python-raw-tls", "demo-python-raw-tls",
+		"timed out waiting for allowed secret in raw TLS demo logs",
+		func(s string) bool { return strings.Contains(s, "REAL-ALLOWED-KEY-12345") })
 	t.Logf("=== demo-python-raw-tls logs ===\n%s", out)
 
 	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {
@@ -213,26 +234,37 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 		t.Fatalf("%s not ready: %v", tc.deploymentName, err)
 	}
 
-	// Poll app logs for the real secret value (definitive per-app check).
-	// This replaces the old arbitrary sleep — we poll until the app has
-	// made at least one request and the eBPF rewrite is visible in output.
-	pollCtx, pollCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	// Two-phase wait. The 90s single-budget approach was flaky on slow CI
+	// runners because it conflated three distinct delays (Node.js cold-
+	// start / TLS module init, DNS+RTT to httpbin.org, and the uprobe
+	// attach race) into one ceiling. Splitting them gives a clearer signal
+	// when something does break:
+	//
+	//   Phase 1 — wait until the demo has issued at least two requests.
+	//   All three demos use the same `--- Request #N ---` prefix; counting
+	//   occurrences (rather than matching `Request #2` literally) stays
+	//   correct after `Request #1` scrolls out of the kubectl --tail
+	//   window on long phase-1 waits. Two requests means the runtime is
+	//   alive AND the uprobe-attach race window has closed at least once,
+	//   so any subsequent rewrite failure points at the eBPF path rather
+	//   than at startup. 120s budget covers Node.js cold-start + first
+	//   public-internet RTT under load.
+	//
+	//   Phase 2 — poll for the rewritten secret in the demo logs. 180s
+	//   budget; the original 90s sat exactly at the failure edge for JS
+	//   on stressed runners.
+	//
+	demoActiveCtx, demoActiveCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer demoActiveCancel()
+	pollDemoLogs(t, demoActiveCtx, tc.appLabel, tc.name,
+		"demo runtime never reached its second request — image, network, or scheduling problem (not an eBPF rewrite issue)",
+		func(s string) bool { return strings.Count(s, "Request #") >= 2 })
+
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer pollCancel()
-	var out string
-	for {
-		select {
-		case <-pollCtx.Done():
-			t.Logf("=== %s final logs ===\n%s", tc.name, out)
-			t.Logf("=== Controller logs ===\n%s", controllerLogs())
-			t.Fatalf("[%s] timed out waiting for allowed secret in app logs", tc.name)
-		default:
-		}
-		out, _ = kubectl("logs", "-n", testNamespace, "-l", tc.appLabel, "--tail=200")
-		if strings.Contains(out, "REAL-ALLOWED-KEY-12345") {
-			break
-		}
-		time.Sleep(pollInterval)
-	}
+	out := pollDemoLogs(t, pollCtx, tc.appLabel, tc.name,
+		"timed out waiting for allowed secret in app logs (demo runtime is healthy — uprobe path failed to rewrite)",
+		func(s string) bool { return strings.Contains(s, "REAL-ALLOWED-KEY-12345") })
 	t.Logf("=== %s demo app logs ===\n%s", tc.name, out)
 
 	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {

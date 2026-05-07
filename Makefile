@@ -134,7 +134,7 @@ e2e-setup:
 # Run e2e tests (including eBPF) against an existing k3d cluster.
 e2e-run:
 	KUBECONFIG=$$(k3d kubeconfig write $(E2E_CLUSTER)) \
-	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 ./test/e2e/
+	$(GOTEST) -v -timeout 1500s -tags=e2e_ebpf -count=1 ./test/e2e/
 
 # Run e2e tests against the current kube context.
 # Builds images, pushes to ttl.sh (anonymous ephemeral registry, 2h TTL),
@@ -166,7 +166,7 @@ E2E_RUN ?=
 
 e2e-local-run:
 	E2E_REGISTRY=$(E2E_REGISTRY) E2E_SKIP_INSTALL=$(E2E_SKIP_INSTALL) \
-	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 $(if $(E2E_RUN),-run $(E2E_RUN)) ./test/e2e/
+	$(GOTEST) -v -timeout 1500s -tags=e2e_ebpf -count=1 $(if $(E2E_RUN),-run $(E2E_RUN)) ./test/e2e/
 
 # Tear down e2e k3d cluster.
 e2e-cleanup:
@@ -213,7 +213,7 @@ e2e-k3s-setup:
 # Run e2e tests against local k3s.
 e2e-k3s-run:
 	KUBECONFIG=$(HOME)/.kube/k3s-e2e.yaml \
-	$(GOTEST) -v -timeout 900s -tags=e2e_ebpf -count=1 $(if $(E2E_RUN),-run $(E2E_RUN)) ./test/e2e/
+	$(GOTEST) -v -timeout 1500s -tags=e2e_ebpf -count=1 $(if $(E2E_RUN),-run $(E2E_RUN)) ./test/e2e/
 
 # Tear down k3s.
 e2e-k3s-cleanup:
