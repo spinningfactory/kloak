@@ -1,0 +1,16 @@
+{
+  "go_version": "go1.21.13",
+  "arch": "arm64",
+  "conn_to_cipher": 568,
+  "aead_iface_off": 24,
+  "h2_hi_off": 256,
+  "h2_lo_off": 264,
+  "conn_vers_off": 72,
+  "raw": {
+    "conn_out": 528,
+    "cipher_off": 32,
+    "aead_off": 16,
+    "product_table": 32,
+    "pd_base": 256
+  }
+}
