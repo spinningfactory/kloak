@@ -2,15 +2,10 @@ package controller
 
 import (
 	"context"
-	"crypto/rand"
 	"fmt"
-	"math/big"
 	"strings"
-	"time"
 
-	"github.com/oklog/ulid/v2"
 	"go.uber.org/zap"
-	"golang.org/x/net/http2/hpack"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -18,6 +13,9 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/spinningfactory/kloak/pkg/secrets"
+	k8ssecrets "github.com/spinningfactory/kloak/pkg/secrets/k8s"
 )
 
 const (
@@ -32,14 +30,6 @@ const (
 
 	// ShadowSecretSuffix is the suffix appended to the name of the shadow secret.
 	ShadowSecretSuffix = "-kloak"
-
-	// ValuePrefix is the prefix for generated UUID values.
-	// Must match what the eBPF program expects.
-	ValuePrefix = "kloak:"
-
-	// ShadowPrefixLen is the length of the prefix used for BPF map key collision detection.
-	// The BPF program uses the first 8 bytes as the lookup key.
-	ShadowPrefixLen = 8
 )
 
 // SecretReconciler reconciles a Secret object
@@ -89,16 +79,17 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// 4. Reconcile Shadow Secret
 	log.Infow("Reconciling enabled secret")
 
-	// Validate secret length: eBPF requires at least ShadowPrefixLen bytes for the BPF key lookup
-	// Short secrets cannot be processed correctly by eBPF and are not supported
+	// Validate secret length: eBPF requires at least secrets.ShadowPrefixLen bytes
+	// for the BPF key lookup. Short secrets cannot be processed correctly by eBPF
+	// and are not supported.
 	for key, originalBytes := range secret.Data {
 		originalLen := len(originalBytes)
-		if originalLen < ShadowPrefixLen {
+		if originalLen < secrets.ShadowPrefixLen {
 			log.Info("Skipping secret with value too short for eBPF (minimum ShadowPrefixLen bytes required)",
 				"secret", req.String(),
 				"key", key,
 				"length", originalLen,
-				"minimumRequired", ShadowPrefixLen)
+				"minimumRequired", secrets.ShadowPrefixLen)
 			// Return early without creating shadow secret
 			return ctrl.Result{}, nil
 		}
@@ -117,32 +108,22 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	newData := make(map[string][]byte)
 	secretID := fmt.Sprintf("%s/%s", secret.Namespace, secret.Name)
 
-	// Fetch all existing shadow secrets from the informer cache for collision detection
-	var shadowSecrets corev1.SecretList
-	if err := r.List(ctx, &shadowSecrets, client.MatchingLabels{"getkloak.io/managed": "true"}); err != nil {
-		return ctrl.Result{}, fmt.Errorf("failed to list shadow secrets: %w", err)
+	// Seed a ShadowGenerator from every shadow currently persisted in the
+	// cluster, so freshly-minted shadows do not collide with anything held
+	// by another secret. The generator excludes secretID from the
+	// collision check, so re-reconciling our own shadow under a stable
+	// ULID is not flagged as a self-collision.
+	seed, err := k8ssecrets.SeedShadowGenerator(ctx, r.Client)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("seed shadow generator: %w", err)
 	}
+	gen := secrets.NewShadowGenerator(seed, log)
 
-	// Build a map of existing shadow prefixes to detect collisions with other secrets
-	// Key: 8-byte prefix, Value: set of ownerIDs that use this prefix
-	existingPrefixMap := make(map[string]map[string]struct{})
-	for i := range shadowSecrets.Items {
-		shadow := &shadowSecrets.Items[i]
-		ownerName := shadow.Labels["getkloak.io/owner"]
-		ownerID := shadow.Namespace + "/" + ownerName
-		for _, val := range shadow.Data {
-			shadowStr := string(val)
-			if len(shadowStr) >= ShadowPrefixLen {
-				prefix := shadowStr[:ShadowPrefixLen]
-				if existingPrefixMap[prefix] == nil {
-					existingPrefixMap[prefix] = make(map[string]struct{})
-				}
-				existingPrefixMap[prefix][ownerID] = struct{}{}
-			}
-		}
-	}
-
-	// Track all shadows in this batch to detect intra-secret collisions
+	// Track shadows already chosen within THIS Reconcile to detect
+	// intra-secret collisions across data keys. The generator's
+	// cross-owner check excludes secretID, so it would not catch the
+	// case where two keys of the same Secret happen onto the same
+	// 8-byte prefix.
 	var shadowsInBatch []string
 
 	for key, originalBytes := range secret.Data {
@@ -153,13 +134,11 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		// Try to reuse existing UUID
 		if shadowExists && len(existingShadow.Data[key]) > 0 {
 			existingVal := string(existingShadow.Data[key])
-			if strings.HasPrefix(existingVal, ValuePrefix) {
-				// Check if existing shadow collides with other secrets
-				// Pass secretID to exclude shadows from the current secret
+			if strings.HasPrefix(existingVal, secrets.ValuePrefix) {
 				if len(existingVal) == originalLen {
-					if !checkCollisionsWithMap(existingVal, secretID, existingPrefixMap) {
+					if !gen.Collides(existingVal, secretID) {
 						// Check it doesn't collide with other keys in this same secret
-						if prefix := existingVal[:ShadowPrefixLen]; !isPrefixUsed(shadowsInBatch, prefix) {
+						if prefix := existingVal[:secrets.ShadowPrefixLen]; !isPrefixUsed(shadowsInBatch, prefix) {
 							shadowValue = existingVal
 						}
 					}
@@ -170,9 +149,7 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		// Generate new if needed or if length mismatch or collision detected
 		if shadowValue == "" {
 			var err error
-			shadowValue, err = r.generateShadowValueWithCollisionCheck(
-				originalLen, originalValue, secretID, 3, existingPrefixMap,
-			)
+			shadowValue, err = gen.Generate(originalLen, originalValue, secretID, 3)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to generate shadow value for key %s: %w", key, err)
 			}
@@ -226,55 +203,14 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	return ctrl.Result{}, nil
 }
 
-// checkCollisionsWithMap checks if a shadow value's 8-byte BPF prefix collides with any existing
-// shadow values in the provided prefix map (excluding shadows from the current secret being reconciled).
-// Returns true if a collision is detected.
-func checkCollisionsWithMap(newShadow, excludeSecretID string, existingPrefixMap map[string]map[string]struct{}) bool {
-	newPrefix := newShadow[:ShadowPrefixLen]
-
-	// Check if this prefix is used by other secrets
-	if owners, exists := existingPrefixMap[newPrefix]; exists {
-		for ownerID := range owners {
-			if ownerID != excludeSecretID {
-				// Collision with a different secret
-				return true
-			}
-		}
-	}
-
-	return false
-}
-
-// generateShadowValueWithCollisionCheck creates a shadow value and ensures no 8-byte prefix collision
-// with existing secrets (excluding shadows from the current secret being reconciled).
-// It retries generation up to maxRetries times if collisions are detected.
-func (r *SecretReconciler) generateShadowValueWithCollisionCheck(
-	originalLen int,
-	realSecret string,
-	excludeSecretID string,
-	maxRetries int,
-	existingPrefixMap map[string]map[string]struct{},
-) (string, error) {
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		shadow := generateShadowValue(originalLen, realSecret)
-
-		if checkCollisionsWithMap(shadow, excludeSecretID, existingPrefixMap) {
-			r.Log.Warnw("8-byte BPF key collision detected, regenerating",
-				"attempt", attempt+1, "maxRetries", maxRetries,
-				"prefix", shadow[:ShadowPrefixLen])
-			continue
-		}
-
-		return shadow, nil
-	}
-
-	return "", fmt.Errorf("failed to generate unique shadow value after %d attempts", maxRetries)
-}
-
 // isPrefixUsed checks if a prefix is already used in the given shadows.
+// Used by Reconcile to detect intra-secret collisions across data keys —
+// the cross-owner ShadowGenerator excludes the current secret's owner
+// ID from its check, so a same-secret prefix reuse would not be caught
+// by Collides alone.
 func isPrefixUsed(shadows []string, prefix string) bool {
 	for _, shadow := range shadows {
-		if len(shadow) >= ShadowPrefixLen && shadow[:ShadowPrefixLen] == prefix {
+		if len(shadow) >= secrets.ShadowPrefixLen && shadow[:secrets.ShadowPrefixLen] == prefix {
 			return true
 		}
 	}
@@ -289,60 +225,4 @@ func (r *SecretReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 func ptr[T any](v T) *T {
 	return &v
-}
-
-// generateShadowValue creates a shadow value of exactly originalLen bytes
-// whose HPACK Huffman encoding is at least as long as the real secret's.
-// This ensures HTTP/2 HPACK rewriting works — the shadow's Huffman length
-// determines the space available in the wire buffer for the rewritten value.
-func generateShadowValue(originalLen int, realSecret string) string {
-	realHuffLen := int(hpack.HuffmanEncodeLength(realSecret))
-
-	// ULID uses Crockford Base32 (uppercase + digits, no hyphens).
-	// These chars have long HPACK Huffman codes (7-8 bits), naturally
-	// producing longer Huffman encodings than UUID hex (5-6 bits).
-	// "kloak:" (6) + ULID (26) = 32 chars total.
-	// ULID format: 10 chars timestamp + 16 chars random. For short secrets,
-	// truncation would keep only the timestamp (identical for secrets created
-	// at the same time). Put the random part first to maximize uniqueness.
-	newULID := ulid.MustNew(ulid.Timestamp(time.Now()), rand.Reader).String()
-	ulidRandom := newULID[10:] + newULID[:10] // random first, then timestamp
-	baseVal := ValuePrefix + ulidRandom
-
-	var shadow string
-	switch {
-	case len(baseVal) > originalLen:
-		shadow = baseVal[:originalLen]
-	case len(baseVal) < originalLen:
-		// Pad with random Crockford Base32 chars (same charset as ULID)
-		const base32Chars = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-		padLen := originalLen - len(baseVal)
-		padding := make([]byte, padLen)
-		for i := range padding {
-			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(base32Chars))))
-			padding[i] = base32Chars[n.Int64()]
-		}
-		shadow = baseVal + string(padding)
-	default:
-		shadow = baseVal
-	}
-
-	// Verify Huffman length is sufficient for HTTP/2 HPACK rewriting.
-	// ULID's uppercase chars usually produce long enough Huffman, but for
-	// rare cases (short secrets with all-uppercase real values), replace
-	// trailing digits with random uppercase letters (longer Huffman codes).
-	shadowHuffLen := int(hpack.HuffmanEncodeLength(shadow))
-	if shadowHuffLen < realHuffLen {
-		shadowBytes := []byte(shadow)
-		for j := len(shadowBytes) - 1; j >= 8 && shadowHuffLen < realHuffLen; j-- {
-			if shadowBytes[j] >= '0' && shadowBytes[j] <= '9' {
-				n, _ := rand.Int(rand.Reader, big.NewInt(26))
-				shadowBytes[j] = byte('A') + byte(n.Int64())
-				shadowHuffLen = int(hpack.HuffmanEncodeLength(string(shadowBytes)))
-			}
-		}
-		shadow = string(shadowBytes)
-	}
-
-	return shadow
 }
