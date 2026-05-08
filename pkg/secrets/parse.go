@@ -48,12 +48,14 @@ func ParsePort(spec string) (PortSpec, error) {
 	case 1:
 		// just a port, default proto
 	case 2:
-		protoStr = parts[1]
+		// Trim each part — the user might write "80 / tcp" with spaces
+		// around the slash; outer TrimSpace above doesn't reach here.
+		protoStr = strings.TrimSpace(parts[1])
 	default:
 		return PortSpec{}, fmt.Errorf("invalid port format: %s", spec)
 	}
 
-	p, err := strconv.ParseUint(parts[0], 10, 16)
+	p, err := strconv.ParseUint(strings.TrimSpace(parts[0]), 10, 16)
 	if err != nil {
 		return PortSpec{}, fmt.Errorf("invalid port: %w", err)
 	}

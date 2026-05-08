@@ -162,10 +162,19 @@ func generateShadowValue(originalLen int, realSecret string) string {
 	// ULID's uppercase chars usually produce long enough Huffman, but for
 	// rare cases (short secrets with all-uppercase real values), replace
 	// trailing digits with random uppercase letters (longer Huffman codes).
+	//
+	// Boundary is `j >= 6` (not `>= 8`): bytes 0-5 are the literal
+	// "kloak:" prefix and must not be mutated, but bytes 6-7 are the
+	// random suffix start. Allowing the loop to touch them lets the
+	// minimum-supported 8-byte shadow have its Huffman length tuned;
+	// otherwise an 8-byte secret with all-uppercase real value never
+	// gets its HTTP/2 path enabled. Bytes 6-7 are also part of the BPF
+	// 8-byte lookup key, but the key is computed AFTER generation so
+	// mutating them here just changes the resulting key — not a hazard.
 	shadowHuffLen := int(hpack.HuffmanEncodeLength(shadow))
 	if shadowHuffLen < realHuffLen {
 		shadowBytes := []byte(shadow)
-		for j := len(shadowBytes) - 1; j >= 8 && shadowHuffLen < realHuffLen; j-- {
+		for j := len(shadowBytes) - 1; j >= 6 && shadowHuffLen < realHuffLen; j-- {
 			if shadowBytes[j] >= '0' && shadowBytes[j] <= '9' {
 				n, _ := rand.Int(rand.Reader, big.NewInt(26))
 				shadowBytes[j] = byte('A') + byte(n.Int64())

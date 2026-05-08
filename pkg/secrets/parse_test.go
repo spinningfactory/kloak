@@ -44,6 +44,9 @@ func TestParsePort(t *testing.T) {
 		{"443/tcp", PortSpec{Port: 443, Protocol: tcp}, false},
 		{"53/udp", PortSpec{Port: 53, Protocol: udp}, false},
 		{" 443/TCP ", PortSpec{Port: 443, Protocol: tcp}, false},
+		// Spaces around the slash should be tolerated.
+		{"443 / tcp", PortSpec{Port: 443, Protocol: tcp}, false},
+		{" 53 /udp ", PortSpec{Port: 53, Protocol: udp}, false},
 		{"", PortSpec{}, true},
 		{"0", PortSpec{}, true},
 		{"99999", PortSpec{}, true},

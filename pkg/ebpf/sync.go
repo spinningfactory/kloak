@@ -130,8 +130,12 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, sour
 		huffReal := hpack.AppendHuffmanString(nil, s.Real)
 		realHuffLen := len(huffReal)
 
-		if len(huffShadow) >= 8 && realHuffLen > 0 {
+		if len(huffShadow) >= 8 && realHuffLen > 0 && realHuffLen <= len(huffShadow) {
 			// Pad real with HPACK EOS bits to match shadow's Huffman length.
+			// realHuffLen <= len(huffShadow) is required: the wire-buffer
+			// HPACK length prefix is shadow-sized and immutable, so a longer
+			// Huffman blob would overflow it. The else-if below catches the
+			// "too-long" case explicitly.
 			for len(huffReal) < len(huffShadow) {
 				huffReal = append(huffReal, 0xff)
 			}

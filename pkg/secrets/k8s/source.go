@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 
+	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -37,14 +38,23 @@ const (
 // pkg/ebpf/sync.go::syncSecrets.
 type Source struct {
 	reader client.Reader
+	log    *zap.SugaredLogger // optional; nil = silent
 }
 
 // NewSource returns a Source backed by the given client.Reader. A nil
 // reader yields a source whose Snapshot always returns an empty slice
-// (mirroring the no-op behavior pkg/ebpf has when k8sReader is nil,
+// (mirroring the no-op behavior pkg/ebpf has when its source is nil,
 // e.g. cmd/ebpftest).
 func NewSource(reader client.Reader) *Source {
 	return &Source{reader: reader}
+}
+
+// WithLog attaches a logger so Snapshot can surface diagnostic output
+// (e.g. invalid port annotations falling back to wildcard). Returns the
+// receiver so call sites can chain the constructor.
+func (s *Source) WithLog(log *zap.SugaredLogger) *Source {
+	s.log = log
+	return s
 }
 
 // Snapshot returns the currently effective set of secrets. Each entry
@@ -91,11 +101,14 @@ func (s *Source) Snapshot(ctx context.Context) ([]secrets.Secret, error) {
 			if ps, err := secrets.ParsePort(raw); err == nil {
 				port = ps.Port
 				proto = ps.Protocol
+			} else if s.log != nil {
+				// Bad annotation falls back to wildcard rather than failing
+				// the whole snapshot. Surface it via the optional logger so
+				// the operator can find and fix the manifest.
+				s.log.Warnw("invalid port annotation, treating as wildcard",
+					"namespace", en.Namespace, "secret", en.Name,
+					"annotation", AnnotationPort, "value", raw, "error", err)
 			}
-			// On parse error, fall through to wildcard. Today's
-			// pkg/ebpf/sync.go logs the error and does the same;
-			// an adapter shouldn't fail the whole snapshot for a
-			// single bad annotation.
 		}
 
 		ownerID := en.Namespace + "/" + en.Name
