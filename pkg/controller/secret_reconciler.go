@@ -140,13 +140,19 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 						// Check it doesn't collide with other keys in this same secret
 						if prefix := existingVal[:secrets.ShadowPrefixLen]; !isPrefixUsed(shadowsInBatch, prefix) {
 							shadowValue = existingVal
+							// Record so subsequent gen.Generate within
+							// this Reconcile sees this prefix as taken.
+							gen.Record(shadowValue, secretID)
 						}
 					}
 				}
 			}
 		}
 
-		// Generate new if needed or if length mismatch or collision detected
+		// Generate new if needed or if length mismatch or collision detected.
+		// Generate is strict (avoids every occupied prefix, including ones
+		// recorded above for prior keys of THIS secret) and auto-records on
+		// success.
 		if shadowValue == "" {
 			var err error
 			shadowValue, err = gen.Generate(originalLen, originalValue, secretID, 3)

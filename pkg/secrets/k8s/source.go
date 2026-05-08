@@ -141,7 +141,15 @@ func SeedShadowGenerator(ctx context.Context, reader client.Reader) (map[string]
 	}
 	for i := range managed.Items {
 		shadow := &managed.Items[i]
-		ownerID := shadow.Namespace + "/" + shadow.Labels[LabelOwner]
+		ownerName, ok := shadow.Labels[LabelOwner]
+		if !ok || ownerName == "" {
+			// Skip malformed managed shadows without an owner label —
+			// otherwise multiple ownerless shadows would alias under
+			// the same phantom "<namespace>/" key and pollute the
+			// collision map.
+			continue
+		}
+		ownerID := shadow.Namespace + "/" + ownerName
 		for _, val := range shadow.Data {
 			s := string(val)
 			if len(s) < secrets.ShadowPrefixLen {

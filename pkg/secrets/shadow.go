@@ -56,15 +56,23 @@ func NewShadowGenerator(seed map[string]map[string]struct{}, log *zap.SugaredLog
 }
 
 // Generate returns a shadow value of exactly originalLen bytes whose
-// 8-byte prefix is not occupied by any owner OTHER than ownerID. The
-// ownerID exclusion exists so reconciling the same secret twice is
-// not flagged as a collision against its own previous shadow.
+// 8-byte prefix is occupied by NO owner currently known to the
+// generator. A freshly-minted shadow must be globally unique inside
+// the generator's universe — otherwise two keys of the same Secret
+// (which share an ownerID) could land on the same prefix because an
+// owner-excluded check would let it through. Distinct from Collides,
+// which keeps the owner-exclusion semantic for the "reuse my own
+// existing shadow" decision.
 //
-// Retries up to maxRetries times before giving up.
+// On success the chosen prefix is recorded under ownerID so subsequent
+// Generate calls within the same generator avoid it. Retries up to
+// maxRetries times before giving up.
 func (g *ShadowGenerator) Generate(originalLen int, realSecret, ownerID string, maxRetries int) (string, error) {
 	for attempt := 0; attempt < maxRetries; attempt++ {
 		shadow := generateShadowValue(originalLen, realSecret)
-		if !g.collides(shadow, ownerID) {
+		// Empty ownerID → strict global check: any occupant collides.
+		if !g.collides(shadow, "") {
+			g.Record(shadow, ownerID)
 			return shadow, nil
 		}
 		if g.log != nil {

@@ -67,10 +67,15 @@ func TestShadowGenerator_NoCollisionEmptySeed(t *testing.T) {
 }
 
 func TestShadowGenerator_SkipsCollisionFromOtherOwner(t *testing.T) {
-	// Seed with a synthetic prefix held by owner-b. A new shadow whose
-	// first 8 bytes match must be regenerated; we can't force the
-	// regeneration deterministically (crypto/rand), but we can verify
-	// the generator never *returns* a value that collides.
+	// Seed with a synthetic prefix held by owner-b. Generate is strict
+	// (avoids every occupied prefix regardless of owner), so it must
+	// never return a value whose prefix matches the seed. We can't
+	// force the regeneration deterministically (crypto/rand), but we
+	// can verify the contract empirically across many iterations.
+	//
+	// Generate auto-records its returns, so the used-set grows each
+	// iteration; bumping maxRetries to 20 keeps the test bulletproof
+	// against the birthday-paradox failure mode.
 	seedPrefix := "kloak:00"
 	seed := map[string]map[string]struct{}{
 		seedPrefix: {"owner-b": struct{}{}},
@@ -78,13 +83,41 @@ func TestShadowGenerator_SkipsCollisionFromOtherOwner(t *testing.T) {
 	g := NewShadowGenerator(seed, nil)
 
 	for i := 0; i < 50; i++ {
-		got, err := g.Generate(32, "real", "owner-a", 5)
+		got, err := g.Generate(32, "real", "owner-a", 20)
 		if err != nil {
 			t.Fatalf("iter %d: Generate: %v", i, err)
 		}
 		if got[:ShadowPrefixLen] == seedPrefix {
 			t.Errorf("iter %d: returned colliding shadow %q (prefix %q held by owner-b)", i, got, seedPrefix)
 		}
+	}
+}
+
+func TestShadowGenerator_GenerateAutoRecords(t *testing.T) {
+	// A freshly-minted shadow must be globally unique within the
+	// generator's universe — including against earlier Generate calls
+	// from the SAME ownerID. Two keys of the same Secret must not
+	// land on the same 8-byte prefix.
+	g := NewShadowGenerator(nil, nil)
+	a, err := g.Generate(32, "v1", "owner-a", 20)
+	if err != nil {
+		t.Fatalf("first Generate: %v", err)
+	}
+	b, err := g.Generate(32, "v2", "owner-a", 20)
+	if err != nil {
+		t.Fatalf("second Generate: %v", err)
+	}
+	if a[:ShadowPrefixLen] == b[:ShadowPrefixLen] {
+		t.Errorf("two consecutive Generate calls under owner-a produced the same prefix %q (a=%q, b=%q)",
+			a[:ShadowPrefixLen], a, b)
+	}
+	// Confirm via the public surface that owner-a is recorded for
+	// both prefixes (not just the second).
+	if !g.Collides(a, "owner-b") {
+		t.Errorf("first Generate's prefix should be recorded; Collides(_, owner-b) returned false")
+	}
+	if !g.Collides(b, "owner-b") {
+		t.Errorf("second Generate's prefix should be recorded; Collides(_, owner-b) returned false")
 	}
 }
 

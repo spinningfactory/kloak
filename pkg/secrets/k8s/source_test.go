@@ -243,6 +243,39 @@ func TestSeedShadowGenerator(t *testing.T) {
 	}
 }
 
+func TestSeedShadowGenerator_SkipsOwnerless(t *testing.T) {
+	// A managed shadow without a getkloak.io/owner label is malformed
+	// (kloak's reconciler always sets it). If we kept it, multiple
+	// such shadows would alias under the phantom ownerID
+	// "<namespace>/" and pollute the collision map. Skip them.
+	scheme := newScheme(t)
+	good := makeShadow("ns", "alice", map[string]string{"k": "kloak:goodPRFX"})
+	// Build an ownerless managed shadow by hand (makeShadow always
+	// sets LabelOwner).
+	ownerless := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "stranger-kloak",
+			Namespace: "ns",
+			Labels:    map[string]string{LabelManaged: "true"},
+		},
+		Data: map[string][]byte{"k": []byte("kloak:badPRFXX")},
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(good, ownerless).Build()
+
+	seed, err := SeedShadowGenerator(context.Background(), c)
+	if err != nil {
+		t.Fatalf("Seed: %v", err)
+	}
+	// alice's prefix should be present.
+	if _, ok := seed["kloak:go"]; !ok {
+		t.Errorf("good owner's prefix missing from seed: %v", seed)
+	}
+	// The ownerless shadow's prefix must not be present.
+	if owners, ok := seed["kloak:ba"]; ok {
+		t.Errorf("ownerless shadow leaked into seed under owners %v", owners)
+	}
+}
+
 func TestSeedShadowGenerator_NilReader(t *testing.T) {
 	seed, err := SeedShadowGenerator(context.Background(), nil)
 	if err != nil {
