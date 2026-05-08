@@ -247,12 +247,22 @@ func detectGoTLSFromDWARF(exePath string) (string, GoTLSOffsets, error) {
 		foundPD = true
 	}
 
-	// Go <1.24: GCM struct in crypto/cipher. Name varies across versions.
+	// Go <1.24: prefer crypto/aes.gcmAsm — the AES-NI/PCLMULQDQ runtime
+	// type that crypto/cipher.NewGCM(aesBlock) actually returns. Layout:
+	// ks []uint32 (24-byte slice header) + productTable [256]byte at
+	// offset 24, so PDBase = 24 + 224 = 248. The crypto/cipher.gcm path
+	// is the SOFTWARE FALLBACK used only when the cipher.Block lacks
+	// gcmAble; its productTable lives 8 bytes later (offset 32) and
+	// reading from it produces an off-by-8 garbage value that breaks
+	// GMAC for normal AES-NI builds. Mirrors the search order in
+	// tools/go-tls-offsets/main.go.
 	if !foundPD {
 		for _, sn := range []string{
-			"crypto/cipher.gcm",
+			"crypto/aes.gcmAsm",
+			"crypto/aes.gcmAES",
 			"crypto/cipher.gcmAES",
 			"crypto/cipher.gcmAsm",
+			"crypto/cipher.gcm", // software-fallback (no AES-NI)
 		} {
 			if pt, ok := getField(structFields, sn, "productTable"); ok {
 				pdBase = pt + 224
@@ -312,7 +322,10 @@ func isGoTLSTargetStruct(name string) bool {
 		"crypto/tls.halfConn",
 		"crypto/tls.prefixNonceAEAD",
 		"crypto/tls.xorNonceAEAD",
-		// Go 1.20–1.23: GCM struct in crypto/cipher (name varies).
+		// Go 1.20–1.23: AES-NI runtime type lives in crypto/aes; crypto/cipher
+		// types are the software fallback used when AES-NI is unavailable.
+		"crypto/aes.gcmAsm",
+		"crypto/aes.gcmAES",
 		"crypto/cipher.gcm",
 		"crypto/cipher.gcmAES",
 		"crypto/cipher.gcmAsm",
