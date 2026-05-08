@@ -252,21 +252,27 @@ jobs:
         id: find
         run: |
           set -euo pipefail
-          # Latest stable per minor from go.dev.
+          # Latest stable per minor from go.dev. `comm` (used below) requires
+          # both inputs to be sorted in the SAME collation, and `LC_ALL=C
+          # sort -u` is comm's contract. Don't use `sort -V` here — that's
+          # version-aware (1.2 before 1.10), but `comm` is lex-aware (1.10
+          # before 1.2), and mixing them causes `comm: not in sorted order`.
+          # We only need set membership for the diff; ordering doesn't matter
+          # to the downstream awk filter.
           curl -fsS "https://go.dev/dl/?mode=json&include=all" \
             | jq -r '.[] | select(.stable) | .version' \
             | sed 's/^go//' \
             | awk -F. '{ printf "%d.%d\n", $1, $2 }' \
-            | sort -u -V > upstream-minors.txt
+            | LC_ALL=C sort -u > upstream-minors.txt
 
           ls tools/go-tls-offsets/results/ \
             | sed -n 's/^go-\([0-9]*\.[0-9]*\)-amd64\.json$/\1/p' \
-            | sort -u -V > tracked-minors.txt
+            | LC_ALL=C sort -u > tracked-minors.txt
 
           # MIN_VERSION mirrors the floor used by build-fixtures.sh — anything
           # older than that is intentionally unsupported, not "new".
           MIN_VERSION="1.20"
-          comm -23 upstream-minors.txt tracked-minors.txt \
+          LC_ALL=C comm -23 upstream-minors.txt tracked-minors.txt \
             | awk -v m="$MIN_VERSION" -F. '{ cur = $1 + $2/100; lim = (split(m, mm, ".") ? mm[1] + mm[2]/100 : 0); if (cur >= lim) print }' \
             > new-minors.txt
 
