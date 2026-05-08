@@ -52,8 +52,14 @@ type goTLSOffsetEntry struct {
 //
 // Two distinct shapes:
 //
-//	Go 1.20–1.23: GCM struct is `crypto/cipher.gcm` (size 288, productTable
-//	              at offset 32 → PDBase = 32 + 224 = 256).
+//	Go 1.20–1.23: GCM struct is `crypto/aes.gcmAsm` — the AES-NI/PCLMULQDQ
+//	              path that crypto/cipher.NewGCM(aesBlock) actually returns
+//	              at runtime. Layout: ks []uint32 (24-byte slice header) +
+//	              productTable [256]byte at offset 24 → PDBase = 24 + 224 = 248.
+//	              (crypto/cipher.gcm is the dead software fallback; it has
+//	              productTable at offset 32 and earlier table entries used
+//	              PDBase=256, off-by-8, which silently broke GMAC for
+//	              Go ≤1.23 demos.)
 //	Go 1.24+:     GCM moved into `crypto/internal/fips140/aes/gcm.GCM` with
 //	              a gcmPlatformData wrapper (gcmPlatformData=504,
 //	              productTable=0 → PDBase = 504 + 0 + 224 = 728).
@@ -63,11 +69,11 @@ type goTLSOffsetEntry struct {
 //	make go-tls-discover    (Docker; rebuilds fixtures + JSONs)
 //	then mirror the JSON values into a new entry below.
 var goTLSOffsetTableBase = map[string]goTLSOffsetEntry{
-	// Go 1.20–1.23: crypto/cipher.gcm (PDBase = 32 + 224 = 256).
-	"1.20": {ConnToCipher: 552, AEADIfaceOff: 24, PDBase: 256, ConnVersOff: 64},
-	"1.21": {ConnToCipher: 568, AEADIfaceOff: 24, PDBase: 256, ConnVersOff: 72},
-	"1.22": {ConnToCipher: 568, AEADIfaceOff: 24, PDBase: 256, ConnVersOff: 72},
-	"1.23": {ConnToCipher: 576, AEADIfaceOff: 24, PDBase: 256, ConnVersOff: 72},
+	// Go 1.20–1.23: crypto/aes.gcmAsm (PDBase = 24 + 224 = 248).
+	"1.20": {ConnToCipher: 552, AEADIfaceOff: 24, PDBase: 248, ConnVersOff: 64},
+	"1.21": {ConnToCipher: 568, AEADIfaceOff: 24, PDBase: 248, ConnVersOff: 72},
+	"1.22": {ConnToCipher: 568, AEADIfaceOff: 24, PDBase: 248, ConnVersOff: 72},
+	"1.23": {ConnToCipher: 576, AEADIfaceOff: 24, PDBase: 248, ConnVersOff: 72},
 	// Go 1.24+: FIPS module, gcmPlatformData (PDBase = 504 + 0 + 224 = 728).
 	"1.24": {ConnToCipher: 576, AEADIfaceOff: 24, PDBase: 728, ConnVersOff: 72},
 	"1.25": {ConnToCipher: 560, AEADIfaceOff: 24, PDBase: 728, ConnVersOff: 72},

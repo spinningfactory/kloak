@@ -181,15 +181,30 @@ func main() {
 		fmt.Fprintf(os.Stderr, "PDBase = GCM.gcmPlatformData(%d) + productTable(%d) + 224 = %d\n", gcmPD, pdPT, pdBase)
 	}
 
-	// Go <1.24: the GCM struct lives in crypto/cipher. Its name varies:
-	//   Go 1.20–1.23: crypto/cipher.gcm
-	//   (some compile paths in older versions also expose: gcmAES,
-	//    gcmAESCBC, gcmAsm — left here for forward-compat.)
+	// Go <1.24: prefer crypto/aes.gcmAsm — the AES-NI/PCLMULQDQ-optimized
+	// path that crypto/cipher.NewGCM(aesBlock) actually returns at runtime
+	// when the CPU supports it. crypto/cipher.gcm is the SOFTWARE FALLBACK
+	// used only when the cipher.Block doesn't implement gcmAble; the AEAD
+	// interface in a normal TLS process points to *gcmAsm, not *gcm. Old
+	// versions of this tool used cipher.gcm offsets and produced offsets
+	// that were correct for the dead fallback type but wrong for the
+	// runtime type — `pd_base` was off by 8 bytes (cipher.gcm has its
+	// productTable at offset 32 after a 16-byte cipher iface; gcmAsm has
+	// it at offset 24 after a 24-byte slice header `ks []uint32`). That
+	// 8-byte miss made BPF read garbage, fail GMAC, and silently drop
+	// every rewrite for Go 1.20–1.23 demos.
+	//
+	// `gcmAES` / `gcmAESCBC` are kept as forward-compat hooks; if a future
+	// Go ships either, fall back to them (and finally to crypto/cipher.gcm
+	// for builds without AES-NI, where the fallback type IS the runtime
+	// type — those produce correct offsets too).
 	if !foundPD {
 		for _, sn := range []string{
-			"crypto/cipher.gcm",
+			"crypto/aes.gcmAsm",
+			"crypto/aes.gcmAES",
 			"crypto/cipher.gcmAES",
 			"crypto/cipher.gcmAsm",
+			"crypto/cipher.gcm", // software-fallback path (no AES-NI)
 		} {
 			if pt, ok := getField(structs, sn, "productTable"); ok {
 				pdBase = pt + 224
@@ -249,7 +264,10 @@ func isTargetStruct(name string) bool {
 		"crypto/tls.halfConn",
 		"crypto/tls.prefixNonceAEAD",
 		"crypto/tls.xorNonceAEAD",
-		// Go 1.20–1.23: GCM struct in crypto/cipher.
+		// Go 1.20–1.23: AES-NI runtime type lives in crypto/aes; crypto/cipher
+		// types are the software fallback used when AES-NI is unavailable.
+		"crypto/aes.gcmAsm",
+		"crypto/aes.gcmAES",
 		"crypto/cipher.gcm",
 		"crypto/cipher.gcmAES",
 		"crypto/cipher.gcmAsm",
