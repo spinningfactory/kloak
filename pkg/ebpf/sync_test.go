@@ -14,7 +14,17 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	k8ssecrets "github.com/spinningfactory/kloak/pkg/secrets/k8s"
 )
+
+// k8sSource wraps a controller-runtime fake client as a secrets.Source so
+// the existing k8s-shaped fixtures keep driving syncSecrets. The adapter
+// itself has its own unit tests in pkg/secrets/k8s; here we just want the
+// "k8s state → BPF map" integration coverage.
+func k8sSource(reader client.Reader) *k8ssecrets.Source {
+	return k8ssecrets.NewSource(reader)
+}
 
 // createTestSecretMap creates a BPF hash map matching the secret_map spec.
 func createTestSecretMap(t *testing.T) *ciliumebpf.Map {
@@ -103,7 +113,7 @@ func TestSyncSecrets_BasicSync(t *testing.T) {
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
 
-	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -134,7 +144,7 @@ func TestSyncSecrets_MinLength(t *testing.T) {
 			map[string][]byte{"api-key": []byte("kloak:")}),
 	)
 
-	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -158,7 +168,7 @@ func TestSyncSecrets_Truncation(t *testing.T) {
 			map[string][]byte{"api-key": []byte(longShadow)}),
 	)
 
-	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -184,7 +194,7 @@ func TestSyncSecrets_HostFilter(t *testing.T) {
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
 
-	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -214,7 +224,7 @@ func TestSyncSecrets_WildcardHost(t *testing.T) {
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
 
-	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -240,7 +250,7 @@ func TestSyncSecrets_StaleEntryPruning(t *testing.T) {
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
-	if err := syncSecrets(context.Background(), m, nil, reader1, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader1), testLog()); err != nil {
 		t.Fatalf("first sync failed: %v", err)
 	}
 
@@ -254,7 +264,7 @@ func TestSyncSecrets_StaleEntryPruning(t *testing.T) {
 
 	// Remove the enabled secret (simulate deletion) and sync again with empty client
 	reader2 := newFakeClient()
-	if err := syncSecrets(context.Background(), m, nil, reader2, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader2), testLog()); err != nil {
 		t.Fatalf("second sync failed: %v", err)
 	}
 
@@ -274,7 +284,7 @@ func TestSyncSecrets_Update(t *testing.T) {
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
-	if err := syncSecrets(context.Background(), m, nil, reader1, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader1), testLog()); err != nil {
 		t.Fatalf("first sync failed: %v", err)
 	}
 
@@ -285,7 +295,7 @@ func TestSyncSecrets_Update(t *testing.T) {
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
-	if err := syncSecrets(context.Background(), m, nil, reader2, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader2), testLog()); err != nil {
 		t.Fatalf("second sync failed: %v", err)
 	}
 
@@ -312,7 +322,7 @@ func TestSyncSecrets_FullPrefix(t *testing.T) {
 			map[string][]byte{"api-key": []byte(shadow)}),
 	)
 
-	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -348,7 +358,7 @@ func TestSyncSecrets_WatchedHostsSync(t *testing.T) {
 			map[string][]byte{"api-key": []byte("kloak:efgh5678-1234-5678")}),
 	)
 
-	if err := syncSecrets(context.Background(), m, wh, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, wh, k8sSource(reader), testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -379,7 +389,7 @@ func TestSyncSecrets_WatchedHostsPruning(t *testing.T) {
 		shadowSecret("my-secret-kloak", "default", "my-secret",
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
-	if err := syncSecrets(context.Background(), m, wh, reader1, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, wh, k8sSource(reader1), testLog()); err != nil {
 		t.Fatalf("first sync failed: %v", err)
 	}
 
@@ -393,7 +403,7 @@ func TestSyncSecrets_WatchedHostsPruning(t *testing.T) {
 
 	// Remove secret and sync again
 	reader2 := newFakeClient()
-	if err := syncSecrets(context.Background(), m, wh, reader2, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, wh, k8sSource(reader2), testLog()); err != nil {
 		t.Fatalf("second sync failed: %v", err)
 	}
 
@@ -413,7 +423,7 @@ func TestSyncSecrets_IPFilter(t *testing.T) {
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
 
-	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
@@ -456,7 +466,7 @@ func TestSyncSecrets_IPv6Filter(t *testing.T) {
 			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
 	)
 
-	if err := syncSecrets(context.Background(), m, nil, reader, testLog()); err != nil {
+	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
 		t.Fatalf("syncSecrets failed: %v", err)
 	}
 
