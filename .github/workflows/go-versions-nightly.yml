@@ -308,7 +308,7 @@ jobs:
 
       - name: Open PR
         if: steps.find.outputs.new != ''
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           commit-message: "chore(go): add offset support for Go ${{ steps.find.outputs.new }}"
           branch: auto/go-versions/${{ steps.find.outputs.new }}
