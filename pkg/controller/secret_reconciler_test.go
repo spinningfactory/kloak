@@ -14,6 +14,8 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
 func newSecretReconciler(objs ...client.Object) (*SecretReconciler, client.Client) {
@@ -79,8 +81,8 @@ func TestSecretReconciler_CreatesShadowSecret(t *testing.T) {
 	if len(shadowVal) != len("super-secret-value-12345678") {
 		t.Errorf("shadow length %d != original length %d", len(shadowVal), len("super-secret-value-12345678"))
 	}
-	if !strings.HasPrefix(string(shadowVal), ValuePrefix) {
-		t.Errorf("shadow value %q should start with %q", shadowVal, ValuePrefix)
+	if !strings.HasPrefix(string(shadowVal), secrets.ValuePrefix) {
+		t.Errorf("shadow value %q should start with %q", shadowVal, secrets.ValuePrefix)
 	}
 }
 

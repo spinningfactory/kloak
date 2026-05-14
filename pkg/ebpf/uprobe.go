@@ -21,10 +21,9 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 
-	"sigs.k8s.io/controller-runtime/pkg/client"
-
 	"github.com/spinningfactory/kloak/pkg/cgroups"
 	"github.com/spinningfactory/kloak/pkg/logging"
+	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
 // tlsEvent must match the C struct tls_event (lightweight, no data payload)
@@ -83,8 +82,11 @@ type TLSUprobeManager struct {
 	log        *zap.SugaredLogger
 	links      []link.Link
 
-	// k8sReader provides access to Kubernetes secrets via the informer cache
-	k8sReader client.Reader
+	// secretSource produces snapshots of the secrets the BPF map should
+	// hold. The k8s controller wires a pkg/secrets/k8s.Source here; tests
+	// or non-k8s callers may pass nil (sync becomes a no-op) or a
+	// different implementation.
+	secretSource secrets.Source
 	// cgroupRoot is the path to the cgroup v2 filesystem (e.g. /sys/fs/cgroup)
 	cgroupRoot string
 	// cgroupPaths maps cgroup inode ID -> filesystem path.
@@ -221,7 +223,7 @@ func parseBPFLogLevel(s string) ebpf.LogLevel {
 }
 
 // NewTLSUprobeManager initializes a new uprobe manager.
-func NewTLSUprobeManager(k8sReader client.Reader, cgroupRoot string, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
+func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot string, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
 	log = log.Named("ebpf-uprobe")
 
 	objs := &tlsuprobeObjects{}
@@ -291,12 +293,12 @@ func NewTLSUprobeManager(k8sReader client.Reader, cgroupRoot string, log *zap.Su
 	}
 
 	mgr := &TLSUprobeManager{
-		objs:       objs,
-		reader:     reader,
-		procReader: procReader,
-		log:        log,
-		k8sReader:  k8sReader,
-		cgroupRoot: cgroupRoot,
+		objs:         objs,
+		reader:       reader,
+		procReader:   procReader,
+		log:          log,
+		secretSource: secretSource,
+		cgroupRoot:   cgroupRoot,
 	}
 
 	// Attach tracepoints for DNS interception and connect tracking.
@@ -1201,7 +1203,7 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 // syncSecretsToBPF updates the eBPF map with the latest shadow secret values
 // and the watched_hosts map with hostnames from secret entries.
 func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
-	if err := syncSecrets(ctx, m.objs.SecretMap, m.objs.WatchedHosts, m.k8sReader, m.log); err != nil {
+	if err := syncSecrets(ctx, m.objs.SecretMap, m.objs.WatchedHosts, m.secretSource, m.log); err != nil {
 		m.log.Errorw("failed to sync secrets to BPF map", "error", err)
 	}
 }
