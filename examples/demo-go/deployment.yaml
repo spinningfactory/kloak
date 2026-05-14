@@ -20,26 +20,26 @@ spec:
         - name: demo-app
           image: kloak-demo-go:latest
           imagePullPolicy: Never
+          # demo-go uses env-var injection via secretKeyRef so the
+          # full path is covered end-to-end:
+          #   1. webhook rewrites secretKeyRef.name → <name>-kloak
+          #   2. container starts with the shadow placeholder in env
+          #   3. demo sends it as an HTTP header
+          #   4. eBPF rewrites the placeholder → real value on the wire
+          # demo-python / demo-js continue to use the volume-mount path
+          # so both injection models stay covered by the e2e suite.
           env:
-            - name: SECRET_ALLOWED_FILE
-              value: "/etc/secrets/allowed/api-key"
-            - name: SECRET_BLOCKED_FILE
-              value: "/etc/secrets/blocked/api-key"
+            - name: SECRET_ALLOWED
+              valueFrom:
+                secretKeyRef:
+                  name: secret-allowed
+                  key: api-key
+            - name: SECRET_BLOCKED
+              valueFrom:
+                secretKeyRef:
+                  name: secret-blocked
+                  key: api-key
             - name: TARGET_URL
               value: "https://httpbin.org/headers"
             - name: REQUEST_INTERVAL
               value: "5"
-          volumeMounts:
-            - name: secret-allowed-vol
-              mountPath: "/etc/secrets/allowed"
-              readOnly: true
-            - name: secret-blocked-vol
-              mountPath: "/etc/secrets/blocked"
-              readOnly: true
-      volumes:
-        - name: secret-allowed-vol
-          secret:
-            secretName: secret-allowed
-        - name: secret-blocked-vol
-          secret:
-            secretName: secret-blocked

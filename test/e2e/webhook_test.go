@@ -123,6 +123,91 @@ func TestWebhookNonEnabledSecretUntouched(t *testing.T) {
 	}
 }
 
+func TestWebhookEnvVarRewrite(t *testing.T) {
+	// secretKeyRef path: the webhook should rewrite
+	// `env[].valueFrom.secretKeyRef.name` to point at the shadow,
+	// same fail-closed posture as the volume path. This is the
+	// Datadog-style injection model that issue #96 covers.
+	secretData := map[string][]byte{"api-key": []byte("envvar-test-secret-val")}
+	createEnabledSecret(t, "test-wh-env", secretData, nil, nil)
+	assertShadowSecret(t, "test-wh-env", secretData)
+
+	createPodWithSecretEnvVar(t, "test-wh-env-pod", "test-wh-env", "api-key")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := waitForPodPhase(ctx, testNamespace, "test-wh-env-pod"); err != nil {
+		t.Fatalf("pod not created: %v", err)
+	}
+
+	pod, err := clientset.CoreV1().Pods(testNamespace).Get(context.Background(), "test-wh-env-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get pod: %v", err)
+	}
+
+	// Verify the secretKeyRef was rewritten to the shadow name.
+	var foundRewrite bool
+	for _, c := range pod.Spec.Containers {
+		for _, ev := range c.Env {
+			if ev.ValueFrom == nil || ev.ValueFrom.SecretKeyRef == nil {
+				continue
+			}
+			name := ev.ValueFrom.SecretKeyRef.Name
+			if name == "test-wh-env" {
+				t.Errorf("env %q still references original secret 'test-wh-env', expected 'test-wh-env-kloak'", ev.Name)
+			}
+			if name == "test-wh-env-kloak" {
+				foundRewrite = true
+			}
+		}
+	}
+	if !foundRewrite {
+		t.Error("no env var found referencing shadow secret 'test-wh-env-kloak'")
+	}
+}
+
+func TestWebhookEnvFromRewrite(t *testing.T) {
+	// envFrom path: every key from the secret becomes an env var.
+	// Same rewrite semantics — the SecretRef.Name swaps to the shadow.
+	secretData := map[string][]byte{
+		"api-key":   []byte("envfrom-test-secret-val"),
+		"other-key": []byte("envfrom-extra-value"),
+	}
+	createEnabledSecret(t, "test-wh-envfrom", secretData, nil, nil)
+	assertShadowSecret(t, "test-wh-envfrom", secretData)
+
+	createPodWithSecretEnvFrom(t, "test-wh-envfrom-pod", "test-wh-envfrom")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := waitForPodPhase(ctx, testNamespace, "test-wh-envfrom-pod"); err != nil {
+		t.Fatalf("pod not created: %v", err)
+	}
+
+	pod, err := clientset.CoreV1().Pods(testNamespace).Get(context.Background(), "test-wh-envfrom-pod", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("failed to get pod: %v", err)
+	}
+
+	var foundRewrite bool
+	for _, c := range pod.Spec.Containers {
+		for _, ef := range c.EnvFrom {
+			if ef.SecretRef == nil {
+				continue
+			}
+			if ef.SecretRef.Name == "test-wh-envfrom" {
+				t.Error("envFrom still references original secret 'test-wh-envfrom', expected 'test-wh-envfrom-kloak'")
+			}
+			if ef.SecretRef.Name == "test-wh-envfrom-kloak" {
+				foundRewrite = true
+			}
+		}
+	}
+	if !foundRewrite {
+		t.Error("no envFrom found referencing shadow secret 'test-wh-envfrom-kloak'")
+	}
+}
+
 func TestWebhookMountedContent(t *testing.T) {
 	secretData := map[string][]byte{"api-key": []byte("REAL-SECRET-DO-NOT-LEAK")}
 	createEnabledSecret(t, "test-wh-content", secretData, nil, nil)
@@ -203,6 +288,72 @@ func createPodThatReadsSecret(t *testing.T, name, secretName, key string) {
 	}
 	_, err := clientset.CoreV1().Pods(testNamespace).Create(context.Background(), pod, metav1.CreateOptions{})
 	if err != nil {
+		t.Fatalf("failed to create pod %s: %v", name, err)
+	}
+	t.Cleanup(func() {
+		_ = clientset.CoreV1().Pods(testNamespace).Delete(context.Background(), name, metav1.DeleteOptions{})
+	})
+}
+
+// createPodWithSecretEnvVar creates a pod that exposes a single env var
+// sourced from a secret via env[].valueFrom.secretKeyRef.
+func createPodWithSecretEnvVar(t *testing.T, name, secretName, key string) {
+	t.Helper()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: testNamespace,
+			Labels:    map[string]string{"getkloak.io/enabled": "true"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:    "app",
+				Image:   "busybox:latest",
+				Command: []string{"sleep", "3600"},
+				Env: []corev1.EnvVar{{
+					Name: "API_KEY",
+					ValueFrom: &corev1.EnvVarSource{
+						SecretKeyRef: &corev1.SecretKeySelector{
+							LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+							Key:                  key,
+						},
+					},
+				}},
+			}},
+		},
+	}
+	if _, err := clientset.CoreV1().Pods(testNamespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create pod %s: %v", name, err)
+	}
+	t.Cleanup(func() {
+		_ = clientset.CoreV1().Pods(testNamespace).Delete(context.Background(), name, metav1.DeleteOptions{})
+	})
+}
+
+// createPodWithSecretEnvFrom creates a pod that pulls every key from
+// `secretName` via envFrom[].secretRef.
+func createPodWithSecretEnvFrom(t *testing.T, name, secretName string) {
+	t.Helper()
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: testNamespace,
+			Labels:    map[string]string{"getkloak.io/enabled": "true"},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:    "app",
+				Image:   "busybox:latest",
+				Command: []string{"sleep", "3600"},
+				EnvFrom: []corev1.EnvFromSource{{
+					SecretRef: &corev1.SecretEnvSource{
+						LocalObjectReference: corev1.LocalObjectReference{Name: secretName},
+					},
+				}},
+			}},
+		},
+	}
+	if _, err := clientset.CoreV1().Pods(testNamespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("failed to create pod %s: %v", name, err)
 	}
 	t.Cleanup(func() {
