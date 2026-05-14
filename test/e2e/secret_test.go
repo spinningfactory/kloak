@@ -1,3 +1,5 @@
+//go:build e2e_ebpf
+
 package e2e
 
 import (
