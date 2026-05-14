@@ -144,33 +144,56 @@ func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, nam
 	return nil
 }
 
-// rewriteSecretEnvVars rewrites every container + init container's
-// `env[].valueFrom.secretKeyRef.name` and `envFrom[].secretRef.name` to
-// point at the shadow secret when the referenced secret is kloak-enabled.
-// Same fail-closed semantics as rewriteSecretVolumes.
+// rewriteSecretEnvVars rewrites secretKeyRef + envFrom secretRef
+// references across every Container, InitContainer, AND EphemeralContainer
+// to point at the shadow secret. Same fail-closed semantics as
+// rewriteSecretVolumes.
 //
-// Env / EnvFrom are container-level fields, so we iterate both
-// Spec.Containers and Spec.InitContainers — unlike Spec.Volumes which is
-// pod-level and shared.
+// Env / EnvFrom are container-level fields, so all three container slices
+// must be iterated separately — unlike Spec.Volumes which is pod-level
+// and shared. EphemeralContainers carry their fields under the embedded
+// EphemeralContainerCommon struct (same shape as Container), so the inner
+// helper is factored to take the slices directly rather than a
+// *corev1.Container.
+//
+// Note: kloak's MutatingWebhookConfiguration is scoped to pod CREATE
+// today; the `ephemeralcontainers` subresource (used by `kubectl debug`)
+// doesn't trigger this webhook. The EphemeralContainers loop is defensive
+// coverage for pods that pre-declare ephemeral containers at create time,
+// and so the helper stays correct if the webhook scope ever widens.
 func (h *Handler) rewriteSecretEnvVars(ctx context.Context, pod *corev1.Pod, namespace string) error {
 	for i := range pod.Spec.Containers {
-		if err := h.rewriteContainerEnv(ctx, &pod.Spec.Containers[i], namespace); err != nil {
+		c := &pod.Spec.Containers[i]
+		if err := h.rewriteEnvSlices(ctx, c.Name, c.Env, c.EnvFrom, namespace); err != nil {
 			return err
 		}
 	}
 	for i := range pod.Spec.InitContainers {
-		if err := h.rewriteContainerEnv(ctx, &pod.Spec.InitContainers[i], namespace); err != nil {
+		c := &pod.Spec.InitContainers[i]
+		if err := h.rewriteEnvSlices(ctx, c.Name, c.Env, c.EnvFrom, namespace); err != nil {
+			return err
+		}
+	}
+	for i := range pod.Spec.EphemeralContainers {
+		ec := &pod.Spec.EphemeralContainers[i]
+		if err := h.rewriteEnvSlices(ctx, ec.Name, ec.Env, ec.EnvFrom, namespace); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// rewriteContainerEnv handles a single container's Env + EnvFrom slices.
-func (h *Handler) rewriteContainerEnv(ctx context.Context, c *corev1.Container, namespace string) error {
+// rewriteEnvSlices is the inner per-container logic. Takes slices
+// directly so it can work for Container, InitContainer (both
+// corev1.Container) AND EphemeralContainer (whose Env/EnvFrom fields
+// live on the embedded EphemeralContainerCommon, not directly on a
+// *corev1.Container). Modifications happen via the pointer-typed
+// ValueFrom / SecretRef fields, so the slice itself doesn't need to
+// be a pointer.
+func (h *Handler) rewriteEnvSlices(ctx context.Context, containerName string, env []corev1.EnvVar, envFrom []corev1.EnvFromSource, namespace string) error {
 	// env[].valueFrom.secretKeyRef — single key from a secret.
-	for i := range c.Env {
-		vf := c.Env[i].ValueFrom
+	for i := range env {
+		vf := env[i].ValueFrom
 		if vf == nil || vf.SecretKeyRef == nil {
 			continue
 		}
@@ -183,14 +206,14 @@ func (h *Handler) rewriteContainerEnv(ctx context.Context, c *corev1.Container, 
 			continue
 		}
 		h.log.Debugw("rewriting env secretKeyRef to use shadow secret",
-			"container", c.Name, "envVar", c.Env[i].Name,
+			"container", containerName, "envVar", env[i].Name,
 			"original", vf.SecretKeyRef.Name, "shadow", shadow)
 		vf.SecretKeyRef.Name = shadow
 	}
 
 	// envFrom[].secretRef — every key from a secret.
-	for i := range c.EnvFrom {
-		sr := c.EnvFrom[i].SecretRef
+	for i := range envFrom {
+		sr := envFrom[i].SecretRef
 		if sr == nil {
 			continue
 		}
@@ -203,7 +226,7 @@ func (h *Handler) rewriteContainerEnv(ctx context.Context, c *corev1.Container, 
 			continue
 		}
 		h.log.Debugw("rewriting envFrom secretRef to use shadow secret",
-			"container", c.Name, "original", sr.Name, "shadow", shadow)
+			"container", containerName, "original", sr.Name, "shadow", shadow)
 		sr.Name = shadow
 	}
 	return nil

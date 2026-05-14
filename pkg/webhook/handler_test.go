@@ -697,6 +697,54 @@ func TestRewriteContainerEnv_InitContainer(t *testing.T) {
 	}
 }
 
+func TestRewriteContainerEnv_EphemeralContainer(t *testing.T) {
+	// EphemeralContainers carry Env/EnvFrom under the embedded
+	// EphemeralContainerCommon, not directly on a *corev1.Container.
+	// The rewrite loop must walk that slice too — defensive coverage
+	// for pods that pre-declare ephemerals at create time (the only
+	// path that triggers kloak's CREATE-scoped webhook). Both
+	// env-paths (secretKeyRef + envFrom) are exercised here so a
+	// regression in either is caught.
+	keyRefSecret, keyRefShadow := enabledAndShadow("ec-key", "default")
+	fromSecret, fromShadow := enabledAndShadow("ec-bundle", "default")
+	h := newTestHandler(keyRefSecret, keyRefShadow, fromSecret, fromShadow)
+
+	pod := &corev1.Pod{
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{Name: "app", Image: "busybox"}},
+			EphemeralContainers: []corev1.EphemeralContainer{{
+				EphemeralContainerCommon: corev1.EphemeralContainerCommon{
+					Name:  "debug",
+					Image: "busybox",
+					Env: []corev1.EnvVar{{
+						Name: "DEBUG_TOKEN",
+						ValueFrom: &corev1.EnvVarSource{
+							SecretKeyRef: &corev1.SecretKeySelector{
+								LocalObjectReference: corev1.LocalObjectReference{Name: "ec-key"},
+								Key:                  "token",
+							},
+						},
+					}},
+					EnvFrom: []corev1.EnvFromSource{{
+						SecretRef: &corev1.SecretEnvSource{
+							LocalObjectReference: corev1.LocalObjectReference{Name: "ec-bundle"},
+						},
+					}},
+				},
+			}},
+		},
+	}
+	if err := h.rewriteSecretEnvVars(context.Background(), pod, "default"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if got := pod.Spec.EphemeralContainers[0].Env[0].ValueFrom.SecretKeyRef.Name; got != "ec-key-kloak" {
+		t.Errorf("ephemeralContainer Env: expected ec-key-kloak, got %q", got)
+	}
+	if got := pod.Spec.EphemeralContainers[0].EnvFrom[0].SecretRef.Name; got != "ec-bundle-kloak" {
+		t.Errorf("ephemeralContainer EnvFrom: expected ec-bundle-kloak, got %q", got)
+	}
+}
+
 func TestRewriteContainerEnv_MultipleRefsSameSecret(t *testing.T) {
 	// Two env vars sourced from the same secret → both rewritten in
 	// one pass. Verifies the inner loop doesn't bail after the first
