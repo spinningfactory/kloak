@@ -2,6 +2,7 @@ package secrets
 
 import (
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"math/big"
 	"time"
@@ -69,7 +70,13 @@ func NewShadowGenerator(seed map[string]map[string]struct{}, log *zap.SugaredLog
 // maxRetries times before giving up.
 func (g *ShadowGenerator) Generate(originalLen int, realSecret, ownerID string, maxRetries int) (string, error) {
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		shadow := generateShadowValue(originalLen, realSecret)
+		shadow, err := generateShadowValue(originalLen, realSecret)
+		if err != nil {
+			// ErrHuffmanInvariantUnsatisfiable is deterministic for
+			// given (originalLen, realSecret) — retrying won't help.
+			// Other errors (rand.Int failures) are also retry-pointless.
+			return "", err
+		}
 		// Empty ownerID → strict global check: any occupant collides.
 		if !g.collides(shadow, "") {
 			g.Record(shadow, ownerID)
@@ -125,7 +132,18 @@ func (g *ShadowGenerator) collides(shadow, ownerID string) bool {
 // value.
 //
 // Lifted verbatim from pkg/controller/secret_reconciler.go.
-func generateShadowValue(originalLen int, realSecret string) string {
+//
+// Returns ErrHuffmanInvariantUnsatisfiable when no shadow of length
+// originalLen can encode to a Huffman length ≥ realSecret's. For very
+// short originalLen (say 10) with a high-entropy real secret (e.g. all
+// 'z's, each 7-bit HPACK code), the fixed-Huffman-cost "kloak:" prefix
+// (36 bits) leaves too few tail bytes to match real's encoded length —
+// even when every tail char is one of HPACK's 7-bit codes. Caller
+// (Generate) propagates the error; the BPF map sync path in
+// pkg/ebpf/sync.go separately gates the HTTP/2 variant on
+// realHuffLen ≤ len(huffShadow), so the HTTP/1.1 path still works for
+// such secrets — they just don't get the HTTP/2 rewrite enabled.
+func generateShadowValue(originalLen int, realSecret string) (string, error) {
 	realHuffLen := int(hpack.HuffmanEncodeLength(realSecret))
 
 	// ULID uses Crockford Base32 (uppercase + digits, no hyphens).
@@ -150,7 +168,10 @@ func generateShadowValue(originalLen int, realSecret string) string {
 		padLen := originalLen - len(baseVal)
 		padding := make([]byte, padLen)
 		for i := range padding {
-			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(base32Chars))))
+			n, err := rand.Int(rand.Reader, big.NewInt(int64(len(base32Chars))))
+			if err != nil {
+				return "", fmt.Errorf("rand.Int for padding: %w", err)
+			}
 			padding[i] = base32Chars[n.Int64()]
 		}
 		shadow = baseVal + string(padding)
@@ -185,19 +206,40 @@ func generateShadowValue(originalLen int, realSecret string) string {
 	if shadowHuffLen < realHuffLen {
 		shadowBytes := []byte(shadow)
 		for j := len(shadowBytes) - 1; j >= 6 && shadowHuffLen < realHuffLen; j-- {
-			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(longHuffmanChars))))
+			n, err := rand.Int(rand.Reader, big.NewInt(int64(len(longHuffmanChars))))
+			if err != nil {
+				return "", fmt.Errorf("rand.Int for tail-tune: %w", err)
+			}
 			shadowBytes[j] = longHuffmanChars[n.Int64()]
 			shadowHuffLen = int(hpack.HuffmanEncodeLength(string(shadowBytes)))
 		}
 		shadow = string(shadowBytes)
+		// Even with every tail char as a 7-bit Huffman code, the fixed-
+		// cost "kloak:" prefix can leave shadow Huffman strictly shorter
+		// than real's for some short originalLen × high-Huffman-density
+		// real combinations (e.g. originalLen=10 with all-'z' real:
+		// real=9 bytes Huffman, shadow=8 bytes max). Signal the caller
+		// rather than silently violating the wire-buffer invariant.
+		if shadowHuffLen < realHuffLen {
+			return "", fmt.Errorf("%w: originalLen=%d, real Huffman %d > max shadow Huffman %d",
+				ErrHuffmanInvariantUnsatisfiable, originalLen, realHuffLen, shadowHuffLen)
+		}
 	}
 
-	return shadow
+	return shadow, nil
 }
 
-// longHuffmanChars are HPACK Huffman code-points whose length is 7 bits
-// (RFC 7541 Appendix B). Overwriting any tail char with one of these is
-// guaranteed to *not decrease* the Huffman length of the surrounding
-// string and to increase it whenever the replaced char's code is shorter.
-// Used by generateShadowValue's tail-tuning loop.
-const longHuffmanChars = "MQVWXZ"
+// ErrHuffmanInvariantUnsatisfiable is returned by generateShadowValue
+// when no shadow of the requested length can match the real secret's
+// HPACK Huffman length. The HTTP/2 rewrite path is skipped for such
+// secrets; HTTP/1.1 rewriting still works via the plaintext map entry.
+var ErrHuffmanInvariantUnsatisfiable = errors.New("shadow Huffman length cannot reach real's")
+
+// longHuffmanChars are the only ASCII letters whose HPACK Huffman
+// code is 8 bits — the maximum bit-length for any printable ASCII
+// character in the static table (RFC 7541 Appendix B; verified
+// empirically against `golang.org/x/net/http2/hpack`). Overwriting any
+// tail char with one of these maximizes shadow Huffman density, which
+// is needed to satisfy the invariant against high-density real
+// secrets (e.g. all 'z', each 7 bits).
+const longHuffmanChars = "XZ"
