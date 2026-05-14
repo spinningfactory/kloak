@@ -13,10 +13,11 @@ package ebpf
 // and `go test ./pkg/secrets/... ./pkg/storage/... ./pkg/webhook/...`
 // to run locally without needing a Linux VM.
 //
-// Every method returns errNotSupported (no-op for the void methods).
-// Callers must handle this gracefully on non-Linux; the production
+// Every method returns ErrNotSupported (no-op for the void methods).
+// Callers can branch on `errors.Is(err, ebpf.ErrNotSupported)` if they
+// want to provide cleaner non-Linux fallback messaging — the production
 // controller entrypoint (`kloak controller`) refuses to run on
-// non-Linux anyway, so these stubs are exercised only by tests and
+// non-Linux anyway, so these stubs are exercised mainly by tests and
 // `go vet`.
 
 import (
@@ -29,25 +30,25 @@ import (
 	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
-var errNotSupported = errors.New("kloak: eBPF uprobes are only supported on Linux")
+var ErrNotSupported = errors.New("kloak: eBPF uprobes are only supported on Linux")
 
 // TLSUprobeManager is the public type the rest of the codebase holds.
 // On non-Linux it's an empty struct — every method returns
-// errNotSupported (or is a no-op for the void methods).
+// ErrNotSupported (or is a no-op for the void methods).
 type TLSUprobeManager struct{}
 
 func NewTLSUprobeManager(_ secrets.Source, _ string, _ *zap.SugaredLogger) (*TLSUprobeManager, error) {
-	return nil, errNotSupported
+	return nil, ErrNotSupported
 }
 
-func (m *TLSUprobeManager) TrackTGID(uint32) error                   { return errNotSupported }
-func (m *TLSUprobeManager) UntrackTGID(uint32) error                 { return errNotSupported }
-func (m *TLSUprobeManager) TrackCgroup(uint64, string) error         { return errNotSupported }
+func (m *TLSUprobeManager) TrackTGID(uint32) error                   { return ErrNotSupported }
+func (m *TLSUprobeManager) UntrackTGID(uint32) error                 { return ErrNotSupported }
+func (m *TLSUprobeManager) TrackCgroup(uint64, string) error         { return ErrNotSupported }
 func (m *TLSUprobeManager) RecordCgroupNetns(uint64, int)            {}
-func (m *TLSUprobeManager) UntrackCgroup(uint64) error               { return errNotSupported }
-func (m *TLSUprobeManager) AttachTLS(int, uint64) error              { return errNotSupported }
-func (m *TLSUprobeManager) Close() error                             { return errNotSupported }
-func (m *TLSUprobeManager) PollExecEvents(context.Context) error     { return errNotSupported }
-func (m *TLSUprobeManager) PollEvents(context.Context) error         { return errNotSupported }
-func (m *TLSUprobeManager) PopulateTrustedDNSServers([]net.IP) error { return errNotSupported }
+func (m *TLSUprobeManager) UntrackCgroup(uint64) error               { return ErrNotSupported }
+func (m *TLSUprobeManager) AttachTLS(int, uint64) error              { return ErrNotSupported }
+func (m *TLSUprobeManager) Close() error                             { return ErrNotSupported }
+func (m *TLSUprobeManager) PollExecEvents(context.Context) error     { return ErrNotSupported }
+func (m *TLSUprobeManager) PollEvents(context.Context) error         { return ErrNotSupported }
+func (m *TLSUprobeManager) PopulateTrustedDNSServers([]net.IP) error { return ErrNotSupported }
 func (m *TLSUprobeManager) DumpDebugCounters()                       {}
