@@ -23,20 +23,29 @@ func TestGenerateShadowValue_Length(t *testing.T) {
 func TestGenerateShadowValue_HuffmanInvariant(t *testing.T) {
 	// The shadow's HPACK Huffman encoding must be >= the real's, so the
 	// HTTP/2 path can patch the rewritten value into a fixed wire buffer
-	// without overflow.
-	cases := []string{
-		"sk-live-0123456789abcdef",
-		strings.Repeat("A", 32),
-		strings.Repeat("z", 64),
-		"PASSWORD123",
+	// without overflow. Run the all-'z' worst case many times to flush
+	// out any randomness-dependent invariant violations — the previous
+	// tail-tuning loop only mutated digits, so an all-letters random
+	// outcome silently produced a shadow that violated the invariant
+	// roughly once every few hundred CI runs.
+	cases := []struct {
+		real     string
+		attempts int
+	}{
+		{"sk-live-0123456789abcdef", 1},
+		{strings.Repeat("A", 32), 1},
+		{strings.Repeat("z", 64), 1000},
+		{"PASSWORD123", 1},
 	}
-	for _, real := range cases {
-		shadow := generateShadowValue(len(real), real)
-		realHL := int(hpack.HuffmanEncodeLength(real))
-		shadowHL := int(hpack.HuffmanEncodeLength(shadow))
-		if shadowHL < realHL {
-			t.Errorf("real=%q: shadow Huffman len %d < real Huffman len %d (shadow=%q)",
-				real, shadowHL, realHL, shadow)
+	for _, tc := range cases {
+		for i := 0; i < tc.attempts; i++ {
+			shadow := generateShadowValue(len(tc.real), tc.real)
+			realHL := int(hpack.HuffmanEncodeLength(tc.real))
+			shadowHL := int(hpack.HuffmanEncodeLength(shadow))
+			if shadowHL < realHL {
+				t.Fatalf("real=%q attempt=%d: shadow Huffman len %d < real Huffman len %d (shadow=%q)",
+					tc.real, i, shadowHL, realHL, shadow)
+			}
 		}
 	}
 }

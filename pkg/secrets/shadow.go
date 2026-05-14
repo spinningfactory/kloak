@@ -159,9 +159,19 @@ func generateShadowValue(originalLen int, realSecret string) string {
 	}
 
 	// Verify Huffman length is sufficient for HTTP/2 HPACK rewriting.
-	// ULID's uppercase chars usually produce long enough Huffman, but for
-	// rare cases (short secrets with all-uppercase real values), replace
-	// trailing digits with random uppercase letters (longer Huffman codes).
+	// ULID's uppercase chars usually produce long enough Huffman, but the
+	// invariant has to hold for the worst real-value case too: 64 bytes
+	// of 'z' encode to 7 bits each (one of HPACK's longest codes), so
+	// the shadow's tail must reach the same density. Overwrite trailing
+	// chars with one of HPACK's guaranteed-7-bit letters until the
+	// shadow's Huffman length meets the real's.
+	//
+	// The previous heuristic only rewrote ASCII digits, which silently
+	// did nothing when the random ULID + padding happened to produce an
+	// all-letters tail — observed in CI as
+	// `TestGenerateShadowValue_HuffmanInvariant` failing once in a few
+	// hundred runs with shadow="kloak:WRPSFTSQ…" (no digits anywhere
+	// after "kloak:"). Replacing unconditionally fixes that.
 	//
 	// Boundary is `j >= 6` (not `>= 8`): bytes 0-5 are the literal
 	// "kloak:" prefix and must not be mutated, but bytes 6-7 are the
@@ -175,14 +185,19 @@ func generateShadowValue(originalLen int, realSecret string) string {
 	if shadowHuffLen < realHuffLen {
 		shadowBytes := []byte(shadow)
 		for j := len(shadowBytes) - 1; j >= 6 && shadowHuffLen < realHuffLen; j-- {
-			if shadowBytes[j] >= '0' && shadowBytes[j] <= '9' {
-				n, _ := rand.Int(rand.Reader, big.NewInt(26))
-				shadowBytes[j] = byte('A') + byte(n.Int64())
-				shadowHuffLen = int(hpack.HuffmanEncodeLength(string(shadowBytes)))
-			}
+			n, _ := rand.Int(rand.Reader, big.NewInt(int64(len(longHuffmanChars))))
+			shadowBytes[j] = longHuffmanChars[n.Int64()]
+			shadowHuffLen = int(hpack.HuffmanEncodeLength(string(shadowBytes)))
 		}
 		shadow = string(shadowBytes)
 	}
 
 	return shadow
 }
+
+// longHuffmanChars are HPACK Huffman code-points whose length is 7 bits
+// (RFC 7541 Appendix B). Overwriting any tail char with one of these is
+// guaranteed to *not decrease* the Huffman length of the surrounding
+// string and to increase it whenever the replaced char's code is shorter.
+// Used by generateShadowValue's tail-tuning loop.
+const longHuffmanChars = "MQVWXZ"
