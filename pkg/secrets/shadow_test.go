@@ -1,6 +1,7 @@
 package secrets
 
 import (
+	"errors"
 	"strings"
 	"testing"
 
@@ -10,7 +11,11 @@ import (
 func TestGenerateShadowValue_Length(t *testing.T) {
 	cases := []int{8, 16, 32, 64, 128}
 	for _, n := range cases {
-		got := generateShadowValue(n, strings.Repeat("a", n))
+		got, err := generateShadowValue(n, strings.Repeat("a", n))
+		if err != nil {
+			t.Errorf("originalLen=%d: unexpected error: %v", n, err)
+			continue
+		}
 		if len(got) != n {
 			t.Errorf("originalLen=%d: got len(shadow)=%d, want %d", n, len(got), n)
 		}
@@ -23,20 +28,58 @@ func TestGenerateShadowValue_Length(t *testing.T) {
 func TestGenerateShadowValue_HuffmanInvariant(t *testing.T) {
 	// The shadow's HPACK Huffman encoding must be >= the real's, so the
 	// HTTP/2 path can patch the rewritten value into a fixed wire buffer
-	// without overflow.
-	cases := []string{
-		"sk-live-0123456789abcdef",
-		strings.Repeat("A", 32),
-		strings.Repeat("z", 64),
-		"PASSWORD123",
+	// without overflow. Run the all-'z' worst case many times to flush
+	// out any randomness-dependent invariant violations — the previous
+	// tail-tuning loop only mutated digits, so an all-letters random
+	// outcome silently produced a shadow that violated the invariant
+	// roughly once every few hundred CI runs.
+	//
+	// Short lengths (8, 9) sit right at the satisfiability boundary for
+	// the all-'z' real; the 36-bit "kloak:" prefix leaves only a few
+	// tail bytes, so the test exercises both the "barely satisfiable"
+	// edge (8, 9) and the comfortable middle (64).
+	cases := []struct {
+		real     string
+		attempts int
+	}{
+		{"sk-live-0123456789abcdef", 1},
+		{strings.Repeat("A", 32), 1},
+		{strings.Repeat("z", 8), 200},
+		{strings.Repeat("z", 9), 200},
+		{strings.Repeat("z", 64), 1000},
+		{"PASSWORD123", 1},
 	}
-	for _, real := range cases {
-		shadow := generateShadowValue(len(real), real)
-		realHL := int(hpack.HuffmanEncodeLength(real))
-		shadowHL := int(hpack.HuffmanEncodeLength(shadow))
-		if shadowHL < realHL {
-			t.Errorf("real=%q: shadow Huffman len %d < real Huffman len %d (shadow=%q)",
-				real, shadowHL, realHL, shadow)
+	for _, tc := range cases {
+		for i := 0; i < tc.attempts; i++ {
+			shadow, err := generateShadowValue(len(tc.real), tc.real)
+			if err != nil {
+				t.Fatalf("real=%q attempt=%d: unexpected error: %v", tc.real, i, err)
+			}
+			realHL := int(hpack.HuffmanEncodeLength(tc.real))
+			shadowHL := int(hpack.HuffmanEncodeLength(shadow))
+			if shadowHL < realHL {
+				t.Fatalf("real=%q attempt=%d: shadow Huffman len %d < real Huffman len %d (shadow=%q)",
+					tc.real, i, shadowHL, realHL, shadow)
+			}
+		}
+	}
+}
+
+func TestGenerateShadowValue_UnsatisfiableReturnsError(t *testing.T) {
+	// 'X' and 'Z' both Huffman-encode to 8 bits — HPACK's maximum for
+	// printable ASCII letters. A real value composed entirely of 'X' has
+	// Huffman length N bytes. The largest possible shadow tail uses the
+	// same 8-bit chars from longHuffmanChars, giving shadow Huffman
+	// bits = 37 ("kloak:") + 8(N-6) = 8N - 11, which rounds up to N-1
+	// bytes for N ≥ 2. shadow is always exactly 1 byte short → the
+	// function must return ErrHuffmanInvariantUnsatisfiable rather
+	// than silently violate the wire-buffer invariant.
+	unsat := []int{10, 11, 12, 13, 14, 15, 20, 32}
+	for _, n := range unsat {
+		real := strings.Repeat("X", n)
+		_, err := generateShadowValue(n, real)
+		if !errors.Is(err, ErrHuffmanInvariantUnsatisfiable) {
+			t.Errorf("originalLen=%d all-'X' real: expected ErrHuffmanInvariantUnsatisfiable, got %v", n, err)
 		}
 	}
 }
@@ -46,7 +89,10 @@ func TestGenerateShadowValue_TruncationPreservesPrefix(t *testing.T) {
 	// prefix "kloak:" must be present so the BPF scanner detects the
 	// shadow. At length 8 the shadow is exactly "kloak:XX" (6-char
 	// prefix + 2 random tail chars).
-	got := generateShadowValue(ShadowPrefixLen, "abcdefgh")
+	got, err := generateShadowValue(ShadowPrefixLen, "abcdefgh")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
 	if !strings.HasPrefix(got, ValuePrefix) {
 		t.Errorf("8-byte shadow %q does not start with %q", got, ValuePrefix)
 	}
