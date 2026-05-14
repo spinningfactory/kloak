@@ -10,8 +10,18 @@ import (
 	"time"
 )
 
-func loadSecret(envVar, defaultValue string) string {
-	filePath := os.Getenv(envVar)
+// loadSecret reads the secret value, preferring a direct env-var injection
+// (envVar) over a file path read from fileEnvVar. The direct-env path is
+// what the kloak webhook covers via `env[].valueFrom.secretKeyRef`
+// rewriting (issue #96); the file path is the older volume-mount model.
+// Keeping both lets the demo exercise either injection method without
+// any code change — only the deployment manifest decides.
+func loadSecret(envVar, fileEnvVar, defaultValue string) string {
+	if val := os.Getenv(envVar); val != "" {
+		log.Printf("Loaded secret from env var %s", envVar)
+		return val
+	}
+	filePath := os.Getenv(fileEnvVar)
 	if filePath != "" {
 		content, err := os.ReadFile(filePath)
 		if err == nil {
@@ -23,9 +33,12 @@ func loadSecret(envVar, defaultValue string) string {
 }
 
 func main() {
-	// Load secrets
-	keyAllowed := loadSecret("SECRET_ALLOWED_FILE", "")
-	keyBlocked := loadSecret("SECRET_BLOCKED_FILE", "")
+	// Load secrets. demo-go's deployment.yaml injects via
+	// `env[].valueFrom.secretKeyRef` (env-var path), which exercises
+	// the webhook's env rewriting plus the eBPF wire rewrite. Other
+	// demos (demo-python, demo-js) still use the volume-mount path.
+	keyAllowed := loadSecret("SECRET_ALLOWED", "SECRET_ALLOWED_FILE", "")
+	keyBlocked := loadSecret("SECRET_BLOCKED", "SECRET_BLOCKED_FILE", "")
 
 	targetURL := os.Getenv("TARGET_URL")
 	if targetURL == "" {
