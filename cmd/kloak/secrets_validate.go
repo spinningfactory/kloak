@@ -40,10 +40,15 @@ same dispatcher.`,
 		if err != nil {
 			return fmt.Errorf("snapshot: %w", err)
 		}
-		fmt.Fprintf(os.Stdout, "%s: ok (%d secret%s)\n", path, len(snap), plural(len(snap)))
-		for _, s := range snap {
-			fmt.Fprintf(os.Stdout, "  - %s: host=%q port=%d inject=%s\n",
-				s.Key, hostOrIP(s), s.Port, formatInject(s.Inject))
+		if _, err := fmt.Fprintf(os.Stdout, "%s: ok (%d secret%s)\n", path, len(snap), plural(len(snap))); err != nil {
+			return fmt.Errorf("write output: %w", err)
+		}
+		for i := range snap {
+			s := &snap[i]
+			if _, err := fmt.Fprintf(os.Stdout, "  - %s: host=%q port=%d inject=%s\n",
+				s.Key, hostOrIP(s), s.Port, formatInject(s.Inject)); err != nil {
+				return fmt.Errorf("write output: %w", err)
+			}
 		}
 		return nil
 	},
@@ -63,8 +68,9 @@ func plural(n int) string {
 
 // hostOrIP returns the textual host/IP form for the validator output.
 // Host takes precedence; IP fills in for literal-IP secrets. Empty
-// string when both are unset (wildcard).
-func hostOrIP(s secrets.Secret) string {
+// string when both are unset (wildcard). Takes a pointer to avoid the
+// 144-byte hugeParam copy the linter flags.
+func hostOrIP(s *secrets.Secret) string {
 	if s.Host != "" {
 		return s.Host
 	}

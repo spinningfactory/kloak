@@ -43,13 +43,14 @@ func translate(spec fileSpec, gen *secrets.ShadowGenerator) ([]secrets.Secret, e
 	}
 
 	out := make([]secrets.Secret, 0, len(spec.Secrets))
-	for i, s := range spec.Secrets {
-		real, err := resolveRealValue(s)
+	for i := range spec.Secrets {
+		s := &spec.Secrets[i]
+		realVal, err := resolveRealValue(s)
 		if err != nil {
 			return nil, fmt.Errorf("secrets.yaml: entry %d (%q): %w", i, s.Name, err)
 		}
-		if len(real) > maxRealLen {
-			return nil, fmt.Errorf("secrets.yaml: entry %d (%q): real value is %d bytes, max is %d", i, s.Name, len(real), maxRealLen)
+		if len(realVal) > maxRealLen {
+			return nil, fmt.Errorf("secrets.yaml: entry %d (%q): real value is %d bytes, max is %d", i, s.Name, len(realVal), maxRealLen)
 		}
 
 		host, ip := secrets.ParseHost(s.Host)
@@ -74,7 +75,7 @@ func translate(spec fileSpec, gen *secrets.ShadowGenerator) ([]secrets.Secret, e
 		// future hot-reload of the same secret reuses its own prefix
 		// instead of treating itself as a collision. maxRetries=20
 		// mirrors the controller's value at pkg/controller/secret_reconciler.go.
-		shadow, err := gen.Generate(len(real), real, s.Name, 20)
+		shadow, err := gen.Generate(len(realVal), realVal, s.Name, 20)
 		if err != nil {
 			if errors.Is(err, secrets.ErrHuffmanInvariantUnsatisfiable) {
 				return nil, fmt.Errorf("secrets.yaml: entry %d (%q): cannot mint a shadow with sufficient HPACK Huffman length — the real value's encoding is too dense for the requested length (consider a longer secret value): %w", i, s.Name, err)
@@ -85,7 +86,7 @@ func translate(spec fileSpec, gen *secrets.ShadowGenerator) ([]secrets.Secret, e
 		out = append(out, secrets.Secret{
 			OwnerID:  s.Name,
 			Key:      s.Name,
-			Real:     real,
+			Real:     realVal,
 			Shadow:   shadow,
 			Host:     host,
 			IP:       ip,
@@ -101,8 +102,9 @@ func translate(spec fileSpec, gen *secrets.ShadowGenerator) ([]secrets.Secret, e
 // reading from `valueFrom.env` if Value is empty. Exactly one of the
 // two must be set, and `valueFrom.env` must resolve to a non-empty
 // string — a missing env var is a configuration error, not a silent
-// empty secret.
-func resolveRealValue(s secretSpec) (string, error) {
+// empty secret. Takes a pointer to avoid the hugeParam copy the linter
+// flags (secretSpec is 104 bytes).
+func resolveRealValue(s *secretSpec) (string, error) {
 	switch {
 	case s.Value != "" && s.ValueFrom != nil:
 		return "", fmt.Errorf("`value` and `valueFrom` are mutually exclusive")
