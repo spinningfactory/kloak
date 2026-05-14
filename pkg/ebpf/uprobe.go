@@ -1,3 +1,5 @@
+//go:build linux
+
 package ebpf
 
 import (
@@ -72,7 +74,12 @@ type watchedHostKey struct {
 // Generate eBPF bindings. The KLOAK_TARGET_ARCH env var (set by Dockerfile or
 // Makefile) controls which __TARGET_ARCH_xxx define is passed to clang.
 // Defaults to arm64 for local development on macOS/Lima.
-//go:generate sh -c "ARCH=${KLOAK_TARGET_ARCH:-arm64}; go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags \"-O2 -g -Wall -Werror -D__TARGET_ARCH_${ARCH}\" tlsuprobe bpf/tls_uprobe.c -- -I../ebpf"
+//
+// `-tags linux` makes bpf2go emit `//go:build linux && (<arches>)` on the
+// generated `tlsuprobe_bpfel.go` / `tlsuprobe_bpfeb.go` files. Without it
+// the generated files build on every OS and break macOS compilation
+// because cilium/ebpf is Linux-only.
+//go:generate sh -c "ARCH=${KLOAK_TARGET_ARCH:-arm64}; go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags \"-O2 -g -Wall -Werror -D__TARGET_ARCH_${ARCH}\" -tags linux tlsuprobe bpf/tls_uprobe.c -- -I../ebpf"
 
 // TLSUprobeManager manages the loading and attaching of eBPF uprobes for TLS interception.
 type TLSUprobeManager struct {
