@@ -55,6 +55,36 @@ type Secret struct {
 
 	// Protocol is unix.IPPROTO_TCP / IPPROTO_UDP, or 0 for any.
 	Protocol uint8
+
+	// Inject describes how the standalone `kloak run` runtime should
+	// surface this secret's *shadow* value to a child process. The k8s
+	// adapter leaves this zero — Kubernetes Pods already get their
+	// secret values through the cluster's own injection mechanisms
+	// (volume mounts, env vars rewritten by the webhook), so the
+	// data-plane sync code never reads this field. The YAML / dotenv /
+	// host-env Sources for `kloak run` set it from the user's config.
+	Inject Inject
+}
+
+// Inject describes how a Source wants the shadow value materialized
+// for a child process. A non-runtime consumer (e.g. the k8s adapter)
+// returns the zero value and the field is ignored.
+//
+// Both Env and File may be set on the same Secret — the child will see
+// the shadow placeholder in both the named env var AND the file at the
+// given path. Empty in both fields means "no injection requested";
+// runtimes should treat that as a validation error before they get
+// here.
+type Inject struct {
+	// Env is the name of an environment variable to set on the child
+	// process. The value will be the secret's Shadow placeholder.
+	Env string
+
+	// File is an absolute path inside the child's filesystem where the
+	// Shadow placeholder will be written. Parent directories are
+	// created with 0700; the file itself is mode 0400 owned by the
+	// child's uid (the runtime owns those decisions).
+	File string
 }
 
 // Source produces snapshots of the secrets the data plane should program
