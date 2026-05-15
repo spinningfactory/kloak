@@ -1,9 +1,7 @@
 package main
 
 import (
-	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -30,28 +28,36 @@ The file format is selected by extension: .yaml/.yml use the YAML loader.
 Future formats (.env, host-env, secret backends) will register through the
 same dispatcher.`,
 	Args: cobra.ExactArgs(1),
-	RunE: func(_ *cobra.Command, args []string) error {
-		path := args[0]
-		src, err := openSecretsSource(path)
-		if err != nil {
-			return err
-		}
-		snap, err := src.Snapshot(context.Background())
-		if err != nil {
-			return fmt.Errorf("snapshot: %w", err)
-		}
-		if _, err := fmt.Fprintf(os.Stdout, "%s: ok (%d secret%s)\n", path, len(snap), plural(len(snap))); err != nil {
+	RunE: runSecretsValidate,
+}
+
+// runSecretsValidate is the cobra RunE for `kloak secrets validate`,
+// extracted so unit tests can call it without going through
+// cobra.Execute. Output goes through cmd.OutOrStdout() (test-redirectable)
+// and the context comes from cmd.Context() so Ctrl-C / parent
+// cancellation are respected.
+func runSecretsValidate(cmd *cobra.Command, args []string) error {
+	path := args[0]
+	src, err := openSecretsSource(path)
+	if err != nil {
+		return err
+	}
+	snap, err := src.Snapshot(cmd.Context())
+	if err != nil {
+		return fmt.Errorf("snapshot: %w", err)
+	}
+	out := cmd.OutOrStdout()
+	if _, err := fmt.Fprintf(out, "%s: ok (%d secret%s)\n", path, len(snap), plural(len(snap))); err != nil {
+		return fmt.Errorf("write output: %w", err)
+	}
+	for i := range snap {
+		s := &snap[i]
+		if _, err := fmt.Fprintf(out, "  - %s: host=%q port=%d inject=%s\n",
+			s.Key, hostOrIP(s), s.Port, formatInject(s.Inject)); err != nil {
 			return fmt.Errorf("write output: %w", err)
 		}
-		for i := range snap {
-			s := &snap[i]
-			if _, err := fmt.Fprintf(os.Stdout, "  - %s: host=%q port=%d inject=%s\n",
-				s.Key, hostOrIP(s), s.Port, formatInject(s.Inject)); err != nil {
-				return fmt.Errorf("write output: %w", err)
-			}
-		}
-		return nil
-	},
+	}
+	return nil
 }
 
 func init() {
