@@ -109,6 +109,14 @@ jobs:
         #   - tools/    — CLI utilities, coverage isn't meaningful
         run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/tools/')
 
+      - name: Run klor e2e
+        # klor's e2e suite builds the klor binary and drives it against a
+        # tempdir cgroup root. No cluster, no root required (Linux-only,
+        # self-skips on other OSes). Runs here instead of in the heavy
+        # k3s E2E job because klor's design point is "no k8s required",
+        # and gating its e2e on a cluster would obscure breakage.
+        run: make e2e-klor
+
       - name: Upload unit coverage
         uses: actions/upload-artifact@v7
         with:

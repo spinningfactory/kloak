@@ -1,4 +1,4 @@
-.PHONY: all build build-klor build-linux build-klor-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup \
+.PHONY: all build build-klor build-linux build-klor-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup e2e-klor \
         e2e-k3s e2e-k3s-setup e2e-k3s-run e2e-k3s-cleanup \
         clean deps docker-build generate-ebpf generate-vmlinux run help \
         lima-start lima-stop lima-delete lima-shell lima-exec lima-check \
@@ -154,6 +154,12 @@ e2e-setup:
 e2e-run:
 	KUBECONFIG=$$(k3d kubeconfig write $(E2E_CLUSTER)) \
 	$(GOTEST) -v -timeout 1500s -tags=e2e_ebpf -count=1 ./test/e2e/
+
+# klor e2e — builds the klor binary and exercises its CLI against
+# a tempdir cgroup root. No cluster, no root required (Linux-only,
+# skips on macOS). Cheap; safe to run as part of unit-test CI.
+e2e-klor:
+	$(GOTEST) -v -timeout 120s -tags=e2e_klor -count=1 ./test/e2e/klor/
 
 # Run e2e tests against the current kube context.
 # Builds images, pushes to ttl.sh (anonymous ephemeral registry, 2h TTL),
