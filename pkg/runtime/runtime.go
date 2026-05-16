@@ -35,13 +35,16 @@ import (
 // Runtime is the surface every backend implements. Keep it minimal —
 // the CLI's job is to construct a Spec and dispatch; everything
 // backend-specific lives inside the implementation.
+//
+// Spec is passed by pointer because the struct is ~128 bytes today and
+// growing; backends MUST treat it as read-only.
 type Runtime interface {
 	// Run blocks until the child process exits or ctx is cancelled.
 	// Returns the child's exit code (>= 0) on a normal exit, or a
 	// non-nil error if the runtime itself failed (provisioning,
 	// attach, exec). A nil error with exitCode > 0 means the child
 	// ran but returned a non-zero status — the CLI should mirror it.
-	Run(ctx context.Context, spec Spec) (exitCode int, err error)
+	Run(ctx context.Context, spec *Spec) (exitCode int, err error)
 }
 
 // Spec is the input every Runtime accepts. Fields are deliberately

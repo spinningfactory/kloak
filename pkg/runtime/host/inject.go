@@ -14,16 +14,30 @@ import (
 // materializeInjection writes shadow placeholders to disk and / or
 // composes a `KEY=value` env slice per the `Inject` directive on each
 // Secret in the snapshot. Returns the env slice (to merge into
-// cmd.Env) and a cleanup function that removes the per-invocation
-// tmpfs subdir.
+// cmd.Env) and a cleanup function that removes every file the runtime
+// wrote, including those at user-supplied absolute paths outside the
+// staging dir.
 //
 // Errors short-circuit and trigger an immediate cleanup of any files
 // already written, so a half-applied injection doesn't leak a tmpfs
 // subdir that a subsequent invocation could collide with.
 //
 // Cleanup is idempotent: callers may defer it on every exit path.
+//
+// TODO(phase-3b-followup): when concurrent klor invocations both
+// declare the same `inject.file` path, the second one will fail at
+// writeInjectFile (or worse, race the cleanup of the first). The
+// libkrun backend solves this via virtio-fs into the guest; the host
+// runtime will solve it by bind-mounting a per-invocation staging
+// dir onto the absolute path. Until then, document the constraint:
+// each `inject.file` path must be unique across concurrent invocations.
 func materializeInjection(snap []secrets.Secret, dir string) (env []string, cleanup func() error, err error) {
-	cleanup = func() error { return removeInjectDir(dir) }
+	// Track every absolute path we write so cleanup can reverse the
+	// whole materialization, not just the staging dir. The closure
+	// captures `injectedPaths` by reference so later writes inside
+	// this function show up at cleanup time too.
+	var injectedPaths []string
+	cleanup = func() error { return removeInjection(injectedPaths, dir) }
 
 	// If anything inside this function errors, run the cleanup before
 	// returning so a partial write doesn't leak.
@@ -51,6 +65,7 @@ func materializeInjection(snap []secrets.Secret, dir string) (env []string, clea
 			if err = writeInjectFile(dir, s); err != nil {
 				return nil, cleanup, err
 			}
+			injectedPaths = append(injectedPaths, s.Inject.File)
 		}
 	}
 
@@ -58,16 +73,17 @@ func materializeInjection(snap []secrets.Secret, dir string) (env []string, clea
 }
 
 // writeInjectFile drops a single secret's shadow placeholder at the
-// requested filesystem path. The caller-provided `Inject.File` is an
-// absolute path inside the child's view of the filesystem; we mirror
-// the directory structure under `dir` so the runtime owns its own
-// staging area (and so cleanup is a single RemoveAll).
+// caller-provided `Inject.File` path. The path must be absolute — the
+// child reads it directly from its (shared-with-parent) view of the
+// filesystem. The staging dir is used only for a per-invocation
+// sentinel that records the absolute path; it helps postmortem
+// debugging when the parent crashes mid-run and leaves both the
+// sentinel and the real file behind.
 //
-// The child is expected to read the file at `Inject.File` directly —
-// the staging path is unrelated. Bind-mounting the staging dir onto
-// the child's filesystem is a follow-up; for now the file is created
-// at its absolute path on the host, which works for the host-cgroup
-// runtime where parent and child share a filesystem.
+// Future work (bind-mount-based isolation): the staging dir will hold
+// the real file and a virtio-fs / bind-mount will project it at the
+// child's absolute path. Until then, parent and child share the
+// filesystem and the absolute path IS the storage location.
 func writeInjectFile(stagingDir string, s *secrets.Secret) error {
 	path := s.Inject.File
 	if !filepath.IsAbs(path) {
@@ -81,30 +97,34 @@ func writeInjectFile(stagingDir string, s *secrets.Secret) error {
 	if err := os.WriteFile(path, []byte(s.Shadow), 0o400); err != nil {
 		return fmt.Errorf("write inject file %s: %w", path, err)
 	}
-	// Touch a sentinel inside the staging dir so cleanup knows the
-	// runtime claimed this invocation. Useful when debugging leaked
-	// dirs across crashes.
+	// Touch a sentinel inside the staging dir so postmortem tools can
+	// correlate stale absolute-path files with the invocation that
+	// wrote them. Non-fatal if it fails — the real injection succeeded.
 	sentinel := filepath.Join(stagingDir, "."+filepath.Base(path))
-	if err := os.WriteFile(sentinel, []byte(path), 0o600); err != nil {
-		// Sentinel failure is non-fatal — the real injection succeeded.
-		_ = err
-	}
+	_ = os.WriteFile(sentinel, []byte(path), 0o600)
 	return nil
 }
 
-// removeInjectDir wipes the per-invocation staging dir. Files written
-// to absolute `inject.file` paths outside the dir are NOT removed —
-// they're the child's responsibility once the runtime hands them
-// over, and a stale file outside the staging area is observable by
-// the operator (vs. a hidden tmpfs leak).
+// removeInjection wipes every file the runtime wrote: each
+// user-supplied `Inject.File` absolute path AND the per-invocation
+// staging dir (which holds the sentinels). Failures are joined into
+// a single error so cleanup never short-circuits on a partial removal.
 //
-// Idempotent.
-func removeInjectDir(dir string) error {
-	if err := os.RemoveAll(dir); err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
+// Idempotent — missing entries are treated as success, since the
+// runtime's defer chain may invoke cleanup more than once on
+// error paths.
+func removeInjection(injectedPaths []string, stagingDir string) error {
+	var errs []error
+	for _, p := range injectedPaths {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove inject file %s: %w", p, err))
 		}
-		return fmt.Errorf("remove injection dir %s: %w", dir, err)
+	}
+	if err := os.RemoveAll(stagingDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		errs = append(errs, fmt.Errorf("remove injection staging dir %s: %w", stagingDir, err))
+	}
+	if len(errs) > 0 {
+		return errors.Join(errs...)
 	}
 	return nil
 }

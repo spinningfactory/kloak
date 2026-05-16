@@ -3,7 +3,6 @@ package main
 import (
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -42,8 +41,10 @@ Example:
 
 Use "--" to separate klor flags from the command to execute. The
 command's exit code is propagated as klor's exit code.`,
-	Args: cobra.MinimumNArgs(1),
-	RunE: runRun,
+	Args:          cobra.MinimumNArgs(1),
+	RunE:          runRun,
+	SilenceErrors: true, // exitCodeError's message is internal-only; never print.
+	SilenceUsage:  true, // child exit codes shouldn't trigger cobra's usage dump.
 }
 
 func init() {
@@ -78,7 +79,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 
 	rt := host.New(runCgroupRoot, runInjectRoot, logger.Sugar())
 
-	spec := runtime.Spec{
+	spec := &runtime.Spec{
 		Cmd:     args,
 		Secrets: src,
 		Stdin:   cmd.InOrStdin(),
@@ -91,15 +92,23 @@ func runRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if exitCode != 0 {
-		// Mirror the child's status as klor's own exit code rather
-		// than returning a Go error (which cobra prints to stderr
-		// along with usage). Calling os.Exit bypasses cobra's
-		// wrapping and avoids noise for what is a normal subprocess
-		// outcome.
-		os.Exit(exitCode)
+		// Mirror the child's status as klor's own exit code. We can't
+		// call os.Exit here because that would skip the deferred
+		// logger.Sync (and any future defers added to runRun). Return
+		// a sentinel error type and let main translate it after
+		// rootCmd.Execute returns, so all defers complete first.
+		return &exitCodeError{code: exitCode}
 	}
 	return nil
 }
+
+// exitCodeError carries a child process's non-zero exit code from
+// runRun back to main. It is NOT a real error — we use Go's error
+// channel only because cobra's RunE expects one. main checks for
+// this type and calls os.Exit AFTER all of runRun's defers complete.
+type exitCodeError struct{ code int }
+
+func (e *exitCodeError) Error() string { return fmt.Sprintf("child exited %d", e.code) }
 
 // openSecretsSource selects a secrets.Source implementation based on
 // the file's extension. Inlined here (instead of imported from a

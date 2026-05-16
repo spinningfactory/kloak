@@ -34,6 +34,6 @@ func New(_, _ string, _ *zap.SugaredLogger) runtime.Runtime {
 
 type stubRuntime struct{}
 
-func (*stubRuntime) Run(_ context.Context, _ runtime.Spec) (int, error) {
+func (*stubRuntime) Run(_ context.Context, _ *runtime.Spec) (int, error) {
 	return -1, ErrNotSupported
 }

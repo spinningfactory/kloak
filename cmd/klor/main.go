@@ -16,6 +16,8 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -36,7 +38,18 @@ func init() {
 }
 
 func main() {
-	if err := rootCmd.Execute(); err != nil {
+	err := rootCmd.Execute()
+	// runRun returns *exitCodeError for "child exited non-zero" so its
+	// deferred cleanups can complete before we terminate the process.
+	// Translate the sentinel to os.Exit here, after Execute (and all
+	// of its defers, including runRun's) have returned. runCmd has
+	// SilenceErrors set, so we print real errors ourselves below.
+	var ec *exitCodeError
+	if errors.As(err, &ec) {
+		os.Exit(ec.code)
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error:", err)
 		os.Exit(1)
 	}
 }

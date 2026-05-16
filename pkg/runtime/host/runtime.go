@@ -68,7 +68,10 @@ type hostRuntime struct {
 	log        *zap.SugaredLogger
 }
 
-func (r *hostRuntime) Run(ctx context.Context, spec runtime.Spec) (int, error) {
+func (r *hostRuntime) Run(ctx context.Context, spec *runtime.Spec) (int, error) {
+	if spec == nil {
+		return -1, errors.New("Spec is nil")
+	}
 	if len(spec.Cmd) == 0 {
 		return -1, errors.New("Spec.Cmd is empty")
 	}
@@ -141,18 +144,27 @@ func (r *hostRuntime) Run(ctx context.Context, spec runtime.Spec) (int, error) {
 		return -1, fmt.Errorf("start child: %w", err)
 	}
 
-	// 6. Move the child's PID into the transient cgroup. This is best-
-	//    effort racy with the child's first instructions — the kernel
-	//    schedules the child as soon as Start returns. A future PR
-	//    will gate the child behind a sync pipe so the cgroup membership
-	//    is established before any user-visible work happens.
+	// 6. Move the child's PID into the transient cgroup. Failing this
+	//    is fatal: if the child runs outside our cgroup, the eBPF data
+	//    plane (wired in the follow-up PR) will not intercept its TLS
+	//    writes — the user would think their traffic is being rewritten
+	//    when it isn't, and a real secret would leak unredacted. Kill
+	//    the child immediately and surface the error rather than
+	//    silently degrade to "running but un-intercepted".
+	//
+	//    There's still a tiny race window between Start and this write
+	//    where the child can issue syscalls outside the cgroup. A
+	//    follow-up will gate exec behind a sync pipe so the move
+	//    completes before any user-visible work runs in the child.
 	if err := os.WriteFile(filepath.Join(cgPath, "cgroup.procs"),
 		[]byte(strconv.Itoa(cmd.Process.Pid)), 0o644); err != nil {
-		// Don't kill the child — the runtime still has value without
-		// cgroup attachment (e.g. for testing on hosts without
-		// cgroup.procs write permission). Surface the error in logs.
-		r.log.Warnw("failed to write child pid into cgroup.procs",
-			"err", err, "pid", cmd.Process.Pid, "path", cgPath)
+		// Best-effort kill — the child may already be dead, in which
+		// case Kill returns ESRCH. Wait reaps either way; we ignore
+		// its error since we're returning a more interesting one.
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		return -1, fmt.Errorf("attach child pid %d to cgroup %s: %w (TLS rewrite would not apply — refusing to run unprotected)",
+			cmd.Process.Pid, cgPath, err)
 	}
 
 	// 7. Forward signals to the child. Stop the signal handler before
