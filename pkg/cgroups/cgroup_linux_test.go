@@ -85,14 +85,19 @@ func TestCreateTransient_NonEmptyDirRejected(t *testing.T) {
 }
 
 func TestCreateTransient_DefaultCgroupRoot(t *testing.T) {
-	// Empty cgroupRoot should fall back to DefaultCgroupRoot. We can't
-	// actually mkdir under /sys/fs/cgroup as a non-root test, so just
-	// confirm the call attempts that root (the error message should
-	// quote it).
-	_, _, _, err := CreateTransient("", "x")
+	// Empty cgroupRoot should fall back to DefaultCgroupRoot. As a
+	// non-root test we usually can't mkdir under /sys/fs/cgroup, so we
+	// confirm the call attempts that root by checking the error
+	// message. When the test DOES have permission (CI as root), the
+	// call succeeds — we must call cleanup() before returning or we
+	// leak `/sys/fs/cgroup/kloak.slice/<name>` on the host.
+	_, _, cleanup, err := CreateTransient("", "kloak-test-default-root")
 	if err == nil {
-		// If we DO have permission (CI as root, say), at least we
-		// produced something — skip the rest.
+		if cleanup != nil {
+			if cerr := cleanup(); cerr != nil {
+				t.Errorf("cleanup of root-created dir failed: %v", cerr)
+			}
+		}
 		return
 	}
 	if !strings.Contains(err.Error(), DefaultCgroupRoot) {

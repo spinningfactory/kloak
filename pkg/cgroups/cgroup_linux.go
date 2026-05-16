@@ -113,8 +113,11 @@ func validateTransientName(name string) error {
 	if strings.ContainsRune(name, '/') {
 		return fmt.Errorf("transient cgroup name %q must not contain `/`", name)
 	}
-	if name == "." || name == ".." || strings.Contains(name, "..") {
-		return fmt.Errorf("transient cgroup name %q must not contain `..` or `.`", name)
+	// `..` anywhere allows directory traversal; `.` as the whole name
+	// would land on the parent itself. `name == ".."` is already
+	// covered by the Contains check below, so we don't list it twice.
+	if name == "." || strings.Contains(name, "..") {
+		return fmt.Errorf("transient cgroup name %q must not be `.` and must not contain `..`", name)
 	}
 	return nil
 }
