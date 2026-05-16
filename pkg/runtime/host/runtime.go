@@ -70,10 +70,10 @@ type hostRuntime struct {
 
 func (r *hostRuntime) Run(ctx context.Context, spec *runtime.Spec) (int, error) {
 	if spec == nil {
-		return -1, errors.New("Spec is nil")
+		return -1, errors.New("spec is nil")
 	}
 	if len(spec.Cmd) == 0 {
-		return -1, errors.New("Spec.Cmd is empty")
+		return -1, errors.New("spec.Cmd is empty")
 	}
 
 	// 1. Snapshot the secrets so the same view drives both the

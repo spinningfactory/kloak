@@ -57,13 +57,15 @@ func materializeInjection(snap []secrets.Secret, dir string) (env []string, clea
 		}
 		if s.Inject.File != "" {
 			if !dirCreated {
-				if err = os.MkdirAll(dir, 0o700); err != nil {
-					return nil, cleanup, fmt.Errorf("mkdir injection dir %s: %w", dir, err)
+				if mkErr := os.MkdirAll(dir, 0o700); mkErr != nil {
+					err = mkErr // trip the deferred cleanup-on-error
+					return nil, cleanup, fmt.Errorf("mkdir injection dir %s: %w", dir, mkErr)
 				}
 				dirCreated = true
 			}
-			if err = writeInjectFile(dir, s); err != nil {
-				return nil, cleanup, err
+			if wErr := writeInjectFile(dir, s); wErr != nil {
+				err = wErr // trip the deferred cleanup-on-error
+				return nil, cleanup, wErr
 			}
 			injectedPaths = append(injectedPaths, s.Inject.File)
 		}
