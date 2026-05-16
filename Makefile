@@ -1,4 +1,4 @@
-.PHONY: all build build-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup \
+.PHONY: all build build-klor build-linux build-klor-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup \
         e2e-k3s e2e-k3s-setup e2e-k3s-run e2e-k3s-cleanup \
         clean deps docker-build generate-ebpf generate-vmlinux run help \
         lima-start lima-stop lima-delete lima-shell lima-exec lima-check \
@@ -16,6 +16,11 @@ GOGENERATE=$(GOCMD) generate
 # Binary names
 BINARY_NAME=kloak
 WEBHOOK_BINARY=kloak-webhook
+
+# Klor — the host-CLI runtime. Separate `main` package at cmd/klor/ so its
+# dependency closure shrinks independently (no k8s.io/client-go, no
+# controller-runtime). Not part of the controller Docker image.
+KLOR_BINARY=klor
 
 # Release tag baked into the binary for `kloak version`. `git describe
 # --tags --always --dirty` gives `v0.1.0` exactly on tag, `v0.1.0-3-gabc1234-dirty`
@@ -48,7 +53,7 @@ LIMA_CONFIG=lima.yaml
 # Main targets
 # ============================================================================
 
-all: build
+all: build build-klor
 
 # Build depends on Go sources (and generated eBPF on Linux)
 build: deps $(BUILD_DIR)/$(BINARY_NAME)
@@ -57,12 +62,26 @@ $(BUILD_DIR)/$(BINARY_NAME): $(GO_SOURCES)
 	@mkdir -p $(BUILD_DIR)
 	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./$(CMD_DIR)/kloak
 
+# Build the klor host-CLI binary. Sibling of `build`; lives at cmd/klor/.
+build-klor: deps $(BUILD_DIR)/$(KLOR_BINARY)
+
+$(BUILD_DIR)/$(KLOR_BINARY): $(GO_SOURCES)
+	@mkdir -p $(BUILD_DIR)
+	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(KLOR_BINARY) ./$(CMD_DIR)/klor
+
 # Build for Linux (cross-compile or via Lima)
 build-linux: lima-ensure
 	@if [ "$$(uname)" = "Linux" ]; then \
 		GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak; \
 	else \
 		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak"; \
+	fi
+
+build-klor-linux: lima-ensure
+	@if [ "$$(uname)" = "Linux" ]; then \
+		GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(KLOR_BINARY)-linux ./$(CMD_DIR)/klor; \
+	else \
+		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go build $(LDFLAGS) -o $(BUILD_DIR)/$(KLOR_BINARY)-linux ./$(CMD_DIR)/klor"; \
 	fi
 
 test: deps
