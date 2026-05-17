@@ -37,6 +37,12 @@ type ebpfHandle struct {
 	pollCancel context.CancelFunc
 	pollWG     sync.WaitGroup
 	closeOnce  sync.Once
+	// closeErr persists the result of the one real Close call so
+	// idempotent retries (deferred cleanups firing multiple times on
+	// error paths) report the same outcome instead of returning nil
+	// the second time. Without this, "did the BPF program detach
+	// cleanly?" loses fidelity on the second caller.
+	closeErr error
 }
 
 // setupEBPF constructs a TLSUprobeManager and gets it to the state where
@@ -126,7 +132,6 @@ func (h *ebpfHandle) AttachChild(pid int) error {
 // the pinned netns fd), and detaches the BPF programs. Idempotent so
 // the runtime's defer chain can call it safely on multiple paths.
 func (h *ebpfHandle) Close() error {
-	var closeErr error
 	h.closeOnce.Do(func() {
 		h.pollCancel()
 		h.pollWG.Wait()
@@ -135,9 +140,9 @@ func (h *ebpfHandle) Close() error {
 		if err := h.mgr.UntrackCgroup(h.cgroupID); err != nil {
 			h.log.Warnw("untrack cgroup failed during close", "err", err, "cgroupID", h.cgroupID)
 		}
-		closeErr = h.mgr.Close()
+		h.closeErr = h.mgr.Close()
 	})
-	return closeErr
+	return h.closeErr
 }
 
 // wrapEBPFSetupError annotates a setupEBPF failure with the most likely
@@ -173,8 +178,19 @@ func readResolvConfNameservers(path string) ([]net.IP, error) {
 	var ips []net.IP
 	s := bufio.NewScanner(f)
 	for s.Scan() {
-		line := strings.TrimSpace(s.Text())
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
+		// resolv.conf treats anything from the first `#` or `;` to
+		// end-of-line as a comment, regardless of preceding whitespace.
+		// `nameserver 8.8.8.8#hint` is a valid line: the `8.8.8.8` is
+		// the address, `#hint` is a trailing comment, NOT part of the
+		// IP. Strip first, split into fields second — the reverse order
+		// (the old implementation) would treat the entire `8.8.8.8#hint`
+		// as the address field and ParseIP would drop it silently.
+		line := s.Text()
+		if i := strings.IndexAny(line, "#;"); i >= 0 {
+			line = line[:i]
+		}
+		line = strings.TrimSpace(line)
+		if line == "" {
 			continue
 		}
 		fields := strings.Fields(line)

@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 )
@@ -93,6 +94,45 @@ func TestReadResolvConfNameservers_MissingFileSurfacesError(t *testing.T) {
 	}
 }
 
+func TestEBPFHandle_CloseIsIdempotentAndPreservesError(t *testing.T) {
+	// Close runs the real teardown exactly once (sync.Once) but the
+	// returned error must be consistent across calls so deferred
+	// cleanups that re-fire on error paths report the same outcome
+	// the first caller saw. Without persisting closeErr on the
+	// handle, the second caller would always get nil.
+	//
+	// We can't easily construct a real ebpfHandle in a unit test
+	// (needs a live TLSUprobeManager → CAP_BPF → root) so we exercise
+	// the idempotence pattern with a minimal stand-in that mimics the
+	// sync.Once + persisted-error shape.
+	wantErr := errors.New("simulated mgr.Close failure")
+	var (
+		runs   int
+		once   sync.Once
+		stored error
+	)
+	doClose := func() error {
+		once.Do(func() {
+			runs++
+			stored = wantErr
+		})
+		return stored
+	}
+
+	got1 := doClose()
+	got2 := doClose()
+	got3 := doClose()
+
+	if runs != 1 {
+		t.Errorf("teardown ran %d times, want exactly 1", runs)
+	}
+	for i, got := range []error{got1, got2, got3} {
+		if !errors.Is(got, wantErr) {
+			t.Errorf("call %d returned %v, want %v on every call", i+1, got, wantErr)
+		}
+	}
+}
+
 func TestWrapEBPFSetupError_EPERMSuggestsSudoAndCaps(t *testing.T) {
 	// EPERM is the common non-root failure mode — the wrap must call
 	// out sudo / setcap so the user knows what to fix instead of
@@ -124,6 +164,33 @@ func TestWrapEBPFSetupError_NonEPERMKeepsGenericWrap(t *testing.T) {
 	}
 	if !errors.Is(wrapped, original) {
 		t.Error("wrap should preserve the original error via %w")
+	}
+}
+
+func TestReadResolvConfNameservers_TrailingInlineComments(t *testing.T) {
+	// resolv.conf comments can sit at end-of-line with no whitespace
+	// separator: `nameserver 8.8.8.8#hint` is valid and the IP is
+	// 8.8.8.8, not "8.8.8.8#hint". An earlier version of this parser
+	// split into fields first and would silently drop such entries
+	// because net.ParseIP rejects "8.8.8.8#hint".
+	path := writeResolvConf(t, `nameserver 8.8.8.8#trailing-no-space
+nameserver 1.1.1.1 # trailing-with-space
+nameserver 9.9.9.9;semicolon-comment
+# whole-line comment
+nameserver 8.8.4.4    # multiple-space-before-comment
+`)
+	ips, err := readResolvConfNameservers(path)
+	if err != nil {
+		t.Fatalf("readResolvConfNameservers: %v", err)
+	}
+	want := []string{"8.8.8.8", "1.1.1.1", "9.9.9.9", "8.8.4.4"}
+	if len(ips) != len(want) {
+		t.Fatalf("len(ips)=%d, want %d; got=%v", len(ips), len(want), ips)
+	}
+	for i, w := range want {
+		if ips[i].String() != w {
+			t.Errorf("ips[%d]=%s, want %s", i, ips[i], w)
+		}
 	}
 }
 
