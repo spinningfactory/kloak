@@ -560,6 +560,13 @@ struct tls_offsets {
   __u32 enc_ctx_to_algctx;  // enc_ctx* + off → algctx/PROV_GCM_CTX* (pointer deref)
   __u32 algctx_to_h;        // algctx* + off → H (16 bytes, direct read)
   __u32 ssl_to_version;     // SSL_CONNECTION* + off → int version (0xFFFFFFFF=unknown)
+  // ssl_to_wbio is the offset from the SSL/SSL_CONNECTION pointer to its
+  // `wbio` BIO* field. Used by ssl_read_fd() to walk SSL → wbio → BIO.num
+  // (the socket fd). 3.0/3.1 use struct ssl_st where wbio lives at 24;
+  // 3.2+ wrapped SSL in ssl_connection_st and moved wbio to 88. Pushed by
+  // pushTLSOffsets per detected OpenSSL major.minor — 0 here means
+  // "unknown; ssl_read_fd should fall back to the legacy hardcoded 88".
+  __u32 ssl_to_wbio;
 };
 
 // Shared key for per-binary TLS config maps (see tls_offset_config and
@@ -1335,18 +1342,44 @@ int tp_enter_close(struct trace_event_raw_sys_enter *ctx) {
   return 0;
 }
 
-// Offsets for reading fd from SSL struct's BIO (stable across OpenSSL 3.x).
-// SSL_CONNECTION.wbio → BIO*, BIO.num → int fd
-// Verified via pahole: identical on aarch64 and x86_64, OpenSSL 3.0-3.5.
-#define SSL_WBIO_OFFSET 88  // offsetof(ssl_connection_st, wbio) for 3.2+
-#define BIO_NUM_OFFSET  56  // offsetof(bio_st, num)
+// Fallback wbio offset used only when tls_offset_config has no entry for
+// the current binary yet (cold path very early in a process's lifetime,
+// before pushTLSOffsets has run). Matches OpenSSL 3.2+ ssl_connection_st.
+// 3.0/3.1 resolve their own (smaller) wbio offset at runtime — keeping
+// the fallback at 88 preserves the pre-fix behavior for callers that
+// happen to be on 3.2+ but raced the userspace push.
+#define SSL_WBIO_OFFSET_FALLBACK 88
+// offsetof(bio_st, num). Confirmed identical on OpenSSL 3.0.13 and 3.5
+// via pahole + empirical SSL_set_bio + pointer-scan; the bio_st layout
+// hasn't been reshuffled across 3.x. If a future release does move
+// `num`, lift this into tls_offsets the same way ssl_to_wbio is now.
+#define BIO_NUM_OFFSET  56
+
+// resolve_wbio_offset returns the SSL → wbio field offset for the
+// calling process's libssl, derived from the per-binary tls_offset_config
+// pushed by pushTLSOffsets. Falls back to the hardcoded 3.2+ value if
+// the map has no entry yet (race with userspace push) so existing 3.2+
+// workloads keep working even on the cold path.
+static __always_inline __u32 resolve_wbio_offset(void) {
+  struct tls_binary_key bk = {};
+  bk.cgroup_id = bpf_get_current_cgroup_id();
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+  bk.exe_inode = BPF_CORE_READ(task, mm, exe_file, f_inode, i_ino);
+  struct tls_offsets *off = bpf_map_lookup_elem(&tls_offset_config, &bk);
+  if (off && off->ssl_to_wbio != 0) return off->ssl_to_wbio;
+  bk.exe_inode = 0;
+  off = bpf_map_lookup_elem(&tls_offset_config, &bk);
+  if (off && off->ssl_to_wbio != 0) return off->ssl_to_wbio;
+  return SSL_WBIO_OFFSET_FALLBACK;
+}
 
 // Read the socket fd directly from the SSL struct's write BIO.
 // Returns the fd, or 0 if the read fails.
 static __always_inline __u32 ssl_read_fd(__u64 ssl_ptr) {
   if (!ssl_ptr) return 0;
+  __u32 wbio_off = resolve_wbio_offset();
   __u64 wbio = 0;
-  if (bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + SSL_WBIO_OFFSET)) < 0 || !wbio)
+  if (bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + wbio_off)) < 0 || !wbio)
     return 0;
   __u32 fd = 0;
   if (bpf_probe_read_user(&fd, 4, (void *)(wbio + BIO_NUM_OFFSET)) < 0)
