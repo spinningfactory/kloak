@@ -198,20 +198,22 @@ func TestRun_PropagatesNonZeroExitCode(t *testing.T) {
 	}
 }
 
-func TestRun_BadStartReturnsError(t *testing.T) {
+func TestRun_BadBinaryPropagatesExitCode(t *testing.T) {
+	// Klor wraps the user's command in a `/bin/sh -c 'read <&3; exec "$@"'`
+	// shim that gates exec on the sync pipe (see runtime.go for why).
+	// Result: a missing user binary is no longer a `cmd.Start` failure
+	// (the shim itself is /bin/sh which always exists) — it shows up
+	// as the shim's exec failing, surfacing as exit code 127 with
+	// klor returning no error.
 	rt := New(t.TempDir(), t.TempDir(), zap.NewNop().Sugar())
-	// A binary that definitely won't exist on any runner.
 	code, err := rt.Run(context.Background(), &runtime.Spec{
 		Cmd: []string{"/this/binary/does/not/exist-kloak-test"},
 	})
-	if err == nil {
-		t.Fatal("expected error for non-existent binary")
+	if err != nil {
+		t.Fatalf("Run unexpectedly errored: %v", err)
 	}
-	if code != -1 {
-		t.Errorf("code=%d on Start failure, want -1", code)
-	}
-	if !strings.Contains(err.Error(), "start child") {
-		t.Errorf("error %q should be wrapped with 'start child'", err)
+	if code != 127 {
+		t.Errorf("code=%d, want 127 (shell standard for 'command not found')", code)
 	}
 }
 

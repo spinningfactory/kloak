@@ -222,51 +222,87 @@ func (r *hostRuntime) Run(ctx context.Context, spec *runtime.Spec) (int, error) 
 		}()
 	}
 
-	// 5. Build the child command and start it inside the cgroup.
-	cmd := exec.CommandContext(ctx, spec.Cmd[0], spec.Cmd[1:]...) //nolint:gosec // user-supplied cmd is the whole point of `kloak run`
+	// 5. Build the child command. We don't exec the user's command
+	//    directly — instead a tiny `sh -c 'read <&3; exec "$@"'` shim
+	//    sits between klor and the user's command. The shim's only job
+	//    is to block on a sync pipe (FD 3, the read end of a pipe whose
+	//    write end klor holds) until klor explicitly releases it.
+	//
+	//    This is THE fix for the AttachTLS-vs-short-lived-child race:
+	//    klor previously had no way to guarantee that uprobes were
+	//    attached BEFORE the user's TLS code ran. A loopback `curl`
+	//    completes in ~1 ms — faster than AttachTLS can open
+	//    /proc/<pid>/exe, parse its ELF, and load uprobes — so the
+	//    real value would have already gone over the wire before any
+	//    rewrite hook existed. With the gate, klor finishes all setup
+	//    (cgroup migration, AttachTLS, BPF map updates) and only THEN
+	//    closes the pipe, letting the shim's `read` return EOF and the
+	//    `exec` replace the shim with the user's command in-place
+	//    (same PID, same cgroup, same tracked-tgid state).
+	//
+	//    The shim adds one extra `exec` step in the kernel but no
+	//    extra process — the shell `exec` replaces itself, so cmd.Wait
+	//    still returns the user command's exit code unchanged. Signal
+	//    forwarding still targets the original Process.Pid because
+	//    exec-replacement preserves it.
+	syncRead, syncWrite, err := os.Pipe()
+	if err != nil {
+		return -1, fmt.Errorf("sync pipe: %w", err)
+	}
+	defer func() { _ = syncWrite.Close() }()
+
+	// The shim script: `read _ <&3` waits until we close FD 3's write
+	// end (returns EOF). `_` is a placeholder variable — required by
+	// POSIX `read`, which `dash` (Ubuntu's /bin/sh) enforces strictly
+	// even though `bash` accepts a bare `read`. Without the placeholder
+	// dash prints `read: arg count` and falls through with an error,
+	// defeating the whole point of the gate. Then `exec "$@"` replaces
+	// the shell with the user's command in-place. `--` passes the
+	// remaining args as positional $1, $2, … so `$@` re-assembles them.
+	const shimScript = `read _ <&3; exec "$@"`
+	shimArgs := append([]string{"-c", shimScript, "--"}, spec.Cmd...)
+	cmd := exec.CommandContext(ctx, "/bin/sh", shimArgs...)
 	cmd.Env = composeEnv(spec.ExtraEnv, injEnv)
 	cmd.Dir = spec.WorkDir
 	cmd.Stdin = orDefault(spec.Stdin, os.Stdin)
 	cmd.Stdout = orWriter(spec.Stdout, os.Stdout)
 	cmd.Stderr = orWriter(spec.Stderr, os.Stderr)
+	// ExtraFiles starts mapping at FD 3 in the child — must match the
+	// `<&3` in shimScript above.
+	cmd.ExtraFiles = []*os.File{syncRead}
 	// Put the child in its own process group so a parent SIGINT
 	// doesn't propagate twice (once to us, once to the child) — we
 	// forward it explicitly below.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 	if err := cmd.Start(); err != nil {
+		_ = syncRead.Close()
 		return -1, fmt.Errorf("start child: %w", err)
 	}
+	// klor doesn't read from the sync pipe — only writes (specifically
+	// closing the write end to signal EOF). Close the read end after
+	// fork so klor isn't the second holder; otherwise sh's `read` would
+	// never see EOF when we close `syncWrite`.
+	_ = syncRead.Close()
 
-	// 6. Move the child's PID into the transient cgroup. Failing this
-	//    is fatal: if the child runs outside our cgroup, the eBPF data
-	//    plane will not intercept its TLS writes — the user would
-	//    think their traffic is being rewritten when it isn't, and a
-	//    real secret would leak unredacted. Kill the child immediately
-	//    and surface the error rather than silently degrade to
+	// 6. Move the shim's PID into the transient cgroup BEFORE releasing
+	//    the gate. Failing this is fatal: if the shim runs outside our
+	//    cgroup, the eBPF data plane will not intercept its TLS writes
+	//    — the user would think their traffic is being rewritten when
+	//    it isn't, and a real secret would leak unredacted. Kill the
+	//    shim and surface the error rather than silently degrade to
 	//    "running but un-intercepted".
-	//
-	//    There's still a tiny race window between Start and this write
-	//    where the child can issue syscalls outside the cgroup. A
-	//    follow-up will gate exec behind a sync pipe so the move
-	//    completes before any user-visible work runs in the child.
 	if err := os.WriteFile(filepath.Join(cgPath, "cgroup.procs"),
 		[]byte(strconv.Itoa(cmd.Process.Pid)), 0o644); err != nil {
-		// Best-effort kill — the child may already be dead, in which
-		// case Kill returns ESRCH. Wait reaps either way; we ignore
-		// its error since we're returning a more interesting one.
 		_ = cmd.Process.Kill()
 		_ = cmd.Wait()
 		return -1, fmt.Errorf("attach child pid %d to cgroup %s: %w (TLS rewrite would not apply — refusing to run unprotected)",
 			cmd.Process.Pid, cgPath, err)
 	}
 
-	// Verify the move actually took effect. os.WriteFile to cgroup.procs
-	// can return success even when the kernel silently declined to move
-	// the process (cgroup controller mismatch, race against the child's
-	// own exec, etc.). Log at Debug — when the BPF cgroup filter starts
-	// missing every TLS write in production this is the first thing to
-	// look at, but it's noisy at WARN/INFO for every invocation.
+	// Debug-log to verify the move actually took. Useful when triaging
+	// "rewrite never fires" reports — silent migration failures look
+	// like rewrite failures from the user's perspective.
 	if procBytes, perr := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", cmd.Process.Pid)); perr == nil {
 		r.log.Debugw("post-cgroup-move verification",
 			"pid", cmd.Process.Pid,
@@ -274,10 +310,14 @@ func (r *hostRuntime) Run(ctx context.Context, spec *runtime.Spec) (int, error) 
 			"actual_proc_cgroup", strings.TrimSpace(string(procBytes)))
 	}
 
-	// 6b. Attach TLS uprobes against the child's binary. Same fatal
-	//     stance as the cgroup.procs write: if uprobes don't attach,
-	//     TLS writes go out unredacted, so we kill the child and
-	//     surface the error rather than degrading silently.
+	// 6b. Attach TLS uprobes against the shim — still gated, hasn't
+	//     exec'd the user's command yet. AttachTLS opens /proc/<pid>/exe
+	//     to read the ELF; that's /bin/sh right now and won't have TLS
+	//     symbols, but TrackTGID still runs so DNS / connect filtering
+	//     for the upcoming exec is wired. PollExecEvents picks up the
+	//     subsequent sh→user_command exec and re-attaches uprobes
+	//     against the user binary's libssl (uprobes attach to library
+	//     files system-wide, so the second attach is fast).
 	if ebpf != nil {
 		if err := ebpf.AttachChild(cmd.Process.Pid); err != nil {
 			_ = cmd.Process.Kill()
@@ -285,6 +325,14 @@ func (r *hostRuntime) Run(ctx context.Context, spec *runtime.Spec) (int, error) 
 			return -1, fmt.Errorf("%w (TLS rewrite would not apply — refusing to run unprotected)", err)
 		}
 	}
+
+	// 6c. Everything's in place: cgroup membership locked in, BPF
+	//     programs loaded, uprobes attached, polling goroutines
+	//     running. Close the sync pipe's write end → shim's
+	//     `read <&3` returns EOF → shim exec's the user's command
+	//     in-place. From this moment forward the user's command is
+	//     running with full rewrite coverage.
+	_ = syncWrite.Close()
 
 	// 7. Forward signals to the child. Stop the signal handler before
 	//    Wait returns so the goroutine doesn't outlive the runtime.

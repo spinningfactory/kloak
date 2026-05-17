@@ -140,14 +140,6 @@ func TestKlorRunsWithoutSudoAfterInstall(t *testing.T) {
 		// absolute path.
 		klorPath, "run",
 		"--secrets", yaml,
-		// --no-rewrite because this test is structural-only: it asserts
-		// klor's exec / env-injection / exit-code plumbing without
-		// requiring the eBPF data plane. With --no-rewrite, BPF program
-		// load is skipped, so the AttachTLS-races-short-lived-child race
-		// (documented in runtime.go) can't trip on `echo`'s
-		// near-instant exit. The actual rewrite path is exercised by
-		// TestKlorRewritesShadowOnTheWire below.
-		"--no-rewrite",
 		"--", "sh", "-c", "echo got=$K",
 	)
 	out, err := cmd.CombinedOutput()
@@ -243,22 +235,18 @@ func TestKlorRewritesShadowOnTheWire(t *testing.T) {
 	// progress noise. The whole point: curl is the cap'd klor's
 	// direct child, so klor.cgroup.procs migration races neither bash
 	// nor a re-exec — the cleanest possible attach window.
-	// `sh -c 'sleep 0.5; curl …'` gives klor's AttachTLS time to attach
-	// uprobes BEFORE curl's TLS write happens. A direct curl exec
-	// against loopback completes in ~1 ms — faster than AttachTLS can
-	// open /proc/<pid>/exe + load uprobes, so the SSL_write fires
-	// before any probe is in place and the rewrite never runs. The
-	// sleep is the documented stopgap until the sync-pipe gate (see
-	// runtime.go TODO) lands. The bash-then-curl pattern that
-	// previously failed at cgroup migration (user.slice common
-	// ancestor unwritable) now succeeds because the cap'd binary has
-	// CAP_SYS_ADMIN + CAP_DAC_OVERRIDE.
+	// Direct curl exec — no sleep, no shell wrapper. klor's sync-pipe
+	// gate (see runtime.go) guarantees uprobes are attached BEFORE
+	// the user's curl can call SSL_write, so the loopback-curl-
+	// completes-in-1ms race that previously needed a sleep workaround
+	// is closed at the runtime layer instead of papered over in the
+	// test.
 	cmd := exec.Command(
 		"setpriv", "--reuid", fmt.Sprintf("%d", dropUID), "--regid", fmt.Sprintf("%d", dropUID), "--init-groups",
 		klorPath, "run",
 		"--secrets", yaml,
 		"--",
-		"sh", "-c", fmt.Sprintf("sleep 0.5; /usr/bin/curl -sk --data-binary @%s %s/", payloadPath, echo.URL),
+		"/usr/bin/curl", "-sk", "--data-binary", "@"+payloadPath, echo.URL+"/",
 	)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
