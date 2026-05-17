@@ -71,15 +71,16 @@ type watchedHostKey struct {
 	Host [64]byte
 }
 
-// Generate eBPF bindings. The KLOAK_TARGET_ARCH env var (set by Dockerfile or
-// Makefile) controls which __TARGET_ARCH_xxx define is passed to clang.
-// Defaults to arm64 for local development on macOS/Lima.
+// Generate eBPF bindings. KLOAK_TARGET_ARCH (set by the Makefile or by CI)
+// selects the `__TARGET_ARCH_xxx` define handed to clang. Defaults to arm64
+// for local development on macOS/Lima.
 //
-// `-tags linux` makes bpf2go emit `//go:build linux && (<arches>)` on the
-// generated `tlsuprobe_bpfel.go` / `tlsuprobe_bpfeb.go` files. Without it
-// the generated files build on every OS and break macOS compilation
-// because cilium/ebpf is Linux-only.
-//go:generate sh -c "ARCH=${KLOAK_TARGET_ARCH:-arm64}; go run github.com/cilium/ebpf/cmd/bpf2go -cc clang -cflags \"-O2 -g -Wall -Werror -D__TARGET_ARCH_${ARCH}\" -tags linux tlsuprobe bpf/tls_uprobe.c -- -I../ebpf"
+// The actual command runs out of `generate.sh` rather than inline here — Go's
+// directive substitution mangles `${VAR:-default}` (matches greedily, doesn't
+// understand the shell `:-default` form, drops the whole token to empty),
+// which silently dead-strips the arch-specific register-read code in every
+// uprobe. See generate.sh for the full story.
+//go:generate ./generate.sh
 
 // TLSUprobeManager manages the loading and attaching of eBPF uprobes for TLS interception.
 type TLSUprobeManager struct {
