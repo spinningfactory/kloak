@@ -850,13 +850,15 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, cgroupID uint64, containerLib
 			continue
 		}
 
-		// Must match struct tls_offsets in tls_uprobe.c.
+		// Must match struct tls_offsets in tls_uprobe.c. Field order is
+		// load-bearing — the BPF program reads this struct by offset.
 		type bpfTLSOffsets struct {
 			SSLToWRL       uint32
 			WRLToEncCtx    uint32
 			EncCtxToAlgctx uint32
 			AlgctxToH      uint32
 			SSLToVersion   uint32
+			SSLToWBIO      uint32
 		}
 		val := bpfTLSOffsets(offsets)
 		key := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: exeInode}
