@@ -69,23 +69,69 @@ done
 
 readonly PREFIX VERSION
 
+# Tempdirs for build output / release tarball / etc. We collect them
+# all in a single bash array and `trap … EXIT` clears them on any exit
+# path (success, error, signal). Without this, a `--version foo` typo
+# would leave megabytes of downloaded tarballs in /tmp.
+_TMPDIRS=()
+make_tempdir() {
+    local d
+    d="$(mktemp -d)"
+    _TMPDIRS+=("$d")
+    echo "$d"
+}
+trap '[[ ${#_TMPDIRS[@]} -gt 0 ]] && rm -rf "${_TMPDIRS[@]}"' EXIT
+
 # -----------------------------------------------------------------------
-# Privilege escalation: re-exec under sudo when we need it
+# Privilege escalation strategy
 # -----------------------------------------------------------------------
 #
-# We escalate up-front rather than partway through. Two reasons:
-#  1. Curl|bash pipes can't accept stdin for sudo's password prompt
-#     mid-script; getting the password before any work means the user
-#     sees the prompt at a predictable moment.
-#  2. The `cp` + `setcap` + `getcap verify` block needs to be atomic — if
-#     we re-exec mid-stream we'd lose state (resolved binary path, etc.).
+# We need root for three operations: writing to $PREFIX (typically
+# /usr/local/bin), `setcap` (needs CAP_SETFCAP), and the install/mkdir
+# under root-owned paths. Everything else — resolving the binary,
+# building from source, downloading the release tarball — should run as
+# the *invoking* user, not as root. Two reasons:
+#
+#   1. `go build` writes to the user's Go cache (~/.cache/go-build,
+#      ~/go/pkg). Running it as root via `sudo -E` would either reach
+#      into the user's $HOME (creating root-owned cache files that the
+#      user can't later read/update from their normal shell — gemini
+#      caught this) or to root's own cache, which is uselessly empty.
+#   2. Curl-piped downloads + sha256 verification have no reason to
+#      run privileged; doing them as root only widens the blast radius
+#      if anything goes wrong before `setcap`.
+#
+# So: the script stays as the invoking user, and individual privileged
+# steps re-acquire root via `sudo` (or run directly when we're already
+# root, e.g., in an apt/yum postinst). The early `sudo -n true` probe
+# tells us up-front whether the user will hit a password prompt later —
+# that matters because curl|bash invocations have no controlling tty
+# and can't accept a password mid-stream.
 
+# privileged_run executes the given command as root: directly when we're
+# already root (apt/yum postinst, deliberate `sudo bash install.sh`),
+# via `sudo` otherwise. Stdin is closed for these calls so a misbehaving
+# command can't sit waiting on input.
+privileged_run() {
+    if [[ $EUID -eq 0 ]]; then
+        "$@"
+    else
+        sudo -n "$@" </dev/null
+    fi
+}
+
+# Probe for the privilege we'll need. Fails loud BEFORE any work if
+# sudo would prompt and we have no tty to accept the password (curl|sh
+# case) — running into that mid-script after a long download or build
+# is a worse user experience than refusing up-front.
 if [[ $EUID -ne 0 ]]; then
-    log "klor installer needs root to write to $PREFIX and set file capabilities."
-    log "Re-executing under sudo …"
-    # -E so the user's env (KLOR_BINARY override, HOME for go cache, …)
-    # survives into the privileged context.
-    exec sudo -E "$0" --prefix "$PREFIX" --version "$VERSION"
+    command -v sudo >/dev/null || die "sudo not available and not running as root — re-run as root or in an environment with sudo"
+    if ! sudo -n true 2>/dev/null; then
+        if [[ ! -t 0 ]]; then
+            die "this script needs sudo but no tty is available for a password prompt. Re-run as: curl … | sudo bash"
+        fi
+        log "Privileged steps (install + setcap) will prompt for your sudo password."
+    fi
 fi
 
 # -----------------------------------------------------------------------
@@ -112,7 +158,14 @@ resolve_binary() {
         log "Detected source checkout at $SCRIPT_DIR — building klor locally …"
         command -v go >/dev/null || die "go not installed (needed to build from checkout)"
         local out
-        out="$(mktemp -d)/klor"
+        out="$(make_tempdir)/klor"
+        # Run as the invoking user (not root) — `go build` writes the
+        # build cache under $HOME; doing it as root either reaches into
+        # the user's HOME and leaves root-owned cache files there, or
+        # writes to root's own cache, which is useless. We're not root
+        # here yet (we only escalate at install time) so this is
+        # already correct, but keep the comment as a reminder for
+        # future refactors.
         (cd "$SCRIPT_DIR" && go build -o "$out" ./cmd/klor) || die "go build failed"
         echo "$out"
         return
@@ -146,7 +199,7 @@ download_release_binary() {
 
     tar_name="klor-${os}-${arch}.tar.gz"
     url="https://github.com/$REPO_OWNER/$REPO_NAME/releases/download/$tag/$tar_name"
-    tmp="$(mktemp -d)"
+    tmp="$(make_tempdir)"
 
     log "Fetching klor $tag for $os/$arch …"
     curl -fsSL --output "$tmp/$tar_name"        "$url"        || die "download failed: $url"
@@ -219,26 +272,33 @@ install_binary() {
     command -v getcap >/dev/null \
         || die "getcap not installed (same package as setcap)"
 
+    # Each privileged step goes through `privileged_run` so install.sh
+    # itself stays as the invoking user; `sudo` is acquired only for
+    # the operations that genuinely need root (write to $PREFIX,
+    # `setcap`). `install` does both the mkdir and the file copy in
+    # one syscall — fewer privileged calls is less attack surface.
     log "Installing $dest …"
-    mkdir -p "$PREFIX"
-    install -m 0755 "$src" "$dest"
+    privileged_run install -m 0755 -D "$src" "$dest" \
+        || die "install to $dest failed"
 
     log "Setting capabilities: $capset"
-    if ! setcap "$capset" "$dest"; then
+    if ! privileged_run setcap "$capset" "$dest"; then
         # AppArmor, SELinux, or NFS-without-acl can reject setcap. Don't
         # leave a half-installed binary behind that would mislead the
         # user into thinking klor is ready when it can't actually run.
-        rm -f "$dest"
+        privileged_run rm -f "$dest"
         die "setcap rejected the capability set — your kernel or LSM may not allow file capabilities here"
     fi
 
     # Verify the caps actually stuck. Some filesystems silently strip
     # them at write time (NFS without `acl` mount option is the common
-    # culprit). getcap returns 0 with empty output in that case.
+    # culprit). getcap doesn't need root — readable by anyone. Returns
+    # 0 with empty output in the strip case, so we check the output
+    # rather than the exit code.
     local got
     got="$(getcap "$dest" 2>/dev/null | awk '{ $1=""; sub(/^ /,""); print }')"
     if [[ -z "$got" ]]; then
-        rm -f "$dest"
+        privileged_run rm -f "$dest"
         die "capabilities did not persist on $dest — filesystem may be stripping them (NFS without acl, AppArmor, …)"
     fi
     log "Verified capabilities on $dest: $got"
