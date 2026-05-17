@@ -80,7 +80,12 @@ type watchedHostKey struct {
 // understand the shell `:-default` form, drops the whole token to empty),
 // which silently dead-strips the arch-specific register-read code in every
 // uprobe. See generate.sh for the full story.
-//go:generate ./generate.sh
+//
+// `bash ./generate.sh` (rather than just `./generate.sh`) avoids depending
+// on the file mode bit surviving every clone / tarball / CI checkout — some
+// fetch paths drop the executable bit and we'd get "permission denied" with
+// no obvious cause.
+//go:generate bash ./generate.sh
 
 // TLSUprobeManager manages the loading and attaching of eBPF uprobes for TLS interception.
 type TLSUprobeManager struct {

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # Wrapper around `bpf2go` invoked from this package's //go:generate directive.
 #
 # Why a script instead of inlining the bpf2go command in //go:generate:
