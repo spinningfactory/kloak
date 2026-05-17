@@ -1,4 +1,4 @@
-.PHONY: all build build-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup \
+.PHONY: all build build-klor build-linux build-klor-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup e2e-klor \
         e2e-k3s e2e-k3s-setup e2e-k3s-run e2e-k3s-cleanup \
         clean deps docker-build generate-ebpf generate-vmlinux run help \
         lima-start lima-stop lima-delete lima-shell lima-exec lima-check \
@@ -16,6 +16,11 @@ GOGENERATE=$(GOCMD) generate
 # Binary names
 BINARY_NAME=kloak
 WEBHOOK_BINARY=kloak-webhook
+
+# Klor — the host-CLI runtime. Separate `main` package at cmd/klor/ so its
+# dependency closure shrinks independently (no k8s.io/client-go, no
+# controller-runtime). Not part of the controller Docker image.
+KLOR_BINARY=klor
 
 # Release tag baked into the binary for `kloak version`. `git describe
 # --tags --always --dirty` gives `v0.1.0` exactly on tag, `v0.1.0-3-gabc1234-dirty`
@@ -48,7 +53,7 @@ LIMA_CONFIG=lima.yaml
 # Main targets
 # ============================================================================
 
-all: build
+all: build build-klor
 
 # Build depends on Go sources (and generated eBPF on Linux)
 build: deps $(BUILD_DIR)/$(BINARY_NAME)
@@ -57,12 +62,26 @@ $(BUILD_DIR)/$(BINARY_NAME): $(GO_SOURCES)
 	@mkdir -p $(BUILD_DIR)
 	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./$(CMD_DIR)/kloak
 
+# Build the klor host-CLI binary. Sibling of `build`; lives at cmd/klor/.
+build-klor: deps $(BUILD_DIR)/$(KLOR_BINARY)
+
+$(BUILD_DIR)/$(KLOR_BINARY): $(GO_SOURCES)
+	@mkdir -p $(BUILD_DIR)
+	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(KLOR_BINARY) ./$(CMD_DIR)/klor
+
 # Build for Linux (cross-compile or via Lima)
 build-linux: lima-ensure
 	@if [ "$$(uname)" = "Linux" ]; then \
 		GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak; \
 	else \
 		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak"; \
+	fi
+
+build-klor-linux: lima-ensure
+	@if [ "$$(uname)" = "Linux" ]; then \
+		GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(KLOR_BINARY)-linux ./$(CMD_DIR)/klor; \
+	else \
+		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go build $(LDFLAGS) -o $(BUILD_DIR)/$(KLOR_BINARY)-linux ./$(CMD_DIR)/klor"; \
 	fi
 
 test: deps
@@ -135,6 +154,12 @@ e2e-setup:
 e2e-run:
 	KUBECONFIG=$$(k3d kubeconfig write $(E2E_CLUSTER)) \
 	$(GOTEST) -v -timeout 1500s -tags=e2e_ebpf -count=1 ./test/e2e/
+
+# klor e2e — builds the klor binary and exercises its CLI against
+# a tempdir cgroup root. No cluster, no root required (Linux-only,
+# skips on macOS). Cheap; safe to run as part of unit-test CI.
+e2e-klor:
+	$(GOTEST) -v -timeout 120s -tags=e2e_klor -count=1 ./test/e2e/klor/
 
 # Run e2e tests against the current kube context.
 # Builds images, pushes to ttl.sh (anonymous ephemeral registry, 2h TTL),
@@ -364,40 +389,56 @@ help:
 	@echo "Kloak Makefile - Kubernetes eBPF HTTPS Interceptor"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  build           - Build the kloak binary (native)"
-	@echo "  build-linux     - Build for Linux (uses Lima on macOS)"
-	@echo "  test            - Run unit tests"
-	@echo "  test-linux      - Run tests in Linux VM"
-	@echo "  e2e             - Full e2e: setup + run + cleanup (includes eBPF tests)"
-	@echo "  e2e-setup       - Create k3d cluster with BPF mounts and import images"
-	@echo "  e2e-run         - Run e2e tests (requires e2e-setup first)"
-	@echo "  e2e-cleanup     - Delete e2e k3d cluster"
-	@echo "  clean           - Clean build artifacts"
-	@echo "  deps            - Download and tidy dependencies"
-	@echo "  docker-build    - Build Docker image"
-	@echo "  run             - Build and run locally"
+	@echo "  all              - Build both kloak and klor binaries"
+	@echo "  build            - Build the kloak binary (native)"
+	@echo "  build-klor       - Build the klor host-CLI binary (native)"
+	@echo "  build-linux      - Build kloak for Linux (uses Lima on macOS)"
+	@echo "  build-klor-linux - Build klor for Linux (uses Lima on macOS)"
+	@echo "  clean            - Clean build artifacts"
+	@echo "  deps             - Download and tidy dependencies"
+	@echo "  docker-build     - Build Docker image"
+	@echo "  run              - Build and run kloak locally"
 	@echo ""
-	@echo "eBPF targets:"
-	@echo "  generate-ebpf   - Generate eBPF Go bindings (uses Lima on macOS)"
+	@echo "Test targets:"
+	@echo "  test             - Run unit tests"
+	@echo "  test-linux       - Run tests in Lima VM (needed for eBPF tests)"
+	@echo "  test-bpf-helpers - Run eBPF helper C unit tests"
+	@echo ""
+	@echo "k3d-based e2e (k8s tests; macOS-friendly via Docker):"
+	@echo "  e2e              - Full e2e: setup + run + cleanup"
+	@echo "  e2e-setup        - Create k3d cluster with BPF mounts and import images"
+	@echo "  e2e-run          - Run e2e tests against the existing k3d cluster"
+	@echo "  e2e-cleanup      - Delete e2e k3d cluster"
+	@echo "  e2e-local        - Build + push images to ttl.sh and run e2e against current kube context"
+	@echo "  e2e-local-push   - Build + push e2e images to ttl.sh (or E2E_REGISTRY)"
+	@echo "  e2e-local-run    - Run e2e against existing kube context (assumes images pushed)"
+	@echo ""
+	@echo "k3s-native e2e (CI / Linux workstations — no Docker nesting):"
+	@echo "  e2e-k3s          - Full e2e: setup + run + cleanup (k3s-native)"
+	@echo "  e2e-k3s-setup    - Install k3s, build and import images"
+	@echo "  e2e-k3s-run      - Run e2e tests against local k3s"
+	@echo "  e2e-k3s-cleanup  - Uninstall k3s"
+	@echo ""
+	@echo "klor e2e (no cluster required):"
+	@echo "  e2e-klor         - Build klor and exercise its CLI (Linux-only; self-skips on macOS)"
+	@echo ""
+	@echo "eBPF code generation:"
+	@echo "  generate-ebpf    - Generate eBPF Go bindings (uses Lima on macOS)"
 	@echo "  generate-vmlinux - Generate vmlinux.h from kernel BTF"
+	@echo "  go-tls-fixtures  - Build / refresh Go TLS offset fixtures"
+	@echo "  go-tls-discover  - Discover new Go TLS offsets across versions"
 	@echo ""
-	@echo "k3s-native e2e targets (CI / Linux workstations):"
-	@echo "  e2e-k3s         - Full e2e: setup + run + cleanup (k3s-native)"
-	@echo "  e2e-k3s-setup   - Install k3s, build and import images"
-	@echo "  e2e-k3s-run     - Run e2e tests against local k3s"
-	@echo "  e2e-k3s-cleanup - Uninstall k3s"
+	@echo "Lima VM (for eBPF on macOS):"
+	@echo "  lima-start       - Start the Lima VM"
+	@echo "  lima-stop        - Stop the Lima VM"
+	@echo "  lima-delete      - Delete the Lima VM"
+	@echo "  lima-shell       - Open shell in Lima VM"
+	@echo "  lima-ensure      - Ensure VM is running (idempotent)"
 	@echo ""
-	@echo "Lima VM targets (for eBPF on macOS):"
-	@echo "  lima-start      - Start the Lima VM"
-	@echo "  lima-stop       - Stop the Lima VM"
-	@echo "  lima-delete     - Delete the Lima VM"
-	@echo "  lima-shell      - Open shell in Lima VM"
-	@echo "  lima-ensure     - Ensure VM is running (idempotent)"
-	@echo ""
-	@echo "Lima k3d targets (for e2e on ARM Mac):"
-	@echo "  lima-k3d-shell  - Shell into k3d Lima VM"
-	@echo "  lima-k3d-e2e    - Full e2e: setup + run inside Lima k3d VM"
-	@echo "  lima-k3d-e2e-setup - Create k3d cluster inside Lima VM"
-	@echo "  lima-k3d-e2e-run   - Run e2e tests inside Lima VM"
-	@echo "  lima-k3d-stop   - Stop k3d Lima VM"
-	@echo "  lima-k3d-delete - Delete k3d Lima VM"
+	@echo "Lima k3d (for k8s e2e on ARM Mac):"
+	@echo "  lima-k3d-shell      - Shell into k3d Lima VM"
+	@echo "  lima-k3d-e2e        - Full e2e: setup + run inside Lima k3d VM"
+	@echo "  lima-k3d-e2e-setup  - Create k3d cluster inside Lima VM"
+	@echo "  lima-k3d-e2e-run    - Run e2e tests inside Lima VM"
+	@echo "  lima-k3d-stop       - Stop k3d Lima VM"
+	@echo "  lima-k3d-delete     - Delete k3d Lima VM"
