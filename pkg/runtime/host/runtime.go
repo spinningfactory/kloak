@@ -44,22 +44,15 @@ import (
 	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
-// New returns a host-cgroup Runtime. When cgroupRoot is empty, New
-// picks a sensible default based on the caller's privilege:
+// New returns a host-cgroup Runtime.
 //
-//   - **Root** uses `/sys/fs/cgroup` directly — the kernel-default v2
-//     mount, which only CAP_SYS_ADMIN can mkdir under. This matches the
-//     pre-rootless behavior so existing `sudo klor …` invocations stay
-//     identical.
-//   - **Non-root** attempts cgroups.DiscoverUserDelegatedRoot first.
-//     On a systemd-managed host every logged-in user has a writable
-//     `/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/`
-//     subtree (systemd-logind sets `Delegate=yes`), and mkdir there
-//     needs no privilege. If discovery fails (non-systemd host, daemon
-//     context with no user@ segment, …), we fall through to
-//     `/sys/fs/cgroup` so the existing CreateTransient error path
-//     surfaces a clear "permission denied" with the candidate path,
-//     pointing the operator at `sudo` or a setcap install.
+// cgroupRoot defaults to `/sys/fs/cgroup` (cgroups.DefaultCgroupRoot)
+// when empty. Privilege to mkdir under that path comes from one of:
+//
+//   - `sudo klor …` — CAP_SYS_ADMIN via the sudo session.
+//   - File capabilities applied by install.sh: the binary carries
+//     `cap_dac_override,cap_sys_admin,…+ep` so the process has the
+//     right caps without sudo. See install.sh in the repo root.
 //
 // injectRoot is the tmpfs base for `inject.file` materialization. When
 // empty, defaults to `/run/kloak` for root and `$XDG_RUNTIME_DIR/kloak`
@@ -74,7 +67,7 @@ func New(cgroupRoot, injectRoot string, log *zap.SugaredLogger) runtime.Runtime 
 		injectRoot = chooseInjectRoot()
 	}
 	if cgroupRoot == "" {
-		cgroupRoot = chooseCgroupRoot(log)
+		cgroupRoot = cgroups.DefaultCgroupRoot
 	}
 	return &hostRuntime{
 		cgroupRoot: cgroupRoot,
@@ -83,40 +76,33 @@ func New(cgroupRoot, injectRoot string, log *zap.SugaredLogger) runtime.Runtime 
 	}
 }
 
-// annotateCgroupError wraps a CreateTransient error with rootless-mode
-// remediation hints. EPERM as a non-root user almost always means we're
-// trying to mkdir under /sys/fs/cgroup (root-owned) because either:
-//   - `/proc/self/cgroup` discovery couldn't find a writable user@.service
-//     subtree (typical for interactive shells in session-N.scope, where
-//     cgroup-v2's common-ancestor rule blocks process migration even
-//     though user@.service is mkdir-able), or
-//   - we're in a container / non-systemd host with no delegation.
-//
-// We point at the three real fixes rather than letting the operator
-// chase a bare "permission denied".
+// annotateCgroupError wraps a CreateTransient error with a remediation
+// hint pointing at install.sh (or sudo as the always-works fallback).
+// EPERM as a non-root user always means we don't have the caps needed
+// for cgroup-v2 mkdir + the cgroup.procs write that follows. The
+// in-tree install.sh fixes this by setting file capabilities on the
+// binary; sudo is the per-invocation alternative.
 func annotateCgroupError(err error) error {
 	if os.Geteuid() == 0 || !errors.Is(err, os.ErrPermission) {
 		return fmt.Errorf("create cgroup: %w", err)
 	}
 	return fmt.Errorf("create cgroup: %w\n\n"+
-		"klor needs a writable cgroup-v2 subtree. Three fixes:\n"+
-		"  1. Reinstall klor with install.sh so the binary has CAP_SYS_ADMIN baked in.\n"+
+		"klor needs CAP_SYS_ADMIN + CAP_DAC_OVERRIDE for cgroup-v2 mkdir + process migration. Two fixes:\n"+
+		"  1. Reinstall klor so the binary carries the caps:\n"+
 		"     curl -fsSL https://github.com/spinningfactory/kloak/raw/main/install.sh | bash\n"+
 		"     (one-time, then klor runs as your user with no prefix)\n"+
-		"  2. systemd-run --user --scope -- klor run …\n"+
-		"     (one-off; re-launches inside user@%d.service so logind brokers the cgroup migration)\n"+
-		"  3. sudo klor run …\n"+
-		"     (one-off; CAP_SYS_ADMIN via the sudo session)",
-		err, os.Geteuid())
+		"  2. sudo klor run …\n"+
+		"     (per-invocation; same caps, granted via the sudo session)",
+		err)
 }
 
 // chooseInjectRoot returns the staging root for `inject.file` writes.
-// `/run` requires CAP_SYS_ADMIN to create subdirectories under, so
-// for unprivileged callers we use XDG_RUNTIME_DIR (the per-user tmpfs
-// that systemd-logind provisions at session start). Failing that,
-// `/tmp/kloak` is the last resort — writable to anyone but world-
-// readable, so the `inject.file` 0o400 mode + per-invocation UUID
-// path are the actual confidentiality protection.
+// `/run` requires CAP_DAC_OVERRIDE to create subdirectories under
+// without being root, so for non-root callers we prefer the per-user
+// tmpfs systemd-logind provisions at session start (XDG_RUNTIME_DIR).
+// `/tmp/kloak` is the last resort — writable to anyone but
+// world-readable, so the `inject.file` 0o400 mode + per-invocation
+// UUID path are the actual confidentiality protection there.
 func chooseInjectRoot() string {
 	if os.Geteuid() == 0 {
 		return "/run/kloak"
@@ -125,29 +111,6 @@ func chooseInjectRoot() string {
 		return filepath.Join(x, "kloak")
 	}
 	return "/tmp/kloak"
-}
-
-// chooseCgroupRoot picks the default cgroup root based on euid. The
-// non-root delegation lookup is a non-fatal best-effort: any failure
-// (no v2 entry, no user@.service segment, dir not writable) falls
-// through to /sys/fs/cgroup, where CreateTransient will produce a clear
-// error if the caller doesn't have CAP_SYS_ADMIN.
-//
-// Discovery failure is logged at Debug — common cases (CI runner under
-// system.slice, daemon under its own service scope) are expected and
-// shouldn't spam stderr on every invocation.
-func chooseCgroupRoot(log *zap.SugaredLogger) string {
-	if os.Geteuid() == 0 {
-		return cgroups.DefaultCgroupRoot
-	}
-	root, err := cgroups.DiscoverUserDelegatedRoot("")
-	if err != nil {
-		log.Debugw("no user-delegated cgroup root — falling back to /sys/fs/cgroup (will need privilege)",
-			"err", err)
-		return cgroups.DefaultCgroupRoot
-	}
-	log.Debugw("using user-delegated cgroup root", "path", root)
-	return root
 }
 
 type hostRuntime struct {
