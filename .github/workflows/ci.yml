@@ -117,6 +117,16 @@ jobs:
         # and gating its e2e on a cluster would obscure breakage.
         run: make e2e-klor
 
+      - name: Run klor rooted e2e
+        # Exercises install.sh + cap-on-binary: install.sh sets file
+        # capabilities so klor doesn't need sudo, then the test drops
+        # to a non-root uid via setpriv to prove the cap path actually
+        # delivers. Needs root for setcap; ubuntu-latest provides it.
+        # Once the eBPF wiring follow-up lands, this test will be
+        # extended to assert the actual TLS rewrite end-to-end (which
+        # the `--no-rewrite`-gated e2e-klor above can't).
+        run: sudo make e2e-klor-rooted
+
       - name: Upload unit coverage
         uses: actions/upload-artifact@v7
         with:

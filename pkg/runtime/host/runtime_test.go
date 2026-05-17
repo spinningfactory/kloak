@@ -31,8 +31,8 @@ type staticSource struct{ snap []secrets.Secret }
 func (s staticSource) Snapshot(context.Context) ([]secrets.Secret, error) { return s.snap, nil }
 
 func TestNew_DefaultsInjectRootAndLogger(t *testing.T) {
-	// Construction must default empty injectRoot to /run/kloak and a
-	// nil logger to a no-op — Run dereferences both unconditionally.
+	// nil logger must default to a no-op — Run dereferences r.log
+	// unconditionally on debug/warn paths.
 	rt := New("", "", nil)
 	if rt == nil {
 		t.Fatal("New returned nil")
@@ -41,12 +41,33 @@ func TestNew_DefaultsInjectRootAndLogger(t *testing.T) {
 	if !ok {
 		t.Fatalf("type=%T, want *hostRuntime", rt)
 	}
-	if hr.injectRoot != "/run/kloak" {
-		t.Errorf("injectRoot=%q, want /run/kloak", hr.injectRoot)
-	}
 	if hr.log == nil {
 		t.Error("logger should default to no-op, got nil")
 	}
+	// injectRoot default depends on privilege: /run/kloak for root,
+	// $XDG_RUNTIME_DIR/kloak for unprivileged users (the per-user
+	// systemd-managed tmpfs), /tmp/kloak as last resort.
+	wantInject := expectedDefaultInjectRoot(t)
+	if hr.injectRoot != wantInject {
+		t.Errorf("injectRoot=%q, want %q (euid=%d, XDG_RUNTIME_DIR=%q)",
+			hr.injectRoot, wantInject, os.Geteuid(), os.Getenv("XDG_RUNTIME_DIR"))
+	}
+}
+
+// expectedDefaultInjectRoot mirrors chooseInjectRoot's branch logic so
+// the test asserts the same default the runtime computes. Keeps the
+// assertion robust to whatever the test environment is (root in
+// docker-based CI, non-root with XDG_RUNTIME_DIR in dev/Lima, non-root
+// without it in some kind clusters).
+func expectedDefaultInjectRoot(t *testing.T) string {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		return "/run/kloak"
+	}
+	if x := os.Getenv("XDG_RUNTIME_DIR"); x != "" {
+		return filepath.Join(x, "kloak")
+	}
+	return "/tmp/kloak"
 }
 
 func TestRun_NilSpecRejected(t *testing.T) {
