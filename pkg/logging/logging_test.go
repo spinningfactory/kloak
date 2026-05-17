@@ -93,6 +93,56 @@ func TestSetup_LevelIsCaseInsensitive(t *testing.T) {
 	}
 }
 
+func TestSetupCLI_DefaultIsWarn(t *testing.T) {
+	got := SetupCLI("")
+	if got == nil {
+		t.Fatal("SetupCLI returned nil")
+	}
+	core := got.Desugar().Core()
+	if core.Enabled(zapcore.InfoLevel) {
+		t.Error("default SetupCLI logger should NOT be at Info level (WARN baseline)")
+	}
+	if !core.Enabled(zapcore.WarnLevel) {
+		t.Error("default SetupCLI logger should be at Warn level")
+	}
+}
+
+func TestSetupCLI_LevelMatrix(t *testing.T) {
+	cases := []struct {
+		in            string
+		enabledAt     zapcore.Level
+		disabledBelow zapcore.Level
+	}{
+		// Trace sits below debug — enabled when caller asks for it,
+		// otherwise the per-event Tracew firehose stays silent.
+		{"trace", TraceLevel, 0 /* nothing below trace to test */},
+		{"TRACE", TraceLevel, 0},
+		{"debug", zapcore.DebugLevel, TraceLevel},
+		{"info", zapcore.InfoLevel, zapcore.DebugLevel},
+		{"warn", zapcore.WarnLevel, zapcore.InfoLevel},
+		{"error", zapcore.ErrorLevel, zapcore.WarnLevel},
+		// Invalid → WARN (same fallback as empty).
+		{"garbage", zapcore.WarnLevel, zapcore.InfoLevel},
+		// Case-insensitive: UnmarshalText accepts uppercase.
+		{"WARN", zapcore.WarnLevel, zapcore.InfoLevel},
+		{"Error", zapcore.ErrorLevel, zapcore.WarnLevel},
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			got := SetupCLI(tc.in)
+			core := got.Desugar().Core()
+			if !core.Enabled(tc.enabledAt) {
+				t.Errorf("%q: level %s should be enabled", tc.in, tc.enabledAt)
+			}
+			// Sentinel 0 means "no disabled boundary to test" (e.g. trace
+			// has no level below it in our hierarchy).
+			if tc.disabledBelow != 0 && core.Enabled(tc.disabledBelow) {
+				t.Errorf("%q: level %s should be disabled", tc.in, tc.disabledBelow)
+			}
+		})
+	}
+}
+
 func TestTracew_EmitsAtTraceLevel(t *testing.T) {
 	core, recorded := observer.New(TraceLevel)
 	logger := zap.New(core).Sugar()

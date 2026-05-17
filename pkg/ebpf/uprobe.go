@@ -123,8 +123,43 @@ type tcAttachEntry struct {
 // setupCgroupAncestor finds the kubepods cgroup directory and stores its fd
 // in the BPF cgroup_ancestor map. This enables bpf_current_task_under_cgroup()
 // in the exec tracepoint to catch all container execs without per-container
+// runningInKubepods reports whether the current task is inside a
+// cgroup whose path contains "kubepods" — the cheap, reliable signal
+// that we're running as a k8s pod. False on host binaries (klor, dev
+// invocations, tests).
+//
+// Returns false on any read/parse error: if we can't tell, assume we
+// aren't in k8s. The downstream code path (skipping the ancestor map)
+// is a strict superset of safe behavior on a non-k8s host, so a false
+// negative here only loses a controller-DaemonSet optimization in the
+// pathological case where /proc/self/cgroup is unreadable from inside
+// a real kubepods cgroup.
+func runningInKubepods() bool {
+	data, err := os.ReadFile("/proc/self/cgroup")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), "kubepods")
+}
+
 // cgroup tracking.
 func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log *zap.SugaredLogger) error {
+	// Short-circuit when we're not running inside Kubernetes at all. The
+	// ancestor map is a controller-DaemonSet optimization — its job is to
+	// let the exec tracepoint catch container processes that haven't yet
+	// been TrackCgroup'd by the pod reconciler. Hosts running klor / host
+	// binaries have no kubepods cgroup, and we already TrackCgroup the
+	// transient cgroup directly, so a missing ancestor is the expected
+	// state, not an error.
+	//
+	// Detect by inspecting /proc/self/cgroup: if our own task isn't under
+	// a kubepods-named cgroup, this isn't a k8s host. Log at Info and
+	// return nil — the exec tracepoint still works via tracked_cgroups.
+	if !runningInKubepods() {
+		log.Infow("Not running inside a kubepods cgroup — skipping ancestor map setup (exec tracepoint will use tracked_cgroups only)")
+		return nil
+	}
+
 	// Find the kubepods cgroup directory. Strategy:
 	// 1. Derive from the controller's own cgroup path (/proc/self/cgroup)
 	//    since the controller runs under kubepods — most reliable because

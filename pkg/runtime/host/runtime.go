@@ -12,16 +12,22 @@
 // the runtime requires CAP_SYS_ADMIN (or root) — same operational
 // profile as the controller DaemonSet today.
 //
-// eBPF wiring (TLSUprobeManager construction, TrackCgroup / AttachTLS /
-// PollEvents goroutines, trusted DNS population) is a follow-up PR.
-// What lands here:
-//   - the Runtime interface surface (`New() Runtime`)
+// What lands here (PR #221 + the eBPF wiring on top):
+//   - the Runtime interface surface (`New() Runtime`, `WithEBPF()`)
 //   - cgroup primitive integration (CreateTransient from #220)
 //   - injection materialization (env + file per Secret.Inject)
 //   - child exec inside the cgroup with stdio inheritance
+//   - eBPF data plane: TLSUprobeManager load, TrackCgroup,
+//     RecordCgroupNetns, AttachTLS, trusted-DNS population, and the
+//     PollEvents/PollExecEvents goroutines that drain the ring buffers
 //   - signal forwarding (SIGINT / SIGTERM / SIGHUP) to the child
 //   - exit-code propagation
-//   - deterministic cleanup of cgroup + tmpfs injection dir
+//   - deterministic cleanup of cgroup + tmpfs injection dir + BPF
+//     program detach
+//
+// Open follow-ups (intentionally deferred):
+//   - sync-pipe gate to close the cmd.Start → AttachChild race window
+//   - rootless mode via cgroup-v2 delegation + CAP_BPF/CAP_PERFMON
 package host
 
 import (
@@ -33,6 +39,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -43,6 +50,27 @@ import (
 	"github.com/spinningfactory/kloak/pkg/runtime"
 	"github.com/spinningfactory/kloak/pkg/secrets"
 )
+
+// Option configures a hostRuntime at construction. Options are
+// composable so the caller picks the policy that matches its context
+// (CLI invocation vs unit test vs future microvm-agent re-use).
+type Option func(*hostRuntime)
+
+// WithEBPF enables the in-kernel TLS rewrite for invocations made
+// through this Runtime. The CLI sets this by default; tests omit it
+// because loading BPF programs needs CAP_BPF / CAP_SYS_ADMIN — readily
+// available after install.sh runs setcap, or via sudo, but absent from
+// a vanilla `go test` invocation.
+//
+// When unset (the zero-value default) Run exec's the child correctly
+// but the rewrite is a no-op — the child's shadow placeholders go on
+// the wire verbatim. This is useful for testing the injection
+// plumbing without privileges; it is NOT a secure mode and must not
+// be the production default. cmd/klor wraps this behind the explicit
+// `--no-rewrite` flag with a loud startup warning.
+func WithEBPF() Option {
+	return func(r *hostRuntime) { r.ebpfEnabled = true }
+}
 
 // New returns a host-cgroup Runtime.
 //
@@ -59,7 +87,10 @@ import (
 // (typically `/run/user/$UID/kloak`) for unprivileged callers, since
 // `/run` is not writable to them. Falls back to `/tmp/kloak` if
 // XDG_RUNTIME_DIR isn't set — better than failing outright.
-func New(cgroupRoot, injectRoot string, log *zap.SugaredLogger) runtime.Runtime {
+//
+// opts is a variadic of Option-returning helpers (currently only
+// WithEBPF); callers pass them to opt into the in-kernel TLS rewrite.
+func New(cgroupRoot, injectRoot string, log *zap.SugaredLogger, opts ...Option) runtime.Runtime {
 	if log == nil {
 		log = zap.NewNop().Sugar()
 	}
@@ -69,11 +100,15 @@ func New(cgroupRoot, injectRoot string, log *zap.SugaredLogger) runtime.Runtime 
 	if cgroupRoot == "" {
 		cgroupRoot = cgroups.DefaultCgroupRoot
 	}
-	return &hostRuntime{
+	r := &hostRuntime{
 		cgroupRoot: cgroupRoot,
 		injectRoot: injectRoot,
 		log:        log,
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // annotateCgroupError wraps a CreateTransient error with a one-line
@@ -108,9 +143,10 @@ func chooseInjectRoot() string {
 }
 
 type hostRuntime struct {
-	cgroupRoot string
-	injectRoot string
-	log        *zap.SugaredLogger
+	cgroupRoot  string
+	injectRoot  string
+	log         *zap.SugaredLogger
+	ebpfEnabled bool
 }
 
 func (r *hostRuntime) Run(ctx context.Context, spec *runtime.Spec) (int, error) {
@@ -163,15 +199,28 @@ func (r *hostRuntime) Run(ctx context.Context, spec *runtime.Spec) (int, error) 
 		}
 	}()
 
-	// TODO(phase-3b-followup): construct pkg/ebpf.TLSUprobeManager
-	// here, call TrackCgroup(cgID, cgPath), RecordCgroupNetns(cgID,
-	// child PID once available), AttachTLS(child PID, cgID),
-	// PopulateTrustedDNSServers from /etc/resolv.conf, and spawn
-	// PollEvents / PollExecEvents goroutines. Until that lands the
-	// runtime executes the child correctly but the in-kernel rewrite
-	// is a no-op — the child sees shadow placeholders in its env and
-	// sends them over the wire verbatim.
-	_ = snap // referenced by the BPF map sync in the follow-up
+	// 4b. Construct the eBPF data plane *before* the child starts so
+	//     TLS uprobes are ready to attach the moment we have a PID.
+	//     With WithEBPF() off (unit tests, dev no-rewrite mode) this
+	//     is a no-op and the child sees shadow placeholders verbatim
+	//     on the wire.
+	//
+	//     TODO(phase-3b-followup): the window between cmd.Start and
+	//     AttachChild remains unguarded. A sync pipe will let the
+	//     parent gate the child's exec until uprobes are attached.
+	var ebpf *ebpfHandle
+	if r.ebpfEnabled {
+		var setupErr error
+		ebpf, setupErr = setupEBPF(ctx, spec.Secrets, r.cgroupRoot, cgPath, cgID, r.log)
+		if setupErr != nil {
+			return -1, wrapEBPFSetupError(setupErr)
+		}
+		defer func() {
+			if err := ebpf.Close(); err != nil {
+				r.log.Warnw("eBPF close failed", "err", err)
+			}
+		}()
+	}
 
 	// 5. Build the child command and start it inside the cgroup.
 	cmd := exec.CommandContext(ctx, spec.Cmd[0], spec.Cmd[1:]...) //nolint:gosec // user-supplied cmd is the whole point of `kloak run`
@@ -191,11 +240,11 @@ func (r *hostRuntime) Run(ctx context.Context, spec *runtime.Spec) (int, error) 
 
 	// 6. Move the child's PID into the transient cgroup. Failing this
 	//    is fatal: if the child runs outside our cgroup, the eBPF data
-	//    plane (wired in the follow-up PR) will not intercept its TLS
-	//    writes — the user would think their traffic is being rewritten
-	//    when it isn't, and a real secret would leak unredacted. Kill
-	//    the child immediately and surface the error rather than
-	//    silently degrade to "running but un-intercepted".
+	//    plane will not intercept its TLS writes — the user would
+	//    think their traffic is being rewritten when it isn't, and a
+	//    real secret would leak unredacted. Kill the child immediately
+	//    and surface the error rather than silently degrade to
+	//    "running but un-intercepted".
 	//
 	//    There's still a tiny race window between Start and this write
 	//    where the child can issue syscalls outside the cgroup. A
@@ -210,6 +259,31 @@ func (r *hostRuntime) Run(ctx context.Context, spec *runtime.Spec) (int, error) 
 		_ = cmd.Wait()
 		return -1, fmt.Errorf("attach child pid %d to cgroup %s: %w (TLS rewrite would not apply — refusing to run unprotected)",
 			cmd.Process.Pid, cgPath, err)
+	}
+
+	// Verify the move actually took effect. os.WriteFile to cgroup.procs
+	// can return success even when the kernel silently declined to move
+	// the process (cgroup controller mismatch, race against the child's
+	// own exec, etc.). Log at Debug — when the BPF cgroup filter starts
+	// missing every TLS write in production this is the first thing to
+	// look at, but it's noisy at WARN/INFO for every invocation.
+	if procBytes, perr := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", cmd.Process.Pid)); perr == nil {
+		r.log.Debugw("post-cgroup-move verification",
+			"pid", cmd.Process.Pid,
+			"expected_cgroup_path", cgPath,
+			"actual_proc_cgroup", strings.TrimSpace(string(procBytes)))
+	}
+
+	// 6b. Attach TLS uprobes against the child's binary. Same fatal
+	//     stance as the cgroup.procs write: if uprobes don't attach,
+	//     TLS writes go out unredacted, so we kill the child and
+	//     surface the error rather than degrading silently.
+	if ebpf != nil {
+		if err := ebpf.AttachChild(cmd.Process.Pid); err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return -1, fmt.Errorf("%w (TLS rewrite would not apply — refusing to run unprotected)", err)
+		}
 	}
 
 	// 7. Forward signals to the child. Stop the signal handler before

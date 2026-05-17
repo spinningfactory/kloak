@@ -52,6 +52,9 @@ func TestNew_DefaultsInjectRootAndLogger(t *testing.T) {
 		t.Errorf("injectRoot=%q, want %q (euid=%d, XDG_RUNTIME_DIR=%q)",
 			hr.injectRoot, wantInject, os.Geteuid(), os.Getenv("XDG_RUNTIME_DIR"))
 	}
+	if hr.ebpfEnabled {
+		t.Error("ebpfEnabled should default to false (no rewrite without explicit opt-in)")
+	}
 }
 
 // expectedDefaultInjectRoot mirrors chooseInjectRoot's branch logic so
@@ -68,6 +71,16 @@ func expectedDefaultInjectRoot(t *testing.T) string {
 		return filepath.Join(x, "kloak")
 	}
 	return "/tmp/kloak"
+}
+
+func TestWithEBPF_OptInOnly(t *testing.T) {
+	// WithEBPF flips ebpfEnabled; without it the runtime stays in the
+	// safe no-rewrite mode used by unit tests + the CLI's
+	// --no-rewrite flag.
+	rt := New("", "", nil, WithEBPF()).(*hostRuntime)
+	if !rt.ebpfEnabled {
+		t.Error("WithEBPF() did not set ebpfEnabled")
+	}
 }
 
 func TestRun_NilSpecRejected(t *testing.T) {

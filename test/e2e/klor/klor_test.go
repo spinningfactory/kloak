@@ -197,6 +197,11 @@ func TestKlor_RunExecsChildWithEnvInjection(t *testing.T) {
 		"--secrets", yaml,
 		"--cgroup-root", cgroupRoot,
 		"--inject-root", injectRoot,
+		// --no-rewrite: this test validates the injection + cgroup +
+		// child-exec plumbing without the eBPF data plane. Loading BPF
+		// programs needs root + a real cgroupfs; the rooted e2e
+		// (added separately) covers the rewrite end-to-end.
+		"--no-rewrite",
 		"--",
 		"sh", "-c", "echo got=$TEST_KEY",
 	)
@@ -233,6 +238,7 @@ func TestKlor_RunPropagatesChildExitCode(t *testing.T) {
 		"--secrets", yaml,
 		"--cgroup-root", t.TempDir(),
 		"--inject-root", t.TempDir(),
+		"--no-rewrite", // same reasoning as TestKlor_RunExecsChildWithEnvInjection
 		"--",
 		"sh", "-c", "exit 17",
 	)

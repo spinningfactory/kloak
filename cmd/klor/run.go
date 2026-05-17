@@ -7,8 +7,8 @@ import (
 	"strings"
 
 	"github.com/spf13/cobra"
-	"go.uber.org/zap"
 
+	"github.com/spinningfactory/kloak/pkg/logging"
 	"github.com/spinningfactory/kloak/pkg/runtime"
 	"github.com/spinningfactory/kloak/pkg/runtime/host"
 	"github.com/spinningfactory/kloak/pkg/secrets"
@@ -19,6 +19,8 @@ var (
 	runSecretsPath string
 	runCgroupRoot  string
 	runInjectRoot  string
+	runNoRewrite   bool
+	runLogLevel    string
 )
 
 var runCmd = &cobra.Command{
@@ -54,6 +56,10 @@ func init() {
 		"Cgroup v2 root (default: /sys/fs/cgroup). Override for tests or non-standard hosts.")
 	runCmd.Flags().StringVar(&runInjectRoot, "inject-root", "",
 		"Base directory for staging `inject.file` materializations (default: /run/kloak). Per-invocation subdir is created here and removed on exit.")
+	runCmd.Flags().BoolVar(&runNoRewrite, "no-rewrite", false,
+		"Disable the in-kernel TLS rewrite. The child sees shadow placeholders verbatim — useful for testing the injection plumbing without root, NOT for production. Shadow values WILL leak unredacted.")
+	runCmd.Flags().StringVar(&runLogLevel, "log-level", "warn",
+		"Log level: trace, debug, info, warn, error. WARN by default — the child's own output is what you usually care about. Use trace to see per-event eBPF debug counters.")
 }
 
 // runRun is the cobra RunE for `klor run`, extracted so tests can
@@ -69,15 +75,18 @@ func runRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	logCfg := zap.NewProductionConfig()
-	logCfg.Level = zap.NewAtomicLevelAt(zap.InfoLevel)
-	logger, err := logCfg.Build()
-	if err != nil {
-		return fmt.Errorf("build logger: %w", err)
-	}
+	logger := logging.SetupCLI(runLogLevel)
 	defer func() { _ = logger.Sync() }()
 
-	rt := host.New(runCgroupRoot, runInjectRoot, logger.Sugar())
+	var opts []host.Option
+	if !runNoRewrite {
+		opts = append(opts, host.WithEBPF())
+	} else {
+		logger.Warn(
+			"--no-rewrite: in-kernel TLS rewrite is DISABLED. Shadow placeholders will leak unredacted on outbound TLS. This mode is for development only.",
+		)
+	}
+	rt := host.New(runCgroupRoot, runInjectRoot, logger, opts...)
 
 	spec := &runtime.Spec{
 		Cmd:     args,
