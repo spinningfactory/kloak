@@ -29,6 +29,15 @@ type TLSOffsets struct {
 	EncCtxToAlgctx uint32 // enc_ctx* + off → algctx/PROV_GCM_CTX* (pointer deref)
 	AlgctxToH      uint32 // algctx* + off → H (16 bytes, direct read)
 	SSLToVersion   uint32 // SSL_CONNECTION* + off → int version (0xFFFFFFFF=unknown, use heuristic)
+	// SSLToWBIO is the offset from the SSL/SSL_CONNECTION pointer to its
+	// `wbio` BIO* field. The BPF data plane reads SSL → wbio → BIO.num to
+	// recover the socket fd, then looks it up in conn_ip_map to confirm
+	// client-mode (set by connect()). 3.0/3.1 use struct ssl_st where
+	// wbio sits at 24; 3.2+ wrapped SSL in ssl_connection_st and moved it
+	// to 88. Before this field existed, the BPF program hardcoded 88 —
+	// which silently broke every 3.0/3.1 workload by reading garbage and
+	// tripping the server-mode guard in bpf_uprobe_ssl_write.
+	SSLToWBIO uint32
 }
 
 // opensslOffsetTable maps OpenSSL major.minor version strings to their TLS
@@ -53,21 +62,29 @@ var opensslOffsetTable = map[string]TLSOffsets{
 	// 3-hop chain (3.0-3.1): SSL.enc_write_ctx → algctx → gcm.H
 	//   SSLToWRL stores enc_write_ctx offset; WRLToEncCtx=0 signals 3-hop to BPF.
 
+	// SSLToWBIO is the SSL → wbio field offset (used by ssl_read_fd in the
+	// BPF data plane). 3.0/3.1 use struct ssl_st where wbio = 24 (verified
+	// empirically on OpenSSL 3.0.13 via SSL_set_bio + pointer scan: rbio
+	// at 16, wbio at 24). 3.2+ wrapped SSL inside ssl_connection_st and
+	// moved wbio to 88. Before this field was added, the BPF program
+	// hardcoded 88 — which silently broke every 3.0/3.1 caller.
+
 	// OpenSSL 3.5.x — SSLToWRL grew due to new fields in SSL_CONNECTION.
 	// SSLToVersion=72: ssl_connection_st.version (after 64-byte embedded ssl_st).
-	"3.5": {SSLToWRL: 3208, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328, SSLToVersion: 72},
+	"3.5": {SSLToWRL: 3208, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
 
 	// OpenSSL 3.2.x–3.4.x — identical offsets across these versions.
 	// TODO: verify SSLToVersion for 3.2-3.4 via pahole (likely 72, same as 3.5).
-	"3.4": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0xFFFFFFFF},
-	"3.3": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0xFFFFFFFF},
-	"3.2": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0xFFFFFFFF},
+	"3.4": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0xFFFFFFFF, SSLToWBIO: 88},
+	"3.3": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0xFFFFFFFF, SSLToWBIO: 88},
+	"3.2": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0xFFFFFFFF, SSLToWBIO: 88},
 
 	// OpenSSL 3.0.x–3.1.x — 3-hop chain (no record layer indirection).
 	// SSLToWRL stores enc_write_ctx=2168; WRLToEncCtx=0 signals 3-hop to BPF.
 	// SSLToVersion=0: ssl_st.version is at offset 0 (verified via pahole on Debian bookworm).
-	"3.1": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0},
-	"3.0": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0},
+	// SSLToWBIO=24: empirically confirmed on Ubuntu 24.04's libssl3 (3.0.13).
+	"3.1": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0, SSLToWBIO: 24},
+	"3.0": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0, SSLToWBIO: 24},
 }
 
 // DetectOpenSSLVersion reads an OpenSSL/libssl shared library from a
