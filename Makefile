@@ -1,4 +1,4 @@
-.PHONY: all build build-klor build-linux build-klor-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup e2e-klor \
+.PHONY: all build build-klor build-linux build-klor-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup e2e-klor e2e-klor-rooted \
         e2e-k3s e2e-k3s-setup e2e-k3s-run e2e-k3s-cleanup \
         clean deps docker-build generate-ebpf generate-vmlinux run help \
         lima-start lima-stop lima-delete lima-shell lima-exec lima-check \
@@ -160,6 +160,15 @@ e2e-run:
 # skips on macOS). Cheap; safe to run as part of unit-test CI.
 e2e-klor:
 	$(GOTEST) -v -timeout 120s -tags=e2e_klor -count=1 ./test/e2e/klor/
+
+# klor rootless e2e — exercises install.sh + cap-on-binary so klor
+# runs without sudo. TestMain skips unless running as root (so
+# install.sh can setcap); the test itself then drops to a non-root
+# uid via setpriv to prove the cap-on-binary path actually delivers
+# the privilege drop. CI's ubuntu-latest runs root by default; dev
+# hosts use `sudo make e2e-klor-rooted`.
+e2e-klor-rooted:
+	$(GOTEST) -v -timeout 180s -tags=e2e_klor_rooted -count=1 ./test/e2e/klor/
 
 # Run e2e tests against the current kube context.
 # Builds images, pushes to ttl.sh (anonymous ephemeral registry, 2h TTL),
@@ -421,6 +430,7 @@ help:
 	@echo ""
 	@echo "klor e2e (no cluster required):"
 	@echo "  e2e-klor         - Build klor and exercise its CLI (Linux-only; self-skips on macOS)"
+	@echo "  e2e-klor-rooted  - Run install.sh + verify cap-on-binary lets klor run without sudo (needs root)"
 	@echo ""
 	@echo "eBPF code generation:"
 	@echo "  generate-ebpf    - Generate eBPF Go bindings (uses Lima on macOS)"

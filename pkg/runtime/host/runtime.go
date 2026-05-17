@@ -44,22 +44,67 @@ import (
 	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
-// New returns a host-cgroup Runtime. cgroupRoot defaults to
-// `/sys/fs/cgroup` (via cgroups.DefaultCgroupRoot) when empty;
-// injectRoot is the tmpfs base for `inject.file` materialization
-// (defaults to `/run/kloak`).
+// New returns a host-cgroup Runtime.
+//
+// cgroupRoot defaults to `/sys/fs/cgroup` (cgroups.DefaultCgroupRoot)
+// when empty. Privilege to mkdir under that path comes from one of:
+//
+//   - `sudo klor …` — CAP_SYS_ADMIN via the sudo session.
+//   - File capabilities applied by install.sh: the binary carries
+//     `cap_dac_override,cap_sys_admin,…+ep` so the process has the
+//     right caps without sudo. See install.sh in the repo root.
+//
+// injectRoot is the tmpfs base for `inject.file` materialization. When
+// empty, defaults to `/run/kloak` for root and `$XDG_RUNTIME_DIR/kloak`
+// (typically `/run/user/$UID/kloak`) for unprivileged callers, since
+// `/run` is not writable to them. Falls back to `/tmp/kloak` if
+// XDG_RUNTIME_DIR isn't set — better than failing outright.
 func New(cgroupRoot, injectRoot string, log *zap.SugaredLogger) runtime.Runtime {
-	if injectRoot == "" {
-		injectRoot = "/run/kloak"
-	}
 	if log == nil {
 		log = zap.NewNop().Sugar()
+	}
+	if injectRoot == "" {
+		injectRoot = chooseInjectRoot()
+	}
+	if cgroupRoot == "" {
+		cgroupRoot = cgroups.DefaultCgroupRoot
 	}
 	return &hostRuntime{
 		cgroupRoot: cgroupRoot,
 		injectRoot: injectRoot,
 		log:        log,
 	}
+}
+
+// annotateCgroupError wraps a CreateTransient error with a one-line
+// remediation hint. EPERM as a non-root user always means we don't
+// have the caps needed for cgroup-v2 mkdir + the cgroup.procs write
+// that follows; we point at the required cap set and let the operator
+// decide between `sudo`, file capabilities, or another path.
+func annotateCgroupError(err error) error {
+	if os.Geteuid() == 0 || !errors.Is(err, os.ErrPermission) {
+		return fmt.Errorf("create cgroup: %w", err)
+	}
+	return fmt.Errorf("create cgroup: %w\n"+
+		"klor needs CAP_SYS_ADMIN + CAP_DAC_OVERRIDE to mkdir under /sys/fs/cgroup and write cgroup.procs",
+		err)
+}
+
+// chooseInjectRoot returns the staging root for `inject.file` writes.
+// `/run` requires CAP_DAC_OVERRIDE to create subdirectories under
+// without being root, so for non-root callers we prefer the per-user
+// tmpfs systemd-logind provisions at session start (XDG_RUNTIME_DIR).
+// `/tmp/kloak` is the last resort — writable to anyone but
+// world-readable, so the `inject.file` 0o400 mode + per-invocation
+// UUID path are the actual confidentiality protection there.
+func chooseInjectRoot() string {
+	if os.Geteuid() == 0 {
+		return "/run/kloak"
+	}
+	if x := os.Getenv("XDG_RUNTIME_DIR"); x != "" {
+		return filepath.Join(x, "kloak")
+	}
+	return "/tmp/kloak"
 }
 
 type hostRuntime struct {
@@ -95,7 +140,7 @@ func (r *hostRuntime) Run(ctx context.Context, spec *runtime.Spec) (int, error) 
 	//    exit path via defer.
 	cgPath, cgID, cgCleanup, err := cgroups.CreateTransient(r.cgroupRoot, invID)
 	if err != nil {
-		return -1, fmt.Errorf("create cgroup: %w", err)
+		return -1, annotateCgroupError(err)
 	}
 	defer func() {
 		if err := cgCleanup(); err != nil {

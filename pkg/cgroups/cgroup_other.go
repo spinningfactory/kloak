@@ -20,6 +20,6 @@ func GetCgroupInodeFromPath(_ string) (uint64, error) {
 // pattern from PR #217: signature matches the real implementation so
 // the rest of the codebase compiles on macOS for unit testing, and
 // every method returns an actionable "not supported" error.
-func CreateTransient(_, _ string) (string, uint64, func() error, error) {
+func CreateTransient(_, _ string) (path string, id uint64, cleanup func() error, err error) {
 	return "", 0, nil, fmt.Errorf("cgroups not supported on this OS")
 }
