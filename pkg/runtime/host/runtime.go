@@ -76,23 +76,17 @@ func New(cgroupRoot, injectRoot string, log *zap.SugaredLogger) runtime.Runtime 
 	}
 }
 
-// annotateCgroupError wraps a CreateTransient error with a remediation
-// hint pointing at install.sh (or sudo as the always-works fallback).
-// EPERM as a non-root user always means we don't have the caps needed
-// for cgroup-v2 mkdir + the cgroup.procs write that follows. The
-// in-tree install.sh fixes this by setting file capabilities on the
-// binary; sudo is the per-invocation alternative.
+// annotateCgroupError wraps a CreateTransient error with a one-line
+// remediation hint. EPERM as a non-root user always means we don't
+// have the caps needed for cgroup-v2 mkdir + the cgroup.procs write
+// that follows; we point at the required cap set and let the operator
+// decide between `sudo`, file capabilities, or another path.
 func annotateCgroupError(err error) error {
 	if os.Geteuid() == 0 || !errors.Is(err, os.ErrPermission) {
 		return fmt.Errorf("create cgroup: %w", err)
 	}
-	return fmt.Errorf("create cgroup: %w\n\n"+
-		"klor needs CAP_SYS_ADMIN + CAP_DAC_OVERRIDE for cgroup-v2 mkdir + process migration. Two fixes:\n"+
-		"  1. Reinstall klor so the binary carries the caps:\n"+
-		"     curl -fsSL https://github.com/spinningfactory/kloak/raw/main/install.sh | bash\n"+
-		"     (one-time, then klor runs as your user with no prefix)\n"+
-		"  2. sudo klor run …\n"+
-		"     (per-invocation; same caps, granted via the sudo session)",
+	return fmt.Errorf("create cgroup: %w\n"+
+		"klor needs CAP_SYS_ADMIN + CAP_DAC_OVERRIDE to mkdir under /sys/fs/cgroup and write cgroup.procs",
 		err)
 }
 

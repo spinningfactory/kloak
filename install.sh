@@ -319,6 +319,4 @@ ${c_green}✓${c_reset} klor installed.
 
   $ klor run --secrets ./secrets.yaml -- curl https://api.example.com/...
 
-No sudo needed for normal invocations.
-
 EOF
