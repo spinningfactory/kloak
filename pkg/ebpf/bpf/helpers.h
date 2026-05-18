@@ -68,6 +68,9 @@ HELPER_INLINE __u32 parse_http_host(const char *data, __u32 data_len,
 
 // Compare two host buffers (each MAX_HOST_LEN bytes) as uint64 chunks.
 // Returns 1 if all bytes match, 0 otherwise.
+// _Static_assert below enforces the 8-byte alignment invariant: if MAX_HOST_LEN
+// is ever changed, this will produce a compile error rather than silently
+// skipping trailing bytes or reading out of bounds.
 _Static_assert(MAX_HOST_LEN % 8 == 0,
                "MAX_HOST_LEN must be a multiple of 8 for hosts_match chunked comparison");
 HELPER_INLINE int hosts_match(const char *a, const char *b) {
