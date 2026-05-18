@@ -306,10 +306,18 @@ jobs:
         # -tags cover` to `go build`, so the cap'd binary records
         # runtime coverage. KLOR_COVDATA_DIR=... → rooted_test.go
         # forwards GOCOVERDIR to klor's env, and klor's flushCoverage
-        # writes covcounters there before os.Exit. sudo -E preserves
-        # both env vars across the sudo escalation; the dir is
+        # writes covcounters there before os.Exit. The dir is
         # chmod'd 1777 by the test so the setpriv'd uid can write.
-        run: sudo -E make e2e-klor-rooted
+        #
+        # --preserve-env=PATH overrides sudo's `secure_path` reset
+        # — necessary because `setup-go@v6` installs Go 1.26 under
+        # `/opt/hostedtoolcache/go/...`, which is NOT in sudo's
+        # default secure_path. Without this, sudo's `go` resolves
+        # to the system's Go 1.24.13 and go.mod's `go 1.26.0`
+        # requirement EPERMs with `requires go >= 1.26.0`.
+        # The other --preserve-env entries forward our coverage
+        # control vars across the escalation.
+        run: sudo --preserve-env=PATH,KLOR_COVER,KLOR_COVDATA_DIR make e2e-klor-rooted
         env:
           KLOR_COVER: "1"
           KLOR_COVDATA_DIR: /tmp/klor-covdata
