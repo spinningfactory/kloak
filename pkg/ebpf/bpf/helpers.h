@@ -68,10 +68,10 @@ HELPER_INLINE __u32 parse_http_host(const char *data, __u32 data_len,
 
 // Compare two host buffers (each MAX_HOST_LEN bytes) as uint64 chunks.
 // Returns 1 if all bytes match, 0 otherwise.
+_Static_assert(MAX_HOST_LEN % 8 == 0,
+               "MAX_HOST_LEN must be a multiple of 8 for hosts_match chunked comparison");
 HELPER_INLINE int hosts_match(const char *a, const char *b) {
   for (__u32 i = 0; i < MAX_HOST_LEN; i += 8) {
-    if (i + 8 > MAX_HOST_LEN)
-      break;
     __u64 va, vb;
     __builtin_memcpy(&va, a + i, 8);
     __builtin_memcpy(&vb, b + i, 8);
