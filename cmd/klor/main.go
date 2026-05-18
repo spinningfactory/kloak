@@ -46,10 +46,17 @@ func main() {
 	// SilenceErrors set, so we print real errors ourselves below.
 	var ec *exitCodeError
 	if errors.As(err, &ec) {
+		// Flush covcounters BEFORE os.Exit — os.Exit skips Go's
+		// runtime exit hooks, so the standard `-cover` auto-flush
+		// wouldn't fire. flushCoverage is a no-op in production
+		// builds (compiled in only via `-tags cover`).
+		flushCoverage()
 		os.Exit(ec.code)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "Error:", err)
+		flushCoverage()
 		os.Exit(1)
 	}
+	flushCoverage()
 }

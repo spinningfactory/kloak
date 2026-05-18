@@ -142,6 +142,7 @@ func TestKlorRunsWithoutSudoAfterInstall(t *testing.T) {
 		"--secrets", yaml,
 		"--", "sh", "-c", "echo got=$K",
 	)
+	cmd.Env = append(os.Environ(), klorCoverEnv(t)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("klor (post-install, uid %d) failed: %v\n%s", dropUID, err, out)
@@ -248,6 +249,7 @@ func TestKlorRewritesShadowOnTheWire(t *testing.T) {
 		"--",
 		"/usr/bin/curl", "-sk", "--data-binary", "@"+payloadPath, echo.URL+"/",
 	)
+	cmd.Env = append(os.Environ(), klorCoverEnv(t)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("klor + curl failed: %v\n%s", err, out)
@@ -267,6 +269,40 @@ func TestKlorRewritesShadowOnTheWire(t *testing.T) {
 	if strings.Contains(got, "kloak:") {
 		t.Errorf("echo server saw the SHADOW on the wire — rewrite did not fire:\n  body: %q", got)
 	}
+}
+
+// klorCoverEnv returns the env entries to pass when invoking the cap'd
+// klor binary so that any `-cover`-instrumented runs flush covcounters
+// into a directory the CI's Klor E2E job can later pick up and merge
+// into the combined coverage profile.
+//
+// The mechanism: CI sets `KLOR_COVDATA_DIR=/tmp/klor-covdata` (host
+// path) and `KLOR_COVER=1` (consumed by install.sh to add
+// `-cover -covermode=atomic -tags cover` to `go build`). Each rooted
+// test then forwards `GOCOVERDIR=<that dir>` into klor's env. Klor's
+// `flushCoverage` (cmd/klor/coverage_flush_cover.go, compiled in via
+// `-tags cover`) writes covcounters into that dir before os.Exit
+// fires. CI converts the binary covdata to text format via
+// `go tool covdata textfmt` and merges into combined-coverage.
+//
+// chmod 1777 because the dir is created as root (the test runs as
+// root via TestMain's gate) but klor runs under setpriv as the
+// dropped uid — without a permissive mode the writer would EACCES.
+func klorCoverEnv(t *testing.T) []string {
+	t.Helper()
+	dir := os.Getenv("KLOR_COVDATA_DIR")
+	if dir == "" {
+		return nil
+	}
+	if err := os.MkdirAll(dir, 0o1777); err != nil {
+		t.Fatalf("mkdir KLOR_COVDATA_DIR=%s: %v", dir, err)
+	}
+	// MkdirAll may not apply the sticky bit when the dir already
+	// exists — re-chmod to be explicit.
+	if err := os.Chmod(dir, 0o1777); err != nil {
+		t.Fatalf("chmod KLOR_COVDATA_DIR=%s: %v", dir, err)
+	}
+	return []string{"GOCOVERDIR=" + dir}
 }
 
 // dropTargetUID picks a non-root uid to drop privilege to. Preference

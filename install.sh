@@ -166,7 +166,21 @@ resolve_binary() {
         # here yet (we only escalate at install time) so this is
         # already correct, but keep the comment as a reminder for
         # future refactors.
-        (cd "$SCRIPT_DIR" && go build -o "$out" ./cmd/klor) || die "go build failed"
+        #
+        # KLOR_COVER=1 (CI's Klor E2E job) builds a coverage-
+        # instrumented binary so the cap'd klor's runtime coverage
+        # contributes back to the merged profile. `-cover` arms
+        # runtime/coverage, `-covermode=atomic` makes counters safe
+        # under klor's background pollers, `-tags cover` pulls in
+        # cmd/klor/coverage_flush_cover.go which writes covcounters
+        # to $GOCOVERDIR on exit (Go's auto-flush is unreliable for
+        # os.Exit paths, which klor uses for exit-code propagation).
+        local build_args=("-o" "$out")
+        if [[ "${KLOR_COVER:-0}" = "1" ]]; then
+            log "KLOR_COVER=1 — building klor with -cover instrumentation"
+            build_args+=("-cover" "-covermode=atomic" "-tags" "cover")
+        fi
+        (cd "$SCRIPT_DIR" && go build "${build_args[@]}" ./cmd/klor) || die "go build failed"
         echo "$out"
         return
     fi

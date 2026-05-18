@@ -302,7 +302,45 @@ jobs:
         run: make e2e-klor
 
       - name: Run klor rooted e2e (install.sh + cap-on-binary)
-        run: sudo make e2e-klor-rooted
+        # KLOR_COVER=1 → install.sh adds `-cover -covermode=atomic
+        # -tags cover` to `go build`, so the cap'd binary records
+        # runtime coverage. KLOR_COVDATA_DIR=... → rooted_test.go
+        # forwards GOCOVERDIR to klor's env, and klor's flushCoverage
+        # writes covcounters there before os.Exit. sudo -E preserves
+        # both env vars across the sudo escalation; the dir is
+        # chmod'd 1777 by the test so the setpriv'd uid can write.
+        run: sudo -E make e2e-klor-rooted
+        env:
+          KLOR_COVER: "1"
+          KLOR_COVDATA_DIR: /tmp/klor-covdata
+
+      - name: Convert klor covdata to text profile
+        if: always()
+        run: |
+          mkdir -p /tmp/klor-coverage
+          if ls /tmp/klor-covdata/covcounters.* 1>/dev/null 2>&1; then
+            sudo chown -R "$(id -u):$(id -g)" /tmp/klor-covdata
+            go tool covdata textfmt \
+              -i=/tmp/klor-covdata \
+              -o=/tmp/klor-coverage/klor-coverage.out
+            echo "Klor E2E coverage converted to text format:"
+            head -3 /tmp/klor-coverage/klor-coverage.out
+            echo "Lines: $(wc -l < /tmp/klor-coverage/klor-coverage.out)"
+          else
+            echo "No klor covcounters collected — check that test/e2e/klor/rooted_test.go forwarded GOCOVERDIR"
+            ls -la /tmp/klor-covdata/ 2>/dev/null || true
+          fi
+
+      - name: Upload klor e2e coverage
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: klor-e2e-coverage
+          path: /tmp/klor-coverage/
+          # Match the retention of unit-coverage so the downstream
+          # merge step (in the `e2e` job) can find it on re-runs.
+          retention-days: 7
+          if-no-files-found: warn
 
   e2e:
     name: E2E Tests
@@ -495,6 +533,19 @@ jobs:
           name: unit-coverage
           path: /tmp/unit-coverage
 
+      - name: Download klor-e2e coverage
+        # Klor E2E runs in parallel to E2E Tests (both depend on Build).
+        # By the time this `e2e` job's merge step runs the klor-e2e job
+        # has typically finished, so its artifact is available. If the
+        # artifact is missing (klor-e2e still running, or that job
+        # failed before uploading), we fall through with no klor data.
+        if: always()
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: klor-e2e-coverage
+          path: /tmp/klor-coverage
+
       - name: Merge unit and e2e coverage
         if: always()
         run: |
@@ -516,27 +567,38 @@ jobs:
           # half too, since pkg/ebpf is now in unit coverage.
           UNIT=/tmp/unit-coverage/coverage.out
           E2E=/tmp/e2e-coverage.out
+          KLOR=/tmp/klor-coverage/klor-coverage.out
           OUT=/tmp/combined-coverage.out
 
           # head -1 keeps the `mode:` line; the filter trims subsequent lines.
           strip_generated() { grep -v 'tlsuprobe_bpf'; }
 
-          if [ -f "$UNIT" ] && [ -f "$E2E" ]; then
+          # Pick the first existing profile for the `mode:` line, then
+          # append non-header lines from each input that exists. Both
+          # `unit` and the two e2e profiles use `mode: atomic`, so
+          # appending is safe — Go's coverage tools merge by summing
+          # per-line counters across duplicate records.
+          if [ -f "$UNIT" ]; then
             head -1 "$UNIT" > "$OUT"
-            tail -n +2 "$UNIT" | strip_generated >> "$OUT"
-            tail -n +2 "$E2E"  | strip_generated >> "$OUT"
-            echo "Combined unit + e2e coverage"
-          elif [ -f "$UNIT" ]; then
-            head -1 "$UNIT" > "$OUT"
-            tail -n +2 "$UNIT" | strip_generated >> "$OUT"
-            echo "Unit coverage only (no e2e data)"
           elif [ -f "$E2E" ]; then
             head -1 "$E2E" > "$OUT"
-            tail -n +2 "$E2E" | strip_generated >> "$OUT"
-            echo "E2E coverage only (no unit artifact — likely a single-job re-run after retention)"
+          elif [ -f "$KLOR" ]; then
+            head -1 "$KLOR" > "$OUT"
+          else
+            echo "mode: atomic" > "$OUT"
+          fi
+
+          merged_from=""
+          for src in "$UNIT" "$E2E" "$KLOR"; do
+            if [ -f "$src" ]; then
+              tail -n +2 "$src" | strip_generated >> "$OUT"
+              merged_from="$merged_from $(basename "$src")"
+            fi
+          done
+          if [ -n "$merged_from" ]; then
+            echo "Merged coverage from:$merged_from"
           else
             echo "No coverage data available; producing empty profile"
-            echo "mode: atomic" > "$OUT"
           fi
 
           echo "=== Combined coverage summary ==="
