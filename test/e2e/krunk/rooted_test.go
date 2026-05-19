@@ -1,15 +1,15 @@
-//go:build e2e_klor_rooted
+//go:build e2e_krunk_rooted
 
-// Package klor_e2e_rooted exercises the install.sh + cap-on-binary
+// Package krunk_e2e_rooted exercises the install.sh + cap-on-binary
 // rootless install path end-to-end.
 //
 // What this validates today (PR #221 base, no eBPF wiring yet):
 //   - install.sh runs (with sudo-detect, with checkout-local build)
-//   - the binary lands at PREFIX/klor with the kernel-version-appropriate
+//   - the binary lands at PREFIX/krunk with the kernel-version-appropriate
 //     capability set
 //   - getcap confirms the caps actually stuck (catches AppArmor /
 //     SELinux / NFS-acl strip regressions)
-//   - klor, invoked as the same user (no sudo prefix), exits 0 — proves
+//   - krunk, invoked as the same user (no sudo prefix), exits 0 — proves
 //     the cgroup operations work via cap delegation
 //
 // What this does NOT validate yet:
@@ -20,7 +20,7 @@
 //
 // The test does NOT touch /usr/local/bin — it uses a temp INSTALL_PREFIX
 // so re-runs are safe on dev machines.
-package klor_e2e
+package krunk_e2e
 
 import (
 	"bytes"
@@ -36,7 +36,7 @@ import (
 
 // requireRootedEnv gates every rooted test on (Linux + root). Lifted
 // into a helper instead of a package-level TestMain because the
-// `e2e_klor` and `e2e_klor_rooted` build tags can be active
+// `e2e_krunk` and `e2e_krunk_rooted` build tags can be active
 // simultaneously (golangci-lint typechecks across all tags), and
 // having two TestMains in the same package fails to link.
 func requireRootedEnv(t *testing.T) {
@@ -63,7 +63,7 @@ func TestInstallScript_FromCheckout(t *testing.T) {
 	}
 
 	// Run install.sh against a sandbox prefix so we don't clobber a real
-	// /usr/local/bin/klor on the test host.
+	// /usr/local/bin/krunk on the test host.
 	cmd := exec.Command(installSh, "--prefix", prefix)
 	cmd.Dir = repoRoot
 	out, err := cmd.CombinedOutput()
@@ -71,13 +71,13 @@ func TestInstallScript_FromCheckout(t *testing.T) {
 		t.Fatalf("install.sh failed: %v\n%s", err, out)
 	}
 
-	klorPath := filepath.Join(prefix, "klor")
-	st, err := os.Stat(klorPath)
+	krunkPath := filepath.Join(prefix, "krunk")
+	st, err := os.Stat(krunkPath)
 	if err != nil {
-		t.Fatalf("klor not at %s after install.sh: %v\n%s", klorPath, err, out)
+		t.Fatalf("krunk not at %s after install.sh: %v\n%s", krunkPath, err, out)
 	}
 	if mode := st.Mode().Perm(); mode&0o111 == 0 {
-		t.Errorf("installed klor at %s is not executable (mode %v)", klorPath, mode)
+		t.Errorf("installed krunk at %s is not executable (mode %v)", krunkPath, mode)
 	}
 
 	// Verify the caps stuck. The kernel-version-aware capset chosen by
@@ -85,7 +85,7 @@ func TestInstallScript_FromCheckout(t *testing.T) {
 	// kernel), so we verify the bare-minimum subset that every supported
 	// kernel should produce: cap_sys_admin + cap_dac_override. If either
 	// is missing the rest of the suite would fail anyway.
-	caps, err := exec.Command("getcap", klorPath).CombinedOutput()
+	caps, err := exec.Command("getcap", krunkPath).CombinedOutput()
 	if err != nil {
 		t.Fatalf("getcap failed: %v\n%s", err, caps)
 	}
@@ -96,21 +96,21 @@ func TestInstallScript_FromCheckout(t *testing.T) {
 	}
 }
 
-func TestKlorRunsWithoutSudoAfterInstall(t *testing.T) {
+func TestKrunkRunsWithoutSudoAfterInstall(t *testing.T) {
 	requireRootedEnv(t)
 	repoRoot, err := findRepoRootForRootedTest()
 	if err != nil {
 		t.Fatalf("find repo root: %v", err)
 	}
 
-	// Install klor into the sandbox prefix.
+	// Install krunk into the sandbox prefix.
 	prefix := t.TempDir()
 	installCmd := exec.Command(filepath.Join(repoRoot, "install.sh"), "--prefix", prefix)
 	installCmd.Dir = repoRoot
 	if out, err := installCmd.CombinedOutput(); err != nil {
 		t.Fatalf("install.sh failed: %v\n%s", err, out)
 	}
-	klorPath := filepath.Join(prefix, "klor")
+	krunkPath := filepath.Join(prefix, "krunk")
 
 	// Drop privileges via setpriv to prove the cap-on-binary path
 	// actually works for unprivileged users. We need a non-root uid to
@@ -135,23 +135,23 @@ func TestKlorRunsWithoutSudoAfterInstall(t *testing.T) {
 
 	cmd := exec.Command(
 		"setpriv", "--reuid", fmt.Sprintf("%d", dropUID), "--regid", fmt.Sprintf("%d", dropUID), "--init-groups",
-		// Clear PATH-from-root so klor isn't tempted to find some other
+		// Clear PATH-from-root so krunk isn't tempted to find some other
 		// build via the test invoker's $PATH; pass it explicitly via
 		// absolute path.
-		klorPath, "run",
+		krunkPath, "run",
 		"--secrets", yaml,
 		"--", "sh", "-c", "echo got=$K",
 	)
-	cmd.Env = append(os.Environ(), klorCoverEnv(t)...)
+	cmd.Env = append(os.Environ(), krunkCoverEnv(t)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("klor (post-install, uid %d) failed: %v\n%s", dropUID, err, out)
+		t.Fatalf("krunk (post-install, uid %d) failed: %v\n%s", dropUID, err, out)
 	}
 
 	// Child should have seen the shadow placeholder in its env. The
 	// real value never reaches the child until the eBPF rewrite
 	// follow-up lands — for now we assert the structural plumbing:
-	// klor exec'd the child, env injection happened, exit code 0.
+	// krunk exec'd the child, env injection happened, exit code 0.
 	got := strings.TrimSpace(string(out))
 	if !strings.Contains(got, "got=kl::") {
 		t.Errorf("expected shadow 'got=kl::...' in output, got: %q", got)
@@ -161,8 +161,8 @@ func TestKlorRunsWithoutSudoAfterInstall(t *testing.T) {
 	}
 }
 
-// TestKlorRewritesShadowOnTheWire is the end-to-end assertion this
-// whole stack exists to enable: a non-root klor invocation reaches a
+// TestKrunkRewritesShadowOnTheWire is the end-to-end assertion this
+// whole stack exists to enable: a non-root krunk invocation reaches a
 // TLS server with the *real* secret in the request body, while the
 // child process only ever saw the shadow placeholder.
 //
@@ -170,7 +170,7 @@ func TestKlorRunsWithoutSudoAfterInstall(t *testing.T) {
 //   - eBPF program load regressions (PR #223 ARCH substitution bug)
 //   - libssl offset regressions across kernel/OpenSSL versions
 //     (PR #222 wbio offset bug)
-//   - cgroup migration race fixes (klor's cgroup.procs write must land
+//   - cgroup migration race fixes (krunk's cgroup.procs write must land
 //     before curl issues SSL_write)
 //   - the kubepods-on-non-k8s downgrade landing here (without it the
 //     ERROR log would fire and arguably the cgroup_ancestor path
@@ -185,14 +185,14 @@ func TestKlorRunsWithoutSudoAfterInstall(t *testing.T) {
 //     stronger variant that uses host: filter and asserts the
 //     systemd-resolved fallback would be a separate test, currently
 //     gated on a fix for that issue.
-func TestKlorRewritesShadowOnTheWire(t *testing.T) {
+func TestKrunkRewritesShadowOnTheWire(t *testing.T) {
 	requireRootedEnv(t)
 	repoRoot, err := findRepoRootForRootedTest()
 	if err != nil {
 		t.Fatalf("find repo root: %v", err)
 	}
 
-	// Install klor with caps into a sandbox prefix so we don't disturb
+	// Install krunk with caps into a sandbox prefix so we don't disturb
 	// a real install on the test host.
 	prefix := t.TempDir()
 	installCmd := exec.Command(filepath.Join(repoRoot, "install.sh"), "--prefix", prefix)
@@ -200,7 +200,7 @@ func TestKlorRewritesShadowOnTheWire(t *testing.T) {
 	if out, err := installCmd.CombinedOutput(); err != nil {
 		t.Fatalf("install.sh failed: %v\n%s", err, out)
 	}
-	klorPath := filepath.Join(prefix, "klor")
+	krunkPath := filepath.Join(prefix, "krunk")
 
 	// In-process TLS echo server on a random loopback port. The cert
 	// is self-signed and only valid for 127.0.0.1/::1, so curl needs
@@ -233,10 +233,10 @@ func TestKlorRewritesShadowOnTheWire(t *testing.T) {
 
 	// `curl --insecure` to accept the self-signed cert, --data-binary
 	// to send the file contents verbatim (the shadow), -s to silence
-	// progress noise. The whole point: curl is the cap'd klor's
-	// direct child, so klor.cgroup.procs migration races neither bash
+	// progress noise. The whole point: curl is the cap'd krunk's
+	// direct child, so krunk.cgroup.procs migration races neither bash
 	// nor a re-exec — the cleanest possible attach window.
-	// Direct curl exec — no sleep, no shell wrapper. klor's sync-pipe
+	// Direct curl exec — no sleep, no shell wrapper. krunk's sync-pipe
 	// gate (see runtime.go) guarantees uprobes are attached BEFORE
 	// the user's curl can call SSL_write, so the loopback-curl-
 	// completes-in-1ms race that previously needed a sleep workaround
@@ -244,15 +244,15 @@ func TestKlorRewritesShadowOnTheWire(t *testing.T) {
 	// test.
 	cmd := exec.Command(
 		"setpriv", "--reuid", fmt.Sprintf("%d", dropUID), "--regid", fmt.Sprintf("%d", dropUID), "--init-groups",
-		klorPath, "run",
+		krunkPath, "run",
 		"--secrets", yaml,
 		"--",
 		"/usr/bin/curl", "-sk", "--data-binary", "@"+payloadPath, echo.URL+"/",
 	)
-	cmd.Env = append(os.Environ(), klorCoverEnv(t)...)
+	cmd.Env = append(os.Environ(), krunkCoverEnv(t)...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		t.Fatalf("klor + curl failed: %v\n%s", err, out)
+		t.Fatalf("krunk + curl failed: %v\n%s", err, out)
 	}
 
 	// Server-side assertion: the bytes the TLS endpoint saw must
@@ -260,7 +260,7 @@ func TestKlorRewritesShadowOnTheWire(t *testing.T) {
 	// fire, the body is `kloak:<UUID...>` of matching length.
 	body := echo.waitForRequest(5 * time.Second)
 	if body == nil {
-		t.Fatalf("echo server did not receive the request — klor/curl output:\n%s", out)
+		t.Fatalf("echo server did not receive the request — krunk/curl output:\n%s", out)
 	}
 	got := string(body)
 	if !strings.Contains(got, real) {
@@ -271,36 +271,36 @@ func TestKlorRewritesShadowOnTheWire(t *testing.T) {
 	}
 }
 
-// klorCoverEnv returns the env entries to pass when invoking the cap'd
-// klor binary so that any `-cover`-instrumented runs flush covcounters
-// into a directory the CI's Klor E2E job can later pick up and merge
+// krunkCoverEnv returns the env entries to pass when invoking the cap'd
+// krunk binary so that any `-cover`-instrumented runs flush covcounters
+// into a directory the CI's Krunk E2E job can later pick up and merge
 // into the combined coverage profile.
 //
-// The mechanism: CI sets `KLOR_COVDATA_DIR=/tmp/klor-covdata` (host
-// path) and `KLOR_COVER=1` (consumed by install.sh to add
+// The mechanism: CI sets `KRUNK_COVDATA_DIR=/tmp/krunk-covdata` (host
+// path) and `KRUNK_COVER=1` (consumed by install.sh to add
 // `-cover -covermode=atomic -tags cover` to `go build`). Each rooted
-// test then forwards `GOCOVERDIR=<that dir>` into klor's env. Klor's
-// `flushCoverage` (cmd/klor/coverage_flush_cover.go, compiled in via
+// test then forwards `GOCOVERDIR=<that dir>` into krunk's env. Krunk's
+// `flushCoverage` (cmd/krunk/coverage_flush_cover.go, compiled in via
 // `-tags cover`) writes covcounters into that dir before os.Exit
 // fires. CI converts the binary covdata to text format via
 // `go tool covdata textfmt` and merges into combined-coverage.
 //
 // chmod 1777 because the dir is created as root (the test runs as
-// root via TestMain's gate) but klor runs under setpriv as the
+// root via TestMain's gate) but krunk runs under setpriv as the
 // dropped uid — without a permissive mode the writer would EACCES.
-func klorCoverEnv(t *testing.T) []string {
+func krunkCoverEnv(t *testing.T) []string {
 	t.Helper()
-	dir := os.Getenv("KLOR_COVDATA_DIR")
+	dir := os.Getenv("KRUNK_COVDATA_DIR")
 	if dir == "" {
 		return nil
 	}
 	if err := os.MkdirAll(dir, 0o1777); err != nil {
-		t.Fatalf("mkdir KLOR_COVDATA_DIR=%s: %v", dir, err)
+		t.Fatalf("mkdir KRUNK_COVDATA_DIR=%s: %v", dir, err)
 	}
 	// MkdirAll may not apply the sticky bit when the dir already
 	// exists — re-chmod to be explicit.
 	if err := os.Chmod(dir, 0o1777); err != nil {
-		t.Fatalf("chmod KLOR_COVDATA_DIR=%s: %v", dir, err)
+		t.Fatalf("chmod KRUNK_COVDATA_DIR=%s: %v", dir, err)
 	}
 	return []string{"GOCOVERDIR=" + dir}
 }
@@ -342,12 +342,12 @@ func findRepoRootForRootedTest() (string, error) {
 
 func writeYAMLForRootedTest(t *testing.T, body string) string {
 	t.Helper()
-	// The test runs as root (via TestMain gate), but klor will run as
+	// The test runs as root (via TestMain gate), but krunk will run as
 	// the dropped uid via setpriv. The fixture file needs to be
 	// readable by that uid; t.TempDir() gives us a 0700 dir owned by
 	// root that the dropped uid can't read. Use /tmp + a unique
 	// sub-dir we open up to all.
-	dir, err := os.MkdirTemp("/tmp", "klor-rooted-fixture-")
+	dir, err := os.MkdirTemp("/tmp", "krunk-rooted-fixture-")
 	if err != nil {
 		t.Fatalf("mkdir tmp: %v", err)
 	}

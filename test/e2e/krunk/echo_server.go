@@ -1,6 +1,6 @@
-//go:build e2e_klor_rooted
+//go:build e2e_krunk_rooted
 
-package klor_e2e
+package krunk_e2e
 
 import (
 	"crypto/ecdsa"

@@ -38,11 +38,11 @@ operational profile as kloak's controller DaemonSet.
 
 Example:
 
-  sudo klor run --secrets ./secrets.yaml -- \
+  sudo krunk run --secrets ./secrets.yaml -- \
       curl -sk -H "Authorization: Bearer $STRIPE_KEY" https://api.stripe.com/...
 
-Use "--" to separate klor flags from the command to execute. The
-command's exit code is propagated as klor's exit code.`,
+Use "--" to separate krunk flags from the command to execute. The
+command's exit code is propagated as krunk's exit code.`,
 	Args:          cobra.MinimumNArgs(1),
 	RunE:          runRun,
 	SilenceErrors: true, // exitCodeError's message is internal-only; never print.
@@ -62,7 +62,7 @@ func init() {
 		"Log level: trace, debug, info, warn, error. WARN by default — the child's own output is what you usually care about. Use trace to see per-event eBPF debug counters.")
 }
 
-// runRun is the cobra RunE for `klor run`, extracted so tests can
+// runRun is the cobra RunE for `krunk run`, extracted so tests can
 // invoke the command logic directly with a *cobra.Command whose
 // streams are redirected.
 func runRun(cmd *cobra.Command, args []string) error {
@@ -101,7 +101,7 @@ func runRun(cmd *cobra.Command, args []string) error {
 		return err
 	}
 	if exitCode != 0 {
-		// Mirror the child's status as klor's own exit code. We can't
+		// Mirror the child's status as krunk's own exit code. We can't
 		// call os.Exit here because that would skip the deferred
 		// logger.Sync (and any future defers added to runRun). Return
 		// a sentinel error type and let main translate it after
