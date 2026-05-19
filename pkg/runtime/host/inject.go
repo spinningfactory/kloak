@@ -24,7 +24,7 @@ import (
 //
 // Cleanup is idempotent: callers may defer it on every exit path.
 //
-// TODO(phase-3b-followup): when concurrent klor invocations both
+// TODO(phase-3b-followup): when concurrent krunk invocations both
 // declare the same `inject.file` path, the second one will fail at
 // writeInjectFile (or worse, race the cleanup of the first). The
 // libkrun backend solves this via virtio-fs into the guest; the host

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# klor installer — drops a cap'd `klor` binary into /usr/local/bin so it
+# krunk installer — drops a cap'd `krunk` binary into /usr/local/bin so it
 # runs without `sudo` per invocation.
 #
 # Usage:
 #   ./install.sh                              # checkout-local: build from source
 #   curl -fsSL https://.../install.sh | bash  # release: pull latest tagged binary
 #   ./install.sh --version v0.1.2             # release: pull a specific tag
-#   ./install.sh --prefix /opt/klor/bin       # install under a different bindir
+#   ./install.sh --prefix /opt/krunk/bin       # install under a different bindir
 #
 # Privilege handling: the installer starts as whoever invoked it, then
 # re-execs itself under `sudo` for the cp + setcap steps. Curl|bash users
@@ -32,7 +32,7 @@ readonly REPO_NAME="kloak"
 
 PREFIX="/usr/local/bin"
 VERSION="latest"
-KLOR_SOURCE_BINARY=""  # set by env override (KLOR_BINARY=...) for testing
+KRUNK_SOURCE_BINARY=""  # set by env override (KRUNK_BINARY=...) for testing
 
 # -----------------------------------------------------------------------
 # Logging
@@ -135,7 +135,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # -----------------------------------------------------------------------
-# Locate or build the klor binary
+# Locate or build the krunk binary
 # -----------------------------------------------------------------------
 
 # Resolve the script directory (handle bash/zsh + symlinks).
@@ -143,22 +143,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 resolve_binary() {
     # 1. Explicit env override — used by the rooted e2e test and anyone
-    #    who's pre-built klor themselves.
-    if [[ -n "${KLOR_BINARY:-}" ]]; then
-        [[ -x "$KLOR_BINARY" ]] || die "KLOR_BINARY=$KLOR_BINARY is not an executable"
-        echo "$KLOR_BINARY"
+    #    who's pre-built krunk themselves.
+    if [[ -n "${KRUNK_BINARY:-}" ]]; then
+        [[ -x "$KRUNK_BINARY" ]] || die "KRUNK_BINARY=$KRUNK_BINARY is not an executable"
+        echo "$KRUNK_BINARY"
         return
     fi
 
-    # 2. Checkout-local build — if cmd/klor/ exists next to install.sh,
+    # 2. Checkout-local build — if cmd/krunk/ exists next to install.sh,
     #    assume this is a developer running from a git clone and build
     #    from source. Lets contributors validate install.sh without
     #    cutting a release.
-    if [[ -d "$SCRIPT_DIR/cmd/klor" ]]; then
-        log "Detected source checkout at $SCRIPT_DIR — building klor locally …"
+    if [[ -d "$SCRIPT_DIR/cmd/krunk" ]]; then
+        log "Detected source checkout at $SCRIPT_DIR — building krunk locally …"
         command -v go >/dev/null || die "go not installed (needed to build from checkout)"
         local out
-        out="$(make_tempdir)/klor"
+        out="$(make_tempdir)/krunk"
         # Run as the invoking user (not root) — `go build` writes the
         # build cache under $HOME; doing it as root either reaches into
         # the user's HOME and leaves root-owned cache files there, or
@@ -167,20 +167,20 @@ resolve_binary() {
         # already correct, but keep the comment as a reminder for
         # future refactors.
         #
-        # KLOR_COVER=1 (CI's Klor E2E job) builds a coverage-
-        # instrumented binary so the cap'd klor's runtime coverage
+        # KRUNK_COVER=1 (CI's Krunk E2E job) builds a coverage-
+        # instrumented binary so the cap'd krunk's runtime coverage
         # contributes back to the merged profile. `-cover` arms
         # runtime/coverage, `-covermode=atomic` makes counters safe
-        # under klor's background pollers, `-tags cover` pulls in
-        # cmd/klor/coverage_flush_cover.go which writes covcounters
+        # under krunk's background pollers, `-tags cover` pulls in
+        # cmd/krunk/coverage_flush_cover.go which writes covcounters
         # to $GOCOVERDIR on exit (Go's auto-flush is unreliable for
-        # os.Exit paths, which klor uses for exit-code propagation).
+        # os.Exit paths, which krunk uses for exit-code propagation).
         local build_args=("-o" "$out")
-        if [[ "${KLOR_COVER:-0}" = "1" ]]; then
-            log "KLOR_COVER=1 — building klor with -cover instrumentation"
+        if [[ "${KRUNK_COVER:-0}" = "1" ]]; then
+            log "KRUNK_COVER=1 — building krunk with -cover instrumentation"
             build_args+=("-cover" "-covermode=atomic" "-tags" "cover")
         fi
-        (cd "$SCRIPT_DIR" && go build "${build_args[@]}" ./cmd/klor) || die "go build failed"
+        (cd "$SCRIPT_DIR" && go build "${build_args[@]}" ./cmd/krunk) || die "go build failed"
         echo "$out"
         return
     fi
@@ -199,9 +199,9 @@ download_release_binary() {
     case "$(uname -m)" in
         x86_64|amd64) arch="amd64" ;;
         aarch64|arm64) arch="arm64" ;;
-        *) die "unsupported architecture $(uname -m) — klor ships amd64 and arm64 only" ;;
+        *) die "unsupported architecture $(uname -m) — krunk ships amd64 and arm64 only" ;;
     esac
-    [[ "$os" == "linux" ]] || die "klor's host-cgroup runtime is Linux-only (got $os)"
+    [[ "$os" == "linux" ]] || die "krunk's host-cgroup runtime is Linux-only (got $os)"
 
     if [[ "$VERSION" == "latest" ]]; then
         tag="$(curl -fsSL "https://api.github.com/repos/$REPO_OWNER/$REPO_NAME/releases/latest" \
@@ -211,11 +211,11 @@ download_release_binary() {
         tag="$VERSION"
     fi
 
-    tar_name="klor-${os}-${arch}.tar.gz"
+    tar_name="krunk-${os}-${arch}.tar.gz"
     url="https://github.com/$REPO_OWNER/$REPO_NAME/releases/download/$tag/$tar_name"
     tmp="$(make_tempdir)"
 
-    log "Fetching klor $tag for $os/$arch …"
+    log "Fetching krunk $tag for $os/$arch …"
     curl -fsSL --output "$tmp/$tar_name"        "$url"        || die "download failed: $url"
     curl -fsSL --output "$tmp/$tar_name.sha256" "$url.sha256" || die "download failed: $url.sha256"
 
@@ -226,9 +226,9 @@ download_release_binary() {
         || die "sha256 mismatch — refusing to install"
 
     tar -xzf "$tmp/$tar_name" -C "$tmp" || die "tar extraction failed"
-    [[ -x "$tmp/klor" ]] || die "extracted archive doesn't contain an executable 'klor'"
+    [[ -x "$tmp/krunk" ]] || die "extracted archive doesn't contain an executable 'krunk'"
 
-    echo "$tmp/klor"
+    echo "$tmp/krunk"
 }
 
 # -----------------------------------------------------------------------
@@ -258,11 +258,11 @@ choose_capset() {
     # piece that bypasses the VFS DAC check on the root-owned
     # `/sys/fs/cgroup/...` parent directories and on the per-cgroup
     # `cgroup.procs` files (mode 0644). Without DAC_OVERRIDE, even a
-    # CAP_SYS_ADMIN klor would EPERM at the parent-write check before
+    # CAP_SYS_ADMIN krunk would EPERM at the parent-write check before
     # the cgroup hook gets a chance to authorize the operation.
     #
     # Together this is still strictly less than what `sudo` gives the
-    # binary (sudo is "all caps") — DAC_OVERRIDE means klor can
+    # binary (sudo is "all caps") — DAC_OVERRIDE means krunk can
     # read/write/execute any file on the system regardless of mode
     # bits, but it stays as the invoking user (no setuid, no CAP_CHOWN,
     # no CAP_SYS_PTRACE, …).
@@ -279,7 +279,7 @@ choose_capset() {
 
 install_binary() {
     local src="$1" capset="$2"
-    local dest="$PREFIX/klor"
+    local dest="$PREFIX/krunk"
 
     command -v setcap >/dev/null \
         || die "setcap not installed (apt: libcap2-bin; rpm: libcap; alpine: libcap-setcap)"
@@ -299,7 +299,7 @@ install_binary() {
     if ! privileged_run setcap "$capset" "$dest"; then
         # AppArmor, SELinux, or NFS-without-acl can reject setcap. Don't
         # leave a half-installed binary behind that would mislead the
-        # user into thinking klor is ready when it can't actually run.
+        # user into thinking krunk is ready when it can't actually run.
         privileged_run rm -f "$dest"
         die "setcap rejected the capability set — your kernel or LSM may not allow file capabilities here"
     fi
@@ -329,8 +329,8 @@ install_binary "$binary" "$capset"
 
 cat <<EOF
 
-${c_green}✓${c_reset} klor installed.
+${c_green}✓${c_reset} krunk installed.
 
-  $ klor run --secrets ./secrets.yaml -- curl https://api.example.com/...
+  $ krunk run --secrets ./secrets.yaml -- curl https://api.example.com/...
 
 EOF

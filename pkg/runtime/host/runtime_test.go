@@ -199,12 +199,12 @@ func TestRun_PropagatesNonZeroExitCode(t *testing.T) {
 }
 
 func TestRun_BadBinaryPropagatesExitCode(t *testing.T) {
-	// Klor wraps the user's command in a `/bin/sh -c 'read <&3; exec "$@"'`
+	// Krunk wraps the user's command in a `/bin/sh -c 'read <&3; exec "$@"'`
 	// shim that gates exec on the sync pipe (see runtime.go for why).
 	// Result: a missing user binary is no longer a `cmd.Start` failure
 	// (the shim itself is /bin/sh which always exists) — it shows up
 	// as the shim's exec failing, surfacing as exit code 127 with
-	// klor returning no error.
+	// krunk returning no error.
 	rt := New(t.TempDir(), t.TempDir(), zap.NewNop().Sugar())
 	code, err := rt.Run(context.Background(), &runtime.Spec{
 		Cmd: []string{"/this/binary/does/not/exist-kloak-test"},

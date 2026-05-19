@@ -30,7 +30,7 @@ var ErrNotSupported = errors.New("kloak: host-cgroup runtime is only supported o
 // identically on macOS / Windows. Options have no effect on the stub.
 type Option func()
 
-// WithEBPF is a no-op on the stub but exported so cmd/klor compiles
+// WithEBPF is a no-op on the stub but exported so cmd/krunk compiles
 // for cross-platform development. The stub's Run still returns
 // ErrNotSupported regardless of options passed.
 func WithEBPF() Option { return func() {} }

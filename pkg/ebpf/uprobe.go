@@ -125,7 +125,7 @@ type tcAttachEntry struct {
 // in the exec tracepoint to catch all container execs without per-container
 // runningInKubepods reports whether the current task is inside a
 // cgroup whose path contains "kubepods" — the cheap, reliable signal
-// that we're running as a k8s pod. False on host binaries (klor, dev
+// that we're running as a k8s pod. False on host binaries (krunk, dev
 // invocations, tests).
 //
 // Returns false on any read/parse error: if we can't tell, assume we
@@ -147,7 +147,7 @@ func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log *zap.Sug
 	// Short-circuit when we're not running inside Kubernetes at all. The
 	// ancestor map is a controller-DaemonSet optimization — its job is to
 	// let the exec tracepoint catch container processes that haven't yet
-	// been TrackCgroup'd by the pod reconciler. Hosts running klor / host
+	// been TrackCgroup'd by the pod reconciler. Hosts running krunk / host
 	// binaries have no kubepods cgroup, and we already TrackCgroup the
 	// transient cgroup directly, so a missing ancestor is the expected
 	// state, not an error.

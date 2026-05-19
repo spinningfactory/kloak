@@ -167,7 +167,7 @@ func wrapEBPFSetupError(err error) error {
 // `nameserver` entries. Comments (#/;), blank lines, and non-nameserver
 // directives (search, options, …) are silently ignored. Malformed IP
 // addresses are dropped rather than failing the whole parse — a single
-// typo shouldn't prevent klor from running.
+// typo shouldn't prevent krunk from running.
 func readResolvConfNameservers(path string) ([]net.IP, error) {
 	f, err := os.Open(path)
 	if err != nil {

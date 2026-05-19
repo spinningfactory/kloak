@@ -66,7 +66,7 @@ type Option func(*hostRuntime)
 // but the rewrite is a no-op — the child's shadow placeholders go on
 // the wire verbatim. This is useful for testing the injection
 // plumbing without privileges; it is NOT a secure mode and must not
-// be the production default. cmd/klor wraps this behind the explicit
+// be the production default. cmd/krunk wraps this behind the explicit
 // `--no-rewrite` flag with a loud startup warning.
 func WithEBPF() Option {
 	return func(r *hostRuntime) { r.ebpfEnabled = true }
@@ -77,7 +77,7 @@ func WithEBPF() Option {
 // cgroupRoot defaults to `/sys/fs/cgroup` (cgroups.DefaultCgroupRoot)
 // when empty. Privilege to mkdir under that path comes from one of:
 //
-//   - `sudo klor …` — CAP_SYS_ADMIN via the sudo session.
+//   - `sudo krunk …` — CAP_SYS_ADMIN via the sudo session.
 //   - File capabilities applied by install.sh: the binary carries
 //     `cap_dac_override,cap_sys_admin,…+ep` so the process has the
 //     right caps without sudo. See install.sh in the repo root.
@@ -121,7 +121,7 @@ func annotateCgroupError(err error) error {
 		return fmt.Errorf("create cgroup: %w", err)
 	}
 	return fmt.Errorf("create cgroup: %w\n"+
-		"klor needs CAP_SYS_ADMIN + CAP_DAC_OVERRIDE to mkdir under /sys/fs/cgroup and write cgroup.procs",
+		"krunk needs CAP_SYS_ADMIN + CAP_DAC_OVERRIDE to mkdir under /sys/fs/cgroup and write cgroup.procs",
 		err)
 }
 
@@ -224,17 +224,17 @@ func (r *hostRuntime) Run(ctx context.Context, spec *runtime.Spec) (int, error) 
 
 	// 5. Build the child command. We don't exec the user's command
 	//    directly — instead a tiny `sh -c 'read <&3; exec "$@"'` shim
-	//    sits between klor and the user's command. The shim's only job
+	//    sits between krunk and the user's command. The shim's only job
 	//    is to block on a sync pipe (FD 3, the read end of a pipe whose
-	//    write end klor holds) until klor explicitly releases it.
+	//    write end krunk holds) until krunk explicitly releases it.
 	//
 	//    This is THE fix for the AttachTLS-vs-short-lived-child race:
-	//    klor previously had no way to guarantee that uprobes were
+	//    krunk previously had no way to guarantee that uprobes were
 	//    attached BEFORE the user's TLS code ran. A loopback `curl`
 	//    completes in ~1 ms — faster than AttachTLS can open
 	//    /proc/<pid>/exe, parse its ELF, and load uprobes — so the
 	//    real value would have already gone over the wire before any
-	//    rewrite hook existed. With the gate, klor finishes all setup
+	//    rewrite hook existed. With the gate, krunk finishes all setup
 	//    (cgroup migration, AttachTLS, BPF map updates) and only THEN
 	//    closes the pipe, letting the shim's `read` return EOF and the
 	//    `exec` replace the shim with the user's command in-place
@@ -279,9 +279,9 @@ func (r *hostRuntime) Run(ctx context.Context, spec *runtime.Spec) (int, error) 
 		_ = syncRead.Close()
 		return -1, fmt.Errorf("start child: %w", err)
 	}
-	// klor doesn't read from the sync pipe — only writes (specifically
+	// krunk doesn't read from the sync pipe — only writes (specifically
 	// closing the write end to signal EOF). Close the read end after
-	// fork so klor isn't the second holder; otherwise sh's `read` would
+	// fork so krunk isn't the second holder; otherwise sh's `read` would
 	// never see EOF when we close `syncWrite`.
 	_ = syncRead.Close()
 

@@ -62,7 +62,7 @@ func Setup() *zap.SugaredLogger {
 }
 
 // SetupCLI returns a SugaredLogger tuned for interactive CLI tools
-// (klor, future per-binary CLIs):
+// (krunk, future per-binary CLIs):
 //
 //   - console encoder with capital-color levels — human-readable at a
 //     glance, unlike the daemon's JSON
@@ -72,7 +72,7 @@ func Setup() *zap.SugaredLogger {
 //     happens" floor, which becomes noise in a CLI session where the
 //     user already sees the child's own output
 //   - no stacktrace on warn/error — a one-line error is what the user
-//     wants; the trace belongs in `klor --log-level=debug` if at all
+//     wants; the trace belongs in `krunk --log-level=debug` if at all
 //   - no controller-runtime bridge — CLI tools don't host controllers
 //
 // level accepts trace/debug/info/warn/error (trace is below debug, used
