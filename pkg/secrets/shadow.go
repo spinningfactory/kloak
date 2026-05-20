@@ -18,7 +18,16 @@ const (
 
 	// ValuePrefix is the literal prefix every shadow secret carries.
 	// Must match what the eBPF program expects.
-	ValuePrefix = "kloak:"
+	//
+	// Chosen at 4 bytes (27 HPACK Huffman bits) rather than the historical
+	// 6-byte "kloak:" (37 bits) to widen the byte-by-byte construction's
+	// feasibility window for short shadows. The +7-bit fixed slack against
+	// the alphabet's 5-bit floor is the same either way (lower bound at
+	// density 5+7/N), but with 27 prefix bits we get density headroom up to
+	// 7−1/N at the top instead of 7−5/N — meaning hex secrets (density
+	// ≈5.63) and short low-density tokens fit at much smaller N. See PR
+	// description for the openssl-hex / openssl-base64 / JWT density data.
+	ValuePrefix = "kl::"
 )
 
 // ShadowGenerator mints shadow values that don't 8-byte-prefix-collide

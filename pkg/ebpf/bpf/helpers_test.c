@@ -166,27 +166,28 @@ static void test_clamp_exhaustive(void) {
 }
 
 // ============================================================================
-// is_kloak_prefix
+// is_kloak_prefix — matches the 4-byte "kl::" plaintext prefix.
 // ============================================================================
 
 static void test_prefix_valid(void) {
-  assert(is_kloak_prefix("kloak:abc") == 1);
+  assert(is_kloak_prefix("kl::abc") == 1);
 }
 
-static void test_prefix_wrong_colon(void) {
-  assert(is_kloak_prefix("kloak;abc") == 0);
+static void test_prefix_single_colon(void) {
+  // One colon is not the prefix; the matcher requires both colons.
+  assert(is_kloak_prefix("kl:abcd") == 0);
 }
 
 static void test_prefix_uppercase(void) {
-  assert(is_kloak_prefix("Kloak:abc") == 0);
+  assert(is_kloak_prefix("Kl::abc") == 0);
 }
 
-static void test_prefix_wrong_char(void) {
-  assert(is_kloak_prefix("kloal:abc") == 0);
+static void test_prefix_wrong_second_char(void) {
+  assert(is_kloak_prefix("ka::abc") == 0);
 }
 
-static void test_prefix_exact_six(void) {
-  assert(is_kloak_prefix("kloak:") == 1);
+static void test_prefix_exact_four(void) {
+  assert(is_kloak_prefix("kl::") == 1);
 }
 
 // ============================================================================
@@ -369,10 +370,10 @@ int main(void) {
 
   printf("is_kloak_prefix:\n");
   RUN_TEST(test_prefix_valid);
-  RUN_TEST(test_prefix_wrong_colon);
+  RUN_TEST(test_prefix_single_colon);
   RUN_TEST(test_prefix_uppercase);
-  RUN_TEST(test_prefix_wrong_char);
-  RUN_TEST(test_prefix_exact_six);
+  RUN_TEST(test_prefix_wrong_second_char);
+  RUN_TEST(test_prefix_exact_four);
 
   printf("gf128_mul:\n");
   RUN_TEST(test_gf128_mul_identity);

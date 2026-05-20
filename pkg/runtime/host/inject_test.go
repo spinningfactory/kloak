@@ -15,8 +15,8 @@ import (
 
 func TestMaterializeInjection_EnvOnly(t *testing.T) {
 	snap := []secrets.Secret{
-		{Key: "a", Shadow: "kloak:shadowA", Inject: secrets.Inject{Env: "A"}},
-		{Key: "b", Shadow: "kloak:shadowB", Inject: secrets.Inject{Env: "B"}},
+		{Key: "a", Shadow: "kl::shadowA", Inject: secrets.Inject{Env: "A"}},
+		{Key: "b", Shadow: "kl::shadowB", Inject: secrets.Inject{Env: "B"}},
 	}
 	env, cleanup, err := materializeInjection(snap, filepath.Join(t.TempDir(), "stage"))
 	if err != nil {
@@ -25,7 +25,7 @@ func TestMaterializeInjection_EnvOnly(t *testing.T) {
 	defer func() { _ = cleanup() }()
 
 	// Order matches snapshot order so the child sees a predictable view.
-	if got, want := env, []string{"A=kloak:shadowA", "B=kloak:shadowB"}; !equalEnv(got, want) {
+	if got, want := env, []string{"A=kl::shadowA", "B=kl::shadowB"}; !equalEnv(got, want) {
 		t.Errorf("env=%v, want %v", got, want)
 	}
 }
@@ -34,7 +34,7 @@ func TestMaterializeInjection_FileOnly(t *testing.T) {
 	stage := filepath.Join(t.TempDir(), "stage")
 	target := filepath.Join(t.TempDir(), "secret-file")
 	snap := []secrets.Secret{
-		{Key: "k", Shadow: "kloak:shadowK", Inject: secrets.Inject{File: target}},
+		{Key: "k", Shadow: "kl::shadowK", Inject: secrets.Inject{File: target}},
 	}
 	env, cleanup, err := materializeInjection(snap, stage)
 	if err != nil {
@@ -49,8 +49,8 @@ func TestMaterializeInjection_FileOnly(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read target: %v", err)
 	}
-	if string(got) != "kloak:shadowK" {
-		t.Errorf("file contents=%q, want kloak:shadowK", got)
+	if string(got) != "kl::shadowK" {
+		t.Errorf("file contents=%q, want kl::shadowK", got)
 	}
 	// The runtime stages a sentinel inside the per-invocation dir so
 	// post-crash debugging can correlate stale files with the
@@ -72,7 +72,7 @@ func TestMaterializeInjection_BothEnvAndFile(t *testing.T) {
 	stage := filepath.Join(t.TempDir(), "stage")
 	target := filepath.Join(t.TempDir(), "secret-file")
 	snap := []secrets.Secret{
-		{Key: "k", Shadow: "kloak:both", Inject: secrets.Inject{Env: "K", File: target}},
+		{Key: "k", Shadow: "kl::both", Inject: secrets.Inject{Env: "K", File: target}},
 	}
 	env, cleanup, err := materializeInjection(snap, stage)
 	if err != nil {
@@ -80,15 +80,15 @@ func TestMaterializeInjection_BothEnvAndFile(t *testing.T) {
 	}
 	defer func() { _ = cleanup() }()
 
-	if len(env) != 1 || env[0] != "K=kloak:both" {
-		t.Errorf("env=%v, want [K=kloak:both]", env)
+	if len(env) != 1 || env[0] != "K=kl::both" {
+		t.Errorf("env=%v, want [K=kl::both]", env)
 	}
 	got, err := os.ReadFile(target)
 	if err != nil {
 		t.Fatalf("read target: %v", err)
 	}
-	if string(got) != "kloak:both" {
-		t.Errorf("file contents=%q, want kloak:both", got)
+	if string(got) != "kl::both" {
+		t.Errorf("file contents=%q, want kl::both", got)
 	}
 }
 
@@ -100,7 +100,7 @@ func TestMaterializeInjection_RelativePathRejected(t *testing.T) {
 	// produces a relative path.
 	stage := filepath.Join(t.TempDir(), "stage")
 	snap := []secrets.Secret{
-		{Key: "k", Shadow: "kloak:rel", Inject: secrets.Inject{File: "relative/path"}},
+		{Key: "k", Shadow: "kl::rel", Inject: secrets.Inject{File: "relative/path"}},
 	}
 	_, _, err := materializeInjection(snap, stage)
 	if err == nil {
@@ -119,7 +119,7 @@ func TestMaterializeInjection_NoInjectIsZeroState(t *testing.T) {
 	// A snapshot of secrets with empty Inject (e.g. the k8s adapter's
 	// output) must produce no env and no staging dir creation.
 	snap := []secrets.Secret{
-		{Key: "k8s", Shadow: "kloak:k", Real: "r"},
+		{Key: "k8s", Shadow: "kl::k", Real: "r"},
 	}
 	stage := filepath.Join(t.TempDir(), "stage")
 	env, cleanup, err := materializeInjection(snap, stage)
@@ -140,7 +140,7 @@ func TestMaterializeInjection_NoInjectIsZeroState(t *testing.T) {
 func TestMaterializeInjection_CleanupIdempotent(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "secret-file")
 	snap := []secrets.Secret{
-		{Key: "k", Shadow: "kloak:idempotent", Inject: secrets.Inject{File: target}},
+		{Key: "k", Shadow: "kl::idempotent", Inject: secrets.Inject{File: target}},
 	}
 	stage := filepath.Join(t.TempDir(), "stage")
 	_, cleanup, err := materializeInjection(snap, stage)

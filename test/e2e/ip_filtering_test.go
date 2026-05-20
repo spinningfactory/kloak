@@ -115,7 +115,7 @@ func TestEBPFIPFiltering(t *testing.T) {
 
 	// Verify blocked secret's placeholder appears in output
 	// If not rewritten by eBPF, the kloak: placeholder value is sent as-is
-	if !strings.Contains(out, "kloak:") {
+	if !strings.Contains(out, "kl::") {
 		t.Logf("output: %s", out)
 		t.Errorf("blocked secret placeholder should appear unmodified in echo output")
 	}

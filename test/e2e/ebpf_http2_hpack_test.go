@@ -37,7 +37,7 @@ import (
 // Repro shape (verified via golang.org/x/net/http2/hpack):
 //
 //	real   = "lowercase-secret-triggering-hpack-bug" (37 chars, HuffmanLen=26)
-//	shadow ≈ "kloak:<31 chars of Crockford Base32>"  (37 chars, HuffmanLen=31)
+//	shadow ≈ "kl::<31 chars of Crockford Base32>"  (37 chars, HuffmanLen=31)
 //	gap    = 5 bytes (40 bits) of trailing 0xFF — illegal under §5.2.
 //
 // The fix lands in the same PR: pkg/secrets/shadow.go is rewritten as

@@ -121,7 +121,7 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, sour
 
 		// Also store a Huffman-encoded variant for HTTP/2 HPACK interception.
 		// HPACK uses a static Huffman table (RFC 7541) so the encoding is
-		// deterministic. The eBPF scanner checks for both plaintext "kloak:"
+		// deterministic. The eBPF scanner checks for both plaintext "kl::"
 		// and its Huffman encoding (0xeb 0x41 0xc7 0xd6).
 		//
 		// The rewritten Huffman data must be EXACTLY the same length as the

@@ -151,8 +151,8 @@ func TestKlorRunsWithoutSudoAfterInstall(t *testing.T) {
 	// follow-up lands — for now we assert the structural plumbing:
 	// klor exec'd the child, env injection happened, exit code 0.
 	got := strings.TrimSpace(string(out))
-	if !strings.Contains(got, "got=kloak:") {
-		t.Errorf("expected shadow 'got=kloak:...' in output, got: %q", got)
+	if !strings.Contains(got, "got=kl::") {
+		t.Errorf("expected shadow 'got=kl::...' in output, got: %q", got)
 	}
 	if strings.Contains(got, "rooted-e2e-real-value") {
 		t.Errorf("real value leaked to child env (bug regression?): %q", got)

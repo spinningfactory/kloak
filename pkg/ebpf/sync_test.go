@@ -110,7 +110,7 @@ func TestSyncSecrets_BasicSync(t *testing.T) {
 		enabledSecret("my-secret", "default",
 			map[string][]byte{"api-key": []byte("my-real-secret-value!")}, nil, nil),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
-			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
+			map[string][]byte{"api-key": []byte("kl::abcd1234-5678-9abc")}),
 	)
 
 	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
@@ -119,7 +119,7 @@ func TestSyncSecrets_BasicSync(t *testing.T) {
 
 	// Verify the key was stored (first 8 bytes of shadow prefix)
 	var key secretKey
-	copy(key.Prefix[:], []byte("kloak:ab"))
+	copy(key.Prefix[:], []byte("kl::abcd"))
 	var val secretValue
 	if err := m.Lookup(&key, &val); err != nil {
 		t.Fatalf("secret not found in map: %v", err)
@@ -136,12 +136,12 @@ func TestSyncSecrets_BasicSync(t *testing.T) {
 
 func TestSyncSecrets_MinLength(t *testing.T) {
 	m := createTestSecretMap(t)
-	// Shadow value "kloak:" is 6 bytes, below 8-byte minimum
+	// Shadow value "kl::" is 4 bytes, below 8-byte minimum
 	reader := newFakeClient(
 		enabledSecret("my-secret", "default",
 			map[string][]byte{"api-key": []byte("short")}, nil, nil),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
-			map[string][]byte{"api-key": []byte("kloak:")}),
+			map[string][]byte{"api-key": []byte("kl::")}),
 	)
 
 	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
@@ -150,7 +150,7 @@ func TestSyncSecrets_MinLength(t *testing.T) {
 
 	// Map should be empty — secret was too short
 	var key secretKey
-	copy(key.Prefix[:], []byte("kloak:ab"))
+	copy(key.Prefix[:], []byte("kl::abcd"))
 	var val secretValue
 	if err := m.Lookup(&key, &val); err == nil {
 		t.Error("short secret should not be stored in BPF map")
@@ -160,7 +160,7 @@ func TestSyncSecrets_MinLength(t *testing.T) {
 func TestSyncSecrets_Truncation(t *testing.T) {
 	m := createTestSecretMap(t)
 	longValue := strings.Repeat("A", 200)
-	longShadow := "kloak:abcd1234-5678-9abc-def0-123456789abc" + strings.Repeat(" ", 158)
+	longShadow := "kl::abcd1234-5678-9abc-def0-123456789abc" + strings.Repeat(" ", 158)
 	reader := newFakeClient(
 		enabledSecret("my-secret", "default",
 			map[string][]byte{"api-key": []byte(longValue)}, nil, nil),
@@ -173,7 +173,7 @@ func TestSyncSecrets_Truncation(t *testing.T) {
 	}
 
 	var key secretKey
-	copy(key.Prefix[:], []byte("kloak:ab"))
+	copy(key.Prefix[:], []byte("kl::abcd"))
 	var val secretValue
 	if err := m.Lookup(&key, &val); err != nil {
 		t.Fatalf("secret not found in map: %v", err)
@@ -191,7 +191,7 @@ func TestSyncSecrets_HostFilter(t *testing.T) {
 			map[string][]byte{"api-key": []byte("my-real-secret-value!")},
 			nil, map[string]string{"getkloak.io/hosts": "api.stripe.com"}),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
-			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
+			map[string][]byte{"api-key": []byte("kl::abcd1234-5678-9abc")}),
 	)
 
 	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
@@ -199,7 +199,7 @@ func TestSyncSecrets_HostFilter(t *testing.T) {
 	}
 
 	var key secretKey
-	copy(key.Prefix[:], []byte("kloak:ab"))
+	copy(key.Prefix[:], []byte("kl::abcd"))
 	var val secretValue
 	if err := m.Lookup(&key, &val); err != nil {
 		t.Fatalf("secret not found in map: %v", err)
@@ -221,7 +221,7 @@ func TestSyncSecrets_WildcardHost(t *testing.T) {
 			map[string][]byte{"api-key": []byte("my-real-secret-value!")},
 			nil, map[string]string{"getkloak.io/hosts": "*"}),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
-			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
+			map[string][]byte{"api-key": []byte("kl::abcd1234-5678-9abc")}),
 	)
 
 	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
@@ -229,7 +229,7 @@ func TestSyncSecrets_WildcardHost(t *testing.T) {
 	}
 
 	var key secretKey
-	copy(key.Prefix[:], []byte("kloak:ab"))
+	copy(key.Prefix[:], []byte("kl::abcd"))
 	var val secretValue
 	if err := m.Lookup(&key, &val); err != nil {
 		t.Fatalf("secret not found in map: %v", err)
@@ -248,7 +248,7 @@ func TestSyncSecrets_StaleEntryPruning(t *testing.T) {
 		enabledSecret("my-secret", "default",
 			map[string][]byte{"api-key": []byte("my-real-secret-value!")}, nil, nil),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
-			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
+			map[string][]byte{"api-key": []byte("kl::abcd1234-5678-9abc")}),
 	)
 	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader1), testLog()); err != nil {
 		t.Fatalf("first sync failed: %v", err)
@@ -256,7 +256,7 @@ func TestSyncSecrets_StaleEntryPruning(t *testing.T) {
 
 	// Verify it exists
 	var key secretKey
-	copy(key.Prefix[:], []byte("kloak:ab"))
+	copy(key.Prefix[:], []byte("kl::abcd"))
 	var val secretValue
 	if err := m.Lookup(&key, &val); err != nil {
 		t.Fatalf("secret not found after first sync: %v", err)
@@ -282,7 +282,7 @@ func TestSyncSecrets_Update(t *testing.T) {
 		enabledSecret("my-secret", "default",
 			map[string][]byte{"api-key": []byte("old-secret-value-here")}, nil, nil),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
-			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
+			map[string][]byte{"api-key": []byte("kl::abcd1234-5678-9abc")}),
 	)
 	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader1), testLog()); err != nil {
 		t.Fatalf("first sync failed: %v", err)
@@ -293,14 +293,14 @@ func TestSyncSecrets_Update(t *testing.T) {
 		enabledSecret("my-secret", "default",
 			map[string][]byte{"api-key": []byte("new-secret-value-here")}, nil, nil),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
-			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
+			map[string][]byte{"api-key": []byte("kl::abcd1234-5678-9abc")}),
 	)
 	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader2), testLog()); err != nil {
 		t.Fatalf("second sync failed: %v", err)
 	}
 
 	var key secretKey
-	copy(key.Prefix[:], []byte("kloak:ab"))
+	copy(key.Prefix[:], []byte("kl::abcd"))
 	var val secretValue
 	if err := m.Lookup(&key, &val); err != nil {
 		t.Fatalf("secret not found: %v", err)
@@ -314,7 +314,7 @@ func TestSyncSecrets_Update(t *testing.T) {
 
 func TestSyncSecrets_FullPrefix(t *testing.T) {
 	m := createTestSecretMap(t)
-	shadow := "kloak:abcd1234-5678-9abc-def0-123456789abc"
+	shadow := "kl::abcd1234-5678-9abc-def0-123456789abc"
 	reader := newFakeClient(
 		enabledSecret("my-secret", "default",
 			map[string][]byte{"api-key": []byte(shadow)}, nil, nil),
@@ -327,7 +327,7 @@ func TestSyncSecrets_FullPrefix(t *testing.T) {
 	}
 
 	var key secretKey
-	copy(key.Prefix[:], []byte("kloak:ab"))
+	copy(key.Prefix[:], []byte("kl::abcd"))
 	var val secretValue
 	if err := m.Lookup(&key, &val); err != nil {
 		t.Fatalf("secret not found: %v", err)
@@ -350,12 +350,12 @@ func TestSyncSecrets_WatchedHostsSync(t *testing.T) {
 			map[string][]byte{"api-key": []byte("my-real-secret-value!")},
 			nil, map[string]string{"getkloak.io/hosts": "api.stripe.com"}),
 		shadowSecret("secret1-kloak", "default", "secret1",
-			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
+			map[string][]byte{"api-key": []byte("kl::abcd1234-5678-9abc")}),
 		enabledSecret("secret2", "default",
 			map[string][]byte{"api-key": []byte("another-secret-value!")},
 			nil, map[string]string{"getkloak.io/hosts": "api.github.com"}),
 		shadowSecret("secret2-kloak", "default", "secret2",
-			map[string][]byte{"api-key": []byte("kloak:efgh5678-1234-5678")}),
+			map[string][]byte{"api-key": []byte("kl::efgh5678-1234-5678")}),
 	)
 
 	if err := syncSecrets(context.Background(), m, wh, k8sSource(reader), testLog()); err != nil {
@@ -387,7 +387,7 @@ func TestSyncSecrets_WatchedHostsPruning(t *testing.T) {
 			map[string][]byte{"api-key": []byte("my-real-secret-value!")},
 			nil, map[string]string{"getkloak.io/hosts": "api.stripe.com"}),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
-			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
+			map[string][]byte{"api-key": []byte("kl::abcd1234-5678-9abc")}),
 	)
 	if err := syncSecrets(context.Background(), m, wh, k8sSource(reader1), testLog()); err != nil {
 		t.Fatalf("first sync failed: %v", err)
@@ -420,7 +420,7 @@ func TestSyncSecrets_IPFilter(t *testing.T) {
 			map[string][]byte{"api-key": []byte("my-real-secret-value!")},
 			nil, map[string]string{"getkloak.io/hosts": "192.168.1.1"}),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
-			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
+			map[string][]byte{"api-key": []byte("kl::abcd1234-5678-9abc")}),
 	)
 
 	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
@@ -428,7 +428,7 @@ func TestSyncSecrets_IPFilter(t *testing.T) {
 	}
 
 	var key secretKey
-	copy(key.Prefix[:], []byte("kloak:ab"))
+	copy(key.Prefix[:], []byte("kl::abcd"))
 	var val secretValue
 	if err := m.Lookup(&key, &val); err != nil {
 		t.Fatalf("secret not found in map: %v", err)
@@ -463,7 +463,7 @@ func TestSyncSecrets_IPv6Filter(t *testing.T) {
 			map[string][]byte{"api-key": []byte("my-real-secret-value!")},
 			nil, map[string]string{"getkloak.io/hosts": "2001:db8::1"}),
 		shadowSecret("my-secret-kloak", "default", "my-secret",
-			map[string][]byte{"api-key": []byte("kloak:abcd1234-5678-9abc")}),
+			map[string][]byte{"api-key": []byte("kl::abcd1234-5678-9abc")}),
 	)
 
 	if err := syncSecrets(context.Background(), m, nil, k8sSource(reader), testLog()); err != nil {
@@ -471,7 +471,7 @@ func TestSyncSecrets_IPv6Filter(t *testing.T) {
 	}
 
 	var key secretKey
-	copy(key.Prefix[:], []byte("kloak:ab"))
+	copy(key.Prefix[:], []byte("kl::abcd"))
 	var val secretValue
 	if err := m.Lookup(&key, &val); err != nil {
 		t.Fatalf("secret not found in map: %v", err)

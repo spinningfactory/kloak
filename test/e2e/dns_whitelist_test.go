@@ -403,7 +403,7 @@ func verifyRewriteBlocked(t *testing.T, clientPod, serverHost, secretValue strin
 		}
 
 		// Verify the shadow placeholder passed through unrewritten.
-		if strings.Contains(out, "kloak:") {
+		if strings.Contains(out, "kl::") {
 			consecutiveBlocked++
 			t.Logf("blocked response %d/%d confirmed (placeholder visible)", consecutiveBlocked, requiredConsecutive)
 			if consecutiveBlocked >= requiredConsecutive {

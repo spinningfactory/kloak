@@ -136,7 +136,7 @@ func TestRun_HappyPath(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	src := staticSource{snap: []secrets.Secret{
-		{Key: "k1", Real: "real-1", Shadow: "kloak:shadow-1", Inject: secrets.Inject{Env: "KLOAK_TEST"}},
+		{Key: "k1", Real: "real-1", Shadow: "kl::shadow-1", Inject: secrets.Inject{Env: "KLOAK_TEST"}},
 	}}
 
 	// Use sh -c so we can echo $KLOAK_TEST and prove the env injection
@@ -158,8 +158,8 @@ func TestRun_HappyPath(t *testing.T) {
 	if code != 0 {
 		t.Errorf("exit code=%d, want 0; stderr=%s", code, stderr.String())
 	}
-	if got := strings.TrimSpace(stdout.String()); got != "got=kloak:shadow-1" {
-		t.Errorf("child stdout=%q, want 'got=kloak:shadow-1'", got)
+	if got := strings.TrimSpace(stdout.String()); got != "got=kl::shadow-1" {
+		t.Errorf("child stdout=%q, want 'got=kl::shadow-1'", got)
 	}
 
 	// The transient cgroup directory survives cleanup because the
@@ -213,7 +213,7 @@ func TestSnapshotOrEmpty_NilSource(t *testing.T) {
 }
 
 func TestSnapshotOrEmpty_Delegates(t *testing.T) {
-	want := []secrets.Secret{{Key: "k", Real: "r", Shadow: "kloak:s"}}
+	want := []secrets.Secret{{Key: "k", Real: "r", Shadow: "kl::s"}}
 	got, err := snapshotOrEmpty(context.Background(), staticSource{snap: want})
 	if err != nil {
 		t.Fatalf("snapshotOrEmpty: %v", err)

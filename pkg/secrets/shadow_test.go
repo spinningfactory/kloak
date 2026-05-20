@@ -104,19 +104,18 @@ func TestGenerateShadowValue_UnsatisfiableReturnsError(t *testing.T) {
 	}{
 		// Above-the-window: shadow tail can supply at most tailLen*MaxBits
 		// bits, but real demands more. 'X' is 8 bits/byte; 16 chars of
-		// 'X' = 128 bits, minus prefix's 37 = 91 bits required from
-		// (16-6)=10 tail bytes — needs 9.1 bits/byte, above MaxBits=7.
+		// 'X' = 128 bits, minus prefix's 27 = 101 bits required from
+		// (16-4)=12 tail bytes — needs 8.4 bits/byte, above MaxBits=7.
 		{"X×16 in shadowN=16", strings.Repeat("X", 16), 16, true},
 		// Above-the-window classic from the prior algorithm's test:
 		// 32 chars of 'X' demand more bits than the tail can supply.
 		{"X×32 in shadowN=32", strings.Repeat("X", 32), 32, true},
 		// Below-the-window: 'a' is 5 bits, real-of-all-'a' at length 16
-		// = 80 bits; tail must hit 80-37 = 43 bits in 10 bytes = 4.3
+		// = 80 bits; tail must hit 80-27 = 53 bits in 12 bytes = 4.4
 		// bits/byte, below MinBits=5. Not satisfiable.
 		{"a×16 in shadowN=16", strings.Repeat("a", 16), 16, true},
-		// Satisfiable control: 24 chars of 'a' = 120 bits, tail target =
-		// 120-37 = 83 in 18 bytes = 4.6 bits/byte — still below MinBits.
-		// Still infeasible.
+		// Below-the-window again: 24 chars of 'a' = 120 bits, tail target =
+		// 120-27 = 93 in 20 bytes = 4.65 bits/byte — still below MinBits.
 		{"a×24 in shadowN=24", strings.Repeat("a", 24), 24, true},
 		// Comfortable middle: mixed real fits squarely in the window.
 		{"mixed real fits", "REAL-ALLOWED-KEY-12345", 22, false},
@@ -135,9 +134,9 @@ func TestGenerateShadowValue_UnsatisfiableReturnsError(t *testing.T) {
 
 func TestGenerateShadowValue_TooShortRejected(t *testing.T) {
 	// Any originalLen below len(ValuePrefix) cannot embed the literal
-	// "kloak:" the BPF scanner looks for. The function rejects rather
+	// "kl::" the BPF scanner looks for. The function rejects rather
 	// than silently truncating the prefix.
-	for _, n := range []int{0, 1, 5} {
+	for _, n := range []int{0, 1, 3} {
 		_, err := generateShadowValue(n, 0)
 		if !errors.Is(err, ErrHuffmanInvariantUnsatisfiable) {
 			t.Errorf("originalLen=%d: expected ErrHuffmanInvariantUnsatisfiable, got %v", n, err)
@@ -186,7 +185,7 @@ func TestShadowGenerator_SkipsCollisionFromOtherOwner(t *testing.T) {
 	// Generate auto-records its returns, so the used-set grows each
 	// iteration; bumping maxRetries to 20 keeps the test bulletproof
 	// against the birthday-paradox failure mode.
-	seedPrefix := "kloak:00"
+	seedPrefix := "kl::0000"
 	seed := map[string]map[string]struct{}{
 		seedPrefix: {"owner-b": struct{}{}},
 	}
@@ -241,7 +240,7 @@ func TestShadowGenerator_OwnIDExcluded(t *testing.T) {
 	// new request from the same owner-a (this is the reconcile-twice
 	// case: the controller should be allowed to re-emit the same
 	// shadow for its own secret).
-	seedPrefix := "kloak:11"
+	seedPrefix := "kl::1111"
 	seed := map[string]map[string]struct{}{
 		seedPrefix: {"owner-a": struct{}{}},
 	}
@@ -257,7 +256,7 @@ func TestShadowGenerator_OwnIDExcluded(t *testing.T) {
 
 func TestShadowGenerator_Record(t *testing.T) {
 	g := NewShadowGenerator(nil, nil)
-	shadow := "kloak:01ABCDEFGH"
+	shadow := "kl::01ABCDEFGH"
 	g.Record(shadow, "owner-x")
 
 	if !g.Collides(shadow, "owner-y") {
@@ -287,7 +286,7 @@ func TestHuffmanBits_MatchesHpackBytes(t *testing.T) {
 	cases := []string{
 		"",
 		"a",
-		"kloak:",
+		"kl::",
 		"REAL-ALLOWED-KEY-12345",
 		"lowercase-secret-triggering-hpack-bug",
 		strings.Repeat("z", 100),

@@ -35,14 +35,14 @@ var huffmanBuckets [9][]byte
 // shrinking entropy at the top end of the bucket range — not worth it.
 // Lowering MinBits below 5 would require dragging in non-alphanumeric
 // chars (' ', '%', '/', '=') which would surprise anyone scanning a
-// shadow for the literal "kloak:" prefix + identifier pattern.
+// shadow for the literal "kl::" prefix + identifier pattern.
 const (
 	MinBits = 5
 	MaxBits = 7
 )
 
 // prefixHuffmanBits is the cached exact Huffman bit count for ValuePrefix
-// ("kloak:"). The byte-by-byte construction subtracts this from the real's
+// ("kl::"). The byte-by-byte construction subtracts this from the real's
 // total Huffman bits to compute the tail's bit budget.
 var prefixHuffmanBits int
 
@@ -60,7 +60,7 @@ func init() {
 	// We deliberately exclude non-alphanumerics so shadow tails stay
 	// recognizable as identifier-shaped (a holdover from the prior
 	// ULID/Crockford choice — humans reading logs should still see a
-	// shadow as "kloak:<token>", not "kloak:<random%punctuation>").
+	// shadow as "kl::<token>", not "kl::<random%punctuation>").
 	const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 	for _, b := range []byte(alphabet) {
 		bits := huffmanBitsTable[b]
