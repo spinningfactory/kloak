@@ -40,22 +40,14 @@ import (
 //	shadow ≈ "kloak:<31 chars of Crockford Base32>"  (37 chars, HuffmanLen=31)
 //	gap    = 5 bytes (40 bits) of trailing 0xFF — illegal under §5.2.
 //
-// This test will FAIL on main until one of these candidate fixes
-// lands:
-//  1. Strengthen pkg/secrets/shadow.go invariant so
-//     len(huffShadow) ∈ [len(huffReal), len(huffReal)+1] — keeps the
-//     padding strategy unchanged but bounds the gap inside the legal
-//     7-bit window.
-//  2. Rewrite the HPACK length prefix in BPF so the value can shrink
-//     to len(huffReal) with no padding at all (most thorough; needs
-//     in-BPF HPACK awareness for the byte immediately preceding the
-//     matched window).
-//  3. Per-secret fail-open: skip the HTTP/2 variant install in
-//     pkg/ebpf/sync.go when the gap > 7 bits and emit a WARN + metric.
-//     Strict-RFC compliant but leaks the shadow on HTTP/2 for the
-//     affected secrets — only acceptable as a stop-gap with telemetry.
-//
-// See the PR that introduced this test for the full analysis.
+// The fix lands in the same PR: pkg/secrets/shadow.go is rewritten as
+// byte-by-byte construction against an exact (originalLen,
+// realHuffmanBits) budget, so every shadow's Huffman bit length equals
+// the real's bit-exactly. The BPF sync path then rewrites the wire
+// slot byte-for-byte with zero EOS padding, independent of any
+// character-class mismatch between real and shadow. This test
+// transitions from "regression demonstrator" to "regression guard
+// against any future change that reintroduces the over-padding".
 func TestEBPFHttp2HpackOverPadding(t *testing.T) {
 	// GC stale shadows so this test doesn't pick up a shadow created by
 	// a prior TestEBPFSecretRewrite run for the same secret name.

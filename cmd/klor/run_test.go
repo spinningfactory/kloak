@@ -25,7 +25,7 @@ func writeTempYAML(t *testing.T, ext, body string) string {
 func TestOpenSecretsSource_YAMLValid(t *testing.T) {
 	path := writeTempYAML(t, ".yaml", `secrets:
   - name: x
-    value: vvv
+    value: src-snapshot-real
     inject:
       env: X
 `)
@@ -44,7 +44,7 @@ func TestOpenSecretsSource_YMLAndUppercase(t *testing.T) {
 		t.Run(ext, func(t *testing.T) {
 			path := writeTempYAML(t, ext, `secrets:
   - name: x
-    value: vvv
+    value: src-snapshot-real
     inject:
       env: X
 `)
@@ -144,7 +144,7 @@ func TestRunRun_MissingPositionalCmdRejected(t *testing.T) {
 	// suspenders on the args contract.
 	good := writeTempYAML(t, ".yaml", `secrets:
   - name: x
-    value: vvv
+    value: src-snapshot-real
     inject:
       env: X
 `)

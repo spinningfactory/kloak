@@ -21,7 +21,7 @@ func writeTempYAML(t *testing.T, ext, body string) string {
 func TestOpenSecretsSource_YAMLValid(t *testing.T) {
 	path := writeTempYAML(t, ".yaml", `secrets:
   - name: x
-    value: real-val
+    value: src-snapshot-real
     inject:
       env: X
 `)
@@ -39,7 +39,7 @@ func TestOpenSecretsSource_YMLExtensionAlsoWorks(t *testing.T) {
 	// who prefer one or the other don't get a surprising error.
 	path := writeTempYAML(t, ".yml", `secrets:
   - name: x
-    value: v
+    value: src-snapshot-real
     inject:
       env: X
 `)
@@ -52,7 +52,7 @@ func TestOpenSecretsSource_UppercaseExtension(t *testing.T) {
 	// Extension matching is case-insensitive (filepath.Ext + strings.ToLower).
 	path := writeTempYAML(t, ".YAML", `secrets:
   - name: x
-    value: v
+    value: src-snapshot-real
     inject:
       env: X
 `)
@@ -82,7 +82,7 @@ func TestOpenSecretsSource_PropagatesYAMLErrors(t *testing.T) {
 	// unwrapped (the dispatcher is a pass-through).
 	path := writeTempYAML(t, ".yaml", `secrets:
   - name: bad
-    value: v
+    value: src-snapshot-real
     port: not-a-port
     inject:
       env: X

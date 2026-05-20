@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"go.uber.org/zap"
-	"golang.org/x/net/http2/hpack"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -156,12 +155,13 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		// success.
 		if shadowValue == "" {
 			var err error
-			// Pass the Huffman length, not the cleartext: the generator
-			// only needs the length target to honor the HPACK invariant,
-			// and keeping the real value out of its scope prevents any
-			// future logging/error path inside pkg/secrets from
+			// Pass the Huffman bit count, not the cleartext: the
+			// generator only needs the bit-exact length target to
+			// construct a shadow that won't trigger HPACK over-padding,
+			// and keeping the real value out of pkg/secrets's scope
+			// prevents any future logging/error path there from
 			// accidentally surfacing the cleartext.
-			shadowValue, err = gen.Generate(originalLen, int(hpack.HuffmanEncodeLength(originalValue)), secretID, 3)
+			shadowValue, err = gen.Generate(originalLen, secrets.HuffmanBits(originalValue), secretID, 3)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to generate shadow value for key %s: %w", key, err)
 			}

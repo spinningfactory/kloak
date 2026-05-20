@@ -4,7 +4,6 @@ import (
 	"context"
 	"testing"
 
-	"golang.org/x/net/http2/hpack"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -52,7 +51,7 @@ func TestEquivalence_YAMLvsK8s(t *testing.T) {
 	}
 	// Mint a shadow up-front so the k8s join sees one.
 	gen := secrets.NewShadowGenerator(nil, nil)
-	shadowVal, err := gen.Generate(len(realValue), int(hpack.HuffmanEncodeLength(realValue)), "default/stripe-key", 20)
+	shadowVal, err := gen.Generate(len(realValue), secrets.HuffmanBits(realValue), "default/stripe-key", 20)
 	if err != nil {
 		t.Fatalf("shadow gen: %v", err)
 	}

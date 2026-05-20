@@ -74,7 +74,7 @@ func TestRunSecretsValidate_SingleSecretPluralForm(t *testing.T) {
 	// One secret → "(1 secret)" not "(1 secrets)". Guards the plural helper.
 	path := writeTempYAML(t, ".yaml", `secrets:
   - name: only
-    value: v
+    value: src-snapshot-real
     inject:
       env: ONLY
 `)
@@ -91,7 +91,7 @@ func TestRunSecretsValidate_SingleSecretPluralForm(t *testing.T) {
 func TestRunSecretsValidate_ValidatorErrorPropagates(t *testing.T) {
 	path := writeTempYAML(t, ".yaml", `secrets:
   - name: bad
-    value: v
+    value: src-snapshot-real
     port: not-a-port
     inject:
       env: X

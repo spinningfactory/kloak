@@ -6,7 +6,6 @@ require (
 	github.com/cilium/ebpf v0.20.0
 	github.com/go-logr/zapr v1.3.0
 	github.com/google/uuid v1.6.0
-	github.com/oklog/ulid/v2 v2.1.1
 	github.com/spf13/cobra v1.10.2
 	go.uber.org/zap v1.28.0
 	golang.org/x/net v0.54.0
