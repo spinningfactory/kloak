@@ -1,0 +1,126 @@
+//go:build e2e_ebpf
+
+package e2e
+
+import (
+	"context"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+)
+
+// TestEBPFHttp2HpackOverPadding exercises the HTTP/2 HPACK rewrite path
+// with a deliberately low-Huffman-density real value. The shadow secret
+// kloak generates (Crockford Base32 uppercase + digits) has noticeably
+// higher Huffman density than this lowercase-only real, producing a
+// >7-bit gap that pkg/ebpf/sync.go fills with HPACK EOS (0xFF) bits.
+//
+// Per RFC 7541 §5.2: "A padding strictly longer than 7 bits MUST be
+// treated as a decoding error." Strict HPACK decoders (nghttp2, the
+// AWS ALB fronting httpbin.org) therefore reject the header block and
+// drop the stream. The Go demo's http.Client logs an HTTP error rather
+// than the rewritten secret — the test fails by timing out without
+// ever observing the real value in the response echo.
+//
+// Why existing tests miss this:
+//   - TestEBPFSecretRewrite uses real="REAL-ALLOWED-KEY-12345"
+//     (HuffmanEncodeLength=18) with a ULID shadow ~22 chars
+//     (HuffmanEncodeLength=19). The 1-byte gap fits in the 7-bit
+//     allowance so the bug stays latent.
+//   - demo-python (requests) and demo-js (Node http) both default to
+//     HTTP/1.1, which doesn't HPACK-encode headers at all.
+//   - examples/demo-go-boring/main.go:70 explicitly sets
+//     ForceAttemptHTTP2=false — almost certainly to dodge this exact
+//     bug; the workaround leaves no HTTP/2 + non-Go-stdlib coverage.
+//
+// Repro shape (verified via golang.org/x/net/http2/hpack):
+//
+//	real   = "lowercase-secret-triggering-hpack-bug" (37 chars, HuffmanLen=26)
+//	shadow ≈ "kloak:<31 chars of Crockford Base32>"  (37 chars, HuffmanLen=31)
+//	gap    = 5 bytes (40 bits) of trailing 0xFF — illegal under §5.2.
+//
+// TODO(http2-hpack-overpad): this test is t.Skip'd because the
+// underlying bug isn't fixed yet. Remove the Skip line when one of the
+// candidate fixes lands:
+//  1. Strengthen pkg/secrets/shadow.go invariant so
+//     len(huffShadow) ∈ [len(huffReal), len(huffReal)+1] — keeps the
+//     padding strategy unchanged but bounds the gap inside the legal
+//     7-bit window.
+//  2. Rewrite the HPACK length prefix in BPF so the value can shrink
+//     to len(huffReal) with no padding at all (most thorough; needs
+//     in-BPF HPACK awareness for the byte immediately preceding the
+//     matched window).
+//  3. Per-secret fail-open: skip the HTTP/2 variant install in
+//     pkg/ebpf/sync.go when the gap > 7 bits and emit a WARN + metric.
+//     Strict-RFC compliant but leaks the shadow on HTTP/2 for the
+//     affected secrets — only acceptable as a stop-gap with telemetry.
+//
+// See the PR that introduced this test for the full analysis.
+func TestEBPFHttp2HpackOverPadding(t *testing.T) {
+	t.Skip("known bug: BPF sync over-pads HPACK Huffman values with >7 bits of EOS (0xFF), violating RFC 7541 §5.2. Strict HPACK decoders (httpbin's AWS ALB / nghttp2) reset the stream. Remove this Skip once one of the candidate fixes in the comment above lands.")
+
+	// GC stale shadows so this test doesn't pick up a shadow created by
+	// a prior TestEBPFSecretRewrite run for the same secret name.
+	gcCtx, gcCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer gcCancel()
+	_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-allowed-kloak")
+	_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-blocked-kloak")
+
+	// 37 chars of lowercase + dashes. Huffman-encodes to 26 bytes.
+	// The kloak-generated shadow (Crockford Base32 tail) encodes to
+	// ~31 bytes — a 5-byte gap, well past the 7-bit RFC allowance.
+	const realLowDensity = "lowercase-secret-triggering-hpack-bug"
+	allowedData := map[string][]byte{"api-key": []byte(realLowDensity)}
+	blockedData := map[string][]byte{"api-key": []byte("REAL-BLOCKED-KEY-67890")}
+
+	createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{
+		"getkloak.io/hosts": "httpbin.org",
+	})
+	createEnabledSecret(t, "secret-blocked", blockedData, nil, map[string]string{
+		"getkloak.io/hosts": "example.com",
+	})
+
+	assertShadowSecret(t, "secret-allowed", allowedData)
+	assertShadowSecret(t, "secret-blocked", blockedData)
+
+	// demo-go specifically: its http.Client negotiates HTTP/2 over ALPN
+	// against httpbin.org. demo-python (requests) and demo-js (node
+	// http) default to HTTP/1.1 and so don't exercise HPACK at all.
+	demoManifest := filepath.Join(repoRoot, "examples", "demo-go", "deployment.yaml")
+	if err := applyManifest(t, demoManifest); err != nil {
+		t.Fatalf("failed to deploy demo-go: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := waitForDeploymentReady(ctx, testNamespace, "demo-go"); err != nil {
+		demoDesc, _ := kubectl("describe", "deployment", "-n", testNamespace, "demo-go")
+		t.Logf("deployment describe:\n%s", demoDesc)
+		t.Fatalf("demo-go not ready: %v", err)
+	}
+
+	// Two-phase wait mirrors TestEBPFSecretRewrite. Phase 1 confirms the
+	// runtime is alive AND the uprobe attach race has closed at least
+	// once, so any subsequent rewrite failure points at the eBPF path
+	// rather than at startup. Phase 2 polls for the rewritten secret.
+	demoActiveCtx, demoActiveCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer demoActiveCancel()
+	pollDemoLogs(t, demoActiveCtx, "app=demo-go", "http2-hpack-overpad",
+		"demo-go never issued a second request — image, network, or scheduling problem (not the HPACK path)",
+		func(s string) bool { return strings.Count(s, "Request #") >= 2 })
+
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer pollCancel()
+	out := pollDemoLogs(t, pollCtx, "app=demo-go", "http2-hpack-overpad",
+		"timed out waiting for the low-Huffman-density secret in demo-go's response echo — HPACK over-padding bug fired (httpbin's HPACK decoder rejected the stream or the rewritten value didn't decode to the real secret)",
+		func(s string) bool { return strings.Contains(s, realLowDensity) })
+	t.Logf("=== demo-go (HTTP/2 HPACK over-pad) logs ===\n%s", out)
+
+	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {
+		t.Errorf("blocked secret leaked despite host mismatch — host filtering regressed")
+	}
+}
