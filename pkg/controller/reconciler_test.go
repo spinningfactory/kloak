@@ -113,7 +113,12 @@ func TestNewReconciler(t *testing.T) {
 	r := NewReconciler(c, zap.NewNop().Sugar(), scheme, nil, "", "node-1")
 
 	if r == nil {
+		// Explicit return so staticcheck SA5011 sees the subsequent
+		// r.CgroupRoot deref as unreachable on the nil path. t.Fatal is
+		// in fact no-return (calls runtime.Goexit) but the analyzer
+		// doesn't model it.
 		t.Fatal("NewReconciler returned nil")
+		return
 	}
 	if r.CgroupRoot != CgroupBasePath {
 		t.Errorf("expected default cgroup root %q, got %q", CgroupBasePath, r.CgroupRoot)

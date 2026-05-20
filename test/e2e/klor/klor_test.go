@@ -224,7 +224,7 @@ func TestKlor_RunExecsChildWithEnvInjection(t *testing.T) {
 func TestKlor_RunPropagatesChildExitCode(t *testing.T) {
 	yaml := writeYAML(t, `secrets:
   - name: testkey
-    value: vvv
+    value: src-snapshot-real
     inject:
       env: TEST_KEY
 `)
