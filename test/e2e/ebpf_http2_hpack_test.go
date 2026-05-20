@@ -81,14 +81,23 @@ func TestEBPFHttp2HpackOverPadding(t *testing.T) {
 		t.Fatalf("failed to deploy demo-go: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
+		// Cleanup is best-effort but we surface failures via t.Logf so a
+		// leaked deployment doesn't silently affect the next test run.
+		if out, err := kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found"); err != nil {
+			t.Logf("demo-go cleanup failed: %v\n%s", err, out)
+		}
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 	if err := waitForDeploymentReady(ctx, testNamespace, "demo-go"); err != nil {
-		demoDesc, _ := kubectl("describe", "deployment", "-n", testNamespace, "demo-go")
-		t.Logf("deployment describe:\n%s", demoDesc)
+		// describe is for the postmortem; if it also fails, surface the
+		// reason rather than logging an empty string and losing the signal.
+		if demoDesc, descErr := kubectl("describe", "deployment", "-n", testNamespace, "demo-go"); descErr == nil {
+			t.Logf("deployment describe:\n%s", demoDesc)
+		} else {
+			t.Logf("kubectl describe failed: %v", descErr)
+		}
 		t.Fatalf("demo-go not ready: %v", err)
 	}
 
