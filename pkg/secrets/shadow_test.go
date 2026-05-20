@@ -11,7 +11,7 @@ import (
 func TestGenerateShadowValue_Length(t *testing.T) {
 	cases := []int{8, 16, 32, 64, 128}
 	for _, n := range cases {
-		got, err := generateShadowValue(n, strings.Repeat("a", n))
+		got, err := generateShadowValue(n, int(hpack.HuffmanEncodeLength(strings.Repeat("a", n))))
 		if err != nil {
 			t.Errorf("originalLen=%d: unexpected error: %v", n, err)
 			continue
@@ -50,12 +50,12 @@ func TestGenerateShadowValue_HuffmanInvariant(t *testing.T) {
 		{"PASSWORD123", 1},
 	}
 	for _, tc := range cases {
+		realHL := int(hpack.HuffmanEncodeLength(tc.real))
 		for i := 0; i < tc.attempts; i++ {
-			shadow, err := generateShadowValue(len(tc.real), tc.real)
+			shadow, err := generateShadowValue(len(tc.real), realHL)
 			if err != nil {
 				t.Fatalf("real=%q attempt=%d: unexpected error: %v", tc.real, i, err)
 			}
-			realHL := int(hpack.HuffmanEncodeLength(tc.real))
 			shadowHL := int(hpack.HuffmanEncodeLength(shadow))
 			if shadowHL < realHL {
 				t.Fatalf("real=%q attempt=%d: shadow Huffman len %d < real Huffman len %d (shadow=%q)",
@@ -77,7 +77,7 @@ func TestGenerateShadowValue_UnsatisfiableReturnsError(t *testing.T) {
 	unsat := []int{10, 11, 12, 13, 14, 15, 20, 32}
 	for _, n := range unsat {
 		real := strings.Repeat("X", n)
-		_, err := generateShadowValue(n, real)
+		_, err := generateShadowValue(n, int(hpack.HuffmanEncodeLength(real)))
 		if !errors.Is(err, ErrHuffmanInvariantUnsatisfiable) {
 			t.Errorf("originalLen=%d all-'X' real: expected ErrHuffmanInvariantUnsatisfiable, got %v", n, err)
 		}
@@ -89,7 +89,7 @@ func TestGenerateShadowValue_TruncationPreservesPrefix(t *testing.T) {
 	// prefix "kloak:" must be present so the BPF scanner detects the
 	// shadow. At length 8 the shadow is exactly "kloak:XX" (6-char
 	// prefix + 2 random tail chars).
-	got, err := generateShadowValue(ShadowPrefixLen, "abcdefgh")
+	got, err := generateShadowValue(ShadowPrefixLen, int(hpack.HuffmanEncodeLength("abcdefgh")))
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -103,7 +103,7 @@ func TestGenerateShadowValue_TruncationPreservesPrefix(t *testing.T) {
 
 func TestShadowGenerator_NoCollisionEmptySeed(t *testing.T) {
 	g := NewShadowGenerator(nil, nil)
-	got, err := g.Generate(32, "real-value", "owner-a", 3)
+	got, err := g.Generate(32, int(hpack.HuffmanEncodeLength("real-value")), "owner-a", 3)
 	if err != nil {
 		t.Fatalf("Generate: %v", err)
 	}
@@ -129,7 +129,7 @@ func TestShadowGenerator_SkipsCollisionFromOtherOwner(t *testing.T) {
 	g := NewShadowGenerator(seed, nil)
 
 	for i := 0; i < 50; i++ {
-		got, err := g.Generate(32, "real", "owner-a", 20)
+		got, err := g.Generate(32, int(hpack.HuffmanEncodeLength("real")), "owner-a", 20)
 		if err != nil {
 			t.Fatalf("iter %d: Generate: %v", i, err)
 		}
@@ -145,11 +145,11 @@ func TestShadowGenerator_GenerateAutoRecords(t *testing.T) {
 	// from the SAME ownerID. Two keys of the same Secret must not
 	// land on the same 8-byte prefix.
 	g := NewShadowGenerator(nil, nil)
-	a, err := g.Generate(32, "v1", "owner-a", 20)
+	a, err := g.Generate(32, int(hpack.HuffmanEncodeLength("v1")), "owner-a", 20)
 	if err != nil {
 		t.Fatalf("first Generate: %v", err)
 	}
-	b, err := g.Generate(32, "v2", "owner-a", 20)
+	b, err := g.Generate(32, int(hpack.HuffmanEncodeLength("v2")), "owner-a", 20)
 	if err != nil {
 		t.Fatalf("second Generate: %v", err)
 	}
