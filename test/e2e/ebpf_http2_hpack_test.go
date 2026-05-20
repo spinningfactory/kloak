@@ -40,9 +40,8 @@ import (
 //	shadow ≈ "kloak:<31 chars of Crockford Base32>"  (37 chars, HuffmanLen=31)
 //	gap    = 5 bytes (40 bits) of trailing 0xFF — illegal under §5.2.
 //
-// TODO(http2-hpack-overpad): this test is t.Skip'd because the
-// underlying bug isn't fixed yet. Remove the Skip line when one of the
-// candidate fixes lands:
+// This test will FAIL on main until one of these candidate fixes
+// lands:
 //  1. Strengthen pkg/secrets/shadow.go invariant so
 //     len(huffShadow) ∈ [len(huffReal), len(huffReal)+1] — keeps the
 //     padding strategy unchanged but bounds the gap inside the legal
@@ -58,8 +57,6 @@ import (
 //
 // See the PR that introduced this test for the full analysis.
 func TestEBPFHttp2HpackOverPadding(t *testing.T) {
-	t.Skip("known bug: BPF sync over-pads HPACK Huffman values with >7 bits of EOS (0xFF), violating RFC 7541 §5.2. Strict HPACK decoders (httpbin's AWS ALB / nghttp2) reset the stream. Remove this Skip once one of the candidate fixes in the comment above lands.")
-
 	// GC stale shadows so this test doesn't pick up a shadow created by
 	// a prior TestEBPFSecretRewrite run for the same secret name.
 	gcCtx, gcCancel := context.WithTimeout(context.Background(), 30*time.Second)
