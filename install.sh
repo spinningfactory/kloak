@@ -168,8 +168,25 @@ resolve_binary() {
         # "kloak:", so it never matched the new shadows on the wire.
         # Always regenerate from checkout so the binary's BPF is in
         # sync with the .c source the user has checked out.
-        log "Regenerating eBPF bindings (go generate ./pkg/ebpf/) …"
-        (cd "$SCRIPT_DIR" && KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/) \
+        #
+        # KLOAK_TARGET_ARCH selects which `#if defined(bpf_target_*)`
+        # branches in tls_uprobe.c are live — those branches contain
+        # arch-specific register-offset reads (RDI/RSI/RDX on x86 vs
+        # X0/X1/X2 on arm64) for unwrapping the SSL_write arguments
+        # from the uprobe trap frame. A mismatch silently breaks
+        # every uprobe: ssl_ptr and data_ptr come back as garbage and
+        # the early NULL/<=0 checks bail. Detect from `uname -m` so
+        # the same install.sh works on Apple-Silicon Lima VMs
+        # (aarch64) and on amd64 production boxes alike.
+        local arch_uname target_arch
+        arch_uname="$(uname -m)"
+        case "$arch_uname" in
+            x86_64|amd64)  target_arch=x86 ;;
+            aarch64|arm64) target_arch=arm64 ;;
+            *) die "unsupported architecture for eBPF codegen: $arch_uname" ;;
+        esac
+        log "Regenerating eBPF bindings (go generate ./pkg/ebpf/, KLOAK_TARGET_ARCH=$target_arch) …"
+        (cd "$SCRIPT_DIR" && KLOAK_TARGET_ARCH="$target_arch" go generate ./pkg/ebpf/) \
             || die "go generate ./pkg/ebpf/ failed — check clang version and BPF headers"
 
         local out
