@@ -253,11 +253,23 @@ var ErrHuffmanInvariantUnsatisfiable = errors.New("shadow Huffman bit length can
 //     "kl::" marker the BPF scanner looks for.
 //   - realHuffmanBits outside [prefixHuffmanBits + tailLen*MinBits,
 //     prefixHuffmanBits + tailLen*MaxBits]: the alphabet's per-byte
-//     5–7 bits/byte range can't produce a tail that matches the real's
-//     Huffman length, which means the HTTP/2 wire-buffer invariant
-//     can't be satisfied (the shadow's encoded length would differ
-//     from the real's by enough to require >7 bits of EOS padding,
-//     forbidden by RFC 7541 §5.2).
+//     5–MaxBits bits/byte range can't produce a tail that matches the
+//     real's Huffman length, which means the HTTP/2 wire-buffer
+//     invariant can't be satisfied (the shadow's encoded length would
+//     differ from the real's by enough to require >7 bits of EOS
+//     padding, forbidden by RFC 7541 §5.2).
+//
+// IMPORTANT — secret-leak surface: this function never sees the real
+// value's bytes (only its Huffman bit count, computed by the caller via
+// HuffmanBits). The returned errors are also sanitized to exclude
+// `realHuffmanBits` — the bit count is value-derived (sum of per-byte
+// HPACK code lengths) and the admission webhook's denial message goes
+// back to the kubectl caller, may be captured in apiserver audit logs,
+// and could surface in third-party SIEM pipes. Reporting only the
+// length and the achievable range (both invariants the caller already
+// knows, since they constructed the secret and the algorithm is
+// public) gives users actionable diagnostics without exposing any
+// statistic of the value's content distribution.
 //
 // Used by both generateShadowValue (the actual minting path) and the
 // validating webhook (admission-time rejection) so the predicate has a
@@ -273,10 +285,24 @@ func CanShadow(originalLen, realHuffmanBits int) error {
 	// tailBits == 0 (realHuffmanBits == prefixHuffmanBits) is
 	// satisfiable. The same bounds check handles this naturally
 	// (0*MinBits == 0*MaxBits == 0).
-	if tailBits < tailLen*MinBits || tailBits > tailLen*MaxBits {
+	if tailBits < tailLen*MinBits {
+		// Below the achievable floor — the value's average Huffman
+		// density (bits/byte) is too low for any same-length shadow
+		// to match. The error names only the direction ("too low")
+		// and the achievable range; it deliberately omits the
+		// value-derived bit count itself to keep that statistic out
+		// of admission-denial messages and audit logs.
 		return fmt.Errorf(
-			"%w: originalLen=%d, target Huffman bits=%d, achievable range=[%d, %d]",
-			ErrHuffmanInvariantUnsatisfiable, originalLen, realHuffmanBits,
+			"%w: value's HPACK Huffman density is too low at length %d (achievable range %d–%d bits; use a different value or a longer secret)",
+			ErrHuffmanInvariantUnsatisfiable, originalLen,
+			prefixHuffmanBits+tailLen*MinBits,
+			prefixHuffmanBits+tailLen*MaxBits,
+		)
+	}
+	if tailBits > tailLen*MaxBits {
+		return fmt.Errorf(
+			"%w: value's HPACK Huffman density is too high at length %d (achievable range %d–%d bits; use a different value or a longer secret)",
+			ErrHuffmanInvariantUnsatisfiable, originalLen,
 			prefixHuffmanBits+tailLen*MinBits,
 			prefixHuffmanBits+tailLen*MaxBits,
 		)

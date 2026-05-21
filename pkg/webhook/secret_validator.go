@@ -141,8 +141,14 @@ func validateSecretData(data map[string][]byte, stringData map[string]string) er
 		// message instead of the secret being silently left without a
 		// shadow (which would leave the application unprotected on
 		// the wire).
+		//
+		// CanShadow's error is already user-facing and value-leak-free
+		// (names only the length, direction, and achievable range —
+		// never the bit count itself, see CanShadow docstring); we
+		// just prefix with the failing key so users know which entry
+		// to fix.
 		if err := secrets.CanShadow(n, secrets.HuffmanBits(values[k])); err != nil {
-			return fmt.Errorf("data[%q]: %w (value's HPACK Huffman density is outside the range kloak can shadow; use a different value or adjust its length)", k, err)
+			return fmt.Errorf("data[%q]: %w", k, err)
 		}
 	}
 	return nil

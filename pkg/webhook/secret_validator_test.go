@@ -110,7 +110,7 @@ func TestValidateSecretData(t *testing.T) {
 		// one below the window's lower bound. Without this rejection at
 		// admission time, the reconciler would silently fail to mint a
 		// shadow and leave the user's app unprotected on the wire.
-		{"infeasible density rejected", map[string][]byte{"k": []byte("12345678")}, nil, "outside the range kloak can shadow"},
+		{"infeasible density rejected", map[string][]byte{"k": []byte("12345678")}, nil, "Huffman density is too low"},
 		{"valid stringData", nil, map[string]string{"k": "PASS1234"}, ""},
 		{"short stringData rejected", nil, map[string]string{"k": "abc"}, "minimum 8"},
 		{"stringData overrides data (longer wins when keys match)",
