@@ -5,11 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
-	"time"
 
-	"github.com/oklog/ulid/v2"
 	"go.uber.org/zap"
-	"golang.org/x/net/http2/hpack"
 )
 
 const (
@@ -21,7 +18,16 @@ const (
 
 	// ValuePrefix is the literal prefix every shadow secret carries.
 	// Must match what the eBPF program expects.
-	ValuePrefix = "kloak:"
+	//
+	// Chosen at 4 bytes (27 HPACK Huffman bits) rather than the historical
+	// 6-byte "kloak:" (37 bits) to widen the byte-by-byte construction's
+	// feasibility window for short shadows. The +7-bit fixed slack against
+	// the alphabet's 5-bit floor is the same either way (lower bound at
+	// density 5+7/N), but with 27 prefix bits we get density headroom up to
+	// 7−1/N at the top instead of 7−5/N — meaning hex secrets (density
+	// ≈5.63) and short low-density tokens fit at much smaller N. See PR
+	// description for the openssl-hex / openssl-base64 / JWT density data.
+	ValuePrefix = "kl::"
 )
 
 // ShadowGenerator mints shadow values that don't 8-byte-prefix-collide
@@ -68,13 +74,23 @@ func NewShadowGenerator(seed map[string]map[string]struct{}, log *zap.SugaredLog
 // On success the chosen prefix is recorded under ownerID so subsequent
 // Generate calls within the same generator avoid it. Retries up to
 // maxRetries times before giving up.
-func (g *ShadowGenerator) Generate(originalLen int, realSecret, ownerID string, maxRetries int) (string, error) {
+//
+// realHuffmanBits is the EXACT HPACK Huffman bit length of the real
+// secret value the caller wants to shadow — computed by the caller via
+// HuffmanBits(realSecret). It's a bit count, not a byte count: the
+// byte-by-byte construction guarantees a shadow whose Huffman bit
+// length equals realHuffmanBits exactly, which means the encoded byte
+// length matches as well (no padding required). Passing the bit count
+// instead of the cleartext keeps the real secret out of this package's
+// scope entirely.
+func (g *ShadowGenerator) Generate(originalLen, realHuffmanBits int, ownerID string, maxRetries int) (string, error) {
 	for attempt := 0; attempt < maxRetries; attempt++ {
-		shadow, err := generateShadowValue(originalLen, realSecret)
+		shadow, err := generateShadowValue(originalLen, realHuffmanBits)
 		if err != nil {
 			// ErrHuffmanInvariantUnsatisfiable is deterministic for
-			// given (originalLen, realSecret) — retrying won't help.
-			// Other errors (rand.Int failures) are also retry-pointless.
+			// (originalLen, realHuffmanBits) — the feasibility check is
+			// pure arithmetic, so retrying won't help. rand.Int failures
+			// are also retry-pointless.
 			return "", err
 		}
 		// Empty ownerID → strict global check: any occupant collides.
@@ -125,121 +141,171 @@ func (g *ShadowGenerator) collides(shadow, ownerID string) bool {
 	return false
 }
 
-// generateShadowValue creates a shadow value of exactly originalLen bytes
-// whose HPACK Huffman encoding is at least as long as the real secret's.
-// This ensures HTTP/2 HPACK rewriting works — the shadow's Huffman length
-// determines the space available in the wire buffer for the rewritten
-// value.
+// generateShadowValue constructs a shadow whose plaintext length is
+// exactly originalLen AND whose HPACK Huffman bit length is exactly
+// realHuffmanBits. Both invariants hold by construction, not by
+// random-then-tune retry — see the algorithm comment below.
 //
-// Lifted verbatim from pkg/controller/secret_reconciler.go.
+// Why bit-EXACT, not byte-AT-LEAST: the BPF map sync in pkg/ebpf/sync.go
+// rewrites the shadow's encoded slot on the wire with the real's
+// Huffman bytes. If shadow's bit count exceeds real's, the sync code
+// previously padded with 0xFF (HPACK EOS bits) up to the byte boundary.
+// RFC 7541 §5.2 forbids EOS padding longer than 7 bits — strict HPACK
+// decoders (nghttp2, AWS ALB) reset the stream when they see more.
+// Matching bit counts exactly removes any need for padding at all and
+// makes the rewrite safe against every HPACK-compliant peer.
+//
+// The function NEVER sees the real cleartext — only its bit length —
+// which keeps secret-leak surface area in this package to nil.
 //
 // Returns ErrHuffmanInvariantUnsatisfiable when no shadow of length
-// originalLen can encode to a Huffman length ≥ realSecret's. For very
-// short originalLen (say 10) with a high-entropy real secret (e.g. all
-// 'z's, each 7-bit HPACK code), the fixed-Huffman-cost "kloak:" prefix
-// (36 bits) leaves too few tail bytes to match real's encoded length —
-// even when every tail char is one of HPACK's 7-bit codes. Caller
-// (Generate) propagates the error; the BPF map sync path in
-// pkg/ebpf/sync.go separately gates the HTTP/2 variant on
-// realHuffLen ≤ len(huffShadow), so the HTTP/1.1 path still works for
-// such secrets — they just don't get the HTTP/2 rewrite enabled.
-func generateShadowValue(originalLen int, realSecret string) (string, error) {
-	realHuffLen := int(hpack.HuffmanEncodeLength(realSecret))
+// originalLen can hit the bit target. The feasibility check is a single
+// inequality up front (no randomness consumed on the error path), and
+// the predicate is a function of (tail length, target bits) only — so
+// the time spent on the error path is independent of realHuffmanBits's
+// magnitude, removing a timing oracle on the real's encoded length.
+func generateShadowValue(originalLen, realHuffmanBits int) (string, error) {
+	// Feasibility runs first; on failure no randomness is consumed and
+	// the error path is constant-time w.r.t. realHuffmanBits's magnitude
+	// (no timing oracle).
+	if err := CanShadow(originalLen, realHuffmanBits); err != nil {
+		return "", err
+	}
+	tailLen := originalLen - len(ValuePrefix)
+	tailBits := realHuffmanBits - prefixHuffmanBits
 
-	// ULID uses Crockford Base32 (uppercase + digits, no hyphens).
-	// These chars have long HPACK Huffman codes (7-8 bits), naturally
-	// producing longer Huffman encodings than UUID hex (5-6 bits).
-	// "kloak:" (6) + ULID (26) = 32 chars total.
-	// ULID format: 10 chars timestamp + 16 chars random. For short secrets,
-	// truncation would keep only the timestamp (identical for secrets
-	// created at the same time). Put the random part first to maximize
-	// uniqueness.
-	newULID := ulid.MustNew(ulid.Timestamp(time.Now()), rand.Reader).String()
-	ulidRandom := newULID[10:] + newULID[:10] // random first, then timestamp
-	baseVal := ValuePrefix + ulidRandom
-
-	var shadow string
-	switch {
-	case len(baseVal) > originalLen:
-		shadow = baseVal[:originalLen]
-	case len(baseVal) < originalLen:
-		// Pad with random Crockford Base32 chars (same charset as ULID)
-		const base32Chars = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
-		padLen := originalLen - len(baseVal)
-		padding := make([]byte, padLen)
-		for i := range padding {
-			n, err := rand.Int(rand.Reader, big.NewInt(int64(len(base32Chars))))
-			if err != nil {
-				return "", fmt.Errorf("rand.Int for padding: %w", err)
-			}
-			padding[i] = base32Chars[n.Int64()]
+	// Byte-by-byte construction. The loop invariant: at the start of
+	// iteration i, `remaining` is the bit budget the suffix
+	// tail[i..tailLen) must total. The [lo, hi] clamp is the per-byte
+	// window that keeps the remaining suffix feasible at every step —
+	// it's the intersection of [MinBits, MaxBits] (alphabet limits) and
+	// [remaining - left*MaxBits, remaining - left*MinBits] (so the
+	// remaining `left` bytes can still hit `remaining - k`).
+	//
+	// The feasibility precheck guarantees lo <= hi at every step (proof:
+	// induction — entering iter i with remaining ∈ [left+1)*MinBits,
+	// (left+1)*MaxBits] yields lo ≤ hi, and the chosen k preserves
+	// remaining ∈ [left*MinBits, left*MaxBits] for the next iter).
+	tail := make([]byte, tailLen)
+	remaining := tailBits
+	for i := 0; i < tailLen; i++ {
+		left := tailLen - i - 1
+		lo := MinBits
+		if v := remaining - left*MaxBits; v > lo {
+			lo = v
 		}
-		shadow = baseVal + string(padding)
-	default:
-		shadow = baseVal
+		hi := MaxBits
+		if v := remaining - left*MinBits; v < hi {
+			hi = v
+		}
+
+		// Pick a code length k ∈ [lo, hi] uniformly at random, then
+		// pick a byte uniformly from the bucket of that code length.
+		// Two CSPRNG draws per byte, control flow independent of
+		// realHuffmanBits — see function-level comment on timing.
+		k, err := randIntInclusive(lo, hi)
+		if err != nil {
+			return "", fmt.Errorf("rand.Int for code length: %w", err)
+		}
+		bucket := huffmanBuckets[k]
+		idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(bucket))))
+		if err != nil {
+			return "", fmt.Errorf("rand.Int for bucket pick: %w", err)
+		}
+		tail[i] = bucket[idx.Int64()]
+		remaining -= k
 	}
 
-	// Verify Huffman length is sufficient for HTTP/2 HPACK rewriting.
-	// ULID's uppercase chars usually produce long enough Huffman, but the
-	// invariant has to hold for the worst real-value case too: 64 bytes
-	// of 'z' encode to 7 bits each (one of HPACK's longest codes), so
-	// the shadow's tail must reach the same density. Overwrite trailing
-	// chars with one of HPACK's guaranteed-7-bit letters until the
-	// shadow's Huffman length meets the real's.
-	//
-	// The previous heuristic only rewrote ASCII digits, which silently
-	// did nothing when the random ULID + padding happened to produce an
-	// all-letters tail — observed in CI as
-	// `TestGenerateShadowValue_HuffmanInvariant` failing once in a few
-	// hundred runs with shadow="kloak:WRPSFTSQ…" (no digits anywhere
-	// after "kloak:"). Replacing unconditionally fixes that.
-	//
-	// Boundary is `j >= 6` (not `>= 8`): bytes 0-5 are the literal
-	// "kloak:" prefix and must not be mutated, but bytes 6-7 are the
-	// random suffix start. Allowing the loop to touch them lets the
-	// minimum-supported 8-byte shadow have its Huffman length tuned;
-	// otherwise an 8-byte secret with all-uppercase real value never
-	// gets its HTTP/2 path enabled. Bytes 6-7 are also part of the BPF
-	// 8-byte lookup key, but the key is computed AFTER generation so
-	// mutating them here just changes the resulting key — not a hazard.
-	shadowHuffLen := int(hpack.HuffmanEncodeLength(shadow))
-	if shadowHuffLen < realHuffLen {
-		shadowBytes := []byte(shadow)
-		for j := len(shadowBytes) - 1; j >= 6 && shadowHuffLen < realHuffLen; j-- {
-			n, err := rand.Int(rand.Reader, big.NewInt(int64(len(longHuffmanChars))))
-			if err != nil {
-				return "", fmt.Errorf("rand.Int for tail-tune: %w", err)
-			}
-			shadowBytes[j] = longHuffmanChars[n.Int64()]
-			shadowHuffLen = int(hpack.HuffmanEncodeLength(string(shadowBytes)))
-		}
-		shadow = string(shadowBytes)
-		// Even with every tail char as a 7-bit Huffman code, the fixed-
-		// cost "kloak:" prefix can leave shadow Huffman strictly shorter
-		// than real's for some short originalLen × high-Huffman-density
-		// real combinations (e.g. originalLen=10 with all-'z' real:
-		// real=9 bytes Huffman, shadow=8 bytes max). Signal the caller
-		// rather than silently violating the wire-buffer invariant.
-		if shadowHuffLen < realHuffLen {
-			return "", fmt.Errorf("%w: originalLen=%d, real Huffman %d > max shadow Huffman %d",
-				ErrHuffmanInvariantUnsatisfiable, originalLen, realHuffLen, shadowHuffLen)
-		}
-	}
+	return ValuePrefix + string(tail), nil
+}
 
-	return shadow, nil
+// randIntInclusive returns a uniform random int in [lo, hi] (both ends
+// inclusive) drawn from crypto/rand. Returns lo immediately when the
+// range is a single value so we don't pay for a CSPRNG draw on the
+// trivial case (tail positions near the end of a tight-feasibility run
+// frequently hit this branch).
+func randIntInclusive(lo, hi int) (int, error) {
+	if hi <= lo {
+		return lo, nil
+	}
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(hi-lo+1)))
+	if err != nil {
+		return 0, err
+	}
+	return lo + int(n.Int64()), nil
 }
 
 // ErrHuffmanInvariantUnsatisfiable is returned by generateShadowValue
 // when no shadow of the requested length can match the real secret's
-// HPACK Huffman length. The HTTP/2 rewrite path is skipped for such
-// secrets; HTTP/1.1 rewriting still works via the plaintext map entry.
-var ErrHuffmanInvariantUnsatisfiable = errors.New("shadow Huffman length cannot reach real's")
+// HPACK Huffman bit length. Kloak fails-closed on such secrets: the
+// reconciler refuses to mint a shadow (so neither HTTP/1.1 nor HTTP/2
+// rewrite gets enabled) rather than producing a shadow that would
+// silently break the HTTP/2 wire invariant. The validating webhook
+// catches this at admission time via CanShadow so users learn at
+// `kubectl apply` rather than at runtime.
+var ErrHuffmanInvariantUnsatisfiable = errors.New("shadow Huffman bit length cannot match real's")
 
-// longHuffmanChars are the only ASCII letters whose HPACK Huffman
-// code is 8 bits — the maximum bit-length for any printable ASCII
-// character in the static table (RFC 7541 Appendix B; verified
-// empirically against `golang.org/x/net/http2/hpack`). Overwriting any
-// tail char with one of these maximizes shadow Huffman density, which
-// is needed to satisfy the invariant against high-density real
-// secrets (e.g. all 'z', each 7 bits).
-const longHuffmanChars = "XZ"
+// CanShadow returns nil iff a shadow can be minted for a real value of
+// the given plaintext length and Huffman bit count. The two failure
+// modes both surface as ErrHuffmanInvariantUnsatisfiable:
+//
+//   - originalLen < len(ValuePrefix): the shadow can't even carry the
+//     "kl::" marker the BPF scanner looks for.
+//   - realHuffmanBits outside [prefixHuffmanBits + tailLen*MinBits,
+//     prefixHuffmanBits + tailLen*MaxBits]: the alphabet's per-byte
+//     5–MaxBits bits/byte range can't produce a tail that matches the
+//     real's Huffman length, which means the HTTP/2 wire-buffer
+//     invariant can't be satisfied (the shadow's encoded length would
+//     differ from the real's by enough to require >7 bits of EOS
+//     padding, forbidden by RFC 7541 §5.2).
+//
+// IMPORTANT — secret-leak surface: this function never sees the real
+// value's bytes (only its Huffman bit count, computed by the caller via
+// HuffmanBits). The returned errors are also sanitized to exclude
+// `realHuffmanBits` — the bit count is value-derived (sum of per-byte
+// HPACK code lengths) and the admission webhook's denial message goes
+// back to the kubectl caller, may be captured in apiserver audit logs,
+// and could surface in third-party SIEM pipes. Reporting only the
+// length and the achievable range (both invariants the caller already
+// knows, since they constructed the secret and the algorithm is
+// public) gives users actionable diagnostics without exposing any
+// statistic of the value's content distribution.
+//
+// Used by both generateShadowValue (the actual minting path) and the
+// validating webhook (admission-time rejection) so the predicate has a
+// single source of truth.
+func CanShadow(originalLen, realHuffmanBits int) error {
+	if originalLen < len(ValuePrefix) {
+		return fmt.Errorf("%w: originalLen=%d < %d (ValuePrefix length)",
+			ErrHuffmanInvariantUnsatisfiable, originalLen, len(ValuePrefix))
+	}
+	tailLen := originalLen - len(ValuePrefix)
+	tailBits := realHuffmanBits - prefixHuffmanBits
+	// Special case tailLen == 0: the shadow IS the prefix; only
+	// tailBits == 0 (realHuffmanBits == prefixHuffmanBits) is
+	// satisfiable. The same bounds check handles this naturally
+	// (0*MinBits == 0*MaxBits == 0).
+	if tailBits < tailLen*MinBits {
+		// Below the achievable floor — the value's average Huffman
+		// density (bits/byte) is too low for any same-length shadow
+		// to match. The error names only the direction ("too low")
+		// and the achievable range; it deliberately omits the
+		// value-derived bit count itself to keep that statistic out
+		// of admission-denial messages and audit logs.
+		return fmt.Errorf(
+			"%w: value's HPACK Huffman density is too low at length %d (achievable range %d–%d bits; use a different value or a longer secret)",
+			ErrHuffmanInvariantUnsatisfiable, originalLen,
+			prefixHuffmanBits+tailLen*MinBits,
+			prefixHuffmanBits+tailLen*MaxBits,
+		)
+	}
+	if tailBits > tailLen*MaxBits {
+		return fmt.Errorf(
+			"%w: value's HPACK Huffman density is too high at length %d (achievable range %d–%d bits; use a different value or a longer secret)",
+			ErrHuffmanInvariantUnsatisfiable, originalLen,
+			prefixHuffmanBits+tailLen*MinBits,
+			prefixHuffmanBits+tailLen*MaxBits,
+		)
+	}
+	return nil
+}

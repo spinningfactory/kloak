@@ -77,7 +77,7 @@ func TestSnapshot_JoinsEnabledAndShadow(t *testing.T) {
 		AnnotationPort:  "443/tcp",
 	})
 	shadow := makeShadow("default", "stripe", map[string]string{
-		"api-key": "kloak:0123456789abcdefABCDEFGHJK",
+		"api-key": "kl::0123456789abcdefABCDEFGHJK",
 	})
 	c := fake.NewClientBuilder().
 		WithScheme(scheme).
@@ -101,7 +101,7 @@ func TestSnapshot_JoinsEnabledAndShadow(t *testing.T) {
 	if s.Real != "sk-live-real-12345678" {
 		t.Errorf("Real=%q", s.Real)
 	}
-	if s.Shadow != "kloak:0123456789abcdefABCDEFGHJK" {
+	if s.Shadow != "kl::0123456789abcdefABCDEFGHJK" {
 		t.Errorf("Shadow=%q", s.Shadow)
 	}
 	if s.Host != "api.stripe.com" {
@@ -126,7 +126,7 @@ func TestSnapshot_LiteralIPHost(t *testing.T) {
 		AnnotationHosts: "10.0.0.42",
 	})
 	shadow := makeShadow("ns1", "echo", map[string]string{
-		"k": "kloak:01234567",
+		"k": "kl::01234567",
 	})
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(enabled, shadow).Build()
 
@@ -178,8 +178,8 @@ func TestSnapshot_MultipleDataKeys(t *testing.T) {
 		"b": "real-b-5678",
 	}, nil)
 	shadow := makeShadow("default", "multi", map[string]string{
-		"a": "kloak:aa01234567",
-		"b": "kloak:bb01234567",
+		"a": "kl::aa01234567",
+		"b": "kl::bb01234567",
 	})
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(enabled, shadow).Build()
 
@@ -203,7 +203,7 @@ func TestSnapshot_BadPortAnnotationFallsBackToWildcard(t *testing.T) {
 	enabled := makeEnabled("default", "bad", map[string]string{"k": "real-val-1234"}, map[string]string{
 		AnnotationPort: "garbage",
 	})
-	shadow := makeShadow("default", "bad", map[string]string{"k": "kloak:0011223344"})
+	shadow := makeShadow("default", "bad", map[string]string{"k": "kl::0011223344"})
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(enabled, shadow).Build()
 
 	got, _ := NewSource(c).Snapshot(context.Background())
@@ -219,10 +219,10 @@ func TestSeedShadowGenerator(t *testing.T) {
 	scheme := newScheme(t)
 	// Two managed shadows in different owners share a prefix; one's
 	// data also has a too-short value that must be ignored.
-	shadow1 := makeShadow("ns", "alice", map[string]string{"k": "kloak:01ABCDEFGH"})
+	shadow1 := makeShadow("ns", "alice", map[string]string{"k": "kl::01ABCDEFGH"})
 	shadow2 := makeShadow("ns", "bob", map[string]string{
-		"k1":    "kloak:01ABCDEFGH", // same prefix as alice
-		"short": "tiny",             // skipped: < ShadowPrefixLen
+		"k1":    "kl::01ABCDEFGH", // same prefix as alice
+		"short": "tiny",           // skipped: < ShadowPrefixLen
 	})
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(shadow1, shadow2).Build()
 
@@ -230,7 +230,7 @@ func TestSeedShadowGenerator(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Seed: %v", err)
 	}
-	prefix := "kloak:01"
+	prefix := "kl::01AB"
 	owners := seed[prefix]
 	if len(owners) != 2 {
 		t.Errorf("prefix %q: got %d owners, want 2 (alice, bob)", prefix, len(owners))
@@ -249,7 +249,7 @@ func TestSeedShadowGenerator_SkipsOwnerless(t *testing.T) {
 	// such shadows would alias under the phantom ownerID
 	// "<namespace>/" and pollute the collision map. Skip them.
 	scheme := newScheme(t)
-	good := makeShadow("ns", "alice", map[string]string{"k": "kloak:goodPRFX"})
+	good := makeShadow("ns", "alice", map[string]string{"k": "kl::goodPRFX"})
 	// Build an ownerless managed shadow by hand (makeShadow always
 	// sets LabelOwner).
 	ownerless := &corev1.Secret{
@@ -258,7 +258,7 @@ func TestSeedShadowGenerator_SkipsOwnerless(t *testing.T) {
 			Namespace: "ns",
 			Labels:    map[string]string{LabelManaged: "true"},
 		},
-		Data: map[string][]byte{"k": []byte("kloak:badPRFXX")},
+		Data: map[string][]byte{"k": []byte("kl::badPRFXX")},
 	}
 	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(good, ownerless).Build()
 
@@ -267,11 +267,11 @@ func TestSeedShadowGenerator_SkipsOwnerless(t *testing.T) {
 		t.Fatalf("Seed: %v", err)
 	}
 	// alice's prefix should be present.
-	if _, ok := seed["kloak:go"]; !ok {
+	if _, ok := seed["kl::good"]; !ok {
 		t.Errorf("good owner's prefix missing from seed: %v", seed)
 	}
 	// The ownerless shadow's prefix must not be present.
-	if owners, ok := seed["kloak:ba"]; ok {
+	if owners, ok := seed["kl::badP"]; ok {
 		t.Errorf("ownerless shadow leaked into seed under owners %v", owners)
 	}
 }

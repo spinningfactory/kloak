@@ -95,18 +95,30 @@ func TestValidateSecretData(t *testing.T) {
 		wantErr    string
 	}{
 		{"empty rejected", nil, nil, "no data entries"},
-		{"min length accepted", map[string][]byte{"k": []byte("12345678")}, nil, ""},
-		{"max length accepted", map[string][]byte{"k": make([]byte, 128)}, nil, ""},
+		// PASS1234 (49 Huffman bits) sits comfortably inside the
+		// kl::-prefix feasibility window [47, 55] at length 8 — the
+		// CanShadow check accepts it. Earlier "12345678" (46 bits) is
+		// 1 bit below the floor, used below to exercise the rejection
+		// path.
+		{"min length accepted", map[string][]byte{"k": []byte("PASS1234")}, nil, ""},
+		// 128 bytes of "Test1234" repeat. Density ≈5.25 b/B, total
+		// 672 Huffman bits, comfortably inside window [647, 895].
+		{"max length accepted", map[string][]byte{"k": []byte(strings.Repeat("Test1234", 16))}, nil, ""},
 		{"too short rejected", map[string][]byte{"k": []byte("short")}, nil, "minimum 8"},
 		{"too long rejected", map[string][]byte{"k": make([]byte, 129)}, nil, "maximum 128"},
-		{"valid stringData", nil, map[string]string{"k": "12345678"}, ""},
+		// Huffman feasibility check: "12345678" at length 8 is 46 bits,
+		// one below the window's lower bound. Without this rejection at
+		// admission time, the reconciler would silently fail to mint a
+		// shadow and leave the user's app unprotected on the wire.
+		{"infeasible density rejected", map[string][]byte{"k": []byte("12345678")}, nil, "Huffman density is too low"},
+		{"valid stringData", nil, map[string]string{"k": "PASS1234"}, ""},
 		{"short stringData rejected", nil, map[string]string{"k": "abc"}, "minimum 8"},
 		{"stringData overrides data (longer wins when keys match)",
 			map[string][]byte{"k": []byte("short")}, // would fail on its own
-			map[string]string{"k": "12345678"},      // valid
+			map[string]string{"k": "PASS1234"},      // valid
 			""},
 		{"mixed keys, one bad",
-			map[string][]byte{"good": []byte("12345678")},
+			map[string][]byte{"good": []byte("PASS1234")},
 			map[string]string{"bad": "x"},
 			"minimum 8"},
 	}

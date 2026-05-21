@@ -40,7 +40,7 @@
 #define MAX_DATA_SIZE 256
 // Fixed secret rewrite size
 #define SECRET_MAX_LEN 128
-// BPF map key length — short key for lookup (kloak: + 2 UUID chars)
+// BPF map key length — short key for lookup (kl:: + 4 UUID chars)
 #define SECRET_KEY_LEN 8
 // Max prefix bytes stored in secret_value (for future verification use)
 #define SECRET_PREFIX_MAX 42
@@ -72,7 +72,7 @@ struct secret_value {
   __u16 port;                          // 0 = wildcard, otherwise port number (host byte order)
   __u8 protocol;                       // IPPROTO_TCP (6) = TCP, IPPROTO_UDP (17) = UDP
   __u32 prefix_len;                    // actual prefix length (8..42)
-  char full_prefix[SECRET_PREFIX_MAX]; // full kloak:UUID prefix for verification
+  char full_prefix[SECRET_PREFIX_MAX]; // full kl::UUID prefix for verification
 };
 
 struct {
@@ -99,7 +99,7 @@ struct scratch_buf {
   __u32 xor_match_count;   // total matches found by pre-scan
   __u32 xor_current_match; // index of the next match to process
   struct {
-     __u32 pos;                    // byte offset of kloak: prefix in data[]
+     __u32 pos;                    // byte offset of kl:: prefix in data[]
      struct secret_key key;        // 8-byte key prefix
    } xor_matches[XOR_MAX_MATCHES];
    char host_value[MAX_HOST_LEN]; // host from DNS chain
@@ -179,7 +179,7 @@ enum {
   DBG_RESOLVE_HOST_OK,        // hostname resolved successfully
   DBG_XOR_CONN_CHECK,         // entry uprobe checked tls_conn_state
   DBG_XOR_CONN_HIT,           // tls_conn_state found + AES-GCM confirmed
-  DBG_XOR_PRESCAN_MATCH,      // pre-scan found kloak: prefix
+  DBG_XOR_PRESCAN_MATCH,      // pre-scan found kl:: prefix
   DBG_XOR_TAILCALL,           // tail-called to xor_path
   DBG_XOR_PATH_ENTERED,       // bpf_xor_path entered
   DBG_XOR_SECRET_FOUND,       // secret_map lookup succeeded in xor_path
@@ -1516,7 +1516,7 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
 }
 
 // -----------------------------------------------------------------------------
-// Prescan: bpf_loop callback to find all kloak: prefixes in the SSL_write buffer.
+// Prescan: bpf_loop callback to find all kl:: prefixes in the SSL_write buffer.
 // Scans in MAX_DATA_SIZE chunks with SECRET_KEY_LEN-1 overlap so that tokens
 // straddling chunk boundaries are always detected. Match positions are stored as
 // global byte offsets (relative to the start of the SSL_write buffer).
@@ -2553,7 +2553,7 @@ int bpf_uprobe_go_tls_write(void *ctx) {
   // resolve_host uses last_verified_fd -> conn_ip_map -> dns_ip_map for Go.
   resolve_host(scratch_data, 0);
 
-  // Pre-scan for kloak: prefix and tail-call to xor_path.
+  // Pre-scan for kl:: prefix and tail-call to xor_path.
   // Same flow as SSL_write — the downstream pipeline is generic.
   dbg_inc(DBG_XOR_CONN_CHECK);
   scratch_data->ssl_ptr = (__u64)conn_ptr; // reuse ssl_ptr field as connection ID
@@ -2662,7 +2662,7 @@ int bpf_uprobe_ssl_write(void *ctx) {
   // Look up hostname via DNS chain: ssl_fd_map -> conn_ip_map -> dns_ip_map
   resolve_host(scratch_data, (__u64)ssl_ptr);
 
-  // Pre-scan for kloak: prefix BEFORE conn_state check, so both
+  // Pre-scan for kl:: prefix BEFORE conn_state check, so both
   // h_extract and xor_path have the match position in scratch_buf.
   dbg_inc(DBG_XOR_CONN_CHECK);
   scratch_data->ssl_ptr = (__u64)ssl_ptr;
@@ -2670,7 +2670,7 @@ int bpf_uprobe_ssl_write(void *ctx) {
   scratch_data->xor_match_count = 0;
   scratch_data->xor_current_match = 0;
 
-  // Scan the FULL SSL_write buffer for kloak: prefixes using bpf_loop.
+  // Scan the FULL SSL_write buffer for kl:: prefixes using bpf_loop.
   // Each chunk reads MAX_DATA_SIZE bytes with SECRET_KEY_LEN-1 overlap,
   // so tokens spanning chunk boundaries are always detected. Match positions
   // are stored as global offsets relative to the SSL_write buffer start.

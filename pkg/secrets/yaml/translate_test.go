@@ -61,7 +61,7 @@ func TestTranslate_HostParsedAsLiteralIP(t *testing.T) {
 	// The translator should propagate that unchanged.
 	spec := fileSpec{Secrets: []secretSpec{{
 		Name:   "lan-key",
-		Value:  "abc",
+		Value:  "fixture-real-mid",
 		Host:   "192.0.2.7",
 		Inject: injectSpec{File: "/run/kloak/lan"},
 	}}}
@@ -215,7 +215,7 @@ func TestTranslate_HuffmanUnsatisfiableRejectsAtTranslateTime(t *testing.T) {
 func TestTranslate_BothInjectTargets(t *testing.T) {
 	// env + file in the same entry is allowed; runtime exposes both.
 	spec := fileSpec{Secrets: []secretSpec{{
-		Name: "dual", Value: "real-dual",
+		Name: "dual", Value: "abc-real-dual-1",
 		Inject: injectSpec{Env: "DUAL", File: "/run/kloak/dual"},
 	}}}
 	out, err := translate(spec, newGen())
@@ -229,7 +229,7 @@ func TestTranslate_BothInjectTargets(t *testing.T) {
 
 func TestTranslate_PortWithProtocol(t *testing.T) {
 	spec := fileSpec{Secrets: []secretSpec{{
-		Name: "dns", Value: "abcd",
+		Name: "dns", Value: "TEST-fixture-12",
 		Port: "53/udp", Inject: injectSpec{Env: "DNS"},
 	}}}
 	out, err := translate(spec, newGen())

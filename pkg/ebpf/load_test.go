@@ -73,7 +73,7 @@ func TestSecretMapOperations(t *testing.T) {
 
 	// Put
 	var key secretKey
-	copy(key.Prefix[:], []byte("kloak:ab"))
+	copy(key.Prefix[:], []byte("kl::abcd"))
 	var val secretValue
 	val.Len = 10
 	copy(val.RealSecret[:], []byte("my-secret!"))

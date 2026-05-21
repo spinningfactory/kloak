@@ -155,7 +155,13 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		// success.
 		if shadowValue == "" {
 			var err error
-			shadowValue, err = gen.Generate(originalLen, originalValue, secretID, 3)
+			// Pass the Huffman bit count, not the cleartext: the
+			// generator only needs the bit-exact length target to
+			// construct a shadow that won't trigger HPACK over-padding,
+			// and keeping the real value out of pkg/secrets's scope
+			// prevents any future logging/error path there from
+			// accidentally surfacing the cleartext.
+			shadowValue, err = gen.Generate(originalLen, secrets.HuffmanBits(originalValue), secretID, 3)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("failed to generate shadow value for key %s: %w", key, err)
 			}

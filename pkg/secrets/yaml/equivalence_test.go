@@ -51,7 +51,7 @@ func TestEquivalence_YAMLvsK8s(t *testing.T) {
 	}
 	// Mint a shadow up-front so the k8s join sees one.
 	gen := secrets.NewShadowGenerator(nil, nil)
-	shadowVal, err := gen.Generate(len(realValue), realValue, "default/stripe-key", 20)
+	shadowVal, err := gen.Generate(len(realValue), secrets.HuffmanBits(realValue), "default/stripe-key", 20)
 	if err != nil {
 		t.Fatalf("shadow gen: %v", err)
 	}

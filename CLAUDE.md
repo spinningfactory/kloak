@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What is Kloak
 
-Kloak is a Kubernetes eBPF HTTPS interceptor that transparently replaces secret placeholders with real values at runtime. Applications never see actual secrets — they use hashed shadow values (`kloak:<UUID>`) that get rewritten in-kernel via eBPF uprobes before TLS transmission.
+Kloak is a Kubernetes eBPF HTTPS interceptor that transparently replaces secret placeholders with real values at runtime. Applications never see actual secrets — they use hashed shadow values (`kl::<UUID>`) that get rewritten in-kernel via eBPF uprobes before TLS transmission.
 
 ## Build & Test Commands
 
@@ -48,10 +48,10 @@ The binary (`cmd/kloak/main.go`) has two subcommands via cobra:
 
 ### Data Flow
 
-1. Secret labeled `getkloak.io/enabled=true` → SecretReconciler creates shadow secret with `kloak:<UUID>` values (padded/truncated to match original length)
+1. Secret labeled `getkloak.io/enabled=true` → SecretReconciler creates shadow secret with `kl::<UUID>` values (padded/truncated to match original length)
 2. Pod created → webhook rewrites volume mounts from original secret to shadow secret
 3. Pod starts → controller detects pod, finds container cgroup, attaches TLS uprobes
-4. App writes TLS data containing `kloak:<UUID>` → eBPF uprobe intercepts, looks up real secret in BPF map, rewrites in-kernel before transmission
+4. App writes TLS data containing `kl::<UUID>` → eBPF uprobe intercepts, looks up real secret in BPF map, rewrites in-kernel before transmission
 
 ### Key Interfaces
 

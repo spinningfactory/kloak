@@ -70,8 +70,13 @@ func TestSecretValidation_RejectsBadPortLabel(t *testing.T) {
 }
 
 func TestSecretValidation_AcceptsValidSecret(t *testing.T) {
+	// "PASS1234" repeated to 32 chars — density ≈6.13 bits/byte, sits
+	// inside the kl::-prefix feasibility window [167, 223] at length 32.
+	// The earlier all-'a' fixture (160 bits, 5.0 bits/byte) was below
+	// the achievable window; admission-time rejection of that density
+	// is covered in pkg/webhook unit tests.
 	err := tryCreateEnabledSecret(t, "test-val-happy",
-		map[string][]byte{"api-key": []byte(strings.Repeat("a", 32))},
+		map[string][]byte{"api-key": []byte(strings.Repeat("PASS1234", 4))},
 		nil, map[string]string{
 			"getkloak.io/hosts": "api.example.com",
 			"getkloak.io/port":  "443",
@@ -82,11 +87,17 @@ func TestSecretValidation_AcceptsValidSecret(t *testing.T) {
 }
 
 func TestSecretValidation_AcceptsBoundaryLengths(t *testing.T) {
-	// exactly the min (8) and exactly the max (128) must pass.
+	// Exactly the min (8) and exactly the max (128) lengths must pass.
+	// Values are chosen for Huffman feasibility at their length — zero
+	// bytes (the earlier fixture) sit at 13 bits/byte in HPACK, far
+	// above any achievable shadow density, so they'd be denied by the
+	// admission-time CanShadow check. Length-extremity is what this
+	// test asserts; density-extremity is covered in pkg/webhook unit
+	// tests.
 	err := tryCreateEnabledSecret(t, "test-val-boundary",
 		map[string][]byte{
-			"min": make([]byte, 8),
-			"max": make([]byte, 128),
+			"min": []byte("PASS1234"),                     // 8 chars, 49 bits
+			"max": []byte(strings.Repeat("Test1234", 16)), // 128 chars, 704 bits
 		}, nil, nil)
 	if err != nil {
 		t.Fatalf("expected boundary-length secret to be admitted, got: %v", err)

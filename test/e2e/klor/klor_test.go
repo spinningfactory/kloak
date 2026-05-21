@@ -203,11 +203,11 @@ func TestKlor_RunExecsChildWithEnvInjection(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit code=%d, want 0\nstdout=%s\nstderr=%s", code, stdout, stderr)
 	}
-	// Child should have seen the shadow placeholder (kloak:<UUID>),
+	// Child should have seen the shadow placeholder (kl::<UUID>),
 	// NOT the real value — the in-kernel rewrite (follow-up PR) is
 	// what turns the placeholder back into the real value on the wire.
-	if !strings.Contains(stdout, "got=kloak:") {
-		t.Errorf("child stdout should contain shadow placeholder 'kloak:...', got: %s", stdout)
+	if !strings.Contains(stdout, "got=kl::") {
+		t.Errorf("child stdout should contain shadow placeholder 'kl::...', got: %s", stdout)
 	}
 	if strings.Contains(stdout, "my-real-value-1234") {
 		t.Errorf("child saw the real secret value in env — that's a regression. stdout: %s", stdout)
@@ -224,7 +224,7 @@ func TestKlor_RunExecsChildWithEnvInjection(t *testing.T) {
 func TestKlor_RunPropagatesChildExitCode(t *testing.T) {
 	yaml := writeYAML(t, `secrets:
   - name: testkey
-    value: vvv
+    value: src-snapshot-real
     inject:
       env: TEST_KEY
 `)

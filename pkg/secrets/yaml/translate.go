@@ -75,7 +75,13 @@ func translate(spec fileSpec, gen *secrets.ShadowGenerator) ([]secrets.Secret, e
 		// future hot-reload of the same secret reuses its own prefix
 		// instead of treating itself as a collision. maxRetries=20
 		// mirrors the controller's value at pkg/controller/secret_reconciler.go.
-		shadow, err := gen.Generate(len(realVal), realVal, s.Name, 20)
+		//
+		// Pass the Huffman bit count, not the real value itself — keeps
+		// the cleartext from leaving this function's scope. The bit-exact
+		// length is what the shadow generator needs to construct a shadow
+		// whose encoded wire bytes match the real's exactly (no HPACK
+		// EOS over-padding).
+		shadow, err := gen.Generate(len(realVal), secrets.HuffmanBits(realVal), s.Name, 20)
 		if err != nil {
 			if errors.Is(err, secrets.ErrHuffmanInvariantUnsatisfiable) {
 				return nil, fmt.Errorf("secrets.yaml: entry %d (%q): cannot mint a shadow with sufficient HPACK Huffman length — the real value's encoding is too dense for the requested length (consider a longer secret value): %w", i, s.Name, err)

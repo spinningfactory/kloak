@@ -233,8 +233,8 @@ func TestWebhookMountedContent(t *testing.T) {
 	if strings.Contains(output, "REAL-SECRET-DO-NOT-LEAK") {
 		t.Error("pod saw the real secret value — webhook did not rewrite the volume")
 	}
-	if !strings.Contains(output, "kloak:") {
-		t.Errorf("pod output should contain 'kloak:' prefix, got: %q", output)
+	if !strings.Contains(output, "kl::") {
+		t.Errorf("pod output should contain 'kl::' prefix, got: %q", output)
 	}
 }
 

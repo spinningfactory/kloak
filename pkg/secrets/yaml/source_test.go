@@ -114,7 +114,7 @@ func TestSource_SnapshotIsStable(t *testing.T) {
 	// secrets.Source contract — no I/O on the hot path).
 	path := writeTempYAML(t, `secrets:
   - name: a
-    value: aaa
+    value: src-snapshot-real
     inject:
       env: A
 `)

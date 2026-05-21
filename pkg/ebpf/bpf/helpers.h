@@ -91,23 +91,29 @@ HELPER_INLINE __u32 clamp_write_len(__u32 val_len) {
   return ((val_len - 1) & (SECRET_MAX_LEN - 1)) + 1;
 }
 
-// Check if buffer starts with the 6-byte "kloak:" prefix (HTTP/1.1 plaintext).
-// Returns 1 if it matches, 0 otherwise. Caller must ensure buf has >= 6 bytes.
+// Check if buffer starts with the 4-byte "kl::" prefix (HTTP/1.1 plaintext).
+// Returns 1 if it matches, 0 otherwise. Caller must ensure buf has >= 4 bytes.
+//
+// Historical "kloak:" (6 bytes / 37 Huffman bits) shortened to "kl::"
+// (4 bytes / 27 Huffman bits) to widen the byte-by-byte shadow generator's
+// feasibility window. The trailing `::` is still distinctive enough that
+// the cheap prefix filter rejects ~99.999% of byte windows; the 8-byte
+// secret_map lookup confirms genuine matches.
 HELPER_INLINE int is_kloak_prefix(const char *buf) {
-  return (buf[0] == 'k' && buf[1] == 'l' && buf[2] == 'o' && buf[3] == 'a' &&
-          buf[4] == 'k' && buf[5] == ':')
+  return (buf[0] == 'k' && buf[1] == 'l' && buf[2] == ':' && buf[3] == ':')
              ? 1
              : 0;
 }
 
-// Check if buffer starts with the HPACK Huffman encoding of "kloak:" (HTTP/2).
-// The HPACK static Huffman table (RFC 7541 Appendix B) encodes "kloak" as
-// 4 stable bytes: 0xeb 0x41 0xc7 0xd6. The 5th byte varies depending on
-// the character after ":" due to Huffman bit packing. 4 bytes is sufficient
-// to avoid false positives — the 8-byte key lookup confirms the match.
+// Check if buffer starts with the HPACK Huffman encoding of "kl::" (HTTP/2).
+// The HPACK static Huffman table (RFC 7541 Appendix B) encodes "kl::" as
+// 27 bits, of which the first 3 stable bytes are 0xeb 0x45 0xcb. The 4th
+// byte's bits depend on the character after the second ":" because the
+// 27-bit "kl::" doesn't end on a byte boundary. 3 bytes (24 bits) is
+// sufficient to keep BPF false-positive lookups rare; the 8-byte
+// secret_map confirms genuine matches.
 HELPER_INLINE int is_kloak_prefix_huffman(const unsigned char *buf) {
-  return (buf[0] == 0xeb && buf[1] == 0x41 && buf[2] == 0xc7 &&
-          buf[3] == 0xd6)
+  return (buf[0] == 0xeb && buf[1] == 0x45 && buf[2] == 0xcb)
              ? 1
              : 0;
 }
