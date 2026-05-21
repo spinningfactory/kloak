@@ -32,6 +32,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
 // requireRootedEnv gates every rooted test on (Linux + root). Lifted
@@ -257,7 +259,7 @@ func TestKrunkRewritesShadowOnTheWire(t *testing.T) {
 
 	// Server-side assertion: the bytes the TLS endpoint saw must
 	// contain the real value, not the shadow. If the rewrite didn't
-	// fire, the body is `kloak:<UUID...>` of matching length.
+	// fire, the body is `kl::<random-tail>` of matching length.
 	body := echo.waitForRequest(5 * time.Second)
 	if body == nil {
 		t.Fatalf("echo server did not receive the request — krunk/curl output:\n%s", out)
@@ -266,7 +268,7 @@ func TestKrunkRewritesShadowOnTheWire(t *testing.T) {
 	if !strings.Contains(got, real) {
 		t.Errorf("echo server did NOT see real value — rewrite failed.\n  wanted body to contain: %q\n  got body:               %q", real, got)
 	}
-	if strings.Contains(got, "kloak:") {
+	if strings.Contains(got, secrets.ValuePrefix) {
 		t.Errorf("echo server saw the SHADOW on the wire — rewrite did not fire:\n  body: %q", got)
 	}
 }
