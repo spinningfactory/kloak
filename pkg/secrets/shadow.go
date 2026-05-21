@@ -165,33 +165,14 @@ func (g *ShadowGenerator) collides(shadow, ownerID string) bool {
 // the time spent on the error path is independent of realHuffmanBits's
 // magnitude, removing a timing oracle on the real's encoded length.
 func generateShadowValue(originalLen, realHuffmanBits int) (string, error) {
-	// A shadow must carry the ValuePrefix so the BPF scanner recognizes
-	// it. Anything shorter than the prefix can't form a valid shadow.
-	if originalLen < len(ValuePrefix) {
-		return "", fmt.Errorf("%w: originalLen=%d < %d (ValuePrefix length)",
-			ErrHuffmanInvariantUnsatisfiable, originalLen, len(ValuePrefix))
+	// Feasibility runs first; on failure no randomness is consumed and
+	// the error path is constant-time w.r.t. realHuffmanBits's magnitude
+	// (no timing oracle).
+	if err := CanShadow(originalLen, realHuffmanBits); err != nil {
+		return "", err
 	}
-
 	tailLen := originalLen - len(ValuePrefix)
 	tailBits := realHuffmanBits - prefixHuffmanBits
-
-	// Feasibility: with tailLen positions each contributing [MinBits,
-	// MaxBits] bits, the achievable tail-bit range is exactly
-	// [tailLen*MinBits, tailLen*MaxBits]. Any tailBits outside that
-	// window is unreachable regardless of choices made later.
-	//
-	// Special case tailLen == 0: the shadow IS the prefix; only
-	// tailBits == 0 (i.e. realHuffmanBits == prefixHuffmanBits) is
-	// satisfiable. The same bounds check handles this naturally
-	// (0*MinBits == 0*MaxBits == 0).
-	if tailBits < tailLen*MinBits || tailBits > tailLen*MaxBits {
-		return "", fmt.Errorf(
-			"%w: originalLen=%d, target Huffman bits=%d, achievable range=[%d, %d]",
-			ErrHuffmanInvariantUnsatisfiable, originalLen, realHuffmanBits,
-			prefixHuffmanBits+tailLen*MinBits,
-			prefixHuffmanBits+tailLen*MaxBits,
-		)
-	}
 
 	// Byte-by-byte construction. The loop invariant: at the start of
 	// iteration i, `remaining` is the bit budget the suffix
@@ -256,6 +237,49 @@ func randIntInclusive(lo, hi int) (int, error) {
 
 // ErrHuffmanInvariantUnsatisfiable is returned by generateShadowValue
 // when no shadow of the requested length can match the real secret's
-// HPACK Huffman bit length. The HTTP/2 rewrite path is skipped for such
-// secrets; HTTP/1.1 rewriting still works via the plaintext map entry.
+// HPACK Huffman bit length. Kloak fails-closed on such secrets: the
+// reconciler refuses to mint a shadow (so neither HTTP/1.1 nor HTTP/2
+// rewrite gets enabled) rather than producing a shadow that would
+// silently break the HTTP/2 wire invariant. The validating webhook
+// catches this at admission time via CanShadow so users learn at
+// `kubectl apply` rather than at runtime.
 var ErrHuffmanInvariantUnsatisfiable = errors.New("shadow Huffman bit length cannot match real's")
+
+// CanShadow returns nil iff a shadow can be minted for a real value of
+// the given plaintext length and Huffman bit count. The two failure
+// modes both surface as ErrHuffmanInvariantUnsatisfiable:
+//
+//   - originalLen < len(ValuePrefix): the shadow can't even carry the
+//     "kl::" marker the BPF scanner looks for.
+//   - realHuffmanBits outside [prefixHuffmanBits + tailLen*MinBits,
+//     prefixHuffmanBits + tailLen*MaxBits]: the alphabet's per-byte
+//     5–7 bits/byte range can't produce a tail that matches the real's
+//     Huffman length, which means the HTTP/2 wire-buffer invariant
+//     can't be satisfied (the shadow's encoded length would differ
+//     from the real's by enough to require >7 bits of EOS padding,
+//     forbidden by RFC 7541 §5.2).
+//
+// Used by both generateShadowValue (the actual minting path) and the
+// validating webhook (admission-time rejection) so the predicate has a
+// single source of truth.
+func CanShadow(originalLen, realHuffmanBits int) error {
+	if originalLen < len(ValuePrefix) {
+		return fmt.Errorf("%w: originalLen=%d < %d (ValuePrefix length)",
+			ErrHuffmanInvariantUnsatisfiable, originalLen, len(ValuePrefix))
+	}
+	tailLen := originalLen - len(ValuePrefix)
+	tailBits := realHuffmanBits - prefixHuffmanBits
+	// Special case tailLen == 0: the shadow IS the prefix; only
+	// tailBits == 0 (realHuffmanBits == prefixHuffmanBits) is
+	// satisfiable. The same bounds check handles this naturally
+	// (0*MinBits == 0*MaxBits == 0).
+	if tailBits < tailLen*MinBits || tailBits > tailLen*MaxBits {
+		return fmt.Errorf(
+			"%w: originalLen=%d, target Huffman bits=%d, achievable range=[%d, %d]",
+			ErrHuffmanInvariantUnsatisfiable, originalLen, realHuffmanBits,
+			prefixHuffmanBits+tailLen*MinBits,
+			prefixHuffmanBits+tailLen*MaxBits,
+		)
+	}
+	return nil
+}

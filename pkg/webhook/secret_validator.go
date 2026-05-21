@@ -13,6 +13,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
 const (
@@ -115,12 +117,32 @@ func validateSecretData(data map[string][]byte, stringData map[string]string) er
 		sizes[k] = len(v)
 	}
 
+	// Effective per-key value. Resolves the apiserver merge semantics
+	// (stringData overrides data) so the Huffman check looks at the
+	// exact bytes the reconciler will see.
+	values := make(map[string]string, len(sizes))
+	for k, v := range data {
+		values[k] = string(v)
+	}
+	for k, v := range stringData {
+		values[k] = v
+	}
+
 	for k, n := range sizes {
 		if n < minDataLen {
 			return fmt.Errorf("data[%q] is %d bytes, minimum %d required (BPF key lookup)", k, n, minDataLen)
 		}
 		if n > maxDataLen {
 			return fmt.Errorf("data[%q] is %d bytes, maximum %d allowed (BPF rewrite would truncate)", k, n, maxDataLen)
+		}
+		// Huffman feasibility — fails-closed when the value's bit
+		// density would force HPACK over-padding on HTTP/2 rewrite.
+		// Catching it here means `kubectl apply` errors with a clear
+		// message instead of the secret being silently left without a
+		// shadow (which would leave the application unprotected on
+		// the wire).
+		if err := secrets.CanShadow(n, secrets.HuffmanBits(values[k])); err != nil {
+			return fmt.Errorf("data[%q]: %w (value's HPACK Huffman density is outside the range kloak can shadow; use a different value or adjust its length)", k, err)
 		}
 	}
 	return nil

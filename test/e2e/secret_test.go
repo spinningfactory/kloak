@@ -20,8 +20,12 @@ func TestShadowSecretCreation(t *testing.T) {
 }
 
 func TestShadowSecretMultipleKeys(t *testing.T) {
+	// "admin-User" (57 bits) sits at the lower edge of the kl::-prefix
+	// feasibility window for length 10. The earlier "admin-user" (56
+	// bits) was 1 bit below the floor — see TestSecretValidation_*
+	// for the admission-time rejection of out-of-window densities.
 	data := map[string][]byte{
-		"username": []byte("admin-user"),
+		"username": []byte("admin-User"),
 		"password": []byte("super-secret-password-123"),
 		"token":    []byte("tok_live_abcdefghijklmnop"),
 	}
@@ -33,10 +37,16 @@ func TestShadowSecretLengthMatching(t *testing.T) {
 	// Values span the supported BPF range: min key size (8) to max rewrite (128).
 	// Anything outside [8, 128] is rejected by the validating webhook — see
 	// TestSecretValidation_RejectsShortData / TestSecretValidation_RejectsLongData.
+	//
+	// All three values are picked so their HPACK Huffman bit count sits
+	// inside the kl::-prefix feasibility window at their length —
+	// pathological all-density boundaries (e.g. "abcdefgh", "x"×128)
+	// are rejected by admission and covered by TestSecretValidation_*
+	// instead of this happy-path length-matching test.
 	data := map[string][]byte{
-		"short":  []byte("abcdefgh"),
+		"short":  []byte("PASS1234"),
 		"medium": []byte("this-is-a-medium-length-secret-value-here!x"),
-		"long":   []byte(strings.Repeat("x", 128)),
+		"long":   []byte(strings.Repeat("Test1234", 16)),
 	}
 	createEnabledSecret(t, "test-shadow-lengths", data, nil, nil)
 	assertShadowSecret(t, "test-shadow-lengths", data)
