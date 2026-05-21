@@ -105,7 +105,8 @@ func TestGenerateShadowValue_UnsatisfiableReturnsError(t *testing.T) {
 		// Above-the-window: shadow tail can supply at most tailLen*MaxBits
 		// bits, but real demands more. 'X' is 8 bits/byte; 16 chars of
 		// 'X' = 128 bits, minus prefix's 27 = 101 bits required from
-		// (16-4)=12 tail bytes — needs 8.4 bits/byte, above MaxBits=7.
+		// (16-4)=12 tail bytes — needs 8.42 bits/byte, above MaxBits=8.
+		// (At length 16 we're 5 bits over the ceiling with MaxBits=8.)
 		{"X×16 in shadowN=16", strings.Repeat("X", 16), 16, true},
 		// Above-the-window classic from the prior algorithm's test:
 		// 32 chars of 'X' demand more bits than the tail can supply.

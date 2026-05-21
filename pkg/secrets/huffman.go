@@ -18,27 +18,38 @@ var huffmanBitsTable [256]int
 
 // huffmanBuckets[k] is the list of bytes whose Huffman code is exactly
 // k bits long, restricted to the alphabet we're willing to emit in a
-// shadow tail (alphanumeric ASCII, MinBits..MaxBits). The shadow
-// generator picks a code length k inside its feasibility window, then
-// uniformly samples a byte from huffmanBuckets[k].
+// shadow tail (alphanumeric ASCII + 4 punctuation chars used to widen
+// the 8-bit bucket, see MaxBits=8 rationale). The shadow generator
+// picks a code length k inside its feasibility window, then uniformly
+// samples a byte from huffmanBuckets[k].
 var huffmanBuckets [9][]byte
 
 // MinBits / MaxBits define the alphabet for shadow-tail byte selection.
-// MinBits=5 / MaxBits=7 corresponds to ASCII alphanumeric chars except
-// 'X' and 'Z' (which are 8 bits each in HPACK Huffman): a 5-bit bucket
-// of "012aceiost", a 6-bit bucket of "3456789bdfghlmnpruA", and a
-// 7-bit bucket spanning the rest of upper/lowercase alphanumerics.
-// All three buckets are well-populated (≥10 candidates) so per-byte
-// random selection has meaningful entropy.
+// MinBits=5 is the absolute floor of HPACK's static Huffman table
+// (RFC 7541 Appendix B) — there is no code shorter than 5 bits anywhere
+// in HPACK, so reals with average density ≤ 5 bits/byte are
+// unsupportable regardless of alphabet choice (a +7-bit fixed lower
+// slack persists for any non-empty prefix). The validating webhook
+// rejects such secrets at admission via secrets.CanShadow.
 //
-// Increasing MaxBits to 8 would add 'X' and 'Z' (just 2 candidates),
-// shrinking entropy at the top end of the bucket range — not worth it.
-// Lowering MinBits below 5 would require dragging in non-alphanumeric
-// chars (' ', '%', '/', '=') which would surprise anyone scanning a
-// shadow for the literal "kl::" prefix + identifier pattern.
+// MaxBits=8 widens the upper window by one bit/byte vs the original
+// [5, 7] choice. The 8-bit bucket members are 'X', 'Z' (the only two
+// 8-bit ASCII alphanumerics) plus four 8-bit punctuation chars
+// "&*,;" so the bucket has 6 candidates of meaningful entropy. The
+// trade-off: shadows may include punctuation in their tail
+// (e.g. "kl::aB&cD*"), arguably less identifier-shaped than the
+// previous alphanumeric-only choice, but in exchange we cover short
+// uppercase-heavy reals like "SECRET-8" (54 Huffman bits) which sit
+// 3 bits above the [5, 7] ceiling at length 8.
+//
+// Pushing MaxBits to 10+ would add more punctuation (!"()? at 10 bits)
+// and widen the top further. We held the line at 8 because alphabet
+// widening beyond that brings diminishing returns and increasingly
+// weird-looking shadows — the realistic high-density real population
+// (uppercase API keys, base64-with-special) is well covered at 8.
 const (
 	MinBits = 5
-	MaxBits = 7
+	MaxBits = 8
 )
 
 // prefixHuffmanBits is the cached exact Huffman bit count for ValuePrefix
@@ -56,12 +67,14 @@ func init() {
 		huffmanBitsTable[b] = int(hpack.HuffmanEncodeLength(s)) * 8 / 64
 	}
 
-	// Bucket every alphanumeric ASCII byte by its Huffman bit length.
-	// We deliberately exclude non-alphanumerics so shadow tails stay
-	// recognizable as identifier-shaped (a holdover from the prior
-	// ULID/Crockford choice — humans reading logs should still see a
-	// shadow as "kl::<token>", not "kl::<random%punctuation>").
-	const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	// Alphabet = all alphanumeric ASCII plus the four 8-bit punctuation
+	// chars ("&*,;") chosen to populate huffmanBuckets[8] beyond the
+	// two natural alphanumeric residents ('X', 'Z'). Six 8-bit
+	// candidates gives the upper-bucket sampling meaningful entropy;
+	// the punctuation is rare enough in shadows that human-readable
+	// logs still look identifier-shaped ("kl::aB&cD*1" remains
+	// scannable as a kloak placeholder).
+	const alphabet = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ&*,;"
 	for _, b := range []byte(alphabet) {
 		bits := huffmanBitsTable[b]
 		if bits < MinBits || bits > MaxBits {
