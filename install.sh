@@ -156,7 +156,22 @@ resolve_binary() {
     #    cutting a release.
     if [[ -d "$SCRIPT_DIR/cmd/krunk" ]]; then
         log "Detected source checkout at $SCRIPT_DIR — building krunk locally …"
-        command -v go >/dev/null || die "go not installed (needed to build from checkout)"
+        command -v go    >/dev/null || die "go not installed (needed to build from checkout)"
+        command -v clang >/dev/null || die "clang not installed (needed to compile eBPF programs); install clang or use a release tarball"
+
+        # Regenerate the eBPF bindings BEFORE building. The .o files
+        # under pkg/ebpf/ are gitignored AND embedded into the Go
+        # binding via //go:embed, so a stale .o from a previous
+        # generate gets baked into krunk — even on a fresh `go build`.
+        # We hit this on the kloak: → kl:: prefix rename: krunk built
+        # cleanly but the embedded BPF matcher still looked for
+        # "kloak:", so it never matched the new shadows on the wire.
+        # Always regenerate from checkout so the binary's BPF is in
+        # sync with the .c source the user has checked out.
+        log "Regenerating eBPF bindings (go generate ./pkg/ebpf/) …"
+        (cd "$SCRIPT_DIR" && KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/) \
+            || die "go generate ./pkg/ebpf/ failed — check clang version and BPF headers"
+
         local out
         out="$(make_tempdir)/krunk"
         # Run as the invoking user (not root) — `go build` writes the
