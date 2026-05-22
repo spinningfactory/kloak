@@ -1165,7 +1165,7 @@ func walkTLSLibrariesUnder(rootPrefix string) []string {
 			if !ok {
 				return nil
 			}
-			id := fileID{dev: uint64(stat.Dev), ino: stat.Ino}
+			id := fileID{dev: stat.Dev, ino: stat.Ino}
 			if seen[id] {
 				return nil
 			}
