@@ -463,12 +463,10 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 
 	// Resolve which external interface to attach tc egress on. We're now
 	// inside the target netns (setns above), so net.InterfaceByName and
-	// /proc/net/route both see the netns-local view.
-	ifNames, err := m.resolveEgressInterfaces(pid)
-	if err != nil {
-		_ = containerNS.Close()
-		return fmt.Errorf("resolving egress interfaces in pid %d netns: %w", pid, err)
-	}
+	// /proc/net/route both see the netns-local view. resolveEgressInterfaces
+	// is best-effort + log-only — hard-failure cases (explicit interface
+	// name missing from the netns) surface below via net.InterfaceByName.
+	ifNames := m.resolveEgressInterfaces(pid)
 
 	for _, ifName := range ifNames {
 		iface, err := net.InterfaceByName(ifName)
@@ -529,18 +527,26 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 //   - any other value: trust it as an explicit interface name.
 //
 // pid is informational, used only for log messages.
-func (m *TLSUprobeManager) resolveEgressInterfaces(pid int) ([]string, error) {
+//
+// Doesn't return an error: every "failure" (auto-detection couldn't
+// find a default route, etc.) is recoverable by falling back to
+// lo-only attachment with a warning logged at the call site. The
+// hard-failure cases (explicit interface name that's missing from the
+// netns) surface later in attachTCEgress via the net.InterfaceByName
+// lookup, which has the full netns context for the error message.
+func (m *TLSUprobeManager) resolveEgressInterfaces(pid int) []string {
 	var external string
 	switch strings.ToLower(m.egressInterface) {
 	case "", "auto":
 		got, err := findDefaultRouteInterface()
-		if err != nil {
+		switch {
+		case err != nil:
 			m.log.Warnw("default-route auto-detection failed; attaching only to lo — external TLS rewrites will NOT apply",
 				"pid", pid, "error", err)
-		} else if got == "" {
+		case got == "":
 			m.log.Warnw("no default IPv4 route in target netns; attaching only to lo — external TLS rewrites will NOT apply (set --egress-interface explicitly if a default route exists under a non-standard name)",
 				"pid", pid)
-		} else {
+		default:
 			external = got
 			m.log.Debugw("auto-detected egress interface from default route",
 				"pid", pid, "interface", external)
@@ -552,9 +558,9 @@ func (m *TLSUprobeManager) resolveEgressInterfaces(pid int) ([]string, error) {
 	}
 
 	if external == "" {
-		return []string{"lo"}, nil
+		return []string{"lo"}
 	}
-	return []string{external, "lo"}, nil
+	return []string{external, "lo"}
 }
 
 // findDefaultRouteInterface reads /proc/net/route in the current netns
