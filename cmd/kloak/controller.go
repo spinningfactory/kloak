@@ -50,6 +50,7 @@ var (
 	enableEBPF          bool
 	cgroupPath          string
 	trustedDNSServers   string
+	egressInterface     string
 )
 
 func init() {
@@ -57,12 +58,16 @@ func init() {
 	controllerCmd.Flags().BoolVar(&enableEBPF, "enable-ebpf", false, "Enable eBPF traffic redirection (requires Linux + CAP_BPF).")
 	controllerCmd.Flags().StringVar(&cgroupPath, "cgroup-path", "/sys/fs/cgroup", "Path to cgroup v2 filesystem.")
 	controllerCmd.Flags().StringVar(&trustedDNSServers, "trusted-dns-servers", "", "Comma-separated trusted DNS server IPs. If empty, auto-discovers kube-dns.")
+	controllerCmd.Flags().StringVar(&egressInterface, "egress-interface", "auto",
+		"Network interface for tc-egress attachment inside each tracked netns. "+
+			`"auto" detects from the default IPv4 route (works for CNI veth "eth0" AND host-mode netns with non-standard names like wlp3s0/enp0s3). `+
+			`Use an explicit name (e.g., "eth0") to pin, or "none"/"lo-only" to attach only to loopback.`)
 }
 
 func runController(cmd *cobra.Command, args []string) {
 	setupLog := logging.Setup().Named("setup")
 
-	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath)
+	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface)
 
 	// 30 s is well under the daemonset's 60 s terminationGracePeriodSeconds,
 	// leaving headroom for our own cleanup (uprobe/link Close) and any final
@@ -85,7 +90,7 @@ func runController(cmd *cobra.Command, args []string) {
 	var uprobeMgr *ebpf.TLSUprobeManager
 
 	if enableEBPF {
-		uprobeMgr, err = ebpf.NewTLSUprobeManager(k8ssecrets.NewSource(mgr.GetClient()).WithLog(setupLog), cgroupPath, setupLog)
+		uprobeMgr, err = ebpf.NewTLSUprobeManager(k8ssecrets.NewSource(mgr.GetClient()).WithLog(setupLog), cgroupPath, egressInterface, setupLog)
 		if err != nil {
 			setupLog.Errorw("failed to initialize eBPF uprobe manager", "error", err)
 			_ = setupLog.Sync()

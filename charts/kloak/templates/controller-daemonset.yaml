@@ -44,6 +44,7 @@ spec:
           args:
             - --enable-ebpf={{ .Values.controller.ebpf.enabled }}
             - --cgroup-path={{ .Values.controller.cgroupPath }}
+            - --egress-interface={{ .Values.controller.ebpf.egressInterface | default "auto" }}
             {{- if .Values.controller.dns.trustedServers }}
             - --trusted-dns-servers={{ join "," .Values.controller.dns.trustedServers }}
             {{- end }}
