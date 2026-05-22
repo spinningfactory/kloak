@@ -37,7 +37,7 @@ var ErrNotSupported = errors.New("kloak: eBPF uprobes are only supported on Linu
 // ErrNotSupported (or is a no-op for the void methods).
 type TLSUprobeManager struct{}
 
-func NewTLSUprobeManager(_ secrets.Source, _ string, _ *zap.SugaredLogger) (*TLSUprobeManager, error) {
+func NewTLSUprobeManager(_ secrets.Source, _, _ string, _ *zap.SugaredLogger) (*TLSUprobeManager, error) {
 	return nil, ErrNotSupported
 }
 

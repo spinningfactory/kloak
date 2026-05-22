@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"path/filepath"
@@ -102,6 +103,25 @@ type TLSUprobeManager struct {
 	secretSource secrets.Source
 	// cgroupRoot is the path to the cgroup v2 filesystem (e.g. /sys/fs/cgroup)
 	cgroupRoot string
+	// egressInterface selects which NIC inside the target's netns gets the
+	// tc-egress patch program attached:
+	//
+	//	"" or "auto"     — read /proc/net/route inside the netns and pick
+	//	                   the interface backing the default IPv4 route.
+	//	                   Works for the standard CNI veth-named-"eth0"
+	//	                   convention AND for host-mode netns where the
+	//	                   default route exits via e.g. enp0s3 / wlp3s0.
+	//	"none","lo-only" — explicit opt-out of external interface
+	//	                   attachment; lo only. Useful for tests and
+	//	                   loopback-only workloads.
+	//	any other value  — exact interface name (e.g., "eth0", "wlp3s0").
+	//	                   Fail closed if the named interface is not found
+	//	                   in the netns.
+	//
+	// `lo` is always attached in addition to whichever external interface
+	// the above resolves — covers intra-pod loopback (e.g., sidecar →
+	// sidecar via a ClusterIP Service that DNATs back to the same pod).
+	egressInterface string
 	// cgroupPaths maps cgroup inode ID -> filesystem path.
 	// Populated by TrackCgroup.
 	cgroupPaths sync.Map // uint64 -> string
@@ -236,7 +256,13 @@ func parseBPFLogLevel(s string) ebpf.LogLevel {
 }
 
 // NewTLSUprobeManager initializes a new uprobe manager.
-func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot string, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
+//
+// egressInterface selects which interface(s) inside each target netns get the
+// tc-egress patch program attached. Pass "auto" (or empty) to detect from
+// the default route, an explicit name (e.g., "eth0", "wlp3s0") to pin, or
+// "none"/"lo-only" to attach only to loopback. See the field comment on
+// TLSUprobeManager.egressInterface for the full semantics.
+func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterface string, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
 	log = log.Named("ebpf-uprobe")
 
 	objs := &tlsuprobeObjects{}
@@ -306,12 +332,13 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot string, log *za
 	}
 
 	mgr := &TLSUprobeManager{
-		objs:         objs,
-		reader:       reader,
-		procReader:   procReader,
-		log:          log,
-		secretSource: secretSource,
-		cgroupRoot:   cgroupRoot,
+		objs:            objs,
+		reader:          reader,
+		procReader:      procReader,
+		log:             log,
+		secretSource:    secretSource,
+		cgroupRoot:      cgroupRoot,
+		egressInterface: egressInterface,
 	}
 
 	// Attach tracepoints for DNS interception and connect tracking.
@@ -434,17 +461,30 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 		}
 	}()
 
-	// Attach tc egress to both eth0 (external) and lo (intra-pod loopback).
-	for _, ifName := range []string{"eth0", "lo"} {
+	// Resolve which external interface to attach tc egress on. We're now
+	// inside the target netns (setns above), so net.InterfaceByName and
+	// /proc/net/route both see the netns-local view. resolveEgressInterfaces
+	// is best-effort + log-only — hard-failure cases (explicit interface
+	// name missing from the netns) surface below via net.InterfaceByName.
+	ifNames := m.resolveEgressInterfaces(pid)
+
+	for _, ifName := range ifNames {
 		iface, err := net.InterfaceByName(ifName)
 		if err != nil {
-			// lo should always exist; eth0 might not in some setups.
+			// lo should always exist; if it doesn't, the netns is
+			// fundamentally broken — fail loudly.
 			if ifName == "lo" {
 				_ = containerNS.Close()
 				return fmt.Errorf("finding %s in container netns: %w", ifName, err)
 			}
-			m.log.Debugw("interface not found, skipping", "pid", pid, "interface", ifName)
-			continue
+			// External interface lookup failed. If the user pinned
+			// an explicit name and it's missing, that's a hard error
+			// (silently skipping would leave their traffic un-patched
+			// and they'd never know). For the auto-detected case the
+			// resolver wouldn't have returned a name that doesn't
+			// exist, so this branch is reserved for the pinned case.
+			_ = containerNS.Close()
+			return fmt.Errorf("egress interface %q not found in pid %d netns (configured via --egress-interface or controller.ebpf.egressInterface): %w", ifName, pid, err)
 		}
 
 		tcLink, err := link.AttachTCX(link.TCXOptions{
@@ -468,6 +508,99 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 		}
 	}
 	return nil
+}
+
+// resolveEgressInterfaces returns the ordered interface names tc egress
+// should attach to inside the current netns. Must be called AFTER setns
+// to the target netns, since the resolution reads /proc/net/route and
+// performs netns-local interface lookups.
+//
+// Always includes "lo" at the end (intra-pod loopback + local-echo-server
+// test fixtures rely on it). The leading external interface is chosen by:
+//
+//   - empty / "auto": parse /proc/net/route inside the netns and pick
+//     the interface whose Destination is 0.0.0.0 (the default IPv4
+//     route). Returns no external interface if no default route exists
+//     and logs a warning — external TLS rewrites will NOT apply until
+//     a route is configured (typical for a netns mid-CNI-setup).
+//   - "none" / "lo-only": opt out of external interface attachment.
+//   - any other value: trust it as an explicit interface name.
+//
+// pid is informational, used only for log messages.
+//
+// Doesn't return an error: every "failure" (auto-detection couldn't
+// find a default route, etc.) is recoverable by falling back to
+// lo-only attachment with a warning logged at the call site. The
+// hard-failure cases (explicit interface name that's missing from the
+// netns) surface later in attachTCEgress via the net.InterfaceByName
+// lookup, which has the full netns context for the error message.
+func (m *TLSUprobeManager) resolveEgressInterfaces(pid int) []string {
+	var external string
+	switch strings.ToLower(m.egressInterface) {
+	case "", "auto":
+		got, err := findDefaultRouteInterface()
+		switch {
+		case err != nil:
+			m.log.Warnw("default-route auto-detection failed; attaching only to lo — external TLS rewrites will NOT apply",
+				"pid", pid, "error", err)
+		case got == "":
+			m.log.Warnw("no default IPv4 route in target netns; attaching only to lo — external TLS rewrites will NOT apply (set --egress-interface explicitly if a default route exists under a non-standard name)",
+				"pid", pid)
+		default:
+			external = got
+			m.log.Debugw("auto-detected egress interface from default route",
+				"pid", pid, "interface", external)
+		}
+	case "none", "lo-only":
+		// explicit opt-out
+	default:
+		external = m.egressInterface
+	}
+
+	if external == "" {
+		return []string{"lo"}
+	}
+	return []string{external, "lo"}
+}
+
+// findDefaultRouteInterface reads /proc/net/route in the current netns
+// and returns the interface name backing the default IPv4 route, or ""
+// if no default route exists.
+func findDefaultRouteInterface() (string, error) {
+	data, err := os.ReadFile("/proc/net/route")
+	if err != nil {
+		return "", fmt.Errorf("reading /proc/net/route: %w", err)
+	}
+	return parseDefaultRouteInterface(data), nil
+}
+
+// parseDefaultRouteInterface walks a /proc/net/route body and returns
+// the interface name on the row whose Destination column is 00000000
+// (the default IPv4 route). Returns "" if no such row exists.
+//
+// Format reference: kernel Documentation/networking/proc_net.rst —
+// /proc/net/route is a fixed hex-encoded table with one row per route;
+// header line first, then Iface, Destination, Gateway, Flags, …
+// separated by whitespace. Extracted into its own function so the
+// parser can be exercised without reading from the kernel.
+func parseDefaultRouteInterface(data []byte) string {
+	for i, line := range strings.Split(string(data), "\n") {
+		if i == 0 {
+			// header row
+			continue
+		}
+		fields := strings.Fields(line)
+		// Need at least Iface + Destination. Anything shorter is a
+		// blank line or a future format extension we don't grok —
+		// skip rather than fail.
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[1] == "00000000" {
+			return fields[0]
+		}
+	}
+	return ""
 }
 
 // TrackTGID adds a process TGID to the tracked_tgids map, enabling
@@ -931,45 +1064,115 @@ func (m *TLSUprobeManager) pushGoTLSOffsets(pid int, cgroupID uint64) {
 		"pid", pid, "cgroupID", cgroupID, "exeInode", exeInode, "goVersion", version)
 }
 
-// findContainerTLSLibraries scans common library directories in the container's
-// root filesystem for all TLS libraries. Returns container-relative paths
-// (e.g., "/usr/lib/aarch64-linux-gnu/libssl.so.3").
+// findContainerTLSLibraries scans well-known library directories in the
+// container's root filesystem for all TLS libraries. Returns container-
+// relative paths (e.g., "/usr/lib/aarch64-linux-gnu/libssl.so.3",
+// "/usr/lib64/libssl.so.3").
+//
+// Walks recursively under a set of root library directories so any distro
+// that nests TLS libs under arch-specific or vendor-named subdirectories
+// is covered. The roots intentionally include both /usr/lib* and
+// /usr/local/lib* plus the /lib* legacy aliases — different distros put
+// libssl in different places:
+//
+//	Debian/Ubuntu:  /usr/lib/x86_64-linux-gnu/libssl.so.3
+//	Fedora/RHEL:    /usr/lib64/libssl.so.3  (← what the original 3-dir
+//	                                          + one-level scan missed)
+//	Alpine/Arch:    /usr/lib/libssl.so.3
+//
+// filepath.WalkDir does not follow internal symlinks (avoids cycles) but
+// does resolve the root if the root itself is a symlink — which means
+// Fedora's UsrMove pattern (/lib → /usr/lib, /lib64 → /usr/lib64) works
+// without manual EvalSymlinks calls.
 func findContainerTLSLibraries(pid int) []string {
-	rootPrefix := fmt.Sprintf("/proc/%d/root", pid)
-	libDirs := []string{"/usr/lib", "/lib", "/usr/local/lib"}
+	return walkTLSLibrariesUnder(fmt.Sprintf("/proc/%d/root", pid))
+}
 
-	seen := make(map[string]bool)
+// tlsLibScanRoots are the directory prefixes (relative to the target's
+// root filesystem) inside which we look for TLS shared libraries. Ordered
+// from most-common-distro convention to legacy aliases.
+var tlsLibScanRoots = []string{
+	"/usr/lib",       // Debian/Ubuntu primary + Alpine/Arch
+	"/usr/lib64",     // Fedora/RHEL/CentOS/openSUSE 64-bit
+	"/lib",           // legacy FHS root; symlink on modern distros
+	"/lib64",         // legacy FHS 64-bit alias
+	"/usr/local/lib", // operator/admin-installed
+}
+
+// walkTLSLibrariesUnder is the recursive scan that backs
+// findContainerTLSLibraries. Extracted with a configurable rootPrefix so
+// tests can exercise it against a synthetic filesystem laid out under a
+// tmpdir, exercising the exact same walker + isTLSLibrary filter the
+// production path uses.
+//
+// Dedup is by (device, inode), not by path string. Two distinct paths
+// can resolve to the same physical file in two common ways:
+//
+//  1. UsrMove distros (Fedora/Arch/etc.): /lib is a symlink to /usr/lib.
+//     filepath.WalkDir follows the root if the root itself is a symlink,
+//     so walking both /usr/lib AND /lib produces the same files under
+//     different path prefixes (e.g. /usr/lib/libssl.so.3 AND
+//     /lib/libssl.so.3, same inode).
+//  2. Library aliases: libssl.so → libssl.so.3 are typically symlinks
+//     to the same .so file in the same directory. WalkDir does NOT
+//     follow internal symlinks, so both names are visited as separate
+//     DirEntries, but they refer to the same inode.
+//
+// Attaching uprobes twice to the same inode wastes a verifier slot and
+// produces duplicate ringbuf events. Inode-dedup eliminates both.
+//
+// On stat failure we conservatively skip the entry (rather than fall
+// back to path-dedup) so a flaky filesystem can't double-register a
+// uprobe and corrupt event accounting.
+func walkTLSLibrariesUnder(rootPrefix string) []string {
+	type fileID struct {
+		dev uint64
+		ino uint64
+	}
+	seen := make(map[fileID]bool)
 	var libs []string
 
-	addIfTLS := func(hostPath string) {
-		if isTLSLibrary(filepath.Base(hostPath)) && !seen[hostPath] {
-			seen[hostPath] = true
-			libs = append(libs, strings.TrimPrefix(hostPath, rootPrefix))
-		}
-	}
-
-	for _, dir := range libDirs {
+	for _, dir := range tlsLibScanRoots {
 		hostDir := rootPrefix + dir
-		entries, err := os.ReadDir(hostDir)
-		if err != nil {
-			continue
-		}
-		for _, e := range entries {
-			fullPath := filepath.Join(hostDir, e.Name())
-			if e.IsDir() {
-				archEntries, err := os.ReadDir(fullPath)
-				if err != nil {
-					continue
+		_ = filepath.WalkDir(hostDir, func(path string, d fs.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				// Unreadable subtree (perm denied, missing dir) — skip
+				// silently and keep going. Returning SkipDir on a
+				// directory avoids WalkDir re-reporting the same error.
+				if d != nil && d.IsDir() {
+					return fs.SkipDir
 				}
-				for _, ae := range archEntries {
-					if !ae.IsDir() {
-						addIfTLS(filepath.Join(fullPath, ae.Name()))
-					}
-				}
-			} else {
-				addIfTLS(fullPath)
+				return nil
 			}
-		}
+			if d.IsDir() {
+				return nil
+			}
+			if !isTLSLibrary(d.Name()) {
+				return nil
+			}
+			// os.Stat (not d.Info() / lstat) so we follow symlinks
+			// to the underlying file. This matters for the
+			// libssl.so → libssl.so.3 alias case: both DirEntries
+			// pass isTLSLibrary, but lstat would give us each
+			// symlink's own inode and miss the dedup. Following
+			// the symlink gives us the real .so file's inode, so
+			// the second visit short-circuits on `seen[id]`.
+			info, err := os.Stat(path)
+			if err != nil {
+				return nil
+			}
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				return nil
+			}
+			id := fileID{dev: stat.Dev, ino: stat.Ino}
+			if seen[id] {
+				return nil
+			}
+			seen[id] = true
+			libs = append(libs, strings.TrimPrefix(path, rootPrefix))
+			return nil
+		})
 	}
 	return libs
 }
