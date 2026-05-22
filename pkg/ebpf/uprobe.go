@@ -137,6 +137,10 @@ type TLSUprobeManager struct {
 	tcAttached sync.Map // uint64 (netns inode) -> *tcAttachEntry
 	// cgroupToNetns maps cgroup ID → netns inode for cleanup on UntrackCgroup.
 	cgroupToNetns sync.Map // uint64 (cgroup ID) -> uint64 (netns inode)
+	// retryWG tracks the deferred-attach goroutines spawned by PollExecEvents.
+	// Close() waits on it (with a bounded timeout) before tearing down BPF
+	// objects, so a sleeping retry can't fire AttachTLS against a freed map fd.
+	retryWG sync.WaitGroup
 }
 
 // tcAttachEntry holds an open fd to a network namespace to prevent inode reuse.
@@ -1302,6 +1306,23 @@ func isTLSLibrary(name string) bool {
 // long the controller has been running.
 func (m *TLSUprobeManager) Close() error {
 	t0 := time.Now()
+	// Drain in-flight retry goroutines first. PollExecEvents is expected to
+	// be cancelled before Close() is called (its ctx fires the retry's
+	// select case), so the wait is normally instantaneous. The 5 s cap
+	// prevents a stuck retry from holding shutdown past kubelet's grace
+	// period. Must happen BEFORE we snapshot m.links — a retry can append
+	// to it via AttachTLS, and we'd race the snapshot otherwise.
+	waited := make(chan struct{})
+	go func() {
+		m.retryWG.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		m.log.Warnw("timed out waiting for retry goroutines on shutdown; proceeding with teardown")
+	}
+
 	// Snapshot + nil out the slice under the lock, then release before doing
 	// the (slow, ~50-100ms each) kernel syscalls. Holding linksMu across the
 	// parallel Close would serialize any in-flight AttachTLS calls against
@@ -1427,8 +1448,24 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 					// libssl may not be loaded yet (e.g. Python hasn't imported ssl).
 					// Retry after a delay to catch lazy-loaded libraries.
 					m.log.Debugw("first attach attempt failed, scheduling retry", "pid", pid, "err", err)
+					m.retryWG.Add(1)
 					go func(p int, cg uint64) {
-						time.Sleep(2 * time.Second)
+						defer m.retryWG.Done()
+						// Respect shutdown: a bare time.Sleep would call
+						// AttachTLS against freed BPF map fds if Close()
+						// runs during the 2 s window.
+						select {
+						case <-time.After(2 * time.Second):
+						case <-ctx.Done():
+							return
+						}
+						// Skip if the cgroup was untracked while we slept —
+						// the pod was deleted and the PID may have been
+						// reused by an unrelated host process.
+						if _, stillTracked := m.cgroupPaths.Load(cg); !stillTracked {
+							m.log.Debugw("cgroup untracked before retry; skipping", "pid", p, "cgroupID", cg)
+							return
+						}
 						if err := m.AttachTLS(p, cg); err != nil {
 							m.log.Debugw("retry attach also failed", "pid", p, "err", err)
 						}
