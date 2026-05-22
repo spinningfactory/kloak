@@ -56,7 +56,15 @@ func setupEBPF(
 	cgroupID uint64,
 	log *zap.SugaredLogger,
 ) (*ebpfHandle, error) {
-	mgr, err := ebpf.NewTLSUprobeManager(src, cgroupRoot, log)
+	// "auto" lets the eBPF layer resolve egress per-netns from
+	// /proc/net/route — works across CNI (eth0), Fedora (wlp*), and
+	// systemd-named hosts (enp0s3) without per-distro config.
+	//
+	// TODO: plumb this through krunk's CLI as --egress-interface so
+	// a host operator can pin a specific iface or opt out of external
+	// attachment ("none"/"lo-only"). For now we expose only the auto
+	// default, matching the controller DaemonSet's behavior.
+	mgr, err := ebpf.NewTLSUprobeManager(src, cgroupRoot, "auto", log)
 	if err != nil {
 		return nil, fmt.Errorf("load eBPF programs: %w", err)
 	}
