@@ -25,6 +25,16 @@ log:
 controller:
   ebpf:
     enabled: true
+    # Network interface for tc-egress attachment inside each tracked
+    # netns. "auto" (default) reads /proc/net/route inside the netns
+    # and picks the interface backing the default IPv4 route — works
+    # for the standard CNI "eth0" convention AND for host-mode netns
+    # where the default route exits via a non-standard name. Pin to a
+    # specific name (e.g. "eth0", "wlp3s0", "enp0s3") to override.
+    # Use "none" or "lo-only" to attach only to loopback (test fixtures
+    # / loopback-only workloads). `lo` is always attached in addition
+    # to whichever external interface this resolves to.
+    egressInterface: auto
   cgroupPath: /host/sys/fs/cgroup
   dns:
     # Trusted DNS server IPs. Only DNS responses from these servers are used
