@@ -1104,8 +1104,32 @@ var tlsLibScanRoots = []string{
 // tests can exercise it against a synthetic filesystem laid out under a
 // tmpdir, exercising the exact same walker + isTLSLibrary filter the
 // production path uses.
+//
+// Dedup is by (device, inode), not by path string. Two distinct paths
+// can resolve to the same physical file in two common ways:
+//
+//  1. UsrMove distros (Fedora/Arch/etc.): /lib is a symlink to /usr/lib.
+//     filepath.WalkDir follows the root if the root itself is a symlink,
+//     so walking both /usr/lib AND /lib produces the same files under
+//     different path prefixes (e.g. /usr/lib/libssl.so.3 AND
+//     /lib/libssl.so.3, same inode).
+//  2. Library aliases: libssl.so → libssl.so.3 are typically symlinks
+//     to the same .so file in the same directory. WalkDir does NOT
+//     follow internal symlinks, so both names are visited as separate
+//     DirEntries, but they refer to the same inode.
+//
+// Attaching uprobes twice to the same inode wastes a verifier slot and
+// produces duplicate ringbuf events. Inode-dedup eliminates both.
+//
+// On stat failure we conservatively skip the entry (rather than fall
+// back to path-dedup) so a flaky filesystem can't double-register a
+// uprobe and corrupt event accounting.
 func walkTLSLibrariesUnder(rootPrefix string) []string {
-	seen := make(map[string]bool)
+	type fileID struct {
+		dev uint64
+		ino uint64
+	}
+	seen := make(map[fileID]bool)
 	var libs []string
 
 	for _, dir := range tlsLibScanRoots {
@@ -1126,10 +1150,26 @@ func walkTLSLibrariesUnder(rootPrefix string) []string {
 			if !isTLSLibrary(d.Name()) {
 				return nil
 			}
-			if seen[path] {
+			// os.Stat (not d.Info() / lstat) so we follow symlinks
+			// to the underlying file. This matters for the
+			// libssl.so → libssl.so.3 alias case: both DirEntries
+			// pass isTLSLibrary, but lstat would give us each
+			// symlink's own inode and miss the dedup. Following
+			// the symlink gives us the real .so file's inode, so
+			// the second visit short-circuits on `seen[id]`.
+			info, err := os.Stat(path)
+			if err != nil {
 				return nil
 			}
-			seen[path] = true
+			stat, ok := info.Sys().(*syscall.Stat_t)
+			if !ok {
+				return nil
+			}
+			id := fileID{dev: uint64(stat.Dev), ino: stat.Ino}
+			if seen[id] {
+				return nil
+			}
+			seen[id] = true
 			libs = append(libs, strings.TrimPrefix(path, rootPrefix))
 			return nil
 		})

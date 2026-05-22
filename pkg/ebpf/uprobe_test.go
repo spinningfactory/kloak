@@ -3,7 +3,9 @@
 package ebpf
 
 import (
+	"fmt"
 	"os"
+	"syscall"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -216,5 +218,87 @@ func TestWalkTLSLibrariesUnder_Recursive(t *testing.T) {
 		if gotSet[banned] {
 			t.Errorf("scanner picked up %q which should NOT be found", banned)
 		}
+	}
+}
+
+func TestWalkTLSLibrariesUnder_DeduplicatesByInode(t *testing.T) {
+	// Two flavors of duplicate that the path-string dedup missed and
+	// inode-dedup catches:
+	//
+	//   1. UsrMove: /lib is a symlink to /usr/lib (Fedora, Arch, modern
+	//      Debian). WalkDir follows the root if it IS a symlink, so the
+	//      same files appear once under /usr/lib/... and once under
+	//      /lib/... — different path strings, same inode.
+	//   2. Library aliases inside one directory: libssl.so → libssl.so.3
+	//      is a symlink that WalkDir does NOT follow (it's not a root),
+	//      so both DirEntries are visited. Same inode, both pass
+	//      isTLSLibrary.
+	//
+	// Attaching uprobes to the same inode twice wastes a verifier slot
+	// and produces duplicate ringbuf events. This test pins the
+	// invariant that walkTLSLibrariesUnder returns each physical file
+	// once.
+	tmpRoot := t.TempDir()
+	mustMkdir := func(p string) {
+		t.Helper()
+		if err := os.MkdirAll(p, 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", p, err)
+		}
+	}
+	mustTouch := func(p string) {
+		t.Helper()
+		if err := os.WriteFile(p, []byte("fake"), 0o644); err != nil {
+			t.Fatalf("touch %s: %v", p, err)
+		}
+	}
+	mustSymlink := func(target, link string) {
+		t.Helper()
+		if err := os.Symlink(target, link); err != nil {
+			t.Fatalf("symlink %s → %s: %v", link, target, err)
+		}
+	}
+
+	// Case 1: UsrMove — /lib symlinks to /usr/lib.
+	mustMkdir(tmpRoot + "/usr/lib")
+	mustTouch(tmpRoot + "/usr/lib/libssl.so.3")
+	// Relative symlink from tmpRoot/lib → tmpRoot/usr/lib so the
+	// in-tree layout mirrors what a real Fedora root_fs looks like.
+	mustSymlink("usr/lib", tmpRoot+"/lib")
+
+	// Case 2: alias inside one directory — libssl.so → libssl.so.3.
+	// /usr/lib64 stays a real directory; libssl.so is a symlink
+	// pointing at libssl.so.3 inside the same directory.
+	mustMkdir(tmpRoot + "/usr/lib64")
+	mustTouch(tmpRoot + "/usr/lib64/libssl.so.3")
+	mustSymlink("libssl.so.3", tmpRoot+"/usr/lib64/libssl.so")
+
+	got := walkTLSLibrariesUnder(tmpRoot)
+
+	// Each physical inode appears at most once. We don't pin which
+	// path string wins (walk order can pick either) — the contract is
+	// "no two entries share an inode."
+	seen := make(map[string]int)
+	for _, p := range got {
+		info, err := os.Stat(tmpRoot + p)
+		if err != nil {
+			t.Fatalf("stat %s: %v", tmpRoot+p, err)
+		}
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			t.Fatalf("non-Stat_t Sys() on %s", p)
+		}
+		key := fmt.Sprintf("%d:%d", stat.Dev, stat.Ino)
+		seen[key]++
+	}
+	for inodeKey, count := range seen {
+		if count > 1 {
+			t.Errorf("inode %s appears %d times in scan result; expected 1\nfull result: %v", inodeKey, count, got)
+		}
+	}
+
+	// And we still find SOMETHING for each physical lib — the dedup
+	// must not be so aggressive that it drops everything.
+	if len(got) < 2 {
+		t.Errorf("expected at least 2 distinct TLS libs (UsrMove file + alias target), got %d: %v", len(got), got)
 	}
 }
