@@ -815,13 +815,15 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 	// Try main executable first (statically linked OpenSSL/BoringSSL/GnuTLS).
 	// Use PID-scoped because the main exe is unique per container.
 	for _, sym := range append(sslSymbols, gnutlsSymbols...) {
-		if up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid}); err == nil {
-			m.log.Debugw("Attached uprobe to main exe", "pid", pid, "symbol", sym)
-			m.linksMu.Lock()
-			m.links = append(m.links, up)
-			m.linksMu.Unlock()
-			attached = true
+		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid})
+		if err != nil {
+			continue
 		}
+		m.log.Debugw("Attached uprobe to main exe", "pid", pid, "symbol", sym)
+		m.linksMu.Lock()
+		m.links = append(m.links, up)
+		m.linksMu.Unlock()
+		attached = true
 	}
 
 	// Scan container filesystem for all TLS shared libraries
@@ -835,13 +837,15 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 			continue
 		}
 		for _, sym := range append(sslSymbols, gnutlsSymbols...) {
-			if up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil); err == nil {
-				m.log.Debugw("Attached uprobe (system-wide)", "pid", pid, "symbol", sym, "lib", containerPath)
-				m.linksMu.Lock()
-				m.links = append(m.links, up)
-				m.linksMu.Unlock()
-				attached = true
+			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
+			if err != nil {
+				continue
 			}
+			m.log.Debugw("Attached uprobe (system-wide)", "pid", pid, "symbol", sym, "lib", containerPath)
+			m.linksMu.Lock()
+			m.links = append(m.links, up)
+			m.linksMu.Unlock()
+			attached = true
 		}
 	}
 
