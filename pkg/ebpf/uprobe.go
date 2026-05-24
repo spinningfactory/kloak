@@ -94,7 +94,11 @@ type TLSUprobeManager struct {
 	reader     *ringbuf.Reader
 	procReader *ringbuf.Reader
 	log        *zap.SugaredLogger
-	links      []link.Link
+	// linksMu guards links — AttachTLS runs concurrently from the reconciler
+	// goroutine and PollExecEvents (incl. its retry goroutine), so unsynchronized
+	// appends could lose entries, double-write the backing array, or race Close().
+	linksMu sync.Mutex
+	links   []link.Link
 
 	// secretSource produces snapshots of the secrets the BPF map should
 	// hold. The k8s controller wires a pkg/secrets/k8s.Source here; tests
@@ -372,7 +376,9 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 		if err != nil {
 			return fmt.Errorf("attaching tracepoint %s/%s: %w", t.group, t.name, err)
 		}
+		m.linksMu.Lock()
 		m.links = append(m.links, l)
+		m.linksMu.Unlock()
 		m.log.Debugw("Attached tracepoint", "group", t.group, "name", t.name)
 	}
 
@@ -381,14 +387,18 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	if err != nil {
 		return fmt.Errorf("attaching kprobe udp_recvmsg: %w", err)
 	}
+	m.linksMu.Lock()
 	m.links = append(m.links, kp)
+	m.linksMu.Unlock()
 	m.log.Debugw("Attached kprobe", "function", "udp_recvmsg")
 
 	krp, err := link.Kretprobe("udp_recvmsg", m.objs.KretprobeUdpRecvmsg, nil)
 	if err != nil {
 		return fmt.Errorf("attaching kretprobe udp_recvmsg: %w", err)
 	}
+	m.linksMu.Lock()
 	m.links = append(m.links, krp)
+	m.linksMu.Unlock()
 	m.log.Debugw("Attached kretprobe", "function", "udp_recvmsg")
 
 	// Attach kprobe on tcp_sendmsg to bridge xor_pending → tc_pending.
@@ -398,7 +408,9 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	if err != nil {
 		return fmt.Errorf("attaching kprobe tcp_sendmsg: %w", err)
 	}
+	m.linksMu.Lock()
 	m.links = append(m.links, tkp)
+	m.linksMu.Unlock()
 	m.log.Debugw("Attached kprobe", "function", "tcp_sendmsg")
 
 	return nil
@@ -416,15 +428,40 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	// the netns inode. We keep an open fd to the netns file — this prevents
 	// the kernel from freeing the inode, so a new pod's netns always gets a
 	// different inode (no false dedup from inode reuse).
+	//
+	// To avoid a TOCTOU race between this check and the final Store (two
+	// goroutines could both miss the Load and both attach tc, doubling the
+	// patch program on each interface and corrupting GHASH), we reserve the
+	// inode atomically with LoadOrStore using a zero-value placeholder. The
+	// winner proceeds with the attach; losers bail out. On any failure the
+	// winner MUST Delete the placeholder so a future retry can succeed.
 	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+	var netnsIno uint64
+	var haveIno bool
 	if fi, err := os.Stat(netnsPath); err == nil {
 		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
-			if _, loaded := m.tcAttached.Load(stat.Ino); loaded {
-				m.log.Debugw("tc egress already attached for this netns", "pid", pid, "netns_ino", stat.Ino)
+			netnsIno = stat.Ino
+			haveIno = true
+			placeholder := &tcAttachEntry{} // zero value, no fd yet
+			if _, loaded := m.tcAttached.LoadOrStore(netnsIno, placeholder); loaded {
+				m.log.Debugw("tc egress already attached or in-flight for this netns", "pid", pid, "netns_ino", netnsIno)
 				return nil
 			}
 		}
 	}
+
+	// rollback releases the placeholder on any error path so a later retry
+	// can re-attempt the attach. Cleared (set nil) on success.
+	rollback := func() {
+		if haveIno {
+			m.tcAttached.Delete(netnsIno)
+		}
+	}
+	defer func() {
+		if rollback != nil {
+			rollback()
+		}
+	}()
 
 	// Open the netns fd for two purposes:
 	// 1. setns to enter the container's network namespace
@@ -433,8 +470,9 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	if err != nil {
 		return fmt.Errorf("opening container netns %s: %w", netnsPath, err)
 	}
-	// NOTE: containerNS is NOT closed here — it's stored in tcAttachEntry
-	// to pin the netns inode. Closed in UntrackCgroup when the pod is deleted.
+	// NOTE: containerNS is NOT closed here on success — it's stored in
+	// tcAttachEntry to pin the netns inode. Closed in UntrackCgroup when
+	// the pod is deleted.
 
 	// Save our current network namespace.
 	selfNS, err := os.Open("/proc/self/ns/net")
@@ -496,16 +534,24 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 			_ = containerNS.Close()
 			return fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", ifName, iface.Index, pid, err)
 		}
+		m.linksMu.Lock()
 		m.links = append(m.links, tcLink)
+		m.linksMu.Unlock()
 		m.log.Debugw("Attached tc egress to container", "pid", pid, "interface", ifName, "ifindex", iface.Index)
 	}
 
-	// Store the open netns fd keyed by inode. The open fd pins the inode —
-	// the kernel won't reuse it until we close the fd in UntrackCgroup.
-	if fi, err := os.Stat(netnsPath); err == nil {
-		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
-			m.tcAttached.Store(stat.Ino, &tcAttachEntry{netnsFd: containerNS})
-		}
+	// Replace the placeholder with the real entry holding the pinned netns fd.
+	// The open fd pins the inode — the kernel won't reuse it until we close
+	// the fd in UntrackCgroup. We already have the inode from the LoadOrStore
+	// above, so no second os.Stat is needed.
+	if haveIno {
+		m.tcAttached.Store(netnsIno, &tcAttachEntry{netnsFd: containerNS})
+		rollback = nil // success — keep the entry in place
+	} else {
+		// Defensive: we never reserved a placeholder (initial Stat failed),
+		// so there's nothing to roll back. Close the open fd to avoid a leak
+		// since it won't be tracked for cleanup.
+		_ = containerNS.Close()
 	}
 	return nil
 }
@@ -743,7 +789,9 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 	goWriteSym := "crypto/tls.(*Conn).Write"
 	if up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, &link.UprobeOptions{PID: pid}); err == nil {
 		m.log.Debugw("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
+		m.linksMu.Lock()
 		m.links = append(m.links, up)
+		m.linksMu.Unlock()
 
 		// Push Go-specific struct offsets for H extraction and attach tc egress
 		// for ciphertext patching. Both are required for the XOR-patch path.
@@ -767,11 +815,15 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 	// Try main executable first (statically linked OpenSSL/BoringSSL/GnuTLS).
 	// Use PID-scoped because the main exe is unique per container.
 	for _, sym := range append(sslSymbols, gnutlsSymbols...) {
-		if up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid}); err == nil {
-			m.log.Debugw("Attached uprobe to main exe", "pid", pid, "symbol", sym)
-			m.links = append(m.links, up)
-			attached = true
+		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid})
+		if err != nil {
+			continue
 		}
+		m.log.Debugw("Attached uprobe to main exe", "pid", pid, "symbol", sym)
+		m.linksMu.Lock()
+		m.links = append(m.links, up)
+		m.linksMu.Unlock()
+		attached = true
 	}
 
 	// Scan container filesystem for all TLS shared libraries
@@ -785,11 +837,15 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 			continue
 		}
 		for _, sym := range append(sslSymbols, gnutlsSymbols...) {
-			if up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil); err == nil {
-				m.log.Debugw("Attached uprobe (system-wide)", "pid", pid, "symbol", sym, "lib", containerPath)
-				m.links = append(m.links, up)
-				attached = true
+			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
+			if err != nil {
+				continue
 			}
+			m.log.Debugw("Attached uprobe (system-wide)", "pid", pid, "symbol", sym, "lib", containerPath)
+			m.linksMu.Lock()
+			m.links = append(m.links, up)
+			m.linksMu.Unlock()
+			attached = true
 		}
 	}
 
@@ -892,7 +948,9 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []st
 				_ = up.Close()
 				continue
 			}
+			m.linksMu.Lock()
 			m.links = append(m.links, up, ret)
+			m.linksMu.Unlock()
 			m.log.Debugw("Attached EVP_CipherInit hooks (main exe, PID-scoped)",
 				"pid", pid, "symbol", sym)
 			attached = true
@@ -937,7 +995,9 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []st
 					"pid", pid, "symbol", sym, "lib", containerPath, "error", errRet)
 				continue
 			}
+			m.linksMu.Lock()
 			m.links = append(m.links, up, ret)
+			m.linksMu.Unlock()
 			m.log.Debugw("Attached EVP_CipherInit hooks (libcrypto.so, system-wide)",
 				"pid", pid, "symbol", sym, "lib", containerPath)
 			attached = true
@@ -1198,7 +1258,17 @@ func isTLSLibrary(name string) bool {
 // long the controller has been running.
 func (m *TLSUprobeManager) Close() error {
 	t0 := time.Now()
-	linkCount := len(m.links)
+	// Snapshot + nil out the slice under the lock, then release before doing
+	// the (slow, ~50-100ms each) kernel syscalls. Holding linksMu across the
+	// parallel Close would serialize any in-flight AttachTLS calls against
+	// the full shutdown — and the syscalls themselves don't need the lock
+	// since the slice is already detached.
+	m.linksMu.Lock()
+	links := m.links
+	m.links = nil
+	m.linksMu.Unlock()
+
+	linkCount := len(links)
 	var errs []error
 	var errsMu sync.Mutex
 
@@ -1224,12 +1294,11 @@ func (m *TLSUprobeManager) Close() error {
 			}
 		}()
 	}
-	for _, l := range m.links {
+	for _, l := range links {
 		jobs <- l
 	}
 	close(jobs)
 	wg.Wait()
-	m.links = nil
 
 	if m.reader != nil {
 		if err := m.reader.Close(); err != nil {
