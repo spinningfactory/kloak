@@ -1453,10 +1453,17 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 						defer m.retryWG.Done()
 						// Respect shutdown: a bare time.Sleep would call
 						// AttachTLS against freed BPF map fds if Close()
-						// runs during the 2 s window.
+						// runs during the 2 s window. Use time.NewTimer so
+						// that ctx.Done winning the select releases the
+						// underlying runtime timer immediately instead of
+						// leaving it in the heap until it fires — under
+						// pod churn we'd otherwise accumulate one live
+						// timer per failed attach.
+						timer := time.NewTimer(2 * time.Second)
 						select {
-						case <-time.After(2 * time.Second):
+						case <-timer.C:
 						case <-ctx.Done():
+							timer.Stop()
 							return
 						}
 						// Skip if the cgroup was untracked while we slept —
