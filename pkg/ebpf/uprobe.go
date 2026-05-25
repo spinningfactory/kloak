@@ -506,6 +506,14 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	// name missing from the netns) surface below via net.InterfaceByName.
 	ifNames := m.resolveEgressInterfaces(pid)
 
+	// Pre-validate every interface before attaching any. If we attached the
+	// first interface and then failed on the second, the kernel-side TCX
+	// attachment would stay live but tcAttached.Store below would never run,
+	// so the reconciler's next retry would miss the dedup and re-attach the
+	// same TCX program a second time. link.AttachTCX stacks attachments —
+	// every egress packet would then run through the patch program twice and
+	// produce the wrong GHASH.
+	ifaces := make([]*net.Interface, 0, len(ifNames))
 	for _, ifName := range ifNames {
 		iface, err := net.InterfaceByName(ifName)
 		if err != nil {
@@ -524,21 +532,35 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 			_ = containerNS.Close()
 			return fmt.Errorf("egress interface %q not found in pid %d netns (configured via --egress-interface or controller.ebpf.egressInterface): %w", ifName, pid, err)
 		}
+		ifaces = append(ifaces, iface)
+	}
 
+	// Track links attached during this call locally. On a partial failure we
+	// close them and return without adding to m.links, so a retry doesn't see
+	// a half-attached netns.
+	attachedHere := make([]link.Link, 0, len(ifaces))
+	for i, iface := range ifaces {
 		tcLink, err := link.AttachTCX(link.TCXOptions{
 			Interface: iface.Index,
 			Program:   m.objs.TcEgressPatch,
 			Attach:    ebpf.AttachTCXEgress,
 		})
 		if err != nil {
+			for _, prior := range attachedHere {
+				if cerr := prior.Close(); cerr != nil {
+					m.log.Warnw("rollback: failed to close partially-attached tc egress link", "error", cerr, "pid", pid)
+				}
+			}
 			_ = containerNS.Close()
-			return fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", ifName, iface.Index, pid, err)
+			return fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", ifNames[i], iface.Index, pid, err)
 		}
-		m.linksMu.Lock()
-		m.links = append(m.links, tcLink)
-		m.linksMu.Unlock()
-		m.log.Debugw("Attached tc egress to container", "pid", pid, "interface", ifName, "ifindex", iface.Index)
+		attachedHere = append(attachedHere, tcLink)
+		m.log.Debugw("Attached tc egress to container", "pid", pid, "interface", ifNames[i], "ifindex", iface.Index)
 	}
+
+	m.linksMu.Lock()
+	m.links = append(m.links, attachedHere...)
+	m.linksMu.Unlock()
 
 	// Replace the placeholder with the real entry holding the pinned netns fd.
 	// The open fd pins the inode — the kernel won't reuse it until we close
