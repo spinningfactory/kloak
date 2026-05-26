@@ -94,7 +94,11 @@ type TLSUprobeManager struct {
 	reader     *ringbuf.Reader
 	procReader *ringbuf.Reader
 	log        *zap.SugaredLogger
-	links      []link.Link
+	// linksMu guards links — AttachTLS runs concurrently from the reconciler
+	// goroutine and PollExecEvents (incl. its retry goroutine), so unsynchronized
+	// appends could lose entries, double-write the backing array, or race Close().
+	linksMu sync.Mutex
+	links   []link.Link
 
 	// secretSource produces snapshots of the secrets the BPF map should
 	// hold. The k8s controller wires a pkg/secrets/k8s.Source here; tests
@@ -133,6 +137,10 @@ type TLSUprobeManager struct {
 	tcAttached sync.Map // uint64 (netns inode) -> *tcAttachEntry
 	// cgroupToNetns maps cgroup ID → netns inode for cleanup on UntrackCgroup.
 	cgroupToNetns sync.Map // uint64 (cgroup ID) -> uint64 (netns inode)
+	// retryWG tracks the deferred-attach goroutines spawned by PollExecEvents.
+	// Close() waits on it (with a bounded timeout) before tearing down BPF
+	// objects, so a sleeping retry can't fire AttachTLS against a freed map fd.
+	retryWG sync.WaitGroup
 }
 
 // tcAttachEntry holds an open fd to a network namespace to prevent inode reuse.
@@ -407,7 +415,9 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 		if err != nil {
 			return fmt.Errorf("attaching tracepoint %s/%s: %w", t.group, t.name, err)
 		}
+		m.linksMu.Lock()
 		m.links = append(m.links, l)
+		m.linksMu.Unlock()
 		m.log.Debugw("Attached tracepoint", "group", t.group, "name", t.name)
 	}
 
@@ -416,14 +426,18 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	if err != nil {
 		return fmt.Errorf("attaching kprobe udp_recvmsg: %w", err)
 	}
+	m.linksMu.Lock()
 	m.links = append(m.links, kp)
+	m.linksMu.Unlock()
 	m.log.Debugw("Attached kprobe", "function", "udp_recvmsg")
 
 	krp, err := link.Kretprobe("udp_recvmsg", m.objs.KretprobeUdpRecvmsg, nil)
 	if err != nil {
 		return fmt.Errorf("attaching kretprobe udp_recvmsg: %w", err)
 	}
+	m.linksMu.Lock()
 	m.links = append(m.links, krp)
+	m.linksMu.Unlock()
 	m.log.Debugw("Attached kretprobe", "function", "udp_recvmsg")
 
 	// Attach kprobe on tcp_sendmsg to bridge xor_pending → tc_pending.
@@ -433,7 +447,9 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	if err != nil {
 		return fmt.Errorf("attaching kprobe tcp_sendmsg: %w", err)
 	}
+	m.linksMu.Lock()
 	m.links = append(m.links, tkp)
+	m.linksMu.Unlock()
 	m.log.Debugw("Attached kprobe", "function", "tcp_sendmsg")
 
 	return nil
@@ -451,15 +467,55 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	// the netns inode. We keep an open fd to the netns file — this prevents
 	// the kernel from freeing the inode, so a new pod's netns always gets a
 	// different inode (no false dedup from inode reuse).
+	//
+	// To avoid a TOCTOU race between this check and the final Store (two
+	// goroutines could both miss the Load and both attach tc, doubling the
+	// patch program on each interface and corrupting GHASH), we reserve the
+	// inode atomically with LoadOrStore using a zero-value placeholder. The
+	// winner proceeds with the attach; losers bail out. On any failure the
+	// winner MUST Delete the placeholder so a future retry can succeed.
+	//
+	// Placeholder semantics on a hit:
+	//   netnsFd == nil → attach is in-flight by another goroutine. Return
+	//     an error so the caller retries; returning nil would mask an
+	//     in-flight failure (if that goroutine deletes its placeholder, the
+	//     caller who got nil won't retry and the pod stays unpatched).
+	//   netnsFd != nil → a previous attach completed successfully. Return
+	//     nil; no work to do.
 	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+	var netnsIno uint64
+	var haveIno bool
+	var placeholder *tcAttachEntry
 	if fi, err := os.Stat(netnsPath); err == nil {
 		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
-			if _, loaded := m.tcAttached.Load(stat.Ino); loaded {
-				m.log.Debugw("tc egress already attached for this netns", "pid", pid, "netns_ino", stat.Ino)
-				return nil
+			netnsIno = stat.Ino
+			haveIno = true
+			placeholder = &tcAttachEntry{} // zero value, no fd yet
+			if existing, loaded := m.tcAttached.LoadOrStore(netnsIno, placeholder); loaded {
+				placeholder = nil // we didn't reserve a slot; nothing to roll back
+				if e, ok := existing.(*tcAttachEntry); ok && e.netnsFd != nil {
+					m.log.Debugw("tc egress already attached for this netns", "pid", pid, "netns_ino", netnsIno)
+					return nil
+				}
+				return fmt.Errorf("tc egress attach in progress for pid %d netns %d; retry", pid, netnsIno)
 			}
 		}
 	}
+
+	// rollback releases the placeholder on any error path so a later retry
+	// can re-attempt the attach. CompareAndDelete (not plain Delete) so a
+	// real entry that some pathological reorder placed into the slot can't
+	// be accidentally removed. Cleared (set nil) on success.
+	rollback := func() {
+		if haveIno && placeholder != nil {
+			m.tcAttached.CompareAndDelete(netnsIno, placeholder)
+		}
+	}
+	defer func() {
+		if rollback != nil {
+			rollback()
+		}
+	}()
 
 	// Open the netns fd for two purposes:
 	// 1. setns to enter the container's network namespace
@@ -468,8 +524,9 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	if err != nil {
 		return fmt.Errorf("opening container netns %s: %w", netnsPath, err)
 	}
-	// NOTE: containerNS is NOT closed here — it's stored in tcAttachEntry
-	// to pin the netns inode. Closed in UntrackCgroup when the pod is deleted.
+	// NOTE: containerNS is NOT closed here on success — it's stored in
+	// tcAttachEntry to pin the netns inode. Closed in UntrackCgroup when
+	// the pod is deleted.
 
 	// Save our current network namespace.
 	selfNS, err := os.Open("/proc/self/ns/net")
@@ -479,68 +536,135 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	}
 	defer func() { _ = selfNS.Close() }()
 
-	// Lock OS thread — setns is per-thread.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	// Switch to the container's network namespace.
-	if err := unix.Setns(int(containerNS.Fd()), unix.CLONE_NEWNET); err != nil {
-		_ = containerNS.Close()
-		return fmt.Errorf("setns to container netns: %w", err)
+	// Run the netns-entered work in a dedicated worker goroutine, NOT on
+	// the caller's goroutine. Per Go runtime contract
+	// (https://pkg.go.dev/runtime#LockOSThread), if a goroutine exits
+	// without unlocking its OS thread, the runtime retires the thread
+	// instead of returning it to the worker pool. So if setns-restore
+	// fails, we want the goroutine holding the wrong-netns thread to
+	// exit, taking the poisoned thread with it.
+	//
+	// Doing this on the caller's goroutine (the reconciler loop or
+	// PollExecEvents — both long-lived) would leave the poisoned thread
+	// pinned to a caller that keeps running, so subsequent BPF syscalls
+	// / net.Dial / k8s client-go HTTP calls in that caller would silently
+	// route through the container's netns. A short-lived worker
+	// goroutine isolates the failure to the worker alone.
+	//
+	// Do NOT "simplify" this back to inline LockOSThread on the caller.
+	type tcResult struct {
+		links []link.Link
+		err   error
 	}
+	resultCh := make(chan tcResult, 1)
+	go func() {
+		runtime.LockOSThread()
+		threadUsable := true
+		defer func() {
+			if threadUsable {
+				runtime.UnlockOSThread()
+			}
+			// else: goroutine returns with thread still locked; the Go
+			// runtime retires that OS thread and never returns it to
+			// the worker pool. The caller is unaffected.
+		}()
 
-	// Ensure we return to our original netns.
-	defer func() {
-		if err := unix.Setns(int(selfNS.Fd()), unix.CLONE_NEWNET); err != nil {
-			m.log.Errorw("failed to restore original netns", "error", err)
+		// Switch to the container's network namespace.
+		if err := unix.Setns(int(containerNS.Fd()), unix.CLONE_NEWNET); err != nil {
+			resultCh <- tcResult{err: fmt.Errorf("setns to container netns: %w", err)}
+			return
 		}
+		// Ensure we return to our original netns. Registered AFTER the
+		// unlock defer so it runs FIRST (LIFO): restore is attempted,
+		// and on failure threadUsable is flipped before the unlock
+		// defer reads it.
+		defer func() {
+			if err := unix.Setns(int(selfNS.Fd()), unix.CLONE_NEWNET); err != nil {
+				m.log.Errorw("CRITICAL: failed to restore netns; retiring this worker goroutine's OS thread",
+					"error", err, "pid", pid)
+				threadUsable = false
+			}
+		}()
+
+		// Resolve which external interface to attach tc egress on. We're
+		// now inside the target netns (setns above), so net.InterfaceByName
+		// and /proc/net/route both see the netns-local view.
+		ifNames := m.resolveEgressInterfaces(pid)
+
+		// Pre-validate every interface before attaching any. If we
+		// attached the first interface and then failed on the second, the
+		// kernel-side TCX attachment would stay live but the CAS below
+		// would never run, so the reconciler's next retry would miss the
+		// dedup and re-attach the same TCX program a second time.
+		// link.AttachTCX stacks attachments → wrong GHASH.
+		ifaces := make([]*net.Interface, 0, len(ifNames))
+		for _, ifName := range ifNames {
+			iface, err := net.InterfaceByName(ifName)
+			if err != nil {
+				if ifName == "lo" {
+					resultCh <- tcResult{err: fmt.Errorf("finding %s in container netns: %w", ifName, err)}
+					return
+				}
+				resultCh <- tcResult{err: fmt.Errorf("egress interface %q not found in pid %d netns (configured via --egress-interface or controller.ebpf.egressInterface): %w", ifName, pid, err)}
+				return
+			}
+			ifaces = append(ifaces, iface)
+		}
+
+		// Track links attached during this call locally. On a partial
+		// failure close them all and return; the caller won't splice
+		// them into m.links so a retry doesn't see a half-attached netns.
+		attachedHere := make([]link.Link, 0, len(ifaces))
+		for i, iface := range ifaces {
+			tcLink, err := link.AttachTCX(link.TCXOptions{
+				Interface: iface.Index,
+				Program:   m.objs.TcEgressPatch,
+				Attach:    ebpf.AttachTCXEgress,
+			})
+			if err != nil {
+				for _, prior := range attachedHere {
+					if cerr := prior.Close(); cerr != nil {
+						m.log.Warnw("rollback: failed to close partially-attached tc egress link", "error", cerr, "pid", pid)
+					}
+				}
+				resultCh <- tcResult{err: fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", ifNames[i], iface.Index, pid, err)}
+				return
+			}
+			attachedHere = append(attachedHere, tcLink)
+			m.log.Debugw("Attached tc egress to container", "pid", pid, "interface", ifNames[i], "ifindex", iface.Index)
+		}
+		resultCh <- tcResult{links: attachedHere}
 	}()
 
-	// Resolve which external interface to attach tc egress on. We're now
-	// inside the target netns (setns above), so net.InterfaceByName and
-	// /proc/net/route both see the netns-local view. resolveEgressInterfaces
-	// is best-effort + log-only — hard-failure cases (explicit interface
-	// name missing from the netns) surface below via net.InterfaceByName.
-	ifNames := m.resolveEgressInterfaces(pid)
-
-	for _, ifName := range ifNames {
-		iface, err := net.InterfaceByName(ifName)
-		if err != nil {
-			// lo should always exist; if it doesn't, the netns is
-			// fundamentally broken — fail loudly.
-			if ifName == "lo" {
-				_ = containerNS.Close()
-				return fmt.Errorf("finding %s in container netns: %w", ifName, err)
-			}
-			// External interface lookup failed. If the user pinned
-			// an explicit name and it's missing, that's a hard error
-			// (silently skipping would leave their traffic un-patched
-			// and they'd never know). For the auto-detected case the
-			// resolver wouldn't have returned a name that doesn't
-			// exist, so this branch is reserved for the pinned case.
-			_ = containerNS.Close()
-			return fmt.Errorf("egress interface %q not found in pid %d netns (configured via --egress-interface or controller.ebpf.egressInterface): %w", ifName, pid, err)
-		}
-
-		tcLink, err := link.AttachTCX(link.TCXOptions{
-			Interface: iface.Index,
-			Program:   m.objs.TcEgressPatch,
-			Attach:    ebpf.AttachTCXEgress,
-		})
-		if err != nil {
-			_ = containerNS.Close()
-			return fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", ifName, iface.Index, pid, err)
-		}
-		m.links = append(m.links, tcLink)
-		m.log.Debugw("Attached tc egress to container", "pid", pid, "interface", ifName, "ifindex", iface.Index)
+	res := <-resultCh
+	if res.err != nil {
+		_ = containerNS.Close()
+		return res.err
 	}
 
-	// Store the open netns fd keyed by inode. The open fd pins the inode —
-	// the kernel won't reuse it until we close the fd in UntrackCgroup.
-	if fi, err := os.Stat(netnsPath); err == nil {
-		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
-			m.tcAttached.Store(stat.Ino, &tcAttachEntry{netnsFd: containerNS})
+	m.linksMu.Lock()
+	m.links = append(m.links, res.links...)
+	m.linksMu.Unlock()
+
+	// Replace the placeholder with the real entry holding the pinned netns fd.
+	// CompareAndSwap (not Store) guards against a concurrent UntrackCgroup
+	// (pod deleted mid-attach) that already removed our placeholder —
+	// unconditional Store would re-insert the entry and leak containerNS,
+	// since UntrackCgroup is the only place that closes the pinned netns fd.
+	// On a lost CAS, close containerNS directly and let Close() take down
+	// the TCX links via m.links at controller shutdown.
+	if haveIno {
+		finalEntry := &tcAttachEntry{netnsFd: containerNS}
+		if !m.tcAttached.CompareAndSwap(netnsIno, placeholder, finalEntry) {
+			_ = containerNS.Close()
+			m.log.Debugw("tcAttached entry removed mid-attach (pod likely deleted); not reinserting", "pid", pid, "netns_ino", netnsIno)
 		}
+		rollback = nil // success — don't run the rollback defer
+	} else {
+		// Defensive: we never reserved a placeholder (initial Stat failed),
+		// so there's nothing to roll back. Close the open fd to avoid a leak
+		// since it won't be tracked for cleanup.
+		_ = containerNS.Close()
 	}
 	return nil
 }
@@ -778,7 +902,9 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 	goWriteSym := "crypto/tls.(*Conn).Write"
 	if up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, &link.UprobeOptions{PID: pid}); err == nil {
 		m.log.Debugw("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
+		m.linksMu.Lock()
 		m.links = append(m.links, up)
+		m.linksMu.Unlock()
 
 		// Push Go-specific struct offsets for H extraction and attach tc egress
 		// for ciphertext patching. Both are required for the XOR-patch path.
@@ -802,11 +928,15 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 	// Try main executable first (statically linked OpenSSL/BoringSSL/GnuTLS).
 	// Use PID-scoped because the main exe is unique per container.
 	for _, sym := range append(sslSymbols, gnutlsSymbols...) {
-		if up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid}); err == nil {
-			m.log.Debugw("Attached uprobe to main exe", "pid", pid, "symbol", sym)
-			m.links = append(m.links, up)
-			attached = true
+		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid})
+		if err != nil {
+			continue
 		}
+		m.log.Debugw("Attached uprobe to main exe", "pid", pid, "symbol", sym)
+		m.linksMu.Lock()
+		m.links = append(m.links, up)
+		m.linksMu.Unlock()
+		attached = true
 	}
 
 	// Scan container filesystem for all TLS shared libraries
@@ -820,11 +950,15 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 			continue
 		}
 		for _, sym := range append(sslSymbols, gnutlsSymbols...) {
-			if up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil); err == nil {
-				m.log.Debugw("Attached uprobe (system-wide)", "pid", pid, "symbol", sym, "lib", containerPath)
-				m.links = append(m.links, up)
-				attached = true
+			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
+			if err != nil {
+				continue
 			}
+			m.log.Debugw("Attached uprobe (system-wide)", "pid", pid, "symbol", sym, "lib", containerPath)
+			m.linksMu.Lock()
+			m.links = append(m.links, up)
+			m.linksMu.Unlock()
+			attached = true
 		}
 	}
 
@@ -927,7 +1061,9 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []st
 				_ = up.Close()
 				continue
 			}
+			m.linksMu.Lock()
 			m.links = append(m.links, up, ret)
+			m.linksMu.Unlock()
 			m.log.Debugw("Attached EVP_CipherInit hooks (main exe, PID-scoped)",
 				"pid", pid, "symbol", sym)
 			attached = true
@@ -972,7 +1108,9 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []st
 					"pid", pid, "symbol", sym, "lib", containerPath, "error", errRet)
 				continue
 			}
+			m.linksMu.Lock()
 			m.links = append(m.links, up, ret)
+			m.linksMu.Unlock()
 			m.log.Debugw("Attached EVP_CipherInit hooks (libcrypto.so, system-wide)",
 				"pid", pid, "symbol", sym, "lib", containerPath)
 			attached = true
@@ -1233,7 +1371,34 @@ func isTLSLibrary(name string) bool {
 // long the controller has been running.
 func (m *TLSUprobeManager) Close() error {
 	t0 := time.Now()
-	linkCount := len(m.links)
+	// Drain in-flight retry goroutines first. PollExecEvents is expected to
+	// be cancelled before Close() is called (its ctx fires the retry's
+	// select case), so the wait is normally instantaneous. The 5 s cap
+	// prevents a stuck retry from holding shutdown past kubelet's grace
+	// period. Must happen BEFORE we snapshot m.links — a retry can append
+	// to it via AttachTLS, and we'd race the snapshot otherwise.
+	waited := make(chan struct{})
+	go func() {
+		m.retryWG.Wait()
+		close(waited)
+	}()
+	select {
+	case <-waited:
+	case <-time.After(5 * time.Second):
+		m.log.Warnw("timed out waiting for retry goroutines on shutdown; proceeding with teardown")
+	}
+
+	// Snapshot + nil out the slice under the lock, then release before doing
+	// the (slow, ~50-100ms each) kernel syscalls. Holding linksMu across the
+	// parallel Close would serialize any in-flight AttachTLS calls against
+	// the full shutdown — and the syscalls themselves don't need the lock
+	// since the slice is already detached.
+	m.linksMu.Lock()
+	links := m.links
+	m.links = nil
+	m.linksMu.Unlock()
+
+	linkCount := len(links)
 	var errs []error
 	var errsMu sync.Mutex
 
@@ -1259,12 +1424,11 @@ func (m *TLSUprobeManager) Close() error {
 			}
 		}()
 	}
-	for _, l := range m.links {
+	for _, l := range links {
 		jobs <- l
 	}
 	close(jobs)
 	wg.Wait()
-	m.links = nil
 
 	if m.reader != nil {
 		if err := m.reader.Close(); err != nil {
@@ -1349,8 +1513,31 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 					// libssl may not be loaded yet (e.g. Python hasn't imported ssl).
 					// Retry after a delay to catch lazy-loaded libraries.
 					m.log.Debugw("first attach attempt failed, scheduling retry", "pid", pid, "err", err)
+					m.retryWG.Add(1)
 					go func(p int, cg uint64) {
-						time.Sleep(2 * time.Second)
+						defer m.retryWG.Done()
+						// Respect shutdown: a bare time.Sleep would call
+						// AttachTLS against freed BPF map fds if Close()
+						// runs during the 2 s window. Use time.NewTimer so
+						// that ctx.Done winning the select releases the
+						// underlying runtime timer immediately instead of
+						// leaving it in the heap until it fires — under
+						// pod churn we'd otherwise accumulate one live
+						// timer per failed attach.
+						timer := time.NewTimer(2 * time.Second)
+						select {
+						case <-timer.C:
+						case <-ctx.Done():
+							timer.Stop()
+							return
+						}
+						// Skip if the cgroup was untracked while we slept —
+						// the pod was deleted and the PID may have been
+						// reused by an unrelated host process.
+						if _, stillTracked := m.cgroupPaths.Load(cg); !stillTracked {
+							m.log.Debugw("cgroup untracked before retry; skipping", "pid", p, "cgroupID", cg)
+							return
+						}
 						if err := m.AttachTLS(p, cg); err != nil {
 							m.log.Debugw("retry attach also failed", "pid", p, "err", err)
 						}
