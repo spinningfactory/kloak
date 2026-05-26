@@ -435,26 +435,41 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	// inode atomically with LoadOrStore using a zero-value placeholder. The
 	// winner proceeds with the attach; losers bail out. On any failure the
 	// winner MUST Delete the placeholder so a future retry can succeed.
+	//
+	// Placeholder semantics on a hit:
+	//   netnsFd == nil → attach is in-flight by another goroutine. Return
+	//     an error so the caller retries; returning nil would mask an
+	//     in-flight failure (if that goroutine deletes its placeholder, the
+	//     caller who got nil won't retry and the pod stays unpatched).
+	//   netnsFd != nil → a previous attach completed successfully. Return
+	//     nil; no work to do.
 	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
 	var netnsIno uint64
 	var haveIno bool
+	var placeholder *tcAttachEntry
 	if fi, err := os.Stat(netnsPath); err == nil {
 		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
 			netnsIno = stat.Ino
 			haveIno = true
-			placeholder := &tcAttachEntry{} // zero value, no fd yet
-			if _, loaded := m.tcAttached.LoadOrStore(netnsIno, placeholder); loaded {
-				m.log.Debugw("tc egress already attached or in-flight for this netns", "pid", pid, "netns_ino", netnsIno)
-				return nil
+			placeholder = &tcAttachEntry{} // zero value, no fd yet
+			if existing, loaded := m.tcAttached.LoadOrStore(netnsIno, placeholder); loaded {
+				placeholder = nil // we didn't reserve a slot; nothing to roll back
+				if e, ok := existing.(*tcAttachEntry); ok && e.netnsFd != nil {
+					m.log.Debugw("tc egress already attached for this netns", "pid", pid, "netns_ino", netnsIno)
+					return nil
+				}
+				return fmt.Errorf("tc egress attach in progress for pid %d netns %d; retry", pid, netnsIno)
 			}
 		}
 	}
 
 	// rollback releases the placeholder on any error path so a later retry
-	// can re-attempt the attach. Cleared (set nil) on success.
+	// can re-attempt the attach. CompareAndDelete (not plain Delete) so a
+	// real entry that some pathological reorder placed into the slot can't
+	// be accidentally removed. Cleared (set nil) on success.
 	rollback := func() {
-		if haveIno {
-			m.tcAttached.Delete(netnsIno)
+		if haveIno && placeholder != nil {
+			m.tcAttached.CompareAndDelete(netnsIno, placeholder)
 		}
 	}
 	defer func() {
@@ -563,12 +578,19 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	m.linksMu.Unlock()
 
 	// Replace the placeholder with the real entry holding the pinned netns fd.
-	// The open fd pins the inode — the kernel won't reuse it until we close
-	// the fd in UntrackCgroup. We already have the inode from the LoadOrStore
-	// above, so no second os.Stat is needed.
+	// CompareAndSwap (not Store) guards against a concurrent UntrackCgroup
+	// (pod deleted mid-attach) that already removed our placeholder —
+	// unconditional Store would re-insert the entry and leak containerNS,
+	// since UntrackCgroup is the only place that closes the pinned netns fd.
+	// On a lost CAS, close containerNS directly and let Close() take down
+	// the TCX links via m.links at controller shutdown.
 	if haveIno {
-		m.tcAttached.Store(netnsIno, &tcAttachEntry{netnsFd: containerNS})
-		rollback = nil // success — keep the entry in place
+		finalEntry := &tcAttachEntry{netnsFd: containerNS}
+		if !m.tcAttached.CompareAndSwap(netnsIno, placeholder, finalEntry) {
+			_ = containerNS.Close()
+			m.log.Debugw("tcAttached entry removed mid-attach (pod likely deleted); not reinserting", "pid", pid, "netns_ino", netnsIno)
+		}
+		rollback = nil // success — don't run the rollback defer
 	} else {
 		// Defensive: we never reserved a placeholder (initial Stat failed),
 		// so there's nothing to roll back. Close the open fd to avoid a leak
