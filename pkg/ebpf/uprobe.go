@@ -501,84 +501,114 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	}
 	defer func() { _ = selfNS.Close() }()
 
-	// Lock OS thread — setns is per-thread.
-	runtime.LockOSThread()
-	defer runtime.UnlockOSThread()
-
-	// Switch to the container's network namespace.
-	if err := unix.Setns(int(containerNS.Fd()), unix.CLONE_NEWNET); err != nil {
-		_ = containerNS.Close()
-		return fmt.Errorf("setns to container netns: %w", err)
+	// Run the netns-entered work in a dedicated worker goroutine, NOT on
+	// the caller's goroutine. Per Go runtime contract
+	// (https://pkg.go.dev/runtime#LockOSThread), if a goroutine exits
+	// without unlocking its OS thread, the runtime retires the thread
+	// instead of returning it to the worker pool. So if setns-restore
+	// fails, we want the goroutine holding the wrong-netns thread to
+	// exit, taking the poisoned thread with it.
+	//
+	// Doing this on the caller's goroutine (the reconciler loop or
+	// PollExecEvents — both long-lived) would leave the poisoned thread
+	// pinned to a caller that keeps running, so subsequent BPF syscalls
+	// / net.Dial / k8s client-go HTTP calls in that caller would silently
+	// route through the container's netns. A short-lived worker
+	// goroutine isolates the failure to the worker alone.
+	//
+	// Do NOT "simplify" this back to inline LockOSThread on the caller.
+	type tcResult struct {
+		links []link.Link
+		err   error
 	}
+	resultCh := make(chan tcResult, 1)
+	go func() {
+		runtime.LockOSThread()
+		threadUsable := true
+		defer func() {
+			if threadUsable {
+				runtime.UnlockOSThread()
+			}
+			// else: goroutine returns with thread still locked; the Go
+			// runtime retires that OS thread and never returns it to
+			// the worker pool. The caller is unaffected.
+		}()
 
-	// Ensure we return to our original netns.
-	defer func() {
-		if err := unix.Setns(int(selfNS.Fd()), unix.CLONE_NEWNET); err != nil {
-			m.log.Errorw("failed to restore original netns", "error", err)
+		// Switch to the container's network namespace.
+		if err := unix.Setns(int(containerNS.Fd()), unix.CLONE_NEWNET); err != nil {
+			resultCh <- tcResult{err: fmt.Errorf("setns to container netns: %w", err)}
+			return
 		}
+		// Ensure we return to our original netns. Registered AFTER the
+		// unlock defer so it runs FIRST (LIFO): restore is attempted,
+		// and on failure threadUsable is flipped before the unlock
+		// defer reads it.
+		defer func() {
+			if err := unix.Setns(int(selfNS.Fd()), unix.CLONE_NEWNET); err != nil {
+				m.log.Errorw("CRITICAL: failed to restore netns; retiring this worker goroutine's OS thread",
+					"error", err, "pid", pid)
+				threadUsable = false
+			}
+		}()
+
+		// Resolve which external interface to attach tc egress on. We're
+		// now inside the target netns (setns above), so net.InterfaceByName
+		// and /proc/net/route both see the netns-local view.
+		ifNames := m.resolveEgressInterfaces(pid)
+
+		// Pre-validate every interface before attaching any. If we
+		// attached the first interface and then failed on the second, the
+		// kernel-side TCX attachment would stay live but the CAS below
+		// would never run, so the reconciler's next retry would miss the
+		// dedup and re-attach the same TCX program a second time.
+		// link.AttachTCX stacks attachments → wrong GHASH.
+		ifaces := make([]*net.Interface, 0, len(ifNames))
+		for _, ifName := range ifNames {
+			iface, err := net.InterfaceByName(ifName)
+			if err != nil {
+				if ifName == "lo" {
+					resultCh <- tcResult{err: fmt.Errorf("finding %s in container netns: %w", ifName, err)}
+					return
+				}
+				resultCh <- tcResult{err: fmt.Errorf("egress interface %q not found in pid %d netns (configured via --egress-interface or controller.ebpf.egressInterface): %w", ifName, pid, err)}
+				return
+			}
+			ifaces = append(ifaces, iface)
+		}
+
+		// Track links attached during this call locally. On a partial
+		// failure close them all and return; the caller won't splice
+		// them into m.links so a retry doesn't see a half-attached netns.
+		attachedHere := make([]link.Link, 0, len(ifaces))
+		for i, iface := range ifaces {
+			tcLink, err := link.AttachTCX(link.TCXOptions{
+				Interface: iface.Index,
+				Program:   m.objs.TcEgressPatch,
+				Attach:    ebpf.AttachTCXEgress,
+			})
+			if err != nil {
+				for _, prior := range attachedHere {
+					if cerr := prior.Close(); cerr != nil {
+						m.log.Warnw("rollback: failed to close partially-attached tc egress link", "error", cerr, "pid", pid)
+					}
+				}
+				resultCh <- tcResult{err: fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", ifNames[i], iface.Index, pid, err)}
+				return
+			}
+			attachedHere = append(attachedHere, tcLink)
+			m.log.Debugw("Attached tc egress to container", "pid", pid, "interface", ifNames[i], "ifindex", iface.Index)
+		}
+		resultCh <- tcResult{links: attachedHere}
 	}()
 
-	// Resolve which external interface to attach tc egress on. We're now
-	// inside the target netns (setns above), so net.InterfaceByName and
-	// /proc/net/route both see the netns-local view. resolveEgressInterfaces
-	// is best-effort + log-only — hard-failure cases (explicit interface
-	// name missing from the netns) surface below via net.InterfaceByName.
-	ifNames := m.resolveEgressInterfaces(pid)
-
-	// Pre-validate every interface before attaching any. If we attached the
-	// first interface and then failed on the second, the kernel-side TCX
-	// attachment would stay live but tcAttached.Store below would never run,
-	// so the reconciler's next retry would miss the dedup and re-attach the
-	// same TCX program a second time. link.AttachTCX stacks attachments —
-	// every egress packet would then run through the patch program twice and
-	// produce the wrong GHASH.
-	ifaces := make([]*net.Interface, 0, len(ifNames))
-	for _, ifName := range ifNames {
-		iface, err := net.InterfaceByName(ifName)
-		if err != nil {
-			// lo should always exist; if it doesn't, the netns is
-			// fundamentally broken — fail loudly.
-			if ifName == "lo" {
-				_ = containerNS.Close()
-				return fmt.Errorf("finding %s in container netns: %w", ifName, err)
-			}
-			// External interface lookup failed. If the user pinned
-			// an explicit name and it's missing, that's a hard error
-			// (silently skipping would leave their traffic un-patched
-			// and they'd never know). For the auto-detected case the
-			// resolver wouldn't have returned a name that doesn't
-			// exist, so this branch is reserved for the pinned case.
-			_ = containerNS.Close()
-			return fmt.Errorf("egress interface %q not found in pid %d netns (configured via --egress-interface or controller.ebpf.egressInterface): %w", ifName, pid, err)
-		}
-		ifaces = append(ifaces, iface)
-	}
-
-	// Track links attached during this call locally. On a partial failure we
-	// close them and return without adding to m.links, so a retry doesn't see
-	// a half-attached netns.
-	attachedHere := make([]link.Link, 0, len(ifaces))
-	for i, iface := range ifaces {
-		tcLink, err := link.AttachTCX(link.TCXOptions{
-			Interface: iface.Index,
-			Program:   m.objs.TcEgressPatch,
-			Attach:    ebpf.AttachTCXEgress,
-		})
-		if err != nil {
-			for _, prior := range attachedHere {
-				if cerr := prior.Close(); cerr != nil {
-					m.log.Warnw("rollback: failed to close partially-attached tc egress link", "error", cerr, "pid", pid)
-				}
-			}
-			_ = containerNS.Close()
-			return fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", ifNames[i], iface.Index, pid, err)
-		}
-		attachedHere = append(attachedHere, tcLink)
-		m.log.Debugw("Attached tc egress to container", "pid", pid, "interface", ifNames[i], "ifindex", iface.Index)
+	res := <-resultCh
+	if res.err != nil {
+		_ = containerNS.Close()
+		return res.err
 	}
 
 	m.linksMu.Lock()
-	m.links = append(m.links, attachedHere...)
+	m.links = append(m.links, res.links...)
 	m.linksMu.Unlock()
 
 	// Replace the placeholder with the real entry holding the pinned netns fd.
