@@ -124,3 +124,79 @@ jobs:
           AWS_REGION: auto
         run: |
           aws s3 sync .helm-pkg/ s3://kloak-chart/
+
+  krunk:
+    # Cross-compile and publish krunk host-CLI binaries as release
+    # assets. install.sh's `download_release_binary` reads from
+    # `https://github.com/<repo>/releases/download/<tag>/krunk-linux-<arch>.tar.gz`
+    # and verifies against the `.sha256` sidecar via `sha256sum -c`, so
+    # the tarball + sidecar names AND the sidecar's two-column format
+    # (`<hash>  <filename>`) are the install-time contract — change
+    # either side and the curl|sh install path stops working.
+    name: krunk Release Binaries
+    runs-on: ubuntu-latest
+    needs: [validate]
+    permissions:
+      # Required by `gh release upload` to attach assets to the release.
+      contents: write
+    strategy:
+      # Per-arch jobs run in parallel; one arch's build failure shouldn't
+      # block the other from publishing (users on the working arch can
+      # still install) — but the upload is idempotent (`--clobber`) so
+      # rerunning the failed job after a fix is also safe.
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build krunk for linux/${{ matrix.arch }}
+        env:
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: '0'
+          # Bake the release tag into the binary via the same LDFLAGS
+          # symbol the Makefile uses. cmd/krunk doesn't expose `version`
+          # as a subcommand yet (planned follow-up) so the bake is a
+          # no-op at runtime, but wiring it now means the future
+          # `krunk version` command lands on already-versioned binaries
+          # without a CD change.
+          VERSION: v${{ needs.validate.outputs.version }}
+        run: |
+          mkdir -p out
+          go build -ldflags "-X main.version=${VERSION}" -o out/krunk ./cmd/krunk
+          file out/krunk
+
+      - name: Package tarball + sha256 sidecar
+        working-directory: out
+        run: |
+          tar_name="krunk-linux-${{ matrix.arch }}.tar.gz"
+          tar -czf "$tar_name" krunk
+          # `sha256sum <file>` emits the exact two-column format
+          # `sha256sum -c` expects, which is what install.sh runs.
+          sha256sum "$tar_name" > "$tar_name.sha256"
+          # Self-verify locally so we never publish a sidecar that
+          # doesn't match the artifact we just produced.
+          sha256sum -c "$tar_name.sha256"
+          ls -la "$tar_name" "$tar_name.sha256"
+
+      - name: Upload release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # `--clobber` so a re-run of this job (after a fix on the OTHER
+        # arch, say) replaces its assets cleanly rather than failing on
+        # "asset already exists".
+        run: |
+          cd out
+          gh release upload \
+            "${{ github.event.release.tag_name }}" \
+            "krunk-linux-${{ matrix.arch }}.tar.gz" \
+            "krunk-linux-${{ matrix.arch }}.tar.gz.sha256" \
+            --repo "${{ github.repository }}" \
+            --clobber
