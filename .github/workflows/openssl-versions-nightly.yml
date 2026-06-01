@@ -266,12 +266,13 @@ jobs:
           set -euo pipefail
           # Latest stable patch per minor from GitHub releases (newest-first order,
           # so first occurrence of each major.minor is the latest patch).
-          # Filter to openssl-3.x only; ignore pre-releases and drafts.
+          # MIN_VERSION below provides the lower bound — no major-version filter here
+          # so future releases (4.x, ...) are detected automatically.
           curl -fsS \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/openssl/openssl/releases?per_page=100" \
             | jq -r '.[] | select(.prerelease == false and .draft == false) | .tag_name' \
-            | grep '^openssl-3\.' \
+            | grep '^openssl-[0-9]' \
             | sed 's/^openssl-//' \
             | awk -F. '!seen[$1"."$2]++ { print }' \
             | LC_ALL=C sort -u > upstream-latest.txt
