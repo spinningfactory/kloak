@@ -34,6 +34,7 @@ jobs:
         run: |
           ARCH="${{ matrix.platform }}"
           ARCH="${ARCH#linux/}"
+          mkdir -p out
           docker buildx build \
             --platform ${{ matrix.platform }} \
             --build-arg OPENSSL_VERSION=${{ matrix.openssl }} \
@@ -42,7 +43,23 @@ jobs:
             tools/openssl-offsets/
           docker run --rm --platform ${{ matrix.platform }} \
             offsets:${{ matrix.openssl }}-${ARCH} \
-            | tee tools/openssl-offsets/results/openssl-${{ matrix.openssl }}-${ARCH}.json
+            | tee out/openssl-${{ matrix.openssl }}-${ARCH}.json
+
+      - name: Diff against committed JSON
+        run: |
+          ARCH="${{ matrix.platform }}"
+          ARCH="${ARCH#linux/}"
+          NEW="out/openssl-${{ matrix.openssl }}-${ARCH}.json"
+          COMMITTED="tools/openssl-offsets/results/openssl-${{ matrix.openssl }}-${ARCH}.json"
+          if [ -f "${COMMITTED}" ]; then
+            diff <(jq -S . "${COMMITTED}") <(jq -S . "${NEW}") \
+              && echo "No drift detected for openssl-${{ matrix.openssl }}-${ARCH}" \
+              || echo "::warning::Offset drift detected for openssl-${{ matrix.openssl }}-${ARCH} — update tools/openssl-offsets/results/ and opensslOffsetTable"
+          else
+            echo "No committed JSON for openssl-${{ matrix.openssl }}-${ARCH} (first run)"
+          fi
+          mkdir -p tools/openssl-offsets/results
+          cp "${NEW}" "${COMMITTED}"
 
       - name: Upload results
         uses: actions/upload-artifact@v7
