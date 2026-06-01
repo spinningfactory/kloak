@@ -83,23 +83,18 @@ for v in "${NEW_VERSIONS[@]}"; do
       continue
     fi
     # Insert `          - "v"` immediately after the last `- "X.Y.Z"` line
-    # inside every `openssl:` block. awk resets its state on each openssl: key
-    # so multiple jobs with identical matrices are all updated.
+    # in each openssl: block. Stream-based so line order is preserved.
     awk -v new="          - \"$v\"" '
-      /^[[:space:]]+openssl:/ { in_openssl=1; last_ver_line=""; print; next }
+      /^[[:space:]]+openssl:/ { in_openssl=1; has_versions=0; print; next }
       in_openssl && /^[[:space:]]+-[[:space:]]+"[0-9]+\.[0-9]+\.[0-9]+"/ {
-        last_ver_line=NR; buf[NR]=$0; next
+        has_versions=1; print; next
       }
-      in_openssl && !/^[[:space:]]+-[[:space:]]+"[0-9]+\.[0-9]+\.[0-9]+"/ {
-        for (i in buf) print buf[i]
-        if (last_ver_line != "") print new
-        delete buf; last_ver_line=""; in_openssl=0; print; next
+      in_openssl {
+        if (has_versions) { print new; has_versions=0 }
+        in_openssl=0
       }
       { print }
-      END {
-        for (i in buf) print buf[i]
-        if (last_ver_line != "") print new
-      }
+      END { if (in_openssl && has_versions) print new }
     ' "$yml" > "$yml.tmp"
     mv "$yml.tmp" "$yml"
     echo "==> Appended OpenSSL $v to matrix in $yml"
