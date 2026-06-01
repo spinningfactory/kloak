@@ -41,6 +41,19 @@ if [ -z "$SSL_TO_VERSION" ]; then
 fi
 SIZEOF_SSL_CONNECTION=$(get_sizeof "$SSL_OBJ" "$SSL_STRUCT")
 
+# ssl_to_wbio: SSL/SSL_CONNECTION → wbio BIO* field.
+# 3-hop (3.0/3.1): ssl_st.wbio is a direct field (offset 24).
+# 4-hop (3.2+):    try ssl_connection_st.wbio directly; if wbio lives
+# inside an embedded ssl_st, fall back to ssl_connection_st.ssl + ssl_st.wbio.
+SSL_TO_WBIO=$(get_offset "$SSL_OBJ" "$SSL_STRUCT" "wbio")
+if [ -z "$SSL_TO_WBIO" ] && [ "$SSL_STRUCT" = "ssl_connection_st" ]; then
+    SSL_ST_IN_CONN=$(get_offset "$SSL_OBJ" "ssl_connection_st" "ssl")
+    WBIO_IN_SSL_ST=$(get_offset "$SSL_OBJ" "ssl_st" "wbio")
+    if [ -n "$SSL_ST_IN_CONN" ] && [ -n "$WBIO_IN_SSL_ST" ]; then
+        SSL_TO_WBIO=$((SSL_ST_IN_CONN + WBIO_IN_SSL_ST))
+    fi
+fi
+
 # rlayer.wrl (3.2+ only — nested struct)
 RLAYER_OFFSET=$(get_offset "$SSL_OBJ" "$SSL_STRUCT" "rlayer")
 WRL_IN_RLAYER=$(get_offset "$SSL_OBJ" "record_layer_st" "wrl")
@@ -103,7 +116,8 @@ cat <<EOF
     "algctx_to_gcm": ${ALGCTX_TO_GCM:-null},
     "gcm128_h_offset": ${GCM128_H_OFFSET:-null},
     "algctx_to_h": ${ALGCTX_TO_H:-null},
-    "ssl_to_version": ${SSL_TO_VERSION:-null}
+    "ssl_to_version": ${SSL_TO_VERSION:-null},
+    "ssl_to_wbio": ${SSL_TO_WBIO:-null}
   },
   "sizes": {
     "SSL_CONNECTION": ${SIZEOF_SSL_CONNECTION:-null},
@@ -120,7 +134,9 @@ else
     echo "    \"WRLToEncCtx\": ${WRL_TO_ENC_CTX:-null},"
 fi)
     "EncCtxToAlgctx": ${ENC_CTX_TO_ALGCTX:-null},
-    "AlgctxToH": ${ALGCTX_TO_H:-null}
+    "AlgctxToH": ${ALGCTX_TO_H:-null},
+    "SSLToVersion": ${SSL_TO_VERSION:-null},
+    "SSLToWBIO": ${SSL_TO_WBIO:-null}
   }
 }
 EOF

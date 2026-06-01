@@ -1,0 +1,30 @@
+{
+  "openssl_version": "OpenSSL 3.0.16 11 Feb 2025",
+  "arch": "aarch64",
+  "chain": "3-hop",
+  "offsets": {
+    "ssl_to_wrl": null,
+    "ssl_to_enc_write_ctx": 2168,
+    "wrl_to_enc_ctx": null,
+    "enc_ctx_to_algctx": 168,
+    "algctx_to_gcm": 248,
+    "gcm128_h_offset": 80,
+    "algctx_to_h": 328,
+    "ssl_to_version": 0,
+    "ssl_to_wbio": 24
+  },
+  "sizes": {
+    "SSL_CONNECTION": null,
+    "EVP_CIPHER_CTX": 184,
+    "GCM128_CONTEXT": 440,
+    "PROV_GCM_CTX": 704
+  },
+  "kloak_config": {
+    "SSLToWRL": 2168,
+    "WRLToEncCtx": 0,
+    "EncCtxToAlgctx": 168,
+    "AlgctxToH": 328,
+    "SSLToVersion": 0,
+    "SSLToWBIO": 24
+  }
+}

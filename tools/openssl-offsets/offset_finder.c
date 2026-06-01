@@ -35,6 +35,14 @@ int main(void) {
     // SSL_CONNECTION.version
     printf("  \"ssl_to_version\": %zu,\n", offsetof(SSL_CONNECTION, version));
 
+    // SSL/SSL_CONNECTION.wbio — used by BPF data plane to recover the socket fd.
+    // 3-hop (3.0/3.1): ssl_st.wbio = 24. 4-hop (3.2+): ssl_connection_st.wbio = 88.
+#if OPENSSL_VERSION_NUMBER >= 0x30200000L
+    printf("  \"ssl_to_wbio\": %zu,\n", offsetof(SSL_CONNECTION, wbio));
+#else
+    printf("  \"ssl_to_wbio\": %zu,\n", offsetof(SSL, wbio));
+#endif
+
     // EVP_CIPHER_CTX.algctx (provider context pointer)
     printf("  \"enc_ctx_to_algctx\": %zu,\n", offsetof(EVP_CIPHER_CTX, algctx));
 

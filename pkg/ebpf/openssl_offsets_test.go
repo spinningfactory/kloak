@@ -1,6 +1,13 @@
 package ebpf
 
-import "testing"
+import (
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestExtractMajorMinor(t *testing.T) {
 	tests := []struct {
@@ -60,6 +67,111 @@ func TestOpensslOffsetTable_SSLToWBIO(t *testing.T) {
 		if v.SSLToWBIO == 0 {
 			t.Errorf("opensslOffsetTable[%q] has SSLToWBIO=0 — verify and set explicitly", k)
 		}
+	}
+}
+
+// opensslReferenceJSON mirrors the kloak_config section emitted by
+// tools/openssl-offsets/extract_offsets.sh for a single (version, arch) cell.
+// Pointer types distinguish null (extraction failed) from 0 (valid zero offset).
+type opensslReferenceJSON struct {
+	OpenSSLVersion string `json:"openssl_version"`
+	Arch           string `json:"arch"`
+	KloakConfig    struct {
+		SSLToWRL       *uint32 `json:"SSLToWRL"`
+		WRLToEncCtx    *uint32 `json:"WRLToEncCtx"`
+		EncCtxToAlgctx *uint32 `json:"EncCtxToAlgctx"`
+		AlgctxToH      *uint32 `json:"AlgctxToH"`
+		SSLToVersion   *uint32 `json:"SSLToVersion"`
+		SSLToWBIO      *uint32 `json:"SSLToWBIO"`
+	} `json:"kloak_config"`
+}
+
+// parseOpenSSLFixtureFilename extracts (version, arch) from an
+// openssl-<version>-<arch>.json filename.
+func parseOpenSSLFixtureFilename(base string) (version, arch string, ok bool) {
+	stripped := strings.TrimSuffix(base, ".json")
+	stripped = strings.TrimPrefix(stripped, "openssl-")
+	idx := strings.LastIndex(stripped, "-")
+	if idx < 0 {
+		return "", "", false
+	}
+	return stripped[:idx], stripped[idx+1:], true
+}
+
+// TestOpenSSLOffsets_AgainstReferenceJSON is the primary CI check for OpenSSL
+// offsets: every committed reference JSON in tools/openssl-offsets/results/
+// must agree with opensslOffsetTable. Catches drift between the static table
+// and the canonical discovery output (tools/openssl-offsets/extract_offsets.sh).
+//
+// Runs as a plain Go test — no Docker, no network. Subtests are named
+// <version>-<arch> so failures pinpoint the exact cell that drifted.
+//
+// If SSLToVersion in the table is 0xFFFFFFFF (sentinel for "not yet verified,
+// use BPF heuristic") but the JSON has a real offset, update the table entry
+// with the discovered value and remove the sentinel.
+func TestOpenSSLOffsets_AgainstReferenceJSON(t *testing.T) {
+	pattern := filepath.Join("..", "..", "tools", "openssl-offsets", "results", "openssl-*.json")
+	paths, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatalf("glob %q: %v", pattern, err)
+	}
+	if len(paths) == 0 {
+		t.Skipf("no reference JSONs at %s — run the openssl-offsets workflow and commit results", pattern)
+	}
+
+	for _, p := range paths {
+		base := filepath.Base(p)
+		version, arch, ok := parseOpenSSLFixtureFilename(base)
+		if !ok {
+			t.Errorf("unparseable result filename: %s", base)
+			continue
+		}
+		t.Run(fmt.Sprintf("%s-%s", version, arch), func(t *testing.T) {
+			data, err := os.ReadFile(p)
+			if err != nil {
+				t.Fatalf("read %s: %v", p, err)
+			}
+			var ref opensslReferenceJSON
+			if err := json.Unmarshal(data, &ref); err != nil {
+				t.Fatalf("parse %s: %v", p, err)
+			}
+
+			majorMinor := extractMajorMinor(version)
+			entry, ok := opensslOffsetTable[majorMinor]
+			if !ok {
+				t.Fatalf("opensslOffsetTable has no entry for OpenSSL %s — add it from %s", majorMinor, base)
+			}
+
+			if ref.KloakConfig.SSLToWRL == nil || ref.KloakConfig.WRLToEncCtx == nil ||
+				ref.KloakConfig.EncCtxToAlgctx == nil || ref.KloakConfig.AlgctxToH == nil ||
+				ref.KloakConfig.SSLToVersion == nil || ref.KloakConfig.SSLToWBIO == nil {
+				t.Fatalf("one or more offsets are null/missing in reference JSON %s — re-run discovery", base)
+			}
+
+			if entry.SSLToWRL != *ref.KloakConfig.SSLToWRL {
+				t.Errorf("SSLToWRL mismatch: table=%d ref=%d", entry.SSLToWRL, *ref.KloakConfig.SSLToWRL)
+			}
+			if entry.WRLToEncCtx != *ref.KloakConfig.WRLToEncCtx {
+				t.Errorf("WRLToEncCtx mismatch: table=%d ref=%d", entry.WRLToEncCtx, *ref.KloakConfig.WRLToEncCtx)
+			}
+			if entry.EncCtxToAlgctx != *ref.KloakConfig.EncCtxToAlgctx {
+				t.Errorf("EncCtxToAlgctx mismatch: table=%d ref=%d", entry.EncCtxToAlgctx, *ref.KloakConfig.EncCtxToAlgctx)
+			}
+			if entry.AlgctxToH != *ref.KloakConfig.AlgctxToH {
+				t.Errorf("AlgctxToH mismatch: table=%d ref=%d", entry.AlgctxToH, *ref.KloakConfig.AlgctxToH)
+			}
+			// SSLToVersion: 0xFFFFFFFF in the table means "not yet verified, BPF uses
+			// heuristic". If the JSON has a real offset, update the table entry.
+			if entry.SSLToVersion != 0xFFFFFFFF && entry.SSLToVersion != *ref.KloakConfig.SSLToVersion {
+				t.Errorf("SSLToVersion mismatch: table=%d ref=%d", entry.SSLToVersion, *ref.KloakConfig.SSLToVersion)
+			}
+			if entry.SSLToVersion == 0xFFFFFFFF && *ref.KloakConfig.SSLToVersion != 0xFFFFFFFF {
+				t.Logf("SSLToVersion for %s is unverified (table=0xFFFFFFFF); discovered offset=%d — update opensslOffsetTable", majorMinor, *ref.KloakConfig.SSLToVersion)
+			}
+			if entry.SSLToWBIO != *ref.KloakConfig.SSLToWBIO {
+				t.Errorf("SSLToWBIO mismatch: table=%d ref=%d", entry.SSLToWBIO, *ref.KloakConfig.SSLToWBIO)
+			}
+		})
 	}
 }
 
