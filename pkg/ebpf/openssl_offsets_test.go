@@ -72,16 +72,17 @@ func TestOpensslOffsetTable_SSLToWBIO(t *testing.T) {
 
 // opensslReferenceJSON mirrors the kloak_config section emitted by
 // tools/openssl-offsets/extract_offsets.sh for a single (version, arch) cell.
+// Pointer types distinguish null (extraction failed) from 0 (valid zero offset).
 type opensslReferenceJSON struct {
 	OpenSSLVersion string `json:"openssl_version"`
 	Arch           string `json:"arch"`
 	KloakConfig    struct {
-		SSLToWRL       uint32 `json:"SSLToWRL"`
-		WRLToEncCtx    uint32 `json:"WRLToEncCtx"`
-		EncCtxToAlgctx uint32 `json:"EncCtxToAlgctx"`
-		AlgctxToH      uint32 `json:"AlgctxToH"`
-		SSLToVersion   uint32 `json:"SSLToVersion"`
-		SSLToWBIO      uint32 `json:"SSLToWBIO"`
+		SSLToWRL       *uint32 `json:"SSLToWRL"`
+		WRLToEncCtx    *uint32 `json:"WRLToEncCtx"`
+		EncCtxToAlgctx *uint32 `json:"EncCtxToAlgctx"`
+		AlgctxToH      *uint32 `json:"AlgctxToH"`
+		SSLToVersion   *uint32 `json:"SSLToVersion"`
+		SSLToWBIO      *uint32 `json:"SSLToWBIO"`
 	} `json:"kloak_config"`
 }
 
@@ -141,28 +142,34 @@ func TestOpenSSLOffsets_AgainstReferenceJSON(t *testing.T) {
 				t.Fatalf("opensslOffsetTable has no entry for OpenSSL %s — add it from %s", majorMinor, base)
 			}
 
-			if entry.SSLToWRL != ref.KloakConfig.SSLToWRL {
-				t.Errorf("SSLToWRL mismatch: table=%d ref=%d", entry.SSLToWRL, ref.KloakConfig.SSLToWRL)
+			if ref.KloakConfig.SSLToWRL == nil || ref.KloakConfig.WRLToEncCtx == nil ||
+				ref.KloakConfig.EncCtxToAlgctx == nil || ref.KloakConfig.AlgctxToH == nil ||
+				ref.KloakConfig.SSLToVersion == nil || ref.KloakConfig.SSLToWBIO == nil {
+				t.Fatalf("one or more offsets are null/missing in reference JSON %s — re-run discovery", base)
 			}
-			if entry.WRLToEncCtx != ref.KloakConfig.WRLToEncCtx {
-				t.Errorf("WRLToEncCtx mismatch: table=%d ref=%d", entry.WRLToEncCtx, ref.KloakConfig.WRLToEncCtx)
+
+			if entry.SSLToWRL != *ref.KloakConfig.SSLToWRL {
+				t.Errorf("SSLToWRL mismatch: table=%d ref=%d", entry.SSLToWRL, *ref.KloakConfig.SSLToWRL)
 			}
-			if entry.EncCtxToAlgctx != ref.KloakConfig.EncCtxToAlgctx {
-				t.Errorf("EncCtxToAlgctx mismatch: table=%d ref=%d", entry.EncCtxToAlgctx, ref.KloakConfig.EncCtxToAlgctx)
+			if entry.WRLToEncCtx != *ref.KloakConfig.WRLToEncCtx {
+				t.Errorf("WRLToEncCtx mismatch: table=%d ref=%d", entry.WRLToEncCtx, *ref.KloakConfig.WRLToEncCtx)
 			}
-			if entry.AlgctxToH != ref.KloakConfig.AlgctxToH {
-				t.Errorf("AlgctxToH mismatch: table=%d ref=%d", entry.AlgctxToH, ref.KloakConfig.AlgctxToH)
+			if entry.EncCtxToAlgctx != *ref.KloakConfig.EncCtxToAlgctx {
+				t.Errorf("EncCtxToAlgctx mismatch: table=%d ref=%d", entry.EncCtxToAlgctx, *ref.KloakConfig.EncCtxToAlgctx)
+			}
+			if entry.AlgctxToH != *ref.KloakConfig.AlgctxToH {
+				t.Errorf("AlgctxToH mismatch: table=%d ref=%d", entry.AlgctxToH, *ref.KloakConfig.AlgctxToH)
 			}
 			// SSLToVersion: 0xFFFFFFFF in the table means "not yet verified, BPF uses
 			// heuristic". If the JSON has a real offset, update the table entry.
-			if entry.SSLToVersion != 0xFFFFFFFF && entry.SSLToVersion != ref.KloakConfig.SSLToVersion {
-				t.Errorf("SSLToVersion mismatch: table=%d ref=%d", entry.SSLToVersion, ref.KloakConfig.SSLToVersion)
+			if entry.SSLToVersion != 0xFFFFFFFF && entry.SSLToVersion != *ref.KloakConfig.SSLToVersion {
+				t.Errorf("SSLToVersion mismatch: table=%d ref=%d", entry.SSLToVersion, *ref.KloakConfig.SSLToVersion)
 			}
-			if entry.SSLToVersion == 0xFFFFFFFF && ref.KloakConfig.SSLToVersion != 0xFFFFFFFF {
-				t.Logf("SSLToVersion for %s is unverified (table=0xFFFFFFFF); discovered offset=%d — update opensslOffsetTable", majorMinor, ref.KloakConfig.SSLToVersion)
+			if entry.SSLToVersion == 0xFFFFFFFF && *ref.KloakConfig.SSLToVersion != 0xFFFFFFFF {
+				t.Logf("SSLToVersion for %s is unverified (table=0xFFFFFFFF); discovered offset=%d — update opensslOffsetTable", majorMinor, *ref.KloakConfig.SSLToVersion)
 			}
-			if entry.SSLToWBIO != ref.KloakConfig.SSLToWBIO {
-				t.Errorf("SSLToWBIO mismatch: table=%d ref=%d", entry.SSLToWBIO, ref.KloakConfig.SSLToWBIO)
+			if entry.SSLToWBIO != *ref.KloakConfig.SSLToWBIO {
+				t.Errorf("SSLToWBIO mismatch: table=%d ref=%d", entry.SSLToWBIO, *ref.KloakConfig.SSLToWBIO)
 			}
 		})
 	}
