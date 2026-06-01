@@ -7,9 +7,12 @@
 #
 # Reads tools/openssl-offsets/results/openssl-<v>-amd64.json (must exist)
 # and updates:
-#   - pkg/ebpf/openssl_offsets.go                      (appends to opensslOffsetTable)
-#   - .github/workflows/openssl-offsets.yml             (appends to matrix.openssl)
-#   - .github/workflows/openssl-versions-nightly.yml    (appends to matrix.openssl)
+#   - pkg/ebpf/openssl_offsets.go         (appends to opensslOffsetTable)
+#   - .github/workflows/openssl-offsets.yml  (appends to matrix.openssl)
+#
+# Note: openssl-versions-nightly.yml is NOT updated here — its discover/e2e
+# matrix is resolved dynamically at runtime via the resolve-matrix job, so
+# adding a row to opensslOffsetTable is enough for it to appear automatically.
 #
 # Idempotent: versions already in the table or matrix are skipped.
 # Used by openssl-versions-nightly.yml's auto-PR job.
@@ -28,7 +31,6 @@ IFS=',' read -r -a NEW_VERSIONS <<<"$1"
 
 OFFSETS_GO="pkg/ebpf/openssl_offsets.go"
 DISCOVERY_YML=".github/workflows/openssl-offsets.yml"
-NIGHTLY_YML=".github/workflows/openssl-versions-nightly.yml"
 
 for v in "${NEW_VERSIONS[@]}"; do
   json="tools/openssl-offsets/results/openssl-$v-amd64.json"
@@ -76,7 +78,7 @@ for v in "${NEW_VERSIONS[@]}"; do
   # The openssl matrix is a YAML block list (one entry per line). We append
   # the new full version immediately after the last existing `- "X.Y.Z"` entry
   # in each openssl: section, using awk to locate the insertion point.
-  for yml in "$DISCOVERY_YML" "$NIGHTLY_YML"; do
+  for yml in "$DISCOVERY_YML"; do
     [ -f "$yml" ] || continue
     if grep -qF "\"$v\"" "$yml"; then
       echo "==> $v already in $yml — skipping"
@@ -108,4 +110,4 @@ fi
 
 echo
 echo "Done. Modified files:"
-git diff --name-only -- "$OFFSETS_GO" "$DISCOVERY_YML" "$NIGHTLY_YML" 2>/dev/null || true
+git diff --name-only -- "$OFFSETS_GO" "$DISCOVERY_YML" 2>/dev/null || true

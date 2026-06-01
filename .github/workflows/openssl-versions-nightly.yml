@@ -1,7 +1,14 @@
 name: OpenSSL Versions Nightly
 
-# Three things on an OpenSSL-version cadence, in one workflow:
+# Four jobs on an OpenSSL-version cadence, in one workflow:
 #
+#   0. resolve-matrix — fetch the latest stable patch per tracked minor from the
+#                       GitHub releases API. Feeds discover and e2e so they always
+#                       test the current upstream patch (e.g. 3.0.20, not the stale
+#                       3.0.16 that was pinned when the row was first added). The
+#                       nightly never needs hardcoded version strings updated — adding
+#                       a new row to opensslOffsetTable (via detect-new-version) is
+#                       enough for it to appear in the matrix automatically.
 #   1. discover  — rebuild offset JSONs for every supported (OpenSSL, arch) cell
 #                  and diff against the committed tools/openssl-offsets/results/.
 #                  Catches struct-layout drift in patch releases.
@@ -29,23 +36,60 @@ env:
 
 jobs:
   # ────────────────────────────────────────────────────────────────────
+  # (0) Resolve matrix — query GitHub releases for the latest stable patch
+  # of each tracked minor so discover/e2e always exercise current upstream.
+  resolve-matrix:
+    name: Resolve latest patch versions
+    runs-on: ubuntu-latest
+    outputs:
+      versions: ${{ steps.resolve.outputs.versions }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Resolve latest patch per tracked minor
+        id: resolve
+        run: |
+          set -euo pipefail
+          # All stable releases, newest-first. First occurrence of each major.minor
+          # is the latest patch for that minor series.
+          curl -fsS \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/openssl/openssl/releases?per_page=100" \
+            | jq -r '.[] | select(.prerelease == false and .draft == false) | .tag_name' \
+            | grep '^openssl-[0-9]' \
+            | sed 's/^openssl-//' \
+            | awk -F. '!seen[$1"."$2]++ { print }' > upstream-latest-by-minor.txt
+          cat upstream-latest-by-minor.txt
+
+          # Tracked minors derived from committed reference JSON filenames.
+          ls tools/openssl-offsets/results/ \
+            | sed -n 's/^openssl-\([0-9]*\.[0-9]*\)\.[0-9]*-amd64\.json$/\1/p' \
+            | LC_ALL=C sort -u > tracked-minors.txt
+          cat tracked-minors.txt
+
+          # For each tracked minor, pick its latest upstream patch.
+          versions=$(awk -F. '
+            NR==FNR { latest[$1"."$2] = $0; next }
+            { mm = $0; if (mm in latest) print latest[mm] }
+          ' upstream-latest-by-minor.txt tracked-minors.txt \
+            | sort -t. -k1,1n -k2,2n -k3,3n \
+            | jq -R . | jq -sc .)
+          echo "Resolved versions: $versions"
+          echo "versions=$versions" >> "$GITHUB_OUTPUT"
+
+  # ────────────────────────────────────────────────────────────────────
   # (1) Offset discovery — same shape as openssl-offsets.yml's matrix,
   # but on a schedule. Diffs are surfaced as warnings so drift doesn't
   # block the nightly silently.
   discover:
     name: Discover ${{ matrix.openssl }} on ${{ matrix.platform }}
     runs-on: ubuntu-latest
+    needs: [resolve-matrix]
     strategy:
       fail-fast: false
       matrix:
         platform: [linux/amd64, linux/arm64]
-        openssl:
-          - "3.5.0"
-          - "3.4.1"
-          - "3.3.3"
-          - "3.2.4"
-          - "3.1.7"
-          - "3.0.16"
+        openssl: ${{ fromJson(needs.resolve-matrix.outputs.versions) }}
     steps:
       - uses: actions/checkout@v6
 
@@ -106,17 +150,11 @@ jobs:
   e2e:
     name: e2e OpenSSL ${{ matrix.openssl }}
     runs-on: ubuntu-latest
-    needs: [discover]
+    needs: [resolve-matrix, discover]
     strategy:
       fail-fast: false
       matrix:
-        openssl:
-          - "3.5.0"
-          - "3.4.1"
-          - "3.3.3"
-          - "3.2.4"
-          - "3.1.7"
-          - "3.0.16"
+        openssl: ${{ fromJson(needs.resolve-matrix.outputs.versions) }}
     permissions:
       contents: read
       packages: write
@@ -347,7 +385,8 @@ jobs:
             Changes in this PR:
             - New `tools/openssl-offsets/results/openssl-<v>-<arch>.json` per (version, arch).
             - New `opensslOffsetTable` entries in `pkg/ebpf/openssl_offsets.go`.
-            - Updated matrix lists in `.github/workflows/openssl-offsets.yml` and `.github/workflows/openssl-versions-nightly.yml`.
+            - Updated matrix list in `.github/workflows/openssl-offsets.yml`.
+            - (The nightly's `discover`/`e2e` matrix is resolved dynamically at runtime — no static version list to update there.)
 
             ### Reviewer checklist
             - [ ] Diff the JSONs — offsets in expected ranges, no null fields.
