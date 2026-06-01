@@ -42,9 +42,17 @@ fi
 SIZEOF_SSL_CONNECTION=$(get_sizeof "$SSL_OBJ" "$SSL_STRUCT")
 
 # ssl_to_wbio: SSL/SSL_CONNECTION → wbio BIO* field.
-# 3-hop (3.0/3.1): ssl_st.wbio = 24 (second field after rbio).
-# 4-hop (3.2+):    ssl_connection_st.wbio = 88.
+# 3-hop (3.0/3.1): ssl_st.wbio is a direct field (offset 24).
+# 4-hop (3.2+):    try ssl_connection_st.wbio directly; if wbio lives
+# inside an embedded ssl_st, fall back to ssl_connection_st.ssl + ssl_st.wbio.
 SSL_TO_WBIO=$(get_offset "$SSL_OBJ" "$SSL_STRUCT" "wbio")
+if [ -z "$SSL_TO_WBIO" ] && [ "$SSL_STRUCT" = "ssl_connection_st" ]; then
+    SSL_ST_IN_CONN=$(get_offset "$SSL_OBJ" "ssl_connection_st" "ssl")
+    WBIO_IN_SSL_ST=$(get_offset "$SSL_OBJ" "ssl_st" "wbio")
+    if [ -n "$SSL_ST_IN_CONN" ] && [ -n "$WBIO_IN_SSL_ST" ]; then
+        SSL_TO_WBIO=$((SSL_ST_IN_CONN + WBIO_IN_SSL_ST))
+    fi
+fi
 
 # rlayer.wrl (3.2+ only — nested struct)
 RLAYER_OFFSET=$(get_offset "$SSL_OBJ" "$SSL_STRUCT" "rlayer")
