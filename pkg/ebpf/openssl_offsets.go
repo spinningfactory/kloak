@@ -68,10 +68,10 @@ var opensslOffsetTable = map[string]TLSOffsets{
 	"3.5": {SSLToWRL: 3208, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
 
 	// OpenSSL 3.2.x–3.4.x — identical offsets across these versions.
-	// TODO: verify SSLToVersion for 3.2-3.4 via pahole (likely 72, same as 3.5).
-	"3.4": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0xFFFFFFFF, SSLToWBIO: 88},
-	"3.3": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0xFFFFFFFF, SSLToWBIO: 88},
-	"3.2": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0xFFFFFFFF, SSLToWBIO: 88},
+	// SSLToVersion=72: verified via pahole on aarch64 and x86_64 (openssl-offsets workflow).
+	"3.4": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
+	"3.3": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
+	"3.2": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
 
 	// OpenSSL 3.0.x–3.1.x — 3-hop chain (no record layer indirection).
 	// SSLToWRL stores enc_write_ctx=2168; WRLToEncCtx=0 signals 3-hop to BPF.
