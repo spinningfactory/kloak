@@ -41,7 +41,7 @@ WORKDIR /app
 # openssl binary uses its own matched libraries (RPATH-linked to /opt/openssl)
 # and is independent of the Debian system openssl.
 # The 10-year expiry is intentional — this cert is for local demo use only.
-RUN /opt/openssl/bin/openssl req -x509 -newkey rsa:2048 \
+RUN OPENSSL_CONF=/dev/null /opt/openssl/bin/openssl req -x509 -newkey rsa:2048 \
     -keyout /app/key.pem -out /app/cert.pem \
     -days 3650 -nodes -subj "/CN=echo-tls"
 
