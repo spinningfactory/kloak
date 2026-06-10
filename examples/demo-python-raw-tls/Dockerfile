@@ -30,6 +30,17 @@ FROM python:3.11-slim
 COPY --from=openssl-builder /opt/openssl /opt/openssl
 ENV LD_LIBRARY_PATH=/opt/openssl/lib64:/opt/openssl/lib
 
+# Expose the custom libssl under /usr/local/lib so the kloak controller's
+# findContainerTLSLibraries scanner (which walks /usr/lib, /usr/local/lib,
+# etc. but not /opt/*) can find and attach uprobes to it. A relative symlink
+# so it resolves correctly when the controller accesses it via /proc/<pid>/root.
+# The uprobe attaches to the same inode Python loads via LD_LIBRARY_PATH, so
+# SSL_write interception works end-to-end.
+# TODO(kloak): discover libraries from /proc/<pid>/maps instead of fixed scan
+# roots so any install prefix works without this symlink workaround.
+RUN mkdir -p /usr/local/lib && \
+    ln -sf ../../../opt/openssl/lib64/libssl.so.3 /usr/local/lib/libssl.so.3
+
 # curl for health probes.
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
     && rm -rf /var/lib/apt/lists/*
