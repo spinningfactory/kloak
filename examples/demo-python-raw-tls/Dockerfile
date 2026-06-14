@@ -39,7 +39,8 @@ ENV LD_LIBRARY_PATH=/opt/openssl/lib64:/opt/openssl/lib
 # TODO(kloak): discover libraries from /proc/<pid>/maps instead of fixed scan
 # roots so any install prefix works without this symlink workaround.
 RUN mkdir -p /usr/local/lib && \
-    ln -sf ../../../opt/openssl/lib64/libssl.so.3 /usr/local/lib/libssl.so.3
+    ln -sf ../../../opt/openssl/lib64/libssl.so.3 /usr/local/lib/libssl.so.3 && \
+    ln -sf ../../../opt/openssl/lib64/libcrypto.so.3 /usr/local/lib/libcrypto.so.3
 
 # curl for health probes.
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
