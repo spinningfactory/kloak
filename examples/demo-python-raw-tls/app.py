@@ -60,6 +60,7 @@ def main():
     print("=" * 60)
     print("Kloak Demo: Raw TLS Echo (DNS-Verified Host Filtering)")
     print("=" * 60)
+    print(f"OpenSSL: {ssl.OPENSSL_VERSION}")
     print(f"Target: {target_host}:{LISTEN_PORT}")
     print(f"Secret Allowed: {key_allowed[:30]}...")
     print(f"Secret Blocked: {key_blocked[:30]}...")

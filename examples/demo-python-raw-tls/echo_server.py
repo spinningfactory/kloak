@@ -2,30 +2,16 @@
 
 import socket
 import ssl
-import subprocess
 import sys
 
-CERT_PATH = "/tmp/cert.pem"
-KEY_PATH = "/tmp/key.pem"
+# Cert is pre-generated at Docker build time by the Dockerfile so there is no
+# runtime subprocess dependency and no interaction with LD_LIBRARY_PATH.
+CERT_PATH = "/app/cert.pem"
+KEY_PATH = "/app/key.pem"
 LISTEN_PORT = 8443
 
 
-def generate_self_signed_cert():
-    subprocess.run(
-        [
-            "openssl", "req", "-x509", "-newkey", "rsa:2048",
-            "-keyout", KEY_PATH, "-out", CERT_PATH,
-            "-days", "365", "-nodes", "-subj", "/CN=echo-tls",
-        ],
-        check=True,
-        capture_output=True,
-    )
-    print(f"Generated self-signed cert at {CERT_PATH}", flush=True)
-
-
 def main():
-    generate_self_signed_cert()
-
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(CERT_PATH, KEY_PATH)
 
