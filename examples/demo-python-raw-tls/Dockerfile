@@ -22,11 +22,18 @@ RUN ./Configure \
     && make install_sw
 
 # Stage 2: Python demo image using our custom OpenSSL via LD_LIBRARY_PATH.
-# Python's _ssl extension is linked against SONAME libssl.so.3; all
-# OpenSSL 3.x share that SONAME and maintain binary ABI compatibility,
-# so LD_LIBRARY_PATH causes Python to load our custom build without
-# recompiling Python itself.
-FROM python:3.11-slim
+# Python's _ssl extension is linked against SONAME libssl.so.3 and loads our
+# custom build via LD_LIBRARY_PATH without recompiling Python.
+#
+# IMPORTANT: pin to -bookworm (OpenSSL 3.0.x). OpenSSL 3.x symbol versioning is
+# only forward-compatible: an _ssl built against the base image's OpenSSL can
+# load a *newer* libcrypto, but NOT an older one (the older lib lacks the
+# OPENSSL_3.x.0 symbol versions -> "version `OPENSSL_3.x.0' not found" at
+# `import ssl` -> the container crash-loops). The default `python:3.11-slim`
+# tag moved to Debian trixie (OpenSSL 3.5.x), which broke every tested version
+# below 3.5. Bookworm's 3.0.x base loads all currently-tracked versions
+# (3.0.21 … 3.5.7 and newer) via forward compatibility.
+FROM python:3.11-slim-bookworm
 COPY --from=openssl-builder /opt/openssl /opt/openssl
 ENV LD_LIBRARY_PATH=/opt/openssl/lib64:/opt/openssl/lib
 
@@ -38,9 +45,13 @@ ENV LD_LIBRARY_PATH=/opt/openssl/lib64:/opt/openssl/lib
 # SSL_write interception works end-to-end.
 # TODO(kloak): discover libraries from /proc/<pid>/maps instead of fixed scan
 # roots so any install prefix works without this symlink workaround.
+# OpenSSL installs to lib64 or lib depending on version/platform, so resolve the
+# actual libdir rather than hardcoding lib64 (3.0.x installs to lib, which left
+# this symlink dangling and the uprobe unattachable). Keep the link relative.
 RUN mkdir -p /usr/local/lib && \
-    ln -sf ../../../opt/openssl/lib64/libssl.so.3 /usr/local/lib/libssl.so.3 && \
-    ln -sf ../../../opt/openssl/lib64/libcrypto.so.3 /usr/local/lib/libcrypto.so.3
+    libdir="$(cd /opt/openssl && ls -d lib64 lib 2>/dev/null | head -1)" && \
+    ln -sf "../../../opt/openssl/${libdir}/libssl.so.3" /usr/local/lib/libssl.so.3 && \
+    ln -sf "../../../opt/openssl/${libdir}/libcrypto.so.3" /usr/local/lib/libcrypto.so.3
 
 # curl for health probes.
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
