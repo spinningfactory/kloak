@@ -253,10 +253,22 @@ jobs:
         env:
           KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
         run: |
+          echo "=== Pods (kloak-e2e) ==="
+          kubectl get pods -n kloak-e2e -o wide 2>/dev/null || true
+          echo "=== Events (kloak-e2e, by time) ==="
+          # The demo pod goes Pending -> Failed with no logs; the reason (image
+          # pull, scheduling, CrashLoop, DeadlineExceeded, OOM) only shows here.
+          kubectl get events -n kloak-e2e --sort-by=.lastTimestamp 2>/dev/null || true
+          echo "=== Describe demo-python-raw-tls pods ==="
+          kubectl describe pods -n kloak-e2e -l app=demo-python-raw-tls 2>/dev/null || true
+          echo "=== demo-python-raw-tls deployment status ==="
+          kubectl describe deployment -n kloak-e2e demo-python-raw-tls 2>/dev/null || true
           echo "=== Kloak Controller Logs ==="
           kubectl logs -n kloak-system -l app.kubernetes.io/component=controller --tail=5000 2>/dev/null || true
-          echo "=== demo-python-raw-tls Logs ==="
+          echo "=== demo-python-raw-tls Logs (current) ==="
           kubectl logs -n kloak-e2e -l app=demo-python-raw-tls --tail=200 2>/dev/null || true
+          echo "=== demo-python-raw-tls Logs (previous container, if it crashed) ==="
+          kubectl logs -n kloak-e2e -l app=demo-python-raw-tls --tail=200 --previous 2>/dev/null || true
           echo "=== BPF trace (last 500 lines) ==="
           if [ -s /tmp/bpf-trace.log ]; then
             grep -F kloak /tmp/bpf-trace.log | tail -500 || true
@@ -290,7 +302,15 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      # The PR includes an edit to .github/workflows/openssl-offsets.yml, and
+      # GitHub refuses to let the default GITHUB_TOKEN push changes to workflow
+      # files (needs the `workflow` scope, which GITHUB_TOKEN cannot have). So
+      # both the checkout and the PR creation use AUTOMATION_PAT — a PAT (or
+      # GitHub App token) with `repo` + `workflow` scopes, stored as a repo
+      # secret. See the "Open PR" step below.
       - uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.AUTOMATION_PAT }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -370,6 +390,10 @@ jobs:
         if: steps.find.outputs.new != ''
         uses: peter-evans/create-pull-request@v8
         with:
+          # PAT/App token with `repo` + `workflow` scopes. Required because the
+          # PR edits .github/workflows/openssl-offsets.yml, which the default
+          # GITHUB_TOKEN is forbidden from pushing.
+          token: ${{ secrets.AUTOMATION_PAT }}
           commit-message: "chore(openssl): add offset support for OpenSSL ${{ steps.find.outputs.new }}"
           branch: auto/openssl-versions/${{ steps.find.outputs.new }}
           delete-branch: true
@@ -394,5 +418,5 @@ jobs:
             - [ ] Chain type correct: WRLToEncCtx=0 means 3-hop (OpenSSL ≤3.1), non-zero means 4-hop (3.2+).
             - [ ] Spot-check that the on-demand `openssl-offsets.yml` workflow matrix is updated.
 
-            Note: this PR is opened by the default `GITHUB_TOKEN`; CI may not auto-trigger on push.
-            Push an empty commit or close-and-reopen the PR to kick the per-PR checks if needed.
+            Opened with a `workflow`-scoped automation token so the workflow-file
+            edit can be pushed and per-PR CI triggers normally.
