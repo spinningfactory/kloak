@@ -79,6 +79,8 @@ var opensslOffsetTable = map[string]TLSOffsets{
 	// SSLToWBIO=24: empirically confirmed on Ubuntu 24.04's libssl3 (3.0.13).
 	"3.1": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0, SSLToWBIO: 24},
 	"3.0": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0, SSLToWBIO: 24},
+	"3.6": {SSLToWRL: 3216, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
+	"4.0": {SSLToWRL: 3648, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
 }
 
 // DetectOpenSSLVersion reads an OpenSSL/libssl shared library from a
