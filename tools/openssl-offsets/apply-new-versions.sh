@@ -73,13 +73,27 @@ for v in "${NEW_VERSIONS[@]}"; do
       "$major_minor" "$ssl_to_wrl" "$wrl_to_enc" "$enc_to_algctx" "$algctx_to_h" "$ssl_to_ver" "$ssl_to_wbio")
 
     # Insert before the first existing entry so new (newer) versions land at the
-    # top of the table, keeping it in descending version order. The leading doc
-    # comments stay above the entries. Falls back to before the closing `}` if
-    # the table somehow has no entries yet.
+    # top of the table, keeping it in descending version order.
+    #
+    # Comments need care: the leading *general* doc comments (separated from the
+    # entries by blank lines) must stay at the top, but a *version-specific*
+    # comment block sitting immediately above the first entry (e.g.
+    # "// OpenSSL 3.5.x — …") documents that entry and must move down with it,
+    # below the newly inserted line. So we buffer comment lines, flush them in
+    # place at each blank line (general blocks), and emit whatever remains
+    # buffered *after* the new entry (the version-specific block). Falls back to
+    # before the closing `}` if the table somehow has no entries yet.
     awk -v new="$entry" '
       /^var opensslOffsetTable = map\[string\]TLSOffsets\{/ { in_map=1; print; next }
-      in_map && !done && /^[[:space:]]*"[0-9]+\.[0-9]+":[[:space:]]*\{/ { print new; done=1 }
-      in_map && /^\}$/ { if (!done) { print new; done=1 } in_map=0 }
+      in_map && !done && /^[[:space:]]*\/\// { comment_buf = comment_buf $0 "\n"; next }
+      in_map && !done && /^[[:space:]]*$/ { printf "%s%s\n", comment_buf, $0; comment_buf=""; next }
+      in_map && !done && /^[[:space:]]*"[0-9]+\.[0-9]+":[[:space:]]*\{/ {
+        print new; printf "%s", comment_buf; comment_buf=""; done=1
+      }
+      in_map && /^\}$/ {
+        if (!done) { printf "%s", comment_buf; comment_buf=""; print new; done=1 }
+        in_map=0
+      }
       { print }
     ' "$OFFSETS_GO" > "$OFFSETS_GO.tmp"
     mv "$OFFSETS_GO.tmp" "$OFFSETS_GO"
