@@ -7,7 +7,7 @@
 #
 # Reads tools/openssl-offsets/results/openssl-<v>-amd64.json (must exist)
 # and updates:
-#   - pkg/ebpf/openssl_offsets.go         (appends to opensslOffsetTable)
+#   - pkg/ebpf/openssl_offsets.go         (inserts into opensslOffsetTable, newest-first)
 #   - .github/workflows/openssl-offsets.yml  (appends to matrix.openssl)
 #
 # Note: openssl-versions-nightly.yml is NOT updated here — its discover/e2e
@@ -27,7 +27,15 @@ fi
 
 cd "$(dirname "$0")/../.."
 
-IFS=',' read -r -a NEW_VERSIONS <<<"$1"
+IFS=',' read -r -a _RAW_VERSIONS <<<"$1"
+# Process oldest-first: each entry is inserted at the top of the table (above the
+# current newest), so the final order ends up newest-first (descending), matching
+# the table's hand-curated convention. Portable numeric sort (no bash mapfile /
+# GNU `sort -V`, so this also works on the BSD tools shipped on macOS).
+NEW_VERSIONS=()
+while IFS= read -r _v; do
+  [ -n "$_v" ] && NEW_VERSIONS+=("$_v")
+done < <(printf '%s\n' "${_RAW_VERSIONS[@]}" | sort -t. -k1,1n -k2,2n -k3,3n)
 
 OFFSETS_GO="pkg/ebpf/openssl_offsets.go"
 DISCOVERY_YML=".github/workflows/openssl-offsets.yml"
@@ -64,10 +72,14 @@ for v in "${NEW_VERSIONS[@]}"; do
     entry=$(printf '\t"%s": {SSLToWRL: %s, WRLToEncCtx: %s, EncCtxToAlgctx: %s, AlgctxToH: %s, SSLToVersion: %s, SSLToWBIO: %s},' \
       "$major_minor" "$ssl_to_wrl" "$wrl_to_enc" "$enc_to_algctx" "$algctx_to_h" "$ssl_to_ver" "$ssl_to_wbio")
 
-    # Insert immediately before the closing `}` of opensslOffsetTable.
+    # Insert before the first existing entry so new (newer) versions land at the
+    # top of the table, keeping it in descending version order. The leading doc
+    # comments stay above the entries. Falls back to before the closing `}` if
+    # the table somehow has no entries yet.
     awk -v new="$entry" '
       /^var opensslOffsetTable = map\[string\]TLSOffsets\{/ { in_map=1; print; next }
-      in_map && /^\}$/ { print new; print; in_map=0; next }
+      in_map && !done && /^[[:space:]]*"[0-9]+\.[0-9]+":[[:space:]]*\{/ { print new; done=1 }
+      in_map && /^\}$/ { if (!done) { print new; done=1 } in_map=0 }
       { print }
     ' "$OFFSETS_GO" > "$OFFSETS_GO.tmp"
     mv "$OFFSETS_GO.tmp" "$OFFSETS_GO"
