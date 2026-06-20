@@ -49,7 +49,7 @@ ENV LD_LIBRARY_PATH=/opt/openssl/lib64:/opt/openssl/lib
 # actual libdir rather than hardcoding lib64 (3.0.x installs to lib, which left
 # this symlink dangling and the uprobe unattachable). Keep the link relative.
 RUN mkdir -p /usr/local/lib && \
-    libdir="$(cd /opt/openssl && ls -d lib64 lib 2>/dev/null | head -1)" && \
+    libdir="$([ -d /opt/openssl/lib64 ] && echo lib64 || echo lib)" && \
     ln -sf "../../../opt/openssl/${libdir}/libssl.so.3" /usr/local/lib/libssl.so.3 && \
     ln -sf "../../../opt/openssl/${libdir}/libcrypto.so.3" /usr/local/lib/libcrypto.so.3
 
