@@ -394,6 +394,16 @@ jobs:
           # PR edits .github/workflows/openssl-offsets.yml, which the default
           # GITHUB_TOKEN is forbidden from pushing.
           token: ${{ secrets.AUTOMATION_PAT }}
+          # Only commit the intended artifacts. The "Find new minor versions"
+          # step writes scratch files (upstream-latest.txt, tracked-minors.txt,
+          # new-versions.txt) to the repo root; without this, create-pull-request
+          # sweeps them into the PR. tracked-minors.txt in particular is derived
+          # at runtime from the results/*.json filenames, so it must never be
+          # committed.
+          add-paths: |
+            tools/openssl-offsets/results
+            pkg/ebpf/openssl_offsets.go
+            .github/workflows/openssl-offsets.yml
           commit-message: "chore(openssl): add offset support for OpenSSL ${{ steps.find.outputs.new }}"
           branch: auto/openssl-versions/${{ steps.find.outputs.new }}
           delete-branch: true
