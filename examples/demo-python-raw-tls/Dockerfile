@@ -37,21 +37,31 @@ FROM python:3.11-slim-bookworm
 COPY --from=openssl-builder /opt/openssl /opt/openssl
 ENV LD_LIBRARY_PATH=/opt/openssl/lib64:/opt/openssl/lib
 
-# Expose the custom libssl under /usr/local/lib so the kloak controller's
-# findContainerTLSLibraries scanner (which walks /usr/lib, /usr/local/lib,
-# etc. but not /opt/*) can find and attach uprobes to it. A relative symlink
-# so it resolves correctly when the controller accesses it via /proc/<pid>/root.
-# The uprobe attaches to the same inode Python loads via LD_LIBRARY_PATH, so
-# SSL_write interception works end-to-end.
+# Point BOTH the standard library paths at our custom OpenSSL so the container
+# has exactly one OpenSSL version everywhere — the one the app actually uses.
+#
+# This matters for kloak's version detection. The kloak controller scans the
+# standard lib roots (/usr/lib/<triplet>, /usr/local/lib) and keys its uprobe
+# offsets off the *version of libcrypto it finds there*. If we only symlinked
+# /usr/local/lib and left the base image's system libcrypto in place, kloak
+# would detect the base's version (bookworm = 3.0.20) and push 3.0 (3-hop)
+# offsets, while the app's TLS runs through our custom build (e.g. 3.5.0, a
+# 4-hop layout) — so the GCM-H walk fails and nothing gets rewritten. By
+# overwriting the system libssl/libcrypto links too, every path resolves to the
+# same custom inode and kloak detects the correct version.
+#
+# Links are relative so they resolve correctly when the controller reads them
+# via /proc/<pid>/root. Python's _ssl (built against the base's older OpenSSL)
+# loads the newer custom lib fine by forward compatibility.
 # TODO(kloak): discover libraries from /proc/<pid>/maps instead of fixed scan
 # roots so any install prefix works without this symlink workaround.
-# OpenSSL installs to lib64 or lib depending on version/platform, so resolve the
-# actual libdir rather than hardcoding lib64 (3.0.x installs to lib, which left
-# this symlink dangling and the uprobe unattachable). Keep the link relative.
 RUN mkdir -p /usr/local/lib && \
     libdir="$([ -d /opt/openssl/lib64 ] && echo lib64 || echo lib)" && \
-    ln -sf "../../../opt/openssl/${libdir}/libssl.so.3" /usr/local/lib/libssl.so.3 && \
-    ln -sf "../../../opt/openssl/${libdir}/libcrypto.so.3" /usr/local/lib/libcrypto.so.3
+    triplet="$(uname -m)-linux-gnu" && \
+    for f in libssl.so.3 libcrypto.so.3; do \
+      ln -sf "../../../opt/openssl/${libdir}/$f" "/usr/local/lib/$f" && \
+      ln -sf "../../../opt/openssl/${libdir}/$f" "/usr/lib/${triplet}/$f"; \
+    done
 
 # curl for health probes.
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
