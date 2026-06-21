@@ -22,25 +22,46 @@ RUN ./Configure \
     && make install_sw
 
 # Stage 2: Python demo image using our custom OpenSSL via LD_LIBRARY_PATH.
-# Python's _ssl extension is linked against SONAME libssl.so.3; all
-# OpenSSL 3.x share that SONAME and maintain binary ABI compatibility,
-# so LD_LIBRARY_PATH causes Python to load our custom build without
-# recompiling Python itself.
-FROM python:3.11-slim
+# Python's _ssl extension is linked against SONAME libssl.so.3 and loads our
+# custom build via LD_LIBRARY_PATH without recompiling Python.
+#
+# IMPORTANT: pin to -bookworm (OpenSSL 3.0.x). OpenSSL 3.x symbol versioning is
+# only forward-compatible: an _ssl built against the base image's OpenSSL can
+# load a *newer* libcrypto, but NOT an older one (the older lib lacks the
+# OPENSSL_3.x.0 symbol versions -> "version `OPENSSL_3.x.0' not found" at
+# `import ssl` -> the container crash-loops). The default `python:3.11-slim`
+# tag moved to Debian trixie (OpenSSL 3.5.x), which broke every tested version
+# below 3.5. Bookworm's 3.0.x base loads all currently-tracked versions
+# (3.0.21 … 3.5.7 and newer) via forward compatibility.
+FROM python:3.11-slim-bookworm
 COPY --from=openssl-builder /opt/openssl /opt/openssl
 ENV LD_LIBRARY_PATH=/opt/openssl/lib64:/opt/openssl/lib
 
-# Expose the custom libssl under /usr/local/lib so the kloak controller's
-# findContainerTLSLibraries scanner (which walks /usr/lib, /usr/local/lib,
-# etc. but not /opt/*) can find and attach uprobes to it. A relative symlink
-# so it resolves correctly when the controller accesses it via /proc/<pid>/root.
-# The uprobe attaches to the same inode Python loads via LD_LIBRARY_PATH, so
-# SSL_write interception works end-to-end.
+# Point BOTH the standard library paths at our custom OpenSSL so the container
+# has exactly one OpenSSL version everywhere — the one the app actually uses.
+#
+# This matters for kloak's version detection. The kloak controller scans the
+# standard lib roots (/usr/lib/<triplet>, /usr/local/lib) and keys its uprobe
+# offsets off the *version of libcrypto it finds there*. If we only symlinked
+# /usr/local/lib and left the base image's system libcrypto in place, kloak
+# would detect the base's version (bookworm = 3.0.20) and push 3.0 (3-hop)
+# offsets, while the app's TLS runs through our custom build (e.g. 3.5.0, a
+# 4-hop layout) — so the GCM-H walk fails and nothing gets rewritten. By
+# overwriting the system libssl/libcrypto links too, every path resolves to the
+# same custom inode and kloak detects the correct version.
+#
+# Links are relative so they resolve correctly when the controller reads them
+# via /proc/<pid>/root. Python's _ssl (built against the base's older OpenSSL)
+# loads the newer custom lib fine by forward compatibility.
 # TODO(kloak): discover libraries from /proc/<pid>/maps instead of fixed scan
 # roots so any install prefix works without this symlink workaround.
 RUN mkdir -p /usr/local/lib && \
-    ln -sf ../../../opt/openssl/lib64/libssl.so.3 /usr/local/lib/libssl.so.3 && \
-    ln -sf ../../../opt/openssl/lib64/libcrypto.so.3 /usr/local/lib/libcrypto.so.3
+    libdir="$([ -d /opt/openssl/lib64 ] && echo lib64 || echo lib)" && \
+    triplet="$(uname -m)-linux-gnu" && \
+    for f in libssl.so.3 libcrypto.so.3; do \
+      ln -sf "../../../opt/openssl/${libdir}/$f" "/usr/local/lib/$f" && \
+      ln -sf "../../../opt/openssl/${libdir}/$f" "/usr/lib/${triplet}/$f"; \
+    done
 
 # curl for health probes.
 RUN apt-get update && apt-get install -y --no-install-recommends curl \
