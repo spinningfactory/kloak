@@ -69,8 +69,20 @@ func main() {
 	fmt.Println("Waiting 10s for Kloak controller to sync...")
 	time.Sleep(10 * time.Second)
 
+	// Disable HTTP keep-alive so every request opens a fresh TLS connection.
+	// Kloak captures the GCM key (H) at the connection's cipher init; if the
+	// uprobe attaches *after* a long-lived keep-alive connection is already
+	// established, that connection is never instrumented and every subsequent
+	// reused request misses the rewrite permanently (a primary e2e flake). A
+	// fresh connection per request means a late attach is picked up on the very
+	// next request instead. ForceAttemptHTTP2 keeps the h2 path the HPACK test
+	// exercises.
 	client := &http.Client{
 		Timeout: 10 * time.Second,
+		Transport: &http.Transport{
+			DisableKeepAlives: true,
+			ForceAttemptHTTP2: true,
+		},
 	}
 
 	requestCount := 0
