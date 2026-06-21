@@ -36,6 +36,11 @@ function makeRequest(url, headers) {
       path: opts.pathname + opts.search,
       method: "GET",
       headers,
+      // Fresh TLS connection per request (no socket pooling). If the uprobe
+      // attaches after a reused connection's cipher init, every later request
+      // on that socket misses the rewrite permanently — a primary e2e flake.
+      // A new connection each time lets a late attach be picked up next request.
+      agent: false,
     };
 
     const req = https.request(reqOpts, (res) => {
@@ -78,14 +83,14 @@ async function main() {
   );
   console.log("=".repeat(60));
 
-  // Brief delay for kloak controller to attach uprobes before the first
-  // TLS connection. Node's https.globalAgent defaults to keepAlive=true
-  // (and we send Connection: keep-alive explicitly below), so all
-  // subsequent requests reuse the very first connection's SSL_CTX. If
-  // we lose the attach race against that first connection, every later
-  // request misses the rewrite — observable in CI as the kprobe_walk
-  // counter staying frozen while the demo cycles 100+ requests.
-  // Mirrors the startup delay in examples/demo-go/main.go.
+  // Brief delay for the kloak controller to attach uprobes before the first
+  // TLS connection. This used to be load-bearing: with connection pooling, all
+  // requests reused the first connection's SSL_CTX, so losing the attach race
+  // against that first connection meant every later request missed the rewrite
+  // permanently (kprobe_walk frozen while the demo cycled 100+ requests). We
+  // now open a fresh connection per request (agent: false + Connection: close
+  // in makeRequest), so a late attach is picked up on the next request and this
+  // delay is only a minor head-start. Mirrors examples/demo-go/main.go.
   console.log("Waiting 10s for Kloak controller to sync...");
   await new Promise((r) => setTimeout(r, 10000));
 
@@ -103,7 +108,7 @@ async function main() {
         "User-Agent": "node-demo/1.0.0",
         "Accept-Encoding": "gzip, deflate",
         Accept: "*/*",
-        Connection: "keep-alive",
+        Connection: "close",
       };
 
       const { status, body } = await makeRequest(targetURL, headers);

@@ -68,6 +68,12 @@ func main() {
 				NextProtos: []string{"http/1.1"},
 			},
 			ForceAttemptHTTP2: false,
+			// Fresh TLS connection per request: if the uprobe attaches after a
+			// reused keep-alive connection is established, that connection's
+			// cipher init was never captured and every later request on it
+			// misses the rewrite. A new connection each time lets a late attach
+			// be picked up on the next request (a primary e2e flake fix).
+			DisableKeepAlives: true,
 			DialContext: (&net.Dialer{
 				Timeout: 10 * time.Second,
 			}).DialContext,
