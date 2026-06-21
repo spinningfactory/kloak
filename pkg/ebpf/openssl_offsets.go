@@ -63,6 +63,8 @@ var opensslOffsetTable = map[string]TLSOffsets{
 	// moved wbio to 88. Before this field was added, the BPF program
 	// hardcoded 88 — which silently broke every 3.0/3.1 caller.
 
+	"4.0": {SSLToWRL: 3648, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
+	"3.6": {SSLToWRL: 3216, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
 	// OpenSSL 3.5.x — SSLToWRL grew due to new fields in SSL_CONNECTION.
 	// SSLToVersion=72: ssl_connection_st.version (after 64-byte embedded ssl_st).
 	"3.5": {SSLToWRL: 3208, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
