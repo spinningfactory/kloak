@@ -44,7 +44,7 @@ jobs:
     outputs:
       versions: ${{ steps.resolve.outputs.versions }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Resolve latest patch per tracked minor
         id: resolve
@@ -91,7 +91,7 @@ jobs:
         platform: [linux/amd64, linux/arm64]
         openssl: ${{ fromJson(needs.resolve-matrix.outputs.versions) }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -162,7 +162,7 @@ jobs:
       CACHE_REPO: ghcr.io/${{ github.repository }}/cache
     steps:
       - name: Checkout code
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -308,7 +308,7 @@ jobs:
       # both the checkout and the PR creation use AUTOMATION_PAT — a PAT (or
       # GitHub App token) with `repo` + `workflow` scopes, stored as a repo
       # secret. See the "Open PR" step below.
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           token: ${{ secrets.AUTOMATION_PAT }}
 
