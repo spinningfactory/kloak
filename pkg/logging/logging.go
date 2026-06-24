@@ -61,6 +61,52 @@ func Setup() *zap.SugaredLogger {
 	return zapLogger.Sugar()
 }
 
+// SetupCLI returns a SugaredLogger tuned for interactive CLI tools
+// (krunk, future per-binary CLIs):
+//
+//   - console encoder with capital-color levels — human-readable at a
+//     glance, unlike the daemon's JSON
+//   - short time format (HH:MM:SS) — full timestamps are pointless when
+//     stderr scrolls past in real time
+//   - default WARN — INFO is the daemon's "tell ops everything that
+//     happens" floor, which becomes noise in a CLI session where the
+//     user already sees the child's own output
+//   - no stacktrace on warn/error — a one-line error is what the user
+//     wants; the trace belongs in `krunk --log-level=debug` if at all
+//   - no controller-runtime bridge — CLI tools don't host controllers
+//
+// level accepts trace/debug/info/warn/error (trace is below debug, used
+// by Tracew for per-event BPF counters and similar firehose-level
+// detail). Empty / unrecognized values fall back to WARN — flag parsing
+// upstream should reject before we get here, but we never want logger
+// init to fail.
+func SetupCLI(level string) *zap.SugaredLogger {
+	if level == "" {
+		level = "warn"
+	}
+	cfg := zap.NewDevelopmentConfig()
+	cfg.EncoderConfig.EncodeLevel = zapcore.CapitalColorLevelEncoder
+	cfg.EncoderConfig.EncodeTime = zapcore.TimeEncoderOfLayout("15:04:05")
+	cfg.DisableStacktrace = true
+	cfg.Development = false
+
+	if strings.EqualFold(level, "trace") {
+		cfg.Level = zap.NewAtomicLevelAt(TraceLevel)
+	} else {
+		var lvl zapcore.Level
+		if err := lvl.UnmarshalText([]byte(strings.ToLower(level))); err != nil {
+			lvl = zapcore.WarnLevel
+		}
+		cfg.Level = zap.NewAtomicLevelAt(lvl)
+	}
+
+	z, err := cfg.Build()
+	if err != nil {
+		z = zap.NewNop()
+	}
+	return z.Sugar()
+}
+
 // Tracew logs at trace level (below debug). Use for very verbose output
 // like per-secret sync details, BPF debug counters, and per-map-entry operations.
 func Tracew(log *zap.SugaredLogger, msg string, keysAndValues ...interface{}) {

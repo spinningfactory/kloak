@@ -1,4 +1,4 @@
-.PHONY: all build build-klor build-linux build-klor-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup e2e-klor e2e-klor-rooted \
+.PHONY: all build build-krunk build-linux build-krunk-linux test test-linux test-bpf-helpers e2e e2e-setup e2e-run e2e-cleanup e2e-krunk e2e-krunk-rooted \
         e2e-k3s e2e-k3s-setup e2e-k3s-run e2e-k3s-cleanup \
         clean deps docker-build generate-ebpf generate-vmlinux run help \
         lima-start lima-stop lima-delete lima-shell lima-exec lima-check \
@@ -17,10 +17,10 @@ GOGENERATE=$(GOCMD) generate
 BINARY_NAME=kloak
 WEBHOOK_BINARY=kloak-webhook
 
-# Klor — the host-CLI runtime. Separate `main` package at cmd/klor/ so its
+# Krunk — the host-CLI runtime. Separate `main` package at cmd/krunk/ so its
 # dependency closure shrinks independently (no k8s.io/client-go, no
 # controller-runtime). Not part of the controller Docker image.
-KLOR_BINARY=klor
+KRUNK_BINARY=krunk
 
 # Release tag baked into the binary for `kloak version`. `git describe
 # --tags --always --dirty` gives `v0.1.0` exactly on tag, `v0.1.0-3-gabc1234-dirty`
@@ -53,7 +53,7 @@ LIMA_CONFIG=lima.yaml
 # Main targets
 # ============================================================================
 
-all: build build-klor
+all: build build-krunk
 
 # Build depends on Go sources (and generated eBPF on Linux)
 build: deps $(BUILD_DIR)/$(BINARY_NAME)
@@ -62,12 +62,12 @@ $(BUILD_DIR)/$(BINARY_NAME): $(GO_SOURCES)
 	@mkdir -p $(BUILD_DIR)
 	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME) ./$(CMD_DIR)/kloak
 
-# Build the klor host-CLI binary. Sibling of `build`; lives at cmd/klor/.
-build-klor: deps $(BUILD_DIR)/$(KLOR_BINARY)
+# Build the krunk host-CLI binary. Sibling of `build`; lives at cmd/krunk/.
+build-krunk: deps $(BUILD_DIR)/$(KRUNK_BINARY)
 
-$(BUILD_DIR)/$(KLOR_BINARY): $(GO_SOURCES)
+$(BUILD_DIR)/$(KRUNK_BINARY): $(GO_SOURCES)
 	@mkdir -p $(BUILD_DIR)
-	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(KLOR_BINARY) ./$(CMD_DIR)/klor
+	$(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(KRUNK_BINARY) ./$(CMD_DIR)/krunk
 
 # Build for Linux (cross-compile or via Lima)
 build-linux: lima-ensure
@@ -77,11 +77,11 @@ build-linux: lima-ensure
 		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go build $(LDFLAGS) -o $(BUILD_DIR)/$(BINARY_NAME)-linux ./$(CMD_DIR)/kloak"; \
 	fi
 
-build-klor-linux: lima-ensure
+build-krunk-linux: lima-ensure
 	@if [ "$$(uname)" = "Linux" ]; then \
-		GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(KLOR_BINARY)-linux ./$(CMD_DIR)/klor; \
+		GOOS=linux GOARCH=amd64 $(GOBUILD) $(LDFLAGS) -o $(BUILD_DIR)/$(KRUNK_BINARY)-linux ./$(CMD_DIR)/krunk; \
 	else \
-		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go build $(LDFLAGS) -o $(BUILD_DIR)/$(KLOR_BINARY)-linux ./$(CMD_DIR)/klor"; \
+		$(MAKE) lima-exec CMD="cd $(LIMA_WORKDIR) && go build $(LDFLAGS) -o $(BUILD_DIR)/$(KRUNK_BINARY)-linux ./$(CMD_DIR)/krunk"; \
 	fi
 
 test: deps
@@ -155,20 +155,20 @@ e2e-run:
 	KUBECONFIG=$$(k3d kubeconfig write $(E2E_CLUSTER)) \
 	$(GOTEST) -v -timeout 1500s -tags=e2e_ebpf -count=1 ./test/e2e/
 
-# klor e2e — builds the klor binary and exercises its CLI against
+# krunk e2e — builds the krunk binary and exercises its CLI against
 # a tempdir cgroup root. No cluster, no root required (Linux-only,
 # skips on macOS). Cheap; safe to run as part of unit-test CI.
-e2e-klor:
-	$(GOTEST) -v -timeout 120s -tags=e2e_klor -count=1 ./test/e2e/klor/
+e2e-krunk:
+	$(GOTEST) -v -timeout 120s -tags=e2e_krunk -count=1 ./test/e2e/krunk/
 
-# klor rootless e2e — exercises install.sh + cap-on-binary so klor
+# krunk rootless e2e — exercises install.sh + cap-on-binary so krunk
 # runs without sudo. TestMain skips unless running as root (so
 # install.sh can setcap); the test itself then drops to a non-root
 # uid via setpriv to prove the cap-on-binary path actually delivers
 # the privilege drop. CI's ubuntu-latest runs root by default; dev
-# hosts use `sudo make e2e-klor-rooted`.
-e2e-klor-rooted:
-	$(GOTEST) -v -timeout 180s -tags=e2e_klor_rooted -count=1 ./test/e2e/klor/
+# hosts use `sudo make e2e-krunk-rooted`.
+e2e-krunk-rooted:
+	$(GOTEST) -v -timeout 180s -tags=e2e_krunk_rooted -count=1 ./test/e2e/krunk/
 
 # Run e2e tests against the current kube context.
 # Builds images, pushes to ttl.sh (anonymous ephemeral registry, 2h TTL),
@@ -398,11 +398,11 @@ help:
 	@echo "Kloak Makefile - Kubernetes eBPF HTTPS Interceptor"
 	@echo ""
 	@echo "Build targets:"
-	@echo "  all              - Build both kloak and klor binaries"
+	@echo "  all              - Build both kloak and krunk binaries"
 	@echo "  build            - Build the kloak binary (native)"
-	@echo "  build-klor       - Build the klor host-CLI binary (native)"
+	@echo "  build-krunk       - Build the krunk host-CLI binary (native)"
 	@echo "  build-linux      - Build kloak for Linux (uses Lima on macOS)"
-	@echo "  build-klor-linux - Build klor for Linux (uses Lima on macOS)"
+	@echo "  build-krunk-linux - Build krunk for Linux (uses Lima on macOS)"
 	@echo "  clean            - Clean build artifacts"
 	@echo "  deps             - Download and tidy dependencies"
 	@echo "  docker-build     - Build Docker image"
@@ -428,9 +428,9 @@ help:
 	@echo "  e2e-k3s-run      - Run e2e tests against local k3s"
 	@echo "  e2e-k3s-cleanup  - Uninstall k3s"
 	@echo ""
-	@echo "klor e2e (no cluster required):"
-	@echo "  e2e-klor         - Build klor and exercise its CLI (Linux-only; self-skips on macOS)"
-	@echo "  e2e-klor-rooted  - Run install.sh + verify cap-on-binary lets klor run without sudo (needs root)"
+	@echo "krunk e2e (no cluster required):"
+	@echo "  e2e-krunk         - Build krunk and exercise its CLI (Linux-only; self-skips on macOS)"
+	@echo "  e2e-krunk-rooted  - Run install.sh + verify cap-on-binary lets krunk run without sudo (needs root)"
 	@echo ""
 	@echo "eBPF code generation:"
 	@echo "  generate-ebpf    - Generate eBPF Go bindings (uses Lima on macOS)"

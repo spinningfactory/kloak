@@ -52,6 +52,9 @@ func TestNew_DefaultsInjectRootAndLogger(t *testing.T) {
 		t.Errorf("injectRoot=%q, want %q (euid=%d, XDG_RUNTIME_DIR=%q)",
 			hr.injectRoot, wantInject, os.Geteuid(), os.Getenv("XDG_RUNTIME_DIR"))
 	}
+	if hr.ebpfEnabled {
+		t.Error("ebpfEnabled should default to false (no rewrite without explicit opt-in)")
+	}
 }
 
 // expectedDefaultInjectRoot mirrors chooseInjectRoot's branch logic so
@@ -68,6 +71,16 @@ func expectedDefaultInjectRoot(t *testing.T) string {
 		return filepath.Join(x, "kloak")
 	}
 	return "/tmp/kloak"
+}
+
+func TestWithEBPF_OptInOnly(t *testing.T) {
+	// WithEBPF flips ebpfEnabled; without it the runtime stays in the
+	// safe no-rewrite mode used by unit tests + the CLI's
+	// --no-rewrite flag.
+	rt := New("", "", nil, WithEBPF()).(*hostRuntime)
+	if !rt.ebpfEnabled {
+		t.Error("WithEBPF() did not set ebpfEnabled")
+	}
 }
 
 func TestRun_NilSpecRejected(t *testing.T) {
@@ -185,20 +198,22 @@ func TestRun_PropagatesNonZeroExitCode(t *testing.T) {
 	}
 }
 
-func TestRun_BadStartReturnsError(t *testing.T) {
+func TestRun_BadBinaryPropagatesExitCode(t *testing.T) {
+	// Krunk wraps the user's command in a `/bin/sh -c 'read <&3; exec "$@"'`
+	// shim that gates exec on the sync pipe (see runtime.go for why).
+	// Result: a missing user binary is no longer a `cmd.Start` failure
+	// (the shim itself is /bin/sh which always exists) — it shows up
+	// as the shim's exec failing, surfacing as exit code 127 with
+	// krunk returning no error.
 	rt := New(t.TempDir(), t.TempDir(), zap.NewNop().Sugar())
-	// A binary that definitely won't exist on any runner.
 	code, err := rt.Run(context.Background(), &runtime.Spec{
 		Cmd: []string{"/this/binary/does/not/exist-kloak-test"},
 	})
-	if err == nil {
-		t.Fatal("expected error for non-existent binary")
+	if err != nil {
+		t.Fatalf("Run unexpectedly errored: %v", err)
 	}
-	if code != -1 {
-		t.Errorf("code=%d on Start failure, want -1", code)
-	}
-	if !strings.Contains(err.Error(), "start child") {
-		t.Errorf("error %q should be wrapped with 'start child'", err)
+	if code != 127 {
+		t.Errorf("code=%d, want 127 (shell standard for 'command not found')", code)
 	}
 }
 
