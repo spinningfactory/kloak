@@ -1192,7 +1192,7 @@ type bpfTLSOffsets struct {
 // pushOffsetVal writes the offsets for this binary (keyed by exe inode) plus a
 // per-cgroup fallback entry (ExeInode=0) for short-lived processes spawned into
 // the cgroup that fire SSL_write before their inode-specific push runs.
-func (m *TLSUprobeManager) pushOffsetVal(val bpfTLSOffsets, cgroupID uint64, exeInode uint64) {
+func (m *TLSUprobeManager) pushOffsetVal(val bpfTLSOffsets, cgroupID, exeInode uint64) {
 	key := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: exeInode}
 	if err := m.objs.TlsOffsetConfig.Update(&key, &val, 0); err != nil {
 		m.log.Errorw("Failed to push TLS offsets to BPF map",
