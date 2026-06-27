@@ -43,6 +43,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       versions: ${{ steps.resolve.outputs.versions }}
+      e2e_versions: ${{ steps.resolve.outputs.e2e_versions }}
     steps:
       - uses: actions/checkout@v7
 
@@ -76,6 +77,20 @@ jobs:
             | jq -R . | jq -sc .)
           echo "Resolved versions: $versions"
           echo "versions=$versions" >> "$GITHUB_OUTPUT"
+
+          # e2e can only exercise OpenSSL majors whose SONAME matches the demo
+          # image's Python base. demo-python-raw-tls runs on python:3.11-slim-
+          # bookworm, whose _ssl links libssl.so.3 — so it can load any custom
+          # OpenSSL 3.x (forward-compatible within the .so.3 SONAME) but NOT 4.x,
+          # which ships libssl.so.4: the .so.3 symlinks dangle, Python's _ssl
+          # can't load, and the demo pod crash-loops. Offset *discovery* above
+          # is unaffected (it reads struct layout directly), so 4.x still gets
+          # tracked — it just can't be run end-to-end until a 4.x-linked base
+          # image exists. Filter e2e to the 3.x series.
+          # TODO: revisit when a Python base built against OpenSSL 4 is available.
+          e2e_versions=$(printf '%s' "$versions" | jq -c '[.[] | select(test("^3\\."))]')
+          echo "E2E versions (SONAME-compatible with demo base): $e2e_versions"
+          echo "e2e_versions=$e2e_versions" >> "$GITHUB_OUTPUT"
 
   # ────────────────────────────────────────────────────────────────────
   # (1) Offset discovery — same shape as openssl-offsets.yml's matrix,
@@ -147,6 +162,9 @@ jobs:
   # ────────────────────────────────────────────────────────────────────
   # (2) Multi-version e2e — exercises the real BPF rewrite path against a
   # demo-python-raw-tls image built against each supported OpenSSL version.
+  # Uses e2e_versions (3.x only): the demo's bookworm Python base links
+  # libssl.so.3 and cannot load a 4.x (libssl.so.4) build, so those would only
+  # crash-loop. 4.x is still covered by discover above.
   e2e:
     name: e2e OpenSSL ${{ matrix.openssl }}
     runs-on: ubuntu-latest
@@ -154,7 +172,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        openssl: ${{ fromJson(needs.resolve-matrix.outputs.versions) }}
+        openssl: ${{ fromJson(needs.resolve-matrix.outputs.e2e_versions) }}
     permissions:
       contents: read
       packages: write
