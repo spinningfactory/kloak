@@ -319,48 +319,57 @@ HELPER_INLINE __u8 kloak_aes_gmul(__u8 x, __u8 y) {
   return r;
 }
 
-// aes_block_encrypt: encrypt one 16-byte block `in` under the expanded key
-// schedule `rk` ((nr+1)*16 bytes), writing 16 bytes to `out`. nr in {10,12,14}.
-HELPER_INLINE void aes_block_encrypt(const __u8 *rk, __u32 nr,
-                                     const __u8 in[16], __u8 out[16]) {
-  __u8 s[16];
-  for (int i = 0; i < 16; i++) s[i] = in[i] ^ rk[i];
+// aes_shift_rows / aes_mix_columns operate IN PLACE on a column-major state
+// (byte index = row + 4*col), using only scalar temporaries — important because
+// this code is inlined into kloak's already stack-heavy kprobe, and the eBPF
+// stack limit is 512 bytes. No 16-byte working arrays.
+HELPER_INLINE void aes_shift_rows(__u8 s[16]) {
+  __u8 t;
+  // row 1: <<1
+  t = s[1]; s[1] = s[5]; s[5] = s[9]; s[9] = s[13]; s[13] = t;
+  // row 2: <<2 (swap pairs)
+  t = s[2]; s[2] = s[10]; s[10] = t;
+  t = s[6]; s[6] = s[14]; s[14] = t;
+  // row 3: <<3 (== >>1)
+  t = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = s[3]; s[3] = t;
+}
+HELPER_INLINE void aes_mix_columns(__u8 s[16]) {
+  for (int c = 0; c < 4; c++) {
+    __u8 a0 = s[4 * c + 0], a1 = s[4 * c + 1], a2 = s[4 * c + 2], a3 = s[4 * c + 3];
+    s[4 * c + 0] = (__u8)(kloak_aes_gmul(a0, 2) ^ kloak_aes_gmul(a1, 3) ^ a2 ^ a3);
+    s[4 * c + 1] = (__u8)(a0 ^ kloak_aes_gmul(a1, 2) ^ kloak_aes_gmul(a2, 3) ^ a3);
+    s[4 * c + 2] = (__u8)(a0 ^ a1 ^ kloak_aes_gmul(a2, 2) ^ kloak_aes_gmul(a3, 3));
+    s[4 * c + 3] = (__u8)(kloak_aes_gmul(a0, 3) ^ a1 ^ a2 ^ kloak_aes_gmul(a3, 2));
+  }
+}
+
+// aes_block_encrypt encrypts the 16-byte block in `state` IN PLACE under the
+// expanded key schedule `rk` ((nr+1)*16 bytes). nr in {10,12,14}. Operating in
+// place keeps the BPF stack frame flat (no 16-byte temporaries).
+HELPER_INLINE void aes_block_encrypt(const __u8 *rk, __u32 nr, __u8 state[16]) {
+  for (int i = 0; i < 16; i++) state[i] ^= rk[i]; // AddRoundKey 0
 
   // Up to 13 mid rounds (AES-256 nr=14 → 13). Bounded by a constant so the
   // eBPF verifier can unroll; `round < nr` gates the real per-key count.
   for (__u32 round = 1; round < 14 && round < nr; round++) {
-    __u8 t[16];
-    for (int i = 0; i < 16; i++) t[i] = KLOAK_AES_SBOX[s[i]];
-    // ShiftRows (column-major state: byte r + 4*c)
-    __u8 a[16];
-    for (int c = 0; c < 4; c++)
-      for (int r = 0; r < 4; r++) a[r + 4 * c] = t[r + 4 * ((c + r) & 3)];
-    // MixColumns
-    __u8 m[16];
-    for (int c = 0; c < 4; c++) {
-      __u8 *col = a + 4 * c, *o = m + 4 * c;
-      o[0] = (__u8)(kloak_aes_gmul(col[0], 2) ^ kloak_aes_gmul(col[1], 3) ^ col[2] ^ col[3]);
-      o[1] = (__u8)(col[0] ^ kloak_aes_gmul(col[1], 2) ^ kloak_aes_gmul(col[2], 3) ^ col[3]);
-      o[2] = (__u8)(col[0] ^ col[1] ^ kloak_aes_gmul(col[2], 2) ^ kloak_aes_gmul(col[3], 3));
-      o[3] = (__u8)(kloak_aes_gmul(col[0], 3) ^ col[1] ^ col[2] ^ kloak_aes_gmul(col[3], 2));
-    }
+    for (int i = 0; i < 16; i++) state[i] = KLOAK_AES_SBOX[state[i]];
+    aes_shift_rows(state);
+    aes_mix_columns(state);
     const __u8 *k = rk + 16 * round;
-    for (int i = 0; i < 16; i++) s[i] = m[i] ^ k[i];
+    for (int i = 0; i < 16; i++) state[i] ^= k[i];
   }
 
   // Final round (SubBytes + ShiftRows + AddRoundKey, no MixColumns).
-  __u8 t[16];
-  for (int i = 0; i < 16; i++) t[i] = KLOAK_AES_SBOX[s[i]];
-  __u8 a[16];
-  for (int c = 0; c < 4; c++)
-    for (int r = 0; r < 4; r++) a[r + 4 * c] = t[r + 4 * ((c + r) & 3)];
+  for (int i = 0; i < 16; i++) state[i] = KLOAK_AES_SBOX[state[i]];
+  aes_shift_rows(state);
   const __u8 *k = rk + 16 * nr;
-  for (int i = 0; i < 16; i++) out[i] = a[i] ^ k[i];
+  for (int i = 0; i < 16; i++) state[i] ^= k[i];
 }
 
 // aes_recover_h recomputes the GHASH subkey H = AES_encrypt(0) from a persisted
-// AES round-key schedule. Returns 1 on success, 0 if `rounds` is not a TLS AES
-// round count (a guard against a bogus offset read).
+// AES round-key schedule, writing 16 bytes to h_out. Returns 1 on success, 0 if
+// `rounds` is not a TLS AES round count (a guard against a bogus offset read).
+// h_out doubles as the in-place AES state, so no scratch block is needed.
 //
 // Dispatch is on a COMPILE-TIME-CONSTANT round count so aes_block_encrypt
 // inlines with a constant `nr`: clang then fully unrolls its round loop into
@@ -369,14 +378,13 @@ HELPER_INLINE void aes_block_encrypt(const __u8 *rk, __u32 nr,
 // Only AES-128 (10) and AES-256 (14) are handled — TLS never negotiates
 // AES-192-GCM, so 12 is intentionally treated as unsupported.
 HELPER_INLINE int aes_recover_h(const __u8 *rd_key, __u32 rounds, __u8 h_out[16]) {
-  __u8 zero[16];
-  for (int i = 0; i < 16; i++) zero[i] = 0;
+  for (int i = 0; i < 16; i++) h_out[i] = 0; // plaintext block = 0
   if (rounds == 10) {
-    aes_block_encrypt(rd_key, 10, zero, h_out);
+    aes_block_encrypt(rd_key, 10, h_out);
     return 1;
   }
   if (rounds == 14) {
-    aes_block_encrypt(rd_key, 14, zero, h_out);
+    aes_block_encrypt(rd_key, 14, h_out);
     return 1;
   }
   return 0;

@@ -369,26 +369,26 @@ static void aes_kat_expand(const __u8 *key, int nk, __u8 *rk, int nr) {
 
 static void test_aes128_fips197(void) {
   // FIPS-197 Appendix C.1: key 000102…0f, pt 00112233…ff.
-  __u8 key[16], pt[16], ct[16], rk[176], want[16];
+  __u8 key[16], block[16], rk[176], want[16];
   for (int i = 0; i < 16; i++) {
     key[i] = (__u8)i;
-    pt[i] = (__u8)(i * 0x11);
+    block[i] = (__u8)(i * 0x11); // plaintext, encrypted in place
   }
   hex_to_bytes("69c4e0d86a7b0430d8cdb78070b4c55a", want, 16);
   aes_kat_expand(key, 4, rk, 10);
-  aes_block_encrypt(rk, 10, pt, ct);
-  assert(bytes_equal(ct, want, 16));
+  aes_block_encrypt(rk, 10, block);
+  assert(bytes_equal(block, want, 16));
 }
 
 static void test_aes256_fips197(void) {
   // FIPS-197 Appendix C.3: key 000102…1f, pt 00112233…ff.
-  __u8 key[32], pt[16], ct[16], rk[240], want[16];
+  __u8 key[32], block[16], rk[240], want[16];
   for (int i = 0; i < 32; i++) key[i] = (__u8)i;
-  for (int i = 0; i < 16; i++) pt[i] = (__u8)(i * 0x11);
+  for (int i = 0; i < 16; i++) block[i] = (__u8)(i * 0x11);
   hex_to_bytes("8ea2b7ca516745bfeafc49904b496089", want, 16);
   aes_kat_expand(key, 8, rk, 14);
-  aes_block_encrypt(rk, 14, pt, ct);
-  assert(bytes_equal(ct, want, 16));
+  aes_block_encrypt(rk, 14, block);
+  assert(bytes_equal(block, want, 16));
 }
 
 static void test_aes_recover_h(void) {

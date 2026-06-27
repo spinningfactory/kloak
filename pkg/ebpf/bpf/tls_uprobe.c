@@ -610,6 +610,47 @@ struct {
   __type(value, struct aes_scratch_buf);
 } aes_scratch SEC(".maps");
 
+// bssl_recover_h walks the BoringSSL chain SSL → s3 → aead_write_ctx → AES_KEY
+// and recomputes the GHASH subkey H = AES_encrypt(0), writing 16 bytes to
+// h_out. Returns 1 on success, 0 on any failure.
+//
+// Deliberately __noinline: the AES round function plus the 240-byte round-key
+// read need their own stack frame. Inlining this into the already stack-heavy
+// bpf_kprobe_tcp_sendmsg blows the 512-byte BPF stack limit; a BPF-to-BPF call
+// gives it a separate frame. Offsets are passed by value (not the map-value
+// pointer) to keep the verifier's job simple.
+static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_s3,
+                                                    __u32 s3_to_aead,
+                                                    __u32 aead_to_aeskey,
+                                                    __u8 *h_out) {
+  __u64 s3 = 0, aead = 0;
+  if (bpf_probe_read_user(&s3, 8, (void *)(ssl_ptr + ssl_to_s3)) < 0 || !s3)
+    return 0;
+  if (bpf_probe_read_user(&aead, 8, (void *)(s3 + s3_to_aead)) < 0 || !aead)
+    return 0;
+
+  __u32 zk = 0;
+  struct aes_scratch_buf *ab = bpf_map_lookup_elem(&aes_scratch, &zk);
+  if (!ab)
+    return 0;
+
+  __u64 aeskey = aead + aead_to_aeskey;
+  if (bpf_probe_read_user(ab->rd_key, BSSL_AES_RDKEY_BYTES, (void *)aeskey) < 0)
+    return 0;
+  __u32 rounds = 0;
+  if (bpf_probe_read_user(&rounds, 4, (void *)(aeskey + BSSL_AESKEY_ROUNDS_OFF)) < 0)
+    return 0;
+
+  // aes_recover_h validates rounds ∈ {10,14} and writes H to h_out in place.
+  if (!aes_recover_h(ab->rd_key, rounds, h_out))
+    return 0;
+
+  __u64 *bh = (__u64 *)h_out;
+  if (bh[0] == 0 && bh[1] == 0)
+    return 0;
+  return 1;
+}
+
 // Shared key for per-binary TLS config maps (see tls_offset_config and
 // go_tls_offset_config below). Keyed by (cgroup_id, exe_inode) rather than
 // tgid for two reasons:
@@ -2448,40 +2489,13 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     }
 
     if (offsets->tls_lib == TLS_LIB_BORINGSSL) {
-      // BoringSSL: SSL → s3 → aead_write_ctx → AES_KEY, then recompute
-      // H = AES_encrypt(0) (BoringSSL persists no raw H — see helpers.h).
-      __u64 s3 = 0, aead = 0;
-      if (bpf_probe_read_user(&s3, 8, (void *)(ssl_ptr + offsets->bssl_ssl_to_s3)) < 0 || !s3) {
-        dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
-        return 0;
-      }
-      if (bpf_probe_read_user(&aead, 8, (void *)(s3 + offsets->bssl_s3_to_aead)) < 0 || !aead) {
-        dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
-        return 0;
-      }
-      struct aes_scratch_buf *ab = bpf_map_lookup_elem(&aes_scratch, &zero);
-      if (!ab)
-        return 0;
-      __u64 aeskey = aead + offsets->bssl_aead_to_aeskey;
-      if (bpf_probe_read_user(ab->rd_key, BSSL_AES_RDKEY_BYTES, (void *)aeskey) < 0) {
-        dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
-        return 0;
-      }
-      __u32 rounds = 0;
-      if (bpf_probe_read_user(&rounds, 4, (void *)(aeskey + BSSL_AESKEY_ROUNDS_OFF)) < 0) {
-        dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
-        return 0;
-      }
-      // aes_recover_h validates rounds ∈ {10,12,14}. The AES output is the raw
-      // subkey in the same byte layout the OpenSSL branch produces AFTER its
-      // bswap (which exists to undo OpenSSL's big-endian H storage), so the
-      // BoringSSL branch does NOT bswap.
-      if (!aes_recover_h(ab->rd_key, rounds, new_conn.ghash_h)) {
-        dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
-        return 0;
-      }
-      __u64 *bh = (__u64 *)new_conn.ghash_h;
-      if (bh[0] == 0 && bh[1] == 0) {
+      // BoringSSL: recover H via the AES round-key schedule in a separate
+      // BPF-to-BPF subprogram (its own stack frame — see bssl_recover_h). The
+      // AES output is the raw subkey in the same byte layout the OpenSSL branch
+      // produces AFTER its bswap, so no bswap here.
+      if (!bssl_recover_h(ssl_ptr, offsets->bssl_ssl_to_s3,
+                          offsets->bssl_s3_to_aead, offsets->bssl_aead_to_aeskey,
+                          new_conn.ghash_h)) {
         dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
         return 0;
       }
