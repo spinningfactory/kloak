@@ -1121,45 +1121,86 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, cgroupID uint64, containerLib
 	copy(paths[1:], containerLibs)
 
 	for _, libPath := range paths {
-		version, offsets, err := DetectOpenSSLVersion(pid, libPath)
-		if err != nil {
-			m.log.Debugw("OpenSSL version detection skipped", "lib", libPath, "reason", err)
-			continue
+		// OpenSSL: read the version string, look up the 3-/4-hop chain offsets.
+		if version, offsets, err := DetectOpenSSLVersion(pid, libPath); err == nil {
+			val := bpfTLSOffsets{
+				SSLToWRL:       offsets.SSLToWRL,
+				WRLToEncCtx:    offsets.WRLToEncCtx,
+				EncCtxToAlgctx: offsets.EncCtxToAlgctx,
+				AlgctxToH:      offsets.AlgctxToH,
+				SSLToVersion:   offsets.SSLToVersion,
+				SSLToWBIO:      offsets.SSLToWBIO,
+				TLSLib:         bpfTLSLibOpenSSL,
+			}
+			m.pushOffsetVal(val, cgroupID, exeInode)
+			m.log.Debugw("Pushed TLS offsets for XOR-patch path",
+				"lib", libPath, "tls", "openssl", "version", version,
+				"pid", pid, "cgroupID", cgroupID, "exeInode", exeInode,
+				"offsets", fmt.Sprintf("%+v", offsets))
+			return
 		}
 
-		// Must match struct tls_offsets in tls_uprobe.c. Field order is
-		// load-bearing — the BPF program reads this struct by offset.
-		type bpfTLSOffsets struct {
-			SSLToWRL       uint32
-			WRLToEncCtx    uint32
-			EncCtxToAlgctx uint32
-			AlgctxToH      uint32
-			SSLToVersion   uint32
-			SSLToWBIO      uint32
-		}
-		val := bpfTLSOffsets(offsets)
-		key := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: exeInode}
-		if err := m.objs.TlsOffsetConfig.Update(&key, &val, 0); err != nil {
-			m.log.Errorw("Failed to push TLS offsets to BPF map",
-				"error", err, "pid", pid, "cgroupID", cgroupID, "exeInode", exeInode)
-			continue
+		// BoringSSL: no resolvable version and no persisted raw H. Push the
+		// SSL→s3→aead_write_ctx→AES_KEY chain; the BPF kprobe recomputes
+		// H = AES_encrypt(0) from the round-key schedule. SSLToVersion is left
+		// as 0xFFFFFFFF (BoringSSL keeps the TLS version in SSL3_STATE, not at a
+		// fixed SSL offset), so the data plane falls back to its nonce_len
+		// heuristic.
+		if key, boff, err := DetectBoringSSL(pid, libPath); err == nil {
+			val := bpfTLSOffsets{
+				SSLToVersion:     0xFFFFFFFF,
+				SSLToWBIO:        boff.SSLToWBIO,
+				TLSLib:           bpfTLSLibBoringSSL,
+				BsslSSLToS3:      boff.SSLToS3,
+				BsslS3ToAEAD:     boff.S3ToAEAD,
+				BsslAEADToAESKey: boff.AEADToAESKey,
+			}
+			m.pushOffsetVal(val, cgroupID, exeInode)
+			m.log.Debugw("Pushed TLS offsets for XOR-patch path",
+				"lib", libPath, "tls", "boringssl", "version", key,
+				"pid", pid, "cgroupID", cgroupID, "exeInode", exeInode,
+				"offsets", fmt.Sprintf("%+v", boff))
+			return
 		}
 
-		// Per-cgroup fallback entry — short-lived processes spawned into this
-		// cgroup (curl via `kubectl exec`, apt-get helpers, etc.) can fire
-		// SSL_write before our push runs for their specific inode. Every
-		// binary in a cgroup shares the same libssl.so through the container
-		// rootfs, so one offset set is valid for all of them. The BPF kprobe
-		// tries the per-inode entry first and falls back to (cgroup, 0).
-		fallbackKey := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: 0}
-		_ = m.objs.TlsOffsetConfig.Update(&fallbackKey, &val, 0)
-
-		m.log.Debugw("Pushed TLS offsets for XOR-patch path",
-			"lib", libPath, "version", version,
-			"pid", pid, "cgroupID", cgroupID, "exeInode", exeInode,
-			"offsets", fmt.Sprintf("%+v", offsets))
-		return // Only need one successful push.
+		m.log.Debugw("TLS offset detection skipped", "lib", libPath)
 	}
+}
+
+// bpfTLSLib* mirror the TLS_LIB_* constants in tls_uprobe.c.
+const (
+	bpfTLSLibOpenSSL   uint32 = 0
+	bpfTLSLibBoringSSL uint32 = 1
+)
+
+// bpfTLSOffsets must match struct tls_offsets in tls_uprobe.c byte-for-byte.
+// Field order is load-bearing — the BPF program reads this struct by offset.
+type bpfTLSOffsets struct {
+	SSLToWRL       uint32
+	WRLToEncCtx    uint32
+	EncCtxToAlgctx uint32
+	AlgctxToH      uint32
+	SSLToVersion   uint32
+	SSLToWBIO      uint32
+	// BoringSSL chain (unused when TLSLib == bpfTLSLibOpenSSL).
+	TLSLib           uint32
+	BsslSSLToS3      uint32
+	BsslS3ToAEAD     uint32
+	BsslAEADToAESKey uint32
+}
+
+// pushOffsetVal writes the offsets for this binary (keyed by exe inode) plus a
+// per-cgroup fallback entry (ExeInode=0) for short-lived processes spawned into
+// the cgroup that fire SSL_write before their inode-specific push runs.
+func (m *TLSUprobeManager) pushOffsetVal(val bpfTLSOffsets, cgroupID uint64, exeInode uint64) {
+	key := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: exeInode}
+	if err := m.objs.TlsOffsetConfig.Update(&key, &val, 0); err != nil {
+		m.log.Errorw("Failed to push TLS offsets to BPF map",
+			"error", err, "cgroupID", cgroupID, "exeInode", exeInode)
+		return
+	}
+	fallbackKey := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: 0}
+	_ = m.objs.TlsOffsetConfig.Update(&fallbackKey, &val, 0)
 }
 
 // pushGoTLSOffsets detects Go struct offsets from the binary's DWARF or

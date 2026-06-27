@@ -340,6 +340,72 @@ static void test_is_aes_gcm(void) {
 }
 
 // ============================================================================
+// AES (H recovery for BoringSSL)
+// ============================================================================
+
+// Standard FIPS-197 key expansion — only for the known-answer tests. The eBPF
+// data plane never expands a key; it reads BoringSSL's persisted AES_KEY.rd_key
+// (already expanded) and calls aes_block_encrypt directly.
+static void aes_kat_expand(const __u8 *key, int nk, __u8 *rk, int nr) {
+  static const __u8 rcon[] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40,
+                              0x80, 0x1b, 0x36, 0x6c, 0xd8, 0xab, 0x4d};
+  int total = 4 * (nr + 1);
+  for (int i = 0; i < 4 * nk; i++) rk[i] = key[i];
+  for (int i = nk; i < total; i++) {
+    __u8 t[4] = {rk[4 * (i - 1) + 0], rk[4 * (i - 1) + 1],
+                 rk[4 * (i - 1) + 2], rk[4 * (i - 1) + 3]};
+    if (i % nk == 0) {
+      __u8 tmp = t[0];
+      t[0] = KLOAK_AES_SBOX[t[1]] ^ rcon[i / nk - 1];
+      t[1] = KLOAK_AES_SBOX[t[2]];
+      t[2] = KLOAK_AES_SBOX[t[3]];
+      t[3] = KLOAK_AES_SBOX[tmp];
+    } else if (nk > 6 && i % nk == 4) {
+      for (int j = 0; j < 4; j++) t[j] = KLOAK_AES_SBOX[t[j]];
+    }
+    for (int j = 0; j < 4; j++) rk[4 * i + j] = rk[4 * (i - nk) + j] ^ t[j];
+  }
+}
+
+static void test_aes128_fips197(void) {
+  // FIPS-197 Appendix C.1: key 000102…0f, pt 00112233…ff.
+  __u8 key[16], pt[16], ct[16], rk[176], want[16];
+  for (int i = 0; i < 16; i++) {
+    key[i] = (__u8)i;
+    pt[i] = (__u8)(i * 0x11);
+  }
+  hex_to_bytes("69c4e0d86a7b0430d8cdb78070b4c55a", want, 16);
+  aes_kat_expand(key, 4, rk, 10);
+  aes_block_encrypt(rk, 10, pt, ct);
+  assert(bytes_equal(ct, want, 16));
+}
+
+static void test_aes256_fips197(void) {
+  // FIPS-197 Appendix C.3: key 000102…1f, pt 00112233…ff.
+  __u8 key[32], pt[16], ct[16], rk[240], want[16];
+  for (int i = 0; i < 32; i++) key[i] = (__u8)i;
+  for (int i = 0; i < 16; i++) pt[i] = (__u8)(i * 0x11);
+  hex_to_bytes("8ea2b7ca516745bfeafc49904b496089", want, 16);
+  aes_kat_expand(key, 8, rk, 14);
+  aes_block_encrypt(rk, 14, pt, ct);
+  assert(bytes_equal(ct, want, 16));
+}
+
+static void test_aes_recover_h(void) {
+  // H = AES_encrypt(0). For key 0102…10 BoringSSL yields this subkey (verified
+  // empirically against a real BoringSSL AES-GCM context on amd64 + arm64).
+  __u8 key[16], rk[176], h[16], want[16];
+  for (int i = 0; i < 16; i++) key[i] = (__u8)(i + 1);
+  hex_to_bytes("dbf184112eb9111659712bafcff2ab24", want, 16);
+  aes_kat_expand(key, 4, rk, 10);
+  assert(aes_recover_h(rk, 10, h) == 1);
+  assert(bytes_equal(h, want, 16));
+  // Invalid round counts are rejected (guards against a bogus offset read).
+  assert(aes_recover_h(rk, 9, h) == 0);
+  assert(aes_recover_h(rk, 0, h) == 0);
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -385,6 +451,11 @@ int main(void) {
   RUN_TEST(test_gf128_h_power_3);
   RUN_TEST(test_gf128_h_power_table);
   RUN_TEST(test_is_aes_gcm);
+
+  printf("aes (BoringSSL H recovery):\n");
+  RUN_TEST(test_aes128_fips197);
+  RUN_TEST(test_aes256_fips197);
+  RUN_TEST(test_aes_recover_h);
 
   printf("\n%d/%d tests passed.\n", tests_passed, tests_run);
   return 0;
