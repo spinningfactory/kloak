@@ -170,8 +170,10 @@ int main(void) {
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
     // Force AES-128-GCM. kloak rewrites AES-GCM records only; BoringSSL clients
     // otherwise often negotiate ChaCha20-Poly1305, which kloak can't patch.
-    SSL_CTX_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256");          // TLS 1.3
-    SSL_CTX_set_cipher_list(ctx, "ECDHE-RSA-AES128-GCM-SHA256");      // TLS 1.2
+    // BoringSSL doesn't allow configuring TLS 1.3 cipher suites, so pin to
+    // TLS 1.2 and select the AES-128-GCM suite explicitly.
+    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_cipher_list(ctx, "ECDHE-RSA-AES128-GCM-SHA256");
 
     // Wait for the echo server sidecar to come up.
     printf("Waiting for echo server sidecar to be ready...\n");
