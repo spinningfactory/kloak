@@ -973,6 +973,27 @@ const (
 	strategyLibcryptoHook uint8 = 1
 )
 
+// processUsesBoringSSL reports whether the process's main exe or any of its
+// TLS libraries is BoringSSL. Used to keep BoringSSL on the kprobe-walk H
+// strategy (it must not take the OpenSSL libcrypto-hook path).
+func (m *TLSUprobeManager) processUsesBoringSSL(pid int, containerLibs []string) bool {
+	paths := append([]string{fmt.Sprintf("/proc/%d/exe", pid)}, containerLibs...)
+	for _, p := range paths {
+		base := filepath.Base(p)
+		// Only the exe and libssl/libcrypto objects can be BoringSSL; skip the
+		// rest (gnutls, etc.) to avoid needless ELF opens.
+		if !strings.HasPrefix(base, "libssl.so") &&
+			!strings.HasPrefix(base, "libcrypto.so") &&
+			!strings.HasSuffix(p, "/exe") {
+			continue
+		}
+		if _, _, err := DetectBoringSSL(pid, p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // attachLibcryptoCipherInit attaches the EVP_CipherInit_ex entry+uretprobe
 // pair so the libcrypto-hook H-extraction path activates for this process.
 // Returns true if any attach point succeeded, in which case the caller marks
@@ -1000,6 +1021,19 @@ const (
 // practice — Node.js publishes as OpenSSL despite the historical "uses
 // BoringSSL" reputation) stay on STRATEGY_KPROBE_WALK.
 func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []string) bool {
+	// BoringSSL must stay on STRATEGY_KPROBE_WALK. Its libcrypto also exports
+	// EVP_CipherInit_ex, but BoringSSL's cipher init does NOT populate the
+	// OpenSSL evp_h_cache that h_extract reads, and the OpenSSL provider chain
+	// h_extract walks doesn't exist in BoringSSL. Hooking it would set
+	// STRATEGY_LIBCRYPTO_HOOK and route SSL_write to h_extract, which bails on
+	// ssl_to_wrl==0 — bypassing the kprobe BoringSSL H-walk entirely (the path
+	// that recomputes H from the AES round keys). So skip the hook for BoringSSL.
+	if m.processUsesBoringSSL(pid, containerLibs) {
+		m.log.Debugw("BoringSSL process — skipping EVP_CipherInit hook, staying on kprobe-walk",
+			"pid", pid)
+		return false
+	}
+
 	// OpenSSL 3.x exposes two independent cipher-init entry points:
 	//   - EVP_CipherInit_ex  (1.1+ compat): calls evp_cipher_init_internal directly
 	//   - EVP_CipherInit_ex2 (3.0+):        calls evp_cipher_init_internal directly
@@ -1121,45 +1155,86 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, cgroupID uint64, containerLib
 	copy(paths[1:], containerLibs)
 
 	for _, libPath := range paths {
-		version, offsets, err := DetectOpenSSLVersion(pid, libPath)
-		if err != nil {
-			m.log.Debugw("OpenSSL version detection skipped", "lib", libPath, "reason", err)
-			continue
+		// OpenSSL: read the version string, look up the 3-/4-hop chain offsets.
+		if version, offsets, err := DetectOpenSSLVersion(pid, libPath); err == nil {
+			val := bpfTLSOffsets{
+				SSLToWRL:       offsets.SSLToWRL,
+				WRLToEncCtx:    offsets.WRLToEncCtx,
+				EncCtxToAlgctx: offsets.EncCtxToAlgctx,
+				AlgctxToH:      offsets.AlgctxToH,
+				SSLToVersion:   offsets.SSLToVersion,
+				SSLToWBIO:      offsets.SSLToWBIO,
+				TLSLib:         bpfTLSLibOpenSSL,
+			}
+			m.pushOffsetVal(val, cgroupID, exeInode)
+			m.log.Debugw("Pushed TLS offsets for XOR-patch path",
+				"lib", libPath, "tls", "openssl", "version", version,
+				"pid", pid, "cgroupID", cgroupID, "exeInode", exeInode,
+				"offsets", fmt.Sprintf("%+v", offsets))
+			return
 		}
 
-		// Must match struct tls_offsets in tls_uprobe.c. Field order is
-		// load-bearing — the BPF program reads this struct by offset.
-		type bpfTLSOffsets struct {
-			SSLToWRL       uint32
-			WRLToEncCtx    uint32
-			EncCtxToAlgctx uint32
-			AlgctxToH      uint32
-			SSLToVersion   uint32
-			SSLToWBIO      uint32
-		}
-		val := bpfTLSOffsets(offsets)
-		key := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: exeInode}
-		if err := m.objs.TlsOffsetConfig.Update(&key, &val, 0); err != nil {
-			m.log.Errorw("Failed to push TLS offsets to BPF map",
-				"error", err, "pid", pid, "cgroupID", cgroupID, "exeInode", exeInode)
-			continue
+		// BoringSSL: no resolvable version and no persisted raw H. Push the
+		// SSL→s3→aead_write_ctx→AES_KEY chain; the BPF kprobe recomputes
+		// H = AES_encrypt(0) from the round-key schedule. SSLToVersion is left
+		// as 0xFFFFFFFF (BoringSSL keeps the TLS version in SSL3_STATE, not at a
+		// fixed SSL offset), so the data plane falls back to its nonce_len
+		// heuristic.
+		if key, boff, err := DetectBoringSSL(pid, libPath); err == nil {
+			val := bpfTLSOffsets{
+				SSLToVersion:     0xFFFFFFFF,
+				SSLToWBIO:        boff.SSLToWBIO,
+				TLSLib:           bpfTLSLibBoringSSL,
+				BsslSSLToS3:      boff.SSLToS3,
+				BsslS3ToAEAD:     boff.S3ToAEAD,
+				BsslAEADToAESKey: boff.AEADToAESKey,
+			}
+			m.pushOffsetVal(val, cgroupID, exeInode)
+			m.log.Debugw("Pushed TLS offsets for XOR-patch path",
+				"lib", libPath, "tls", "boringssl", "version", key,
+				"pid", pid, "cgroupID", cgroupID, "exeInode", exeInode,
+				"offsets", fmt.Sprintf("%+v", boff))
+			return
 		}
 
-		// Per-cgroup fallback entry — short-lived processes spawned into this
-		// cgroup (curl via `kubectl exec`, apt-get helpers, etc.) can fire
-		// SSL_write before our push runs for their specific inode. Every
-		// binary in a cgroup shares the same libssl.so through the container
-		// rootfs, so one offset set is valid for all of them. The BPF kprobe
-		// tries the per-inode entry first and falls back to (cgroup, 0).
-		fallbackKey := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: 0}
-		_ = m.objs.TlsOffsetConfig.Update(&fallbackKey, &val, 0)
-
-		m.log.Debugw("Pushed TLS offsets for XOR-patch path",
-			"lib", libPath, "version", version,
-			"pid", pid, "cgroupID", cgroupID, "exeInode", exeInode,
-			"offsets", fmt.Sprintf("%+v", offsets))
-		return // Only need one successful push.
+		m.log.Debugw("TLS offset detection skipped", "lib", libPath)
 	}
+}
+
+// bpfTLSLib* mirror the TLS_LIB_* constants in tls_uprobe.c.
+const (
+	bpfTLSLibOpenSSL   uint32 = 0
+	bpfTLSLibBoringSSL uint32 = 1
+)
+
+// bpfTLSOffsets must match struct tls_offsets in tls_uprobe.c byte-for-byte.
+// Field order is load-bearing — the BPF program reads this struct by offset.
+type bpfTLSOffsets struct {
+	SSLToWRL       uint32
+	WRLToEncCtx    uint32
+	EncCtxToAlgctx uint32
+	AlgctxToH      uint32
+	SSLToVersion   uint32
+	SSLToWBIO      uint32
+	// BoringSSL chain (unused when TLSLib == bpfTLSLibOpenSSL).
+	TLSLib           uint32
+	BsslSSLToS3      uint32
+	BsslS3ToAEAD     uint32
+	BsslAEADToAESKey uint32
+}
+
+// pushOffsetVal writes the offsets for this binary (keyed by exe inode) plus a
+// per-cgroup fallback entry (ExeInode=0) for short-lived processes spawned into
+// the cgroup that fire SSL_write before their inode-specific push runs.
+func (m *TLSUprobeManager) pushOffsetVal(val bpfTLSOffsets, cgroupID, exeInode uint64) {
+	key := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: exeInode}
+	if err := m.objs.TlsOffsetConfig.Update(&key, &val, 0); err != nil {
+		m.log.Errorw("Failed to push TLS offsets to BPF map",
+			"error", err, "cgroupID", cgroupID, "exeInode", exeInode)
+		return
+	}
+	fallbackKey := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: 0}
+	_ = m.objs.TlsOffsetConfig.Update(&fallbackKey, &val, 0)
 }
 
 // pushGoTLSOffsets detects Go struct offsets from the binary's DWARF or
@@ -1631,6 +1706,8 @@ var debugCounterNames = []string{
 	"h_extract_cache_hit", "h_extract_cache_miss",
 	"kprobe_bridge_from_pending", "kprobe_walk_legacy",
 	"h_extract_live_walk",
+	"bssl_reached", "bssl_h_ok",
+	"bssl_s3_null", "bssl_aead_null", "bssl_rdkey_fail", "bssl_rounds_bad", "bssl_hzero",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.
@@ -1650,6 +1727,20 @@ func (m *TLSUprobeManager) DumpDebugCounters() {
 		}
 		if total > 0 {
 			logging.Tracew(m.log, "eBPF debug counter", "name", name, "count", total)
+		}
+	}
+
+	// BoringSSL H-walk diagnostic capture (last walk + offset scan).
+	if m.objs.BsslProbe != nil {
+		var pv struct {
+			SSL, S3, AEAD                       uint64
+			CfgOff, RawRounds, GoodOff, GoodRds uint32
+		}
+		if err := m.objs.BsslProbe.Lookup(uint32(0), &pv); err == nil && pv.AEAD != 0 {
+			logging.Tracew(m.log, "bssl probe",
+				"aead", fmt.Sprintf("0x%x", pv.AEAD),
+				"cfg_off", pv.CfgOff, "raw_rounds", pv.RawRounds,
+				"good_off", pv.GoodOff, "good_rounds", pv.GoodRds)
 		}
 	}
 }

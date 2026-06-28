@@ -364,6 +364,13 @@ jobs:
             --cache-to type=registry,ref=${CACHE}:demo-python-raw-tls,mode=max,ignore-error=true \
             -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
 
+          # demo-boringssl builds BoringSSL from source (slow); the registry
+          # cache keeps subsequent runs cheap.
+          docker buildx build --load \
+            --cache-from type=registry,ref=${CACHE}:demo-boringssl \
+            --cache-to type=registry,ref=${CACHE}:demo-boringssl,mode=max,ignore-error=true \
+            -t kloak-demo-boringssl:latest ./examples/demo-boringssl/
+
           docker buildx build --load \
             --cache-from type=registry,ref=${CACHE}:tls-echo \
             --cache-to type=registry,ref=${CACHE}:tls-echo,mode=max,ignore-error=true \
@@ -372,6 +379,7 @@ jobs:
           docker save kloak:e2e kloak-demo-go:latest kloak-demo-python:latest \
             kloak-demo-js:latest kloak-demo-go-boring:latest \
             kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest \
+            kloak-demo-boringssl:latest \
             kloak-tls-echo:latest | sudo k3s ctr -n k8s.io images import -
 
       - name: Install Helm

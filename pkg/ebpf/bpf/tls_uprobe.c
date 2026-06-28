@@ -199,6 +199,13 @@ enum {
   DBG_KPROBE_BRIDGE_FROM_PENDING, // kprobe used H carried via xor_pending (libcrypto-hook hot path)
   DBG_KPROBE_WALK_LEGACY,     // kprobe walked SSL→wrl→enc_ctx→algctx→H (BoringSSL/cold-start path)
   DBG_H_EXTRACT_LIVE_WALK,    // bpf_h_extract derived H live from enc_ctx→algctx→H on cache miss
+  DBG_BSSL_REACHED,           // kprobe entered the BoringSSL branch (tls_lib==BORINGSSL)
+  DBG_BSSL_H_OK,              // BoringSSL bssl_recover_h recovered a non-zero H
+  DBG_BSSL_S3_NULL,          // bssl: SSL→s3 read failed / null
+  DBG_BSSL_AEAD_NULL,        // bssl: s3→aead_write_ctx read failed / null
+  DBG_BSSL_RDKEY_FAIL,       // bssl: AES_KEY.rd_key read failed
+  DBG_BSSL_ROUNDS_BAD,       // bssl: AES_KEY.rounds not in {9,10,12,13,14}
+  DBG_BSSL_HZERO,            // bssl: recovered H was all-zero
   DBG_MAX,
 };
 
@@ -568,7 +575,163 @@ struct tls_offsets {
   // pushTLSOffsets per detected OpenSSL major.minor — 0 here means
   // "unknown; ssl_read_fd should fall back to the legacy hardcoded 88".
   __u32 ssl_to_wbio;
+
+  // tls_lib selects the H-extraction chain. The OpenSSL fields above (ssl_to_wrl
+  // …) are unused when tls_lib == TLS_LIB_BORINGSSL, and the BoringSSL fields
+  // below are unused when tls_lib == TLS_LIB_OPENSSL.
+  __u32 tls_lib;
+  // BoringSSL chain (no OSSL_RECORD_LAYER indirection):
+  //   SSL* + bssl_ssl_to_s3       → SSL3_STATE*     (pointer deref)
+  //        + bssl_s3_to_aead      → SSLAEADContext* (pointer deref, aead_write_ctx)
+  //        + bssl_aead_to_aeskey  → AES_KEY.rd_key  (direct read of round keys)
+  // BoringSSL persists no raw H — only the AES round-key schedule — so the
+  // walk lands on AES_KEY and the data plane recomputes H = AES_encrypt(0).
+  // AES_KEY.rounds sits BSSL_AESKEY_ROUNDS_OFF (240) past rd_key.
+  __u32 bssl_ssl_to_s3;
+  __u32 bssl_s3_to_aead;
+  __u32 bssl_aead_to_aeskey;
 };
+
+#define TLS_LIB_OPENSSL 0
+#define TLS_LIB_BORINGSSL 1
+#define BSSL_AESKEY_ROUNDS_OFF 240  // AES_KEY: uint32_t rd_key[60]; uint32_t rounds;
+#define BSSL_AES_RDKEY_BYTES 240    // (AES_MAXNR+1)*16 = 15*16
+
+// An offsets entry is uncalibrated (push not yet seen / wrong key) when neither
+// the OpenSSL chain (ssl_to_wrl) nor the BoringSSL chain (bssl_ssl_to_s3) is
+// populated. Used to gate the per-binary offset lookup + its exe_inode=0
+// fallback in the kprobe H-walk.
+#define OFFSETS_UNCALIBRATED(o)                                                 \
+  ((o)->ssl_to_wrl == 0 &&                                                      \
+   !((o)->tls_lib == TLS_LIB_BORINGSSL && (o)->bssl_ssl_to_s3 != 0))
+
+// Per-CPU scratch for reading BoringSSL's AES round-key schedule off the BPF
+// stack (240 bytes would otherwise crowd the kprobe stack frame).
+struct aes_scratch_buf {
+  __u8 rd_key[BSSL_AES_RDKEY_BYTES];
+};
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct aes_scratch_buf);
+} aes_scratch SEC(".maps");
+
+// Diagnostic capture for the BoringSSL H-walk (read by the controller). Records
+// the last walk's pointers + the rounds value read at the configured offset,
+// plus a scan that reports the offset where a valid AES round count (10/12/14)
+// actually sits — so a wrong AEADToAESKey on a given build/arch is visible
+// without local reproduction.
+struct bssl_probe_val {
+  __u64 ssl;
+  __u64 s3;
+  __u64 aead;
+  __u32 cfg_off;       // configured aead_to_aeskey
+  __u32 raw_rounds;    // rounds read at aead + cfg_off + 240
+  __u32 good_off;      // scanned offset where rounds ∈ {9,10,12,13,14} (0 if none)
+  __u32 good_rounds;
+};
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct bssl_probe_val);
+} bssl_probe SEC(".maps");
+
+// bssl_recover_h walks the BoringSSL chain SSL → s3 → aead_write_ctx → AES_KEY
+// and recomputes the GHASH subkey H = AES_encrypt(0), writing 16 bytes to
+// h_out. Returns 1 on success, 0 on any failure.
+//
+// Deliberately __noinline: the AES round function plus the 240-byte round-key
+// read need their own stack frame. Inlining this into the already stack-heavy
+// bpf_kprobe_tcp_sendmsg blows the 512-byte BPF stack limit; a BPF-to-BPF call
+// gives it a separate frame. Offsets are passed by value (not the map-value
+// pointer) to keep the verifier's job simple.
+static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_s3,
+                                                    __u32 s3_to_aead,
+                                                    __u32 aead_to_aeskey,
+                                                    __u8 *h_out) {
+  __u64 s3 = 0, aead = 0;
+  if (bpf_probe_read_user(&s3, 8, (void *)(ssl_ptr + ssl_to_s3)) < 0 || !s3) {
+    dbg_inc(DBG_BSSL_S3_NULL);
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [BSSL] s3 read fail ssl=%llx off=%u", ssl_ptr, ssl_to_s3);
+#endif
+    return 0;
+  }
+  if (bpf_probe_read_user(&aead, 8, (void *)(s3 + s3_to_aead)) < 0 || !aead) {
+    dbg_inc(DBG_BSSL_AEAD_NULL);
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [BSSL] aead read fail s3=%llx off=%u", s3, s3_to_aead);
+#endif
+    return 0;
+  }
+
+  __u32 zk = 0;
+  struct aes_scratch_buf *ab = bpf_map_lookup_elem(&aes_scratch, &zk);
+  if (!ab)
+    return 0;
+
+  __u64 aeskey = aead + aead_to_aeskey;
+  if (bpf_probe_read_user(ab->rd_key, BSSL_AES_RDKEY_BYTES, (void *)aeskey) < 0) {
+    dbg_inc(DBG_BSSL_RDKEY_FAIL);
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [BSSL] rd_key read fail aead=%llx off=%u", aead, aead_to_aeskey);
+#endif
+    return 0;
+  }
+  __u32 rounds = 0;
+  if (bpf_probe_read_user(&rounds, 4, (void *)(aeskey + BSSL_AESKEY_ROUNDS_OFF)) < 0) {
+    dbg_inc(DBG_BSSL_RDKEY_FAIL);
+    return 0;
+  }
+
+  // Diagnostic: record the walk + scan for where a valid AES round count
+  // actually sits (the SSLAEADContext is the heap object `aead` points to;
+  // scan a window of offsets within it). Helps pin AEADToAESKey per build/arch.
+  {
+    __u32 zero = 0;
+    struct bssl_probe_val *pv = bpf_map_lookup_elem(&bssl_probe, &zero);
+    if (pv) {
+      pv->ssl = ssl_ptr;
+      pv->s3 = s3;
+      pv->aead = aead;
+      pv->cfg_off = aead_to_aeskey;
+      pv->raw_rounds = rounds;
+      pv->good_off = 0;
+      pv->good_rounds = 0;
+      for (__u32 off = 16; off <= 400; off += 8) {
+        __u32 r = 0;
+        if (bpf_probe_read_user(&r, 4, (void *)(aead + off + BSSL_AESKEY_ROUNDS_OFF)) < 0)
+          continue;
+        if (r == 10 || r == 9 || r == 12 || r == 14 || r == 13) {  // 9/13 = x86 AES-NI nr-1
+          pv->good_off = off;
+          pv->good_rounds = r;
+          break;
+        }
+      }
+    }
+  }
+
+  // aes_recover_h validates rounds ∈ {10,14} and writes H to h_out in place.
+  if (!aes_recover_h(ab->rd_key, rounds, h_out)) {
+    dbg_inc(DBG_BSSL_ROUNDS_BAD);
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [BSSL] aes_recover_h fail rounds=%u", rounds);
+#endif
+    return 0;
+  }
+
+  __u64 *bh = (__u64 *)h_out;
+  if (bh[0] == 0 && bh[1] == 0) {
+    dbg_inc(DBG_BSSL_HZERO);
+    return 0;
+  }
+#ifdef KLOAK_DEBUG
+  bpf_printk("kloak [BSSL] H ok rounds=%u h0=%llx h1=%llx", rounds, bh[0], bh[1]);
+#endif
+  return 1;
+}
 
 // Shared key for per-binary TLS config maps (see tls_offset_config and
 // go_tls_offset_config below). Keyed by (cgroup_id, exe_inode) rather than
@@ -2394,10 +2557,10 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     struct task_struct *ssl_task = (struct task_struct *)bpf_get_current_task();
     bk.exe_inode = BPF_CORE_READ(ssl_task, mm, exe_file, f_inode, i_ino);
     struct tls_offsets *offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
-    if (!offsets || offsets->ssl_to_wrl == 0) {
+    if (!offsets || OFFSETS_UNCALIBRATED(offsets)) {
       bk.exe_inode = 0;
       offsets = bpf_map_lookup_elem(&tls_offset_config, &bk);
-      if (!offsets || offsets->ssl_to_wrl == 0) {
+      if (!offsets || OFFSETS_UNCALIBRATED(offsets)) {
 #ifdef KLOAK_DEBUG
         bpf_printk("kloak [2-KPROBE] H-fail: no offsets cgid=%llx",
                    bk.cgroup_id);
@@ -2405,6 +2568,31 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
         dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
         return 0;
       }
+    }
+
+    if (offsets->tls_lib == TLS_LIB_BORINGSSL) {
+      // BoringSSL: recover H via the AES round-key schedule in a separate
+      // BPF-to-BPF subprogram (its own stack frame — see bssl_recover_h). The
+      // AES output is the raw subkey in the same byte layout the OpenSSL branch
+      // produces AFTER its bswap, so no bswap here.
+      dbg_inc(DBG_BSSL_REACHED);
+      if (!bssl_recover_h(ssl_ptr, offsets->bssl_ssl_to_s3,
+                          offsets->bssl_s3_to_aead, offsets->bssl_aead_to_aeskey,
+                          new_conn.ghash_h)) {
+        dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
+        return 0;
+      }
+      dbg_inc(DBG_BSSL_H_OK);
+      new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
+      new_conn.wrl_ptr = 0;
+      if (offsets->ssl_to_version != 0xFFFFFFFF) {
+        __u32 ssl_ver = 0;
+        bpf_probe_read_user(&ssl_ver, 4, (void *)(ssl_ptr + offsets->ssl_to_version));
+        new_conn.nonce_len = (ssl_ver >= 0x0304) ? 0 : 8;
+      } else {
+        new_conn.nonce_len = 0xFF;
+      }
+      goto h_ready;
     }
 
     __u64 ptr = 0;
@@ -2473,6 +2661,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     }
   }
 
+h_ready:;
   // H extraction succeeded — store connection state (only if H changed).
   struct tls_conn_key ck = {};
   ck.tgid = tgid;
