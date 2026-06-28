@@ -1,6 +1,7 @@
 package ebpf
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -111,11 +112,10 @@ func TestBoringSSLOffsetTable_Sane(t *testing.T) {
 }
 
 func TestIsBoringSSLMarkers(t *testing.T) {
-	// bytesContains is the substring scan isBoringSSL relies on.
-	if !bytesContains([]byte("xx\x00openssl_is_boringssl\x00yy"), []byte("openssl_is_boringssl")) {
+	if !bytes.Contains([]byte("xx\x00openssl_is_boringssl\x00yy"), []byte("openssl_is_boringssl")) {
 		t.Errorf("expected marker to be found")
 	}
-	if bytesContains([]byte("OpenSSL 3.2.1"), []byte("openssl_is_boringssl")) {
+	if bytes.Contains([]byte("OpenSSL 3.2.1"), []byte("openssl_is_boringssl")) {
 		t.Errorf("did not expect marker in OpenSSL banner")
 	}
 }
