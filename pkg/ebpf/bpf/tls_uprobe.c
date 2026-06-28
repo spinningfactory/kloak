@@ -201,6 +201,11 @@ enum {
   DBG_H_EXTRACT_LIVE_WALK,    // bpf_h_extract derived H live from enc_ctx→algctx→H on cache miss
   DBG_BSSL_REACHED,           // kprobe entered the BoringSSL branch (tls_lib==BORINGSSL)
   DBG_BSSL_H_OK,              // BoringSSL bssl_recover_h recovered a non-zero H
+  DBG_BSSL_S3_NULL,          // bssl: SSL→s3 read failed / null
+  DBG_BSSL_AEAD_NULL,        // bssl: s3→aead_write_ctx read failed / null
+  DBG_BSSL_RDKEY_FAIL,       // bssl: AES_KEY.rd_key read failed
+  DBG_BSSL_ROUNDS_BAD,       // bssl: AES_KEY.rounds not in {10,12,14}
+  DBG_BSSL_HZERO,            // bssl: recovered H was all-zero
   DBG_MAX,
 };
 
@@ -627,12 +632,14 @@ static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_
                                                     __u8 *h_out) {
   __u64 s3 = 0, aead = 0;
   if (bpf_probe_read_user(&s3, 8, (void *)(ssl_ptr + ssl_to_s3)) < 0 || !s3) {
+    dbg_inc(DBG_BSSL_S3_NULL);
 #ifdef KLOAK_DEBUG
     bpf_printk("kloak [BSSL] s3 read fail ssl=%llx off=%u", ssl_ptr, ssl_to_s3);
 #endif
     return 0;
   }
   if (bpf_probe_read_user(&aead, 8, (void *)(s3 + s3_to_aead)) < 0 || !aead) {
+    dbg_inc(DBG_BSSL_AEAD_NULL);
 #ifdef KLOAK_DEBUG
     bpf_printk("kloak [BSSL] aead read fail s3=%llx off=%u", s3, s3_to_aead);
 #endif
@@ -646,17 +653,21 @@ static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_
 
   __u64 aeskey = aead + aead_to_aeskey;
   if (bpf_probe_read_user(ab->rd_key, BSSL_AES_RDKEY_BYTES, (void *)aeskey) < 0) {
+    dbg_inc(DBG_BSSL_RDKEY_FAIL);
 #ifdef KLOAK_DEBUG
     bpf_printk("kloak [BSSL] rd_key read fail aead=%llx off=%u", aead, aead_to_aeskey);
 #endif
     return 0;
   }
   __u32 rounds = 0;
-  if (bpf_probe_read_user(&rounds, 4, (void *)(aeskey + BSSL_AESKEY_ROUNDS_OFF)) < 0)
+  if (bpf_probe_read_user(&rounds, 4, (void *)(aeskey + BSSL_AESKEY_ROUNDS_OFF)) < 0) {
+    dbg_inc(DBG_BSSL_RDKEY_FAIL);
     return 0;
+  }
 
   // aes_recover_h validates rounds ∈ {10,14} and writes H to h_out in place.
   if (!aes_recover_h(ab->rd_key, rounds, h_out)) {
+    dbg_inc(DBG_BSSL_ROUNDS_BAD);
 #ifdef KLOAK_DEBUG
     bpf_printk("kloak [BSSL] aes_recover_h fail rounds=%u", rounds);
 #endif
@@ -664,8 +675,10 @@ static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_
   }
 
   __u64 *bh = (__u64 *)h_out;
-  if (bh[0] == 0 && bh[1] == 0)
+  if (bh[0] == 0 && bh[1] == 0) {
+    dbg_inc(DBG_BSSL_HZERO);
     return 0;
+  }
 #ifdef KLOAK_DEBUG
   bpf_printk("kloak [BSSL] H ok rounds=%u h0=%llx h1=%llx", rounds, bh[0], bh[1]);
 #endif
