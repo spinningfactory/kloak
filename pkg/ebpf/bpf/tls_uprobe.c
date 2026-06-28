@@ -198,6 +198,7 @@ enum {
   DBG_H_EXTRACT_CACHE_MISS,   // bpf_h_extract walked SSL→wrl→enc_ctx but cache had no entry
   DBG_KPROBE_BRIDGE_FROM_PENDING, // kprobe used H carried via xor_pending (libcrypto-hook hot path)
   DBG_KPROBE_WALK_LEGACY,     // kprobe walked SSL→wrl→enc_ctx→algctx→H (BoringSSL/cold-start path)
+  DBG_H_EXTRACT_LIVE_WALK,    // bpf_h_extract derived H live from enc_ctx→algctx→H on cache miss
   DBG_MAX,
 };
 
@@ -1737,12 +1738,60 @@ int bpf_h_extract(void *ctx) {
   key.tgid = tgid;
   key.evp_ctx_ptr = enc_ctx;
   struct evp_h_val *cached = bpf_map_lookup_elem(&evp_h_cache, &key);
-  if (!cached) {
-    // Either the handshake completed before kloak's libcrypto attach
-    // (cold start), or this enc_ctx was rebuilt from a different code
-    // path. SSL_write goes through unmodified for this call.
-    dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
-    return 0;
+
+  // H source: prefer the value captured at EVP_CipherInit_ex time (fast
+  // path). On a cache miss the handshake completed before kloak's libcrypto
+  // uretprobe attached (cold-start race), or the enc_ctx was rebuilt (e.g.
+  // TLS 1.3 KeyUpdate). Letting the write go out unmodified would
+  // permanently break rewriting on a keep-alive connection whose enc_ctx is
+  // never re-initialised under our hook — so instead we derive H live from
+  // the same enc_ctx → algctx → H chain the uretprobe and the kprobe-walk
+  // fallback use. The cache is therefore a pure optimisation, not a
+  // correctness dependency.
+  // 8-byte-aligned backing store: the zero-check and bswap operate on it as
+  // __u64, so an under-aligned __u8[16] could trip strict-alignment arches or
+  // the BPF verifier.
+  __u64 ghash_h64[2] = {0};
+  __u8 *ghash_h = (__u8 *)ghash_h64;
+  __u8 cipher_type;
+  if (cached) {
+    __builtin_memcpy(ghash_h, cached->ghash_h, 16);
+    cipher_type = cached->cipher_type;
+    dbg_inc(DBG_H_EXTRACT_CACHE_HIT);
+  } else {
+    __u64 algctx = 0;
+    if (bpf_probe_read_user(&algctx, 8,
+                            (void *)(enc_ctx + offsets->enc_ctx_to_algctx)) < 0 ||
+        !algctx) {
+      dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
+      return 0;
+    }
+    if (bpf_probe_read_user(ghash_h, 16,
+                            (void *)(algctx + offsets->algctx_to_h)) < 0) {
+      dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
+      return 0;
+    }
+    // Non-GCM ciphers (or H not yet populated) read as zero here.
+    if (ghash_h64[0] == 0 && ghash_h64[1] == 0) {
+      dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
+      return 0;
+    }
+    // OpenSSL stores H little-endian; GHASH wants big-endian (matches the
+    // uretprobe and kprobe-walk representations).
+    ghash_h64[0] = __builtin_bswap64(ghash_h64[0]);
+    ghash_h64[1] = __builtin_bswap64(ghash_h64[1]);
+    cipher_type = KLOAK_CIPHER_AES_GCM;
+
+    // Backfill the cache so subsequent writes on this enc_ctx take the
+    // fast path. nonce_len is resolved per-connection below, so the cached
+    // entry keeps the sentinel.
+    struct evp_h_val backfill;
+    __builtin_memset(&backfill, 0, sizeof(backfill));
+    __builtin_memcpy(backfill.ghash_h, ghash_h, 16);
+    backfill.cipher_type = KLOAK_CIPHER_AES_GCM;
+    backfill.nonce_len = 0xFF;
+    bpf_map_update_elem(&evp_h_cache, &key, &backfill, BPF_ANY);
+    dbg_inc(DBG_H_EXTRACT_LIVE_WALK);
   }
 
   // Determine nonce_len from SSL_CONNECTION.version (per-connection, not
@@ -1757,8 +1806,8 @@ int bpf_h_extract(void *ctx) {
 
   struct tls_conn_state new_conn;
   __builtin_memset(&new_conn, 0, sizeof(new_conn));
-  __builtin_memcpy(new_conn.ghash_h, cached->ghash_h, 16);
-  new_conn.cipher_type = cached->cipher_type;
+  __builtin_memcpy(new_conn.ghash_h, ghash_h, 16);
+  new_conn.cipher_type = cipher_type;
   new_conn.nonce_len = nonce_len;
 
   struct tls_conn_key ck;
@@ -1767,7 +1816,7 @@ int bpf_h_extract(void *ctx) {
   ck.ssl_ptr = ssl_ptr;
   bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_ANY);
 
-  dbg_inc(DBG_H_EXTRACT_CACHE_HIT);
+  // CACHE_HIT / LIVE_WALK already counted above per H source.
   dbg_inc(DBG_XOR_CONN_HIT);
 
   bpf_tail_call(ctx, &prog_array, 1);
