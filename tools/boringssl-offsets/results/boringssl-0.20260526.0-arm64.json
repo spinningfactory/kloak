@@ -1,0 +1,36 @@
+{
+  "library": "BoringSSL",
+  "version": "0.20260526.0",
+  "arch": "aarch64",
+  "chain": "boringssl",
+  "structs": {
+    "ssl": "ssl_st",
+    "s3": "SSL3_STATE",
+    "aead_ctx": "SSLAEADContext",
+    "evp_aead_ctx": "evp_aead_ctx_st",
+    "gcm_key": "gcm128_key_st"
+  },
+  "offsets": {
+    "ssl_to_s3": 48,
+    "ssl_to_wbio": 32,
+    "s3_to_aead_write_ctx": 272,
+    "aead_to_ctx": 8,
+    "ctx_to_state": 8,
+    "aead_gcm_key": 0,
+    "gcm_h_offset": 0,
+    "gcm_aes_offset": 272,
+    "aead_to_h": 16,
+    "aead_to_aeskey": 288,
+    "bio_num_offset": null
+  },
+  "sizes": {
+    "SSL": 168,
+    "SSL3_STATE": 600
+  },
+  "kloak_config": {
+    "SSLToS3": 48,
+    "S3ToAEAD": 272,
+    "AEADToAESKey": 288,
+    "SSLToWBIO": 32
+  }
+}

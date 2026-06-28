@@ -70,7 +70,7 @@ var boringsslOffsetTable = map[string]BoringSSLOffsets{
 	//   SSLAEADContext.ctx_(8) + EVP_AEAD_CTX.state(8) + key(0) + gcm128_key.aes(272) = 288,
 	//   ssl_st.wbio = 32.
 	// The LP64 struct layout is architecture-independent (same on x86_64).
-	"default": {SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32},
+	"default": {SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32}, // verified against 0.20260526.0
 }
 
 // boringSSLMarkers are .rodata strings that uniquely identify a BoringSSL
