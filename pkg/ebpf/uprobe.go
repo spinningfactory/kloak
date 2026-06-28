@@ -973,6 +973,27 @@ const (
 	strategyLibcryptoHook uint8 = 1
 )
 
+// processUsesBoringSSL reports whether the process's main exe or any of its
+// TLS libraries is BoringSSL. Used to keep BoringSSL on the kprobe-walk H
+// strategy (it must not take the OpenSSL libcrypto-hook path).
+func (m *TLSUprobeManager) processUsesBoringSSL(pid int, containerLibs []string) bool {
+	paths := append([]string{fmt.Sprintf("/proc/%d/exe", pid)}, containerLibs...)
+	for _, p := range paths {
+		base := filepath.Base(p)
+		// Only the exe and libssl/libcrypto objects can be BoringSSL; skip the
+		// rest (gnutls, etc.) to avoid needless ELF opens.
+		if !strings.HasPrefix(base, "libssl.so") &&
+			!strings.HasPrefix(base, "libcrypto.so") &&
+			!strings.HasSuffix(p, "/exe") {
+			continue
+		}
+		if _, _, err := DetectBoringSSL(pid, p); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // attachLibcryptoCipherInit attaches the EVP_CipherInit_ex entry+uretprobe
 // pair so the libcrypto-hook H-extraction path activates for this process.
 // Returns true if any attach point succeeded, in which case the caller marks
@@ -1000,6 +1021,19 @@ const (
 // practice — Node.js publishes as OpenSSL despite the historical "uses
 // BoringSSL" reputation) stay on STRATEGY_KPROBE_WALK.
 func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []string) bool {
+	// BoringSSL must stay on STRATEGY_KPROBE_WALK. Its libcrypto also exports
+	// EVP_CipherInit_ex, but BoringSSL's cipher init does NOT populate the
+	// OpenSSL evp_h_cache that h_extract reads, and the OpenSSL provider chain
+	// h_extract walks doesn't exist in BoringSSL. Hooking it would set
+	// STRATEGY_LIBCRYPTO_HOOK and route SSL_write to h_extract, which bails on
+	// ssl_to_wrl==0 — bypassing the kprobe BoringSSL H-walk entirely (the path
+	// that recomputes H from the AES round keys). So skip the hook for BoringSSL.
+	if m.processUsesBoringSSL(pid, containerLibs) {
+		m.log.Debugw("BoringSSL process — skipping EVP_CipherInit hook, staying on kprobe-walk",
+			"pid", pid)
+		return false
+	}
+
 	// OpenSSL 3.x exposes two independent cipher-init entry points:
 	//   - EVP_CipherInit_ex  (1.1+ compat): calls evp_cipher_init_internal directly
 	//   - EVP_CipherInit_ex2 (3.0+):        calls evp_cipher_init_internal directly

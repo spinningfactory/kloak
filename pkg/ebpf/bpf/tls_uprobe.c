@@ -624,10 +624,18 @@ static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_
                                                     __u32 aead_to_aeskey,
                                                     __u8 *h_out) {
   __u64 s3 = 0, aead = 0;
-  if (bpf_probe_read_user(&s3, 8, (void *)(ssl_ptr + ssl_to_s3)) < 0 || !s3)
+  if (bpf_probe_read_user(&s3, 8, (void *)(ssl_ptr + ssl_to_s3)) < 0 || !s3) {
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [BSSL] s3 read fail ssl=%llx off=%u", ssl_ptr, ssl_to_s3);
+#endif
     return 0;
-  if (bpf_probe_read_user(&aead, 8, (void *)(s3 + s3_to_aead)) < 0 || !aead)
+  }
+  if (bpf_probe_read_user(&aead, 8, (void *)(s3 + s3_to_aead)) < 0 || !aead) {
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [BSSL] aead read fail s3=%llx off=%u", s3, s3_to_aead);
+#endif
     return 0;
+  }
 
   __u32 zk = 0;
   struct aes_scratch_buf *ab = bpf_map_lookup_elem(&aes_scratch, &zk);
@@ -635,19 +643,30 @@ static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_
     return 0;
 
   __u64 aeskey = aead + aead_to_aeskey;
-  if (bpf_probe_read_user(ab->rd_key, BSSL_AES_RDKEY_BYTES, (void *)aeskey) < 0)
+  if (bpf_probe_read_user(ab->rd_key, BSSL_AES_RDKEY_BYTES, (void *)aeskey) < 0) {
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [BSSL] rd_key read fail aead=%llx off=%u", aead, aead_to_aeskey);
+#endif
     return 0;
+  }
   __u32 rounds = 0;
   if (bpf_probe_read_user(&rounds, 4, (void *)(aeskey + BSSL_AESKEY_ROUNDS_OFF)) < 0)
     return 0;
 
   // aes_recover_h validates rounds ∈ {10,14} and writes H to h_out in place.
-  if (!aes_recover_h(ab->rd_key, rounds, h_out))
+  if (!aes_recover_h(ab->rd_key, rounds, h_out)) {
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [BSSL] aes_recover_h fail rounds=%u", rounds);
+#endif
     return 0;
+  }
 
   __u64 *bh = (__u64 *)h_out;
   if (bh[0] == 0 && bh[1] == 0)
     return 0;
+#ifdef KLOAK_DEBUG
+  bpf_printk("kloak [BSSL] H ok rounds=%u h0=%llx h1=%llx", rounds, bh[0], bh[1]);
+#endif
   return 1;
 }
 
