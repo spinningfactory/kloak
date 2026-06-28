@@ -112,8 +112,29 @@ func DetectBoringSSL(pid int, libPath string) (key string, offsets BoringSSLOffs
 	return "default", offsets, nil
 }
 
-// isBoringSSL scans an ELF's .rodata/.data for BoringSSL identity markers.
+// boringSSLSymbolMarkers are substrings that appear in BoringSSL symbol names
+// but never in OpenSSL's. BoringSSL is C++ and namespaces most of its internals
+// under `bssl::` (mangled as "N4bssl"...), exports BORINGSSL_-prefixed FIPS
+// self-test entry points, and is the only one of the two with the EVP_AEAD API.
+// These live in the symbol tables (.dynsym/.symtab → .dynstr/.strtab), NOT in
+// .rodata — which is why a .rodata-only scan misses them on shared libraries.
+var boringSSLSymbolMarkers = []string{"BORINGSSL_", "N4bssl", "EVP_AEAD_CTX_seal"}
+
+// isBoringSSL reports whether an ELF is BoringSSL. It checks the symbol tables
+// for BoringSSL-only symbol names (the reliable signal on stripped-of-rodata
+// shared libs) and falls back to scanning .rodata/.data for the textual markers
+// (which the packaged claude binary carries).
 func isBoringSSL(f *elf.File) bool {
+	for _, syms := range [][]elf.Symbol{symbolsOf(f), dynSymbolsOf(f)} {
+		for i := range syms {
+			name := syms[i].Name
+			for _, m := range boringSSLSymbolMarkers {
+				if strings.Contains(name, m) {
+					return true
+				}
+			}
+		}
+	}
 	for _, name := range []string{".rodata", ".data"} {
 		sec := f.Section(name)
 		if sec == nil {
@@ -130,6 +151,22 @@ func isBoringSSL(f *elf.File) bool {
 		}
 	}
 	return false
+}
+
+func symbolsOf(f *elf.File) []elf.Symbol {
+	s, err := f.Symbols()
+	if err != nil {
+		return nil
+	}
+	return s
+}
+
+func dynSymbolsOf(f *elf.File) []elf.Symbol {
+	s, err := f.DynamicSymbols()
+	if err != nil {
+		return nil
+	}
+	return s
 }
 
 // bytesContains is a small substring scan over a byte slice (avoids importing

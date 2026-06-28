@@ -37,12 +37,23 @@ RUN gcc -O2 -o demo-app main.c \
     -L/boring-libs -Wl,-rpath,/usr/lib \
     -lssl -lcrypto -lpthread
 
+# Runtime: install ONLY libstdc++6 (BoringSSL's libssl/libcrypto are C++ and
+# need it). Deliberately NOT ca-certificates — it pulls in the system OpenSSL
+# (libssl3), and a container holding both OpenSSL and BoringSSL makes kloak's
+# detection pick OpenSSL first (it scans the system libcrypto.so.3 and never
+# reaches the bundled BoringSSL). The client uses SSL_VERIFY_NONE, so no CA
+# bundle is required. The resulting image has exactly one TLS stack: BoringSSL.
 FROM ubuntu:24.04
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+RUN apt-get update && apt-get install -y --no-install-recommends libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /app/demo-app /app/demo-app
 COPY --from=builder /boring-libs/libssl.so /usr/lib/libssl.so
 COPY --from=builder /boring-libs/libcrypto.so /usr/lib/libcrypto.so
-RUN ldconfig
+# Remove the system OpenSSL shared objects (pulled in transitively by the base
+# image). A container holding both OpenSSL and BoringSSL makes kloak's detection
+# pick OpenSSL first — it scans the system libcrypto.so.3 and never reaches the
+# bundled BoringSSL. demo-app links only the BoringSSL /usr/lib/*.so, so the
+# system ones are unused at runtime. This leaves exactly one TLS stack.
+RUN rm -f /usr/lib/*/libssl.so.3* /usr/lib/*/libcrypto.so.3* && ldconfig
 WORKDIR /app
 CMD ["./demo-app"]
