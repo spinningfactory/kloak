@@ -204,7 +204,7 @@ enum {
   DBG_BSSL_S3_NULL,          // bssl: SSL→s3 read failed / null
   DBG_BSSL_AEAD_NULL,        // bssl: s3→aead_write_ctx read failed / null
   DBG_BSSL_RDKEY_FAIL,       // bssl: AES_KEY.rd_key read failed
-  DBG_BSSL_ROUNDS_BAD,       // bssl: AES_KEY.rounds not in {10,12,14}
+  DBG_BSSL_ROUNDS_BAD,       // bssl: AES_KEY.rounds not in {9,10,12,13,14}
   DBG_BSSL_HZERO,            // bssl: recovered H was all-zero
   DBG_MAX,
 };
@@ -628,7 +628,7 @@ struct bssl_probe_val {
   __u64 aead;
   __u32 cfg_off;       // configured aead_to_aeskey
   __u32 raw_rounds;    // rounds read at aead + cfg_off + 240
-  __u32 good_off;      // scanned offset where rounds ∈ {10,12,14} (0 if none)
+  __u32 good_off;      // scanned offset where rounds ∈ {9,10,12,13,14} (0 if none)
   __u32 good_rounds;
 };
 struct {
@@ -704,7 +704,7 @@ static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_
         __u32 r = 0;
         if (bpf_probe_read_user(&r, 4, (void *)(aead + off + BSSL_AESKEY_ROUNDS_OFF)) < 0)
           continue;
-        if (r == 10 || r == 12 || r == 14) {
+        if (r == 10 || r == 9 || r == 12 || r == 14 || r == 13) {  // 9/13 = x86 AES-NI nr-1
           pv->good_off = off;
           pv->good_rounds = r;
           break;

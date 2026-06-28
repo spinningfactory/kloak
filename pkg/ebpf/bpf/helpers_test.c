@@ -400,8 +400,10 @@ static void test_aes_recover_h(void) {
   aes_kat_expand(key, 4, rk, 10);
   assert(aes_recover_h(rk, 10, h) == 1);
   assert(bytes_equal(h, want, 16));
+  // x86 AES-NI stores rounds as nr-1; both forms must work.
+  assert(aes_recover_h(rk, 9, h) == 1);
+  assert(bytes_equal(h, want, 16));
   // Invalid round counts are rejected (guards against a bogus offset read).
-  assert(aes_recover_h(rk, 9, h) == 0);
   assert(aes_recover_h(rk, 0, h) == 0);
 }
 

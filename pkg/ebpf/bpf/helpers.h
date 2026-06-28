@@ -377,13 +377,16 @@ HELPER_INLINE void aes_block_encrypt(const __u8 *rk, __u32 nr, __u8 state[16]) {
 // (a runtime `nr` would leave a variable-offset access the verifier rejects).
 // Only AES-128 (10) and AES-256 (14) are handled — TLS never negotiates
 // AES-192-GCM, so 12 is intentionally treated as unsupported.
+//
+// x86 AES-NI stores AES_KEY.rounds as nr-1 (9 for AES-128, 13 for AES-256),
+// so both the canonical and AES-NI values are accepted for each key size.
 HELPER_INLINE int aes_recover_h(const __u8 *rd_key, __u32 rounds, __u8 h_out[16]) {
   for (int i = 0; i < 16; i++) h_out[i] = 0; // plaintext block = 0
-  if (rounds == 10) {
+  if (rounds == 10 || rounds == 9) {  // 9 = x86 AES-NI stores nr-1 for AES-128
     aes_block_encrypt(rd_key, 10, h_out);
     return 1;
   }
-  if (rounds == 14) {
+  if (rounds == 14 || rounds == 13) {  // 13 = x86 AES-NI stores nr-1 for AES-256
     aes_block_encrypt(rd_key, 14, h_out);
     return 1;
   }
