@@ -199,6 +199,8 @@ enum {
   DBG_KPROBE_BRIDGE_FROM_PENDING, // kprobe used H carried via xor_pending (libcrypto-hook hot path)
   DBG_KPROBE_WALK_LEGACY,     // kprobe walked SSL→wrl→enc_ctx→algctx→H (BoringSSL/cold-start path)
   DBG_H_EXTRACT_LIVE_WALK,    // bpf_h_extract derived H live from enc_ctx→algctx→H on cache miss
+  DBG_BSSL_REACHED,           // kprobe entered the BoringSSL branch (tls_lib==BORINGSSL)
+  DBG_BSSL_H_OK,              // BoringSSL bssl_recover_h recovered a non-zero H
   DBG_MAX,
 };
 
@@ -2512,12 +2514,14 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
       // BPF-to-BPF subprogram (its own stack frame — see bssl_recover_h). The
       // AES output is the raw subkey in the same byte layout the OpenSSL branch
       // produces AFTER its bswap, so no bswap here.
+      dbg_inc(DBG_BSSL_REACHED);
       if (!bssl_recover_h(ssl_ptr, offsets->bssl_ssl_to_s3,
                           offsets->bssl_s3_to_aead, offsets->bssl_aead_to_aeskey,
                           new_conn.ghash_h)) {
         dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
         return 0;
       }
+      dbg_inc(DBG_BSSL_H_OK);
       new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
       new_conn.wrl_ptr = 0;
       if (offsets->ssl_to_version != 0xFFFFFFFF) {
