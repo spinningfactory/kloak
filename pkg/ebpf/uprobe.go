@@ -1729,4 +1729,18 @@ func (m *TLSUprobeManager) DumpDebugCounters() {
 			logging.Tracew(m.log, "eBPF debug counter", "name", name, "count", total)
 		}
 	}
+
+	// BoringSSL H-walk diagnostic capture (last walk + offset scan).
+	if m.objs.BsslProbe != nil {
+		var pv struct {
+			SSL, S3, AEAD                       uint64
+			CfgOff, RawRounds, GoodOff, GoodRds uint32
+		}
+		if err := m.objs.BsslProbe.Lookup(uint32(0), &pv); err == nil && pv.AEAD != 0 {
+			logging.Tracew(m.log, "bssl probe",
+				"aead", fmt.Sprintf("0x%x", pv.AEAD),
+				"cfg_off", pv.CfgOff, "raw_rounds", pv.RawRounds,
+				"good_off", pv.GoodOff, "good_rounds", pv.GoodRds)
+		}
+	}
 }

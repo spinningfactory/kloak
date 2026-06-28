@@ -617,6 +617,27 @@ struct {
   __type(value, struct aes_scratch_buf);
 } aes_scratch SEC(".maps");
 
+// Diagnostic capture for the BoringSSL H-walk (read by the controller). Records
+// the last walk's pointers + the rounds value read at the configured offset,
+// plus a scan that reports the offset where a valid AES round count (10/12/14)
+// actually sits — so a wrong AEADToAESKey on a given build/arch is visible
+// without local reproduction.
+struct bssl_probe_val {
+  __u64 ssl;
+  __u64 s3;
+  __u64 aead;
+  __u32 cfg_off;       // configured aead_to_aeskey
+  __u32 raw_rounds;    // rounds read at aead + cfg_off + 240
+  __u32 good_off;      // scanned offset where rounds ∈ {10,12,14} (0 if none)
+  __u32 good_rounds;
+};
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct bssl_probe_val);
+} bssl_probe SEC(".maps");
+
 // bssl_recover_h walks the BoringSSL chain SSL → s3 → aead_write_ctx → AES_KEY
 // and recomputes the GHASH subkey H = AES_encrypt(0), writing 16 bytes to
 // h_out. Returns 1 on success, 0 on any failure.
@@ -663,6 +684,33 @@ static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_
   if (bpf_probe_read_user(&rounds, 4, (void *)(aeskey + BSSL_AESKEY_ROUNDS_OFF)) < 0) {
     dbg_inc(DBG_BSSL_RDKEY_FAIL);
     return 0;
+  }
+
+  // Diagnostic: record the walk + scan for where a valid AES round count
+  // actually sits (the SSLAEADContext is the heap object `aead` points to;
+  // scan a window of offsets within it). Helps pin AEADToAESKey per build/arch.
+  {
+    __u32 zero = 0;
+    struct bssl_probe_val *pv = bpf_map_lookup_elem(&bssl_probe, &zero);
+    if (pv) {
+      pv->ssl = ssl_ptr;
+      pv->s3 = s3;
+      pv->aead = aead;
+      pv->cfg_off = aead_to_aeskey;
+      pv->raw_rounds = rounds;
+      pv->good_off = 0;
+      pv->good_rounds = 0;
+      for (__u32 off = 16; off <= 400; off += 8) {
+        __u32 r = 0;
+        if (bpf_probe_read_user(&r, 4, (void *)(aead + off + BSSL_AESKEY_ROUNDS_OFF)) < 0)
+          continue;
+        if (r == 10 || r == 12 || r == 14) {
+          pv->good_off = off;
+          pv->good_rounds = r;
+          break;
+        }
+      }
+    }
   }
 
   // aes_recover_h validates rounds ∈ {10,14} and writes H to h_out in place.
