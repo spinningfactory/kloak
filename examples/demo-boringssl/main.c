@@ -104,6 +104,11 @@ static int send_and_echo(SSL_CTX *ctx, const char *host,
         return -1;
     }
 
+    if (req_num == 1) {
+        printf("Negotiated: %s / %s\n", SSL_get_version(ssl), SSL_get_cipher_name(ssl));
+        fflush(stdout);
+    }
+
     char payload[1024];
     int plen = snprintf(payload, sizeof(payload), "ALLOWED=%s\nBLOCKED=%s\n",
                         secret_allowed, secret_blocked);
@@ -163,6 +168,10 @@ int main(void) {
     }
     // Self-signed echo cert — skip verification (this is a local demo).
     SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+    // Force AES-128-GCM. kloak rewrites AES-GCM records only; BoringSSL clients
+    // otherwise often negotiate ChaCha20-Poly1305, which kloak can't patch.
+    SSL_CTX_set_ciphersuites(ctx, "TLS_AES_128_GCM_SHA256");          // TLS 1.3
+    SSL_CTX_set_cipher_list(ctx, "ECDHE-RSA-AES128-GCM-SHA256");      // TLS 1.2
 
     // Wait for the echo server sidecar to come up.
     printf("Waiting for echo server sidecar to be ready...\n");
