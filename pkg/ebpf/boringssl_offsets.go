@@ -1,6 +1,7 @@
 package ebpf
 
 import (
+	"bytes"
 	"debug/elf"
 	"fmt"
 	"strings"
@@ -145,7 +146,7 @@ func isBoringSSL(f *elf.File) bool {
 			continue
 		}
 		for _, m := range boringSSLMarkers {
-			if bytesContains(data, []byte(m)) {
+			if bytes.Contains(data, []byte(m)) {
 				return true
 			}
 		}
@@ -167,18 +168,4 @@ func dynSymbolsOf(f *elf.File) []elf.Symbol {
 		return nil
 	}
 	return s
-}
-
-// bytesContains is a small substring scan over a byte slice (avoids importing
-// bytes just for this; mirrors the local helpers in openssl_offsets.go).
-func bytesContains(haystack, needle []byte) bool {
-	if len(needle) == 0 || len(haystack) < len(needle) {
-		return len(needle) == 0
-	}
-	for i := 0; i+len(needle) <= len(haystack); i++ {
-		if haystack[i] == needle[0] && startsWith(haystack[i:], needle) {
-			return true
-		}
-	}
-	return false
 }

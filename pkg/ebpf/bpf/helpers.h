@@ -306,17 +306,15 @@ static const __u8 KLOAK_AES_SBOX[256] = {
   0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
   0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16};
 
-// GF(2^8) multiply for AES MixColumns (Rijndael field, reduction poly 0x1b).
-HELPER_INLINE __u8 kloak_aes_gmul(__u8 x, __u8 y) {
-  __u8 r = 0;
-  for (int i = 0; i < 8; i++) {
-    if (y & 1) r ^= x;
-    __u8 hi = x & 0x80;
-    x = (__u8)(x << 1);
-    if (hi) x ^= 0x1b;
-    y >>= 1;
-  }
-  return r;
+// Specialized GF(2^8) multiply-by-2 and multiply-by-3 for AES MixColumns.
+// MixColumns only ever multiplies by 2 or 3, so these two inlines replace the
+// general 8-iteration loop, cutting thousands of eBPF instructions and keeping
+// verifier complexity low.
+HELPER_INLINE __u8 aes_mul2(__u8 x) {
+  return (__u8)((x << 1) ^ ((x & 0x80) ? 0x1b : 0));
+}
+HELPER_INLINE __u8 aes_mul3(__u8 x) {
+  return (__u8)(aes_mul2(x) ^ x);
 }
 
 // aes_shift_rows / aes_mix_columns operate IN PLACE on a column-major state
@@ -336,10 +334,10 @@ HELPER_INLINE void aes_shift_rows(__u8 s[16]) {
 HELPER_INLINE void aes_mix_columns(__u8 s[16]) {
   for (int c = 0; c < 4; c++) {
     __u8 a0 = s[4 * c + 0], a1 = s[4 * c + 1], a2 = s[4 * c + 2], a3 = s[4 * c + 3];
-    s[4 * c + 0] = (__u8)(kloak_aes_gmul(a0, 2) ^ kloak_aes_gmul(a1, 3) ^ a2 ^ a3);
-    s[4 * c + 1] = (__u8)(a0 ^ kloak_aes_gmul(a1, 2) ^ kloak_aes_gmul(a2, 3) ^ a3);
-    s[4 * c + 2] = (__u8)(a0 ^ a1 ^ kloak_aes_gmul(a2, 2) ^ kloak_aes_gmul(a3, 3));
-    s[4 * c + 3] = (__u8)(kloak_aes_gmul(a0, 3) ^ a1 ^ a2 ^ kloak_aes_gmul(a3, 2));
+    s[4 * c + 0] = (__u8)(aes_mul2(a0) ^ aes_mul3(a1) ^ a2 ^ a3);
+    s[4 * c + 1] = (__u8)(a0 ^ aes_mul2(a1) ^ aes_mul3(a2) ^ a3);
+    s[4 * c + 2] = (__u8)(a0 ^ a1 ^ aes_mul2(a2) ^ aes_mul3(a3));
+    s[4 * c + 3] = (__u8)(aes_mul3(a0) ^ a1 ^ a2 ^ aes_mul2(a3));
   }
 }
 

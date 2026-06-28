@@ -112,6 +112,8 @@ static int send_and_echo(SSL_CTX *ctx, const char *host,
     char payload[1024];
     int plen = snprintf(payload, sizeof(payload), "ALLOWED=%s\nBLOCKED=%s\n",
                         secret_allowed, secret_blocked);
+    if (plen >= (int)sizeof(payload))
+        plen = (int)sizeof(payload) - 1;
 
     // SSL_write — kloak's uprobe fires here and the kernel rewrites the
     // shadow placeholders to real values on the encrypted wire.
