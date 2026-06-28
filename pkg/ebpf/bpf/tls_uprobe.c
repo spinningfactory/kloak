@@ -1748,7 +1748,11 @@ int bpf_h_extract(void *ctx) {
   // the same enc_ctx → algctx → H chain the uretprobe and the kprobe-walk
   // fallback use. The cache is therefore a pure optimisation, not a
   // correctness dependency.
-  __u8 ghash_h[16];
+  // 8-byte-aligned backing store: the zero-check and bswap operate on it as
+  // __u64, so an under-aligned __u8[16] could trip strict-alignment arches or
+  // the BPF verifier.
+  __u64 ghash_h64[2] = {0};
+  __u8 *ghash_h = (__u8 *)ghash_h64;
   __u8 cipher_type;
   if (cached) {
     __builtin_memcpy(ghash_h, cached->ghash_h, 16);
@@ -1768,15 +1772,14 @@ int bpf_h_extract(void *ctx) {
       return 0;
     }
     // Non-GCM ciphers (or H not yet populated) read as zero here.
-    __u64 *h64 = (__u64 *)ghash_h;
-    if (h64[0] == 0 && h64[1] == 0) {
+    if (ghash_h64[0] == 0 && ghash_h64[1] == 0) {
       dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
       return 0;
     }
     // OpenSSL stores H little-endian; GHASH wants big-endian (matches the
     // uretprobe and kprobe-walk representations).
-    h64[0] = __builtin_bswap64(h64[0]);
-    h64[1] = __builtin_bswap64(h64[1]);
+    ghash_h64[0] = __builtin_bswap64(ghash_h64[0]);
+    ghash_h64[1] = __builtin_bswap64(ghash_h64[1]);
     cipher_type = KLOAK_CIPHER_AES_GCM;
 
     // Backfill the cache so subsequent writes on this enc_ctx take the
@@ -1813,7 +1816,7 @@ int bpf_h_extract(void *ctx) {
   ck.ssl_ptr = ssl_ptr;
   bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_ANY);
 
-  dbg_inc(DBG_H_EXTRACT_CACHE_HIT);
+  // CACHE_HIT / LIVE_WALK already counted above per H source.
   dbg_inc(DBG_XOR_CONN_HIT);
 
   bpf_tail_call(ctx, &prog_array, 1);
