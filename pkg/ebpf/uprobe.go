@@ -1630,6 +1630,7 @@ var debugCounterNames = []string{
 	"evp_init_entry", "evp_init_h_ok", "evp_init_h_zero", "evp_init_chain_fail",
 	"h_extract_cache_hit", "h_extract_cache_miss",
 	"kprobe_bridge_from_pending", "kprobe_walk_legacy",
+	"h_extract_live_walk",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.
