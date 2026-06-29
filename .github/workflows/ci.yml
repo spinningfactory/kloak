@@ -376,10 +376,17 @@ jobs:
             --cache-to type=registry,ref=${CACHE}:tls-echo,mode=max,ignore-error=true \
             -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
 
+          # demo-bun downloads the Bun profile build at image-build time; the
+          # registry cache avoids re-downloading on every CI run.
+          docker buildx build --load \
+            --cache-from type=registry,ref=${CACHE}:demo-bun \
+            --cache-to type=registry,ref=${CACHE}:demo-bun,mode=max,ignore-error=true \
+            -t kloak-demo-bun:latest ./examples/demo-bun/
+
           docker save kloak:e2e kloak-demo-go:latest kloak-demo-python:latest \
             kloak-demo-js:latest kloak-demo-go-boring:latest \
             kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest \
-            kloak-demo-boringssl:latest \
+            kloak-demo-boringssl:latest kloak-demo-bun:latest \
             kloak-tls-echo:latest | sudo k3s ctr -n k8s.io images import -
 
       - name: Install Helm

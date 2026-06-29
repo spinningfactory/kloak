@@ -882,7 +882,51 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 		return nil
 	}
 
-	// 2. Scan all TLS shared libraries in the container filesystem and attach
+	// 2. Bun single-executable (e.g. Claude Code): detect by version string
+	// embedded in the binary ("bun/X.Y.Z") and attach at the pre-computed
+	// SSL_write file offset. The binary is symbol-stripped, so the normal
+	// symbol-scan below would fail. UprobeOptions.Address bypasses symbol
+	// resolution in cilium/ebpf when non-zero (link/uprobe.go:167-169).
+	if bunOff, bunVer, ok := DetectBun(exePath); ok && bunOff.SSLWriteOffset > 0 {
+		m.log.Infow("Bun single-executable detected — attaching at SSL_write file offset",
+			"pid", pid, "version", bunVer,
+			"ssl_write_offset", fmt.Sprintf("0x%x", bunOff.SSLWriteOffset))
+		if up, err := ex.Uprobe("", m.objs.BpfUprobeSslWrite, &link.UprobeOptions{
+			Address: bunOff.SSLWriteOffset,
+			PID:     pid,
+		}); err == nil {
+			m.linksMu.Lock()
+			m.links = append(m.links, up)
+			m.linksMu.Unlock()
+
+			// Push BoringSSL chain offsets — Bun statically links BoringSSL and
+			// uses the same SSL→s3→aead_write_ctx→AES_KEY walk.
+			var st syscall.Stat_t
+			if serr := syscall.Stat(exePath, &st); serr == nil {
+				val := bpfTLSOffsets{
+					SSLToVersion:     0xFFFFFFFF,
+					SSLToWBIO:        bunOff.BoringSSL.SSLToWBIO,
+					TLSLib:           bpfTLSLibBoringSSL,
+					BsslSSLToS3:      bunOff.BoringSSL.SSLToS3,
+					BsslS3ToAEAD:     bunOff.BoringSSL.S3ToAEAD,
+					BsslAEADToAESKey: bunOff.BoringSSL.AEADToAESKey,
+				}
+				m.pushOffsetVal(val, cgroupID, st.Ino)
+				m.log.Debugw("Pushed BoringSSL offsets for Bun process",
+					"pid", pid, "cgroupID", cgroupID, "offsets", fmt.Sprintf("%+v", bunOff.BoringSSL))
+			}
+			if err := m.attachTCEgress(pid); err != nil {
+				m.log.Errorw("Failed to attach tc egress for Bun — secrets will not be rewritten",
+					"error", err, "pid", pid)
+			}
+			return nil
+		} else {
+			m.log.Warnw("Bun detected but SSL_write uprobe failed — falling through to symbol scan",
+				"pid", pid, "error", err)
+		}
+	}
+
+	// 3. Scan all TLS shared libraries in the container filesystem and attach
 	// system-wide uprobes. Uses /proc/<pid>/root to access the container's
 	// overlay mount — all processes in the same container share the same
 	// overlay inode, so the uprobe fires for any of them.

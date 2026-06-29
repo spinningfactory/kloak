@@ -235,6 +235,109 @@ func TestEBPFBoringSSLHostFiltering(t *testing.T) {
 	}
 }
 
+// TestEBPFBunHostFiltering is the Bun analogue of TestEBPFBoringSSLHostFiltering:
+// a TypeScript client running on a Bun single-executable (BoringSSL statically
+// linked, symbols stripped) sends ALLOWED=/BLOCKED= secrets over raw TLS to an
+// in-cluster echo server. Exercises the file-offset-based uprobe attach path and
+// the BoringSSL H-extraction chain (SSL→s3→aead_write_ctx→AES_KEY).
+func TestEBPFBunHostFiltering(t *testing.T) {
+	echoHostFQDN := "tls-bun." + testNamespace + ".svc.cluster.local"
+
+	allowedData := map[string][]byte{"api-key": []byte("REAL-ALLOWED-BUN-KEY-12345")}
+	blockedData := map[string][]byte{"api-key": []byte("REAL-BLOCKED-BUN-KEY-67890")}
+
+	createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{
+		"getkloak.io/hosts": echoHostFQDN,
+	})
+	createEnabledSecret(t, "secret-blocked", blockedData, nil, map[string]string{
+		"getkloak.io/hosts": "example.com",
+	})
+
+	assertShadowSecret(t, "secret-allowed", allowedData)
+	assertShadowSecret(t, "secret-blocked", blockedData)
+
+	demoManifest := filepath.Join(repoRoot, "examples", "demo-bun", "deployment.yaml")
+	if err := applyManifest(t, demoManifest); err != nil {
+		t.Fatalf("failed to deploy demo-bun: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := waitForDeploymentReady(ctx, testNamespace, "demo-bun"); err != nil {
+		t.Fatalf("demo-bun not ready: %v", err)
+	}
+
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer pollCancel()
+	out := pollDemoLogs(t, pollCtx, "app=demo-bun", "demo-bun",
+		"timed out waiting for allowed secret in Bun demo logs",
+		func(s string) bool { return strings.Contains(s, "REAL-ALLOWED-BUN-KEY-12345") })
+	t.Logf("=== demo-bun logs ===\n%s", out)
+
+	if strings.Contains(out, "REAL-BLOCKED-BUN-KEY-67890") {
+		t.Errorf("blocked secret should NOT be rewritten (host mismatch)")
+	}
+}
+
+// TestEBPFBunClaudeCode exercises the exact pattern that Claude Code uses:
+// a Bun single-executable sends HTTPS requests using fetch() with the secret
+// in an "Authorization: Bearer <key>" header. This is the primary real-world
+// motivation for the Bun file-offset uprobe path.
+//
+// The echo server (kloak-tls-echo) responds to GET /echo with a JSON object
+// containing the full request headers, so the rewritten Authorization value is
+// visible in the demo-app pod logs and assertable here.
+func TestEBPFBunClaudeCode(t *testing.T) {
+	echoHostFQDN := "tls-bun-claude." + testNamespace + ".svc.cluster.local"
+
+	allowedData := map[string][]byte{"api-key": []byte("REAL-API-KEY-CLAUDE-ABCDEF")}
+	blockedData := map[string][]byte{"api-key": []byte("REAL-BLOCKED-KEY-CLAUDE-XYZ")}
+
+	// Allowed secret: scoped to the echo service — kloak should rewrite the
+	// shadow in the Authorization header before it leaves the TLS stack.
+	createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{
+		"getkloak.io/hosts": echoHostFQDN,
+	})
+	// Blocked secret: scoped to a host the client never contacts — should NOT
+	// be rewritten, so the shadow value stays on the wire.
+	createEnabledSecret(t, "secret-blocked", blockedData, nil, map[string]string{
+		"getkloak.io/hosts": "api.anthropic.com",
+	})
+
+	assertShadowSecret(t, "secret-allowed", allowedData)
+	assertShadowSecret(t, "secret-blocked", blockedData)
+
+	demoManifest := filepath.Join(repoRoot, "examples", "demo-bun", "deployment-claude.yaml")
+	if err := applyManifest(t, demoManifest); err != nil {
+		t.Fatalf("failed to deploy demo-bun-claude: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := waitForDeploymentReady(ctx, testNamespace, "demo-bun-claude"); err != nil {
+		t.Fatalf("demo-bun-claude not ready: %v", err)
+	}
+
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer pollCancel()
+	// The echo server returns headers as JSON; the rewritten Authorization value
+	// appears as "Authorization":"Bearer REAL-API-KEY-CLAUDE-ABCDEF".
+	out := pollDemoLogs(t, pollCtx, "app=demo-bun-claude", "demo-bun-claude",
+		"timed out waiting for rewritten API key in demo-bun-claude logs",
+		func(s string) bool { return strings.Contains(s, "REAL-API-KEY-CLAUDE-ABCDEF") })
+	t.Logf("=== demo-bun-claude logs ===\n%s", out)
+
+	if strings.Contains(out, "REAL-BLOCKED-KEY-CLAUDE-XYZ") {
+		t.Errorf("blocked API key should NOT appear in echo (host mismatch — api.anthropic.com != %s)", echoHostFQDN)
+	}
+}
+
 func TestEBPFSecretRewrite(t *testing.T) {
 	// Wait for stale shadows from previous tests to be garbage-collected
 	gcCtx, gcCancel := context.WithTimeout(context.Background(), 30*time.Second)

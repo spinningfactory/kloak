@@ -3,7 +3,7 @@
         clean deps docker-build generate-ebpf generate-vmlinux run help \
         lima-start lima-stop lima-delete lima-shell lima-exec lima-check \
         lima-k3d-ensure lima-k3d-shell lima-k3d-e2e-setup lima-k3d-e2e-run lima-k3d-e2e lima-k3d-stop lima-k3d-delete \
-        go-tls-fixtures go-tls-discover boringssl-offsets
+        go-tls-fixtures go-tls-discover boringssl-offsets bun-offsets-discover
 
 # Go parameters
 GOCMD=go
@@ -100,6 +100,16 @@ go-tls-discover: go-tls-fixtures
 boringssl-offsets:
 	tools/boringssl-offsets/discover.sh $(BORINGSSL_VERSION)
 
+# Discover SSL_write file offset for a Bun single-executable release.
+# Downloads the official Bun profile build (production flags, symbols retained),
+# extracts the SSL_write virtual address via nm, converts to file offset via
+# tools/bun-offsets/va_to_offset.py, and writes
+# tools/bun-offsets/results/bun-VERSION-ARCH.json.
+# Override with: BUN_VERSION=1.3.14 ARCH=arm64 make bun-offsets-discover
+BUN_VERSION ?= 1.3.14
+bun-offsets-discover:
+	BUN_VERSION=$(BUN_VERSION) ARCH=$(or $(ARCH),amd64) tools/bun-offsets/discover.sh
+
 # E2E cluster and image configuration
 E2E_CLUSTER=kloak-e2e
 E2E_IMAGE_TAG=e2e
@@ -127,12 +137,14 @@ e2e-setup:
 	@docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
 	@docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
 	@docker build -t kloak-demo-boringssl:latest ./examples/demo-boringssl/
+	@docker build -t kloak-demo-bun:latest ./examples/demo-bun/
 	@docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
 	@echo "==> Importing images into k3d (via tar to avoid pipe EOF)..."
 	@mkdir -p /tmp/k3d-images
 	@for img in $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest \
 		kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest \
-		kloak-demo-python-raw-tls:latest kloak-demo-boringssl:latest kloak-tls-echo:latest; do \
+		kloak-demo-python-raw-tls:latest kloak-demo-boringssl:latest kloak-demo-bun:latest \
+		kloak-tls-echo:latest; do \
 		echo "  Importing $$img..."; \
 		docker save $$img -o /tmp/k3d-images/$$(echo $$img | tr ':/' '__').tar && \
 		k3d image import /tmp/k3d-images/$$(echo $$img | tr ':/' '__').tar -c $(E2E_CLUSTER); \
@@ -161,7 +173,7 @@ e2e-local-push:
 	@echo "==> Building and pushing images to $(E2E_REGISTRY) ..."
 	@docker build -t $(E2E_REGISTRY)/kloak:e2e .
 	@docker push $(E2E_REGISTRY)/kloak:e2e
-	@for demo in demo-go demo-python demo-js demo-go-boring demo-gnutls demo-python-raw-tls demo-boringssl; do \
+	@for demo in demo-go demo-python demo-js demo-go-boring demo-gnutls demo-python-raw-tls demo-boringssl demo-bun; do \
 		echo "  Pushing kloak-$$demo..."; \
 		docker build -t $(E2E_REGISTRY)/kloak-$$demo:latest ./examples/$$demo/ && \
 		docker push $(E2E_REGISTRY)/kloak-$$demo:latest; \
@@ -213,11 +225,13 @@ e2e-k3s-setup:
 	@docker build -t kloak-demo-gnutls:latest ./examples/demo-gnutls/
 	@docker build -t kloak-demo-python-raw-tls:latest ./examples/demo-python-raw-tls/
 	@docker build -t kloak-demo-boringssl:latest ./examples/demo-boringssl/
+	@docker build -t kloak-demo-bun:latest ./examples/demo-bun/
 	@docker build -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
 	@echo "==> Importing images into k3s containerd..."
 	@docker save $(DOCKER_IMAGE):$(E2E_IMAGE_TAG) kloak-demo-go:latest kloak-demo-python:latest \
 		kloak-demo-js:latest kloak-demo-go-boring:latest kloak-demo-gnutls:latest \
-		kloak-demo-python-raw-tls:latest kloak-demo-boringssl:latest kloak-tls-echo:latest | sudo k3s ctr -n k8s.io images import -
+		kloak-demo-python-raw-tls:latest kloak-demo-boringssl:latest kloak-demo-bun:latest \
+		kloak-tls-echo:latest | sudo k3s ctr -n k8s.io images import -
 	@echo "==> k3s e2e environment ready."
 
 # Run e2e tests against local k3s.
@@ -408,6 +422,7 @@ help:
 	@echo "  go-tls-fixtures  - Build / refresh Go TLS offset fixtures"
 	@echo "  go-tls-discover  - Discover new Go TLS offsets across versions"
 	@echo "  boringssl-offsets - Discover BoringSSL struct offsets (Docker + pahole)"
+	@echo "  bun-offsets-discover - Discover Bun SSL_write file offset (nm + va_to_offset.py)"
 	@echo ""
 	@echo "Lima VM (for eBPF on macOS):"
 	@echo "  lima-start       - Start the Lima VM"
