@@ -1,0 +1,78 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tls-bun-claude
+  labels:
+    app: tls-bun-claude
+spec:
+  selector:
+    app: demo-bun-claude
+  ports:
+    - port: 8443
+      targetPort: 8443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-bun-claude
+  labels:
+    app: demo-bun-claude
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-bun-claude
+  template:
+    metadata:
+      labels:
+        app: demo-bun-claude
+      annotations:
+        getkloak.io/enabled: "true"
+    spec:
+      containers:
+        # Bun TypeScript client mimicking Claude Code: uses fetch() to send
+        # API requests with the secret in an Authorization: Bearer header.
+        # kloak attaches to SSL_write via file offset (no exported symbols in
+        # the stripped Bun binary) and rewrites the shadow key on the wire.
+        - name: demo-app
+          image: kloak-demo-bun:latest
+          imagePullPolicy: Never
+          command: ["/usr/local/bin/bun", "run", "main-claude.ts"]
+          env:
+            - name: SECRET_API_KEY_FILE
+              value: "/etc/secrets/allowed/api-key"
+            - name: SECRET_BLOCKED_KEY_FILE
+              value: "/etc/secrets/blocked/api-key"
+            - name: TARGET_HOST
+              value: "tls-bun-claude"
+            - name: REQUEST_INTERVAL
+              value: "5"
+          volumeMounts:
+            - name: secret-allowed-vol
+              mountPath: "/etc/secrets/allowed"
+              readOnly: true
+            - name: secret-blocked-vol
+              mountPath: "/etc/secrets/blocked"
+              readOnly: true
+        # HTTP-over-TLS echo server: returns request headers as JSON at GET
+        # /echo. The same image used by cipher_test.go and dns_whitelist_test.go.
+        # Opted out of kloak (echo server outbound traffic is test infrastructure).
+        - name: echo-server
+          image: kloak-tls-echo:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8443
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 2
+            periodSeconds: 2
+      volumes:
+        - name: secret-allowed-vol
+          secret:
+            secretName: secret-allowed
+        - name: secret-blocked-vol
+          secret:
+            secretName: secret-blocked

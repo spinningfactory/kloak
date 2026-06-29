@@ -24,6 +24,7 @@ RUN set -e; \
     && chmod +x /usr/local/bin/bun
 
 WORKDIR /app
-COPY main.ts .
+COPY *.ts .
 
+# Default entry point — override CMD in the deployment to run main-claude.ts.
 CMD ["/usr/local/bin/bun", "run", "main.ts"]
