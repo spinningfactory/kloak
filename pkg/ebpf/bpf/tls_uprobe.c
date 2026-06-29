@@ -1104,7 +1104,8 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
 
     struct dns_ip_val div;
     __builtin_memset(&div, 0, sizeof(div));
-    __builtin_memcpy(div.hostname, actx->qname, MAX_HOST_LEN);
+    __u32 hn_len = actx->qname_len < MAX_HOST_LEN ? actx->qname_len : MAX_HOST_LEN;
+    __builtin_memcpy(div.hostname, actx->qname, hn_len);
     div.host_len = actx->qname_len;
     div.ttl_sec = ttl;
     div.inserted_at = bpf_ktime_get_ns();
@@ -1126,7 +1127,8 @@ static int parse_dns_answer(__u32 idx, void *ctx) {
 
     struct dns_ip_val div;
     __builtin_memset(&div, 0, sizeof(div));
-    __builtin_memcpy(div.hostname, actx->qname, MAX_HOST_LEN);
+    __u32 hn_len2 = actx->qname_len < MAX_HOST_LEN ? actx->qname_len : MAX_HOST_LEN;
+    __builtin_memcpy(div.hostname, actx->qname, hn_len2);
     div.host_len = actx->qname_len;
     div.ttl_sec = ttl;
     div.inserted_at = bpf_ktime_get_ns();
