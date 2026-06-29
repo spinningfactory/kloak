@@ -49,7 +49,7 @@ func DetectBun(binPath string) (BunOffsets, string, bool) {
 	if err != nil {
 		return BunOffsets{}, "", false
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	// Scan only the first 64 MiB to cover the ELF runtime without reading
 	// the (potentially large) bundled JS payload that follows.
@@ -77,7 +77,7 @@ func bunELFArch(binPath string) string {
 	if err != nil {
 		return "amd64"
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 	if f.Machine == elf.EM_AARCH64 {
 		return "arm64"
 	}
