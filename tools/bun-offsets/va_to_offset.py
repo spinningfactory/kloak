@@ -28,7 +28,7 @@ def va_to_file_offset(path: str, va: int) -> int | None:
                 p_type   = struct.unpack_from("<I", ph,  0)[0]
                 p_offset = struct.unpack_from("<Q", ph,  8)[0]
                 p_vaddr  = struct.unpack_from("<Q", ph, 16)[0]
-                p_filesz = struct.unpack_from("<Q", ph, 40)[0]
+                p_filesz = struct.unpack_from("<Q", ph, 32)[0]
                 if p_type == 1 and p_vaddr <= va < p_vaddr + p_filesz:
                     return p_offset + (va - p_vaddr)
         else:
