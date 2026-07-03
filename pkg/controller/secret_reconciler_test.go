@@ -201,6 +201,88 @@ func TestSecretReconciler_UpdateShadow(t *testing.T) {
 	}
 }
 
+// TestSecretReconciler_RotateSameLengthDifferentHuffman is the regression test
+// for #269. Rotating a secret to a NEW value of the SAME byte length but a
+// DIFFERENT HPACK Huffman bit length must regenerate the shadow, not reuse it.
+// generateShadowValue mints a shadow whose Huffman bit length equals the real's
+// exactly, and pkg/ebpf/sync.go relies on that equality for the HTTP/2 rewrite;
+// reusing a shadow minted for the old value would leave HuffmanBits(shadow) !=
+// HuffmanBits(real), which either skips the h2 map entry (placeholder leaks
+// upstream) or over-pads with EOS bits (strict HPACK decoders reset the stream).
+func TestSecretReconciler_RotateSameLengthDifferentHuffman(t *testing.T) {
+	// Both values are 16 bytes and shadowable, but differ in Huffman bit
+	// length (90 vs 111 bits), so a same-length rotation between them must
+	// force regeneration rather than shadow reuse.
+	const v1 = "1234567890abcdef"
+	const v2 = "ABCDEFGHIJKLMNOP"
+	if len(v1) != len(v2) {
+		t.Fatalf("test values must be the same length: %d vs %d", len(v1), len(v2))
+	}
+	if secrets.HuffmanBits(v1) == secrets.HuffmanBits(v2) {
+		t.Fatalf("test values must have different Huffman bit lengths; both are %d", secrets.HuffmanBits(v1))
+	}
+
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rotating-secret",
+			Namespace: "default",
+			Labels:    map[string]string{AnnotationSecretEnabled: "true"},
+			UID:       "rotating-uid",
+		},
+		Data: map[string][]byte{"key": []byte(v1)},
+	}
+
+	r, c := newSecretReconciler(secret)
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "rotating-secret", Namespace: "default"}}
+
+	// First reconcile — mints a shadow matched to v1's Huffman length.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	shadow1 := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Name: "rotating-secret-kloak", Namespace: "default"}, shadow1); err != nil {
+		t.Fatal(err)
+	}
+	firstShadow := string(shadow1.Data["key"])
+	if secrets.HuffmanBits(firstShadow) != secrets.HuffmanBits(v1) {
+		t.Fatalf("initial shadow Huffman bits %d != v1 Huffman bits %d",
+			secrets.HuffmanBits(firstShadow), secrets.HuffmanBits(v1))
+	}
+
+	// Rotate to a same-length value with a different Huffman density.
+	if err := c.Get(ctx, types.NamespacedName{Name: "rotating-secret", Namespace: "default"}, secret); err != nil {
+		t.Fatal(err)
+	}
+	secret.Data["key"] = []byte(v2)
+	if err := c.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+
+	// Second reconcile — must regenerate so the shadow tracks v2's Huffman length.
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	shadow2 := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Name: "rotating-secret-kloak", Namespace: "default"}, shadow2); err != nil {
+		t.Fatal(err)
+	}
+	secondShadow := string(shadow2.Data["key"])
+
+	// The core invariant the HTTP/2 rewrite depends on.
+	if secrets.HuffmanBits(secondShadow) != secrets.HuffmanBits(v2) {
+		t.Errorf("after rotation shadow Huffman bits %d != v2 Huffman bits %d (shadow was not regenerated to match the new value)",
+			secrets.HuffmanBits(secondShadow), secrets.HuffmanBits(v2))
+	}
+	// The old shadow could not have satisfied v2's invariant, so it must change.
+	if secondShadow == firstShadow {
+		t.Errorf("shadow was reused across a different-Huffman-density rotation: %q", secondShadow)
+	}
+	if len(secondShadow) != len(v2) {
+		t.Errorf("shadow length %d != new value length %d", len(secondShadow), len(v2))
+	}
+}
+
 func TestSecretReconciler_HostsLabel(t *testing.T) {
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
