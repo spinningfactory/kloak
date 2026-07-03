@@ -131,11 +131,19 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		originalLen := len(originalBytes)
 		var shadowValue string
 
-		// Try to reuse existing UUID
+		// Try to reuse existing UUID. Reuse is only safe when the existing
+		// shadow's HPACK Huffman bit length still equals the real value's:
+		// generateShadowValue mints a shadow whose Huffman bit length matches
+		// the real exactly, and pkg/ebpf/sync.go relies on that equality for
+		// the HTTP/2 rewrite (an unequal shadow either skips the h2 map entry —
+		// leaking the placeholder upstream — or over-pads with EOS bits, which
+		// strict HPACK decoders reset). A same-length secret rotation to a value
+		// with different Huffman density must therefore regenerate, not reuse.
 		if shadowExists && len(existingShadow.Data[key]) > 0 {
 			existingVal := string(existingShadow.Data[key])
 			if strings.HasPrefix(existingVal, secrets.ValuePrefix) {
-				if len(existingVal) == originalLen {
+				if len(existingVal) == originalLen &&
+					secrets.HuffmanBits(existingVal) == secrets.HuffmanBits(originalValue) {
 					if !gen.Collides(existingVal, secretID) {
 						// Check it doesn't collide with other keys in this same secret
 						if prefix := existingVal[:secrets.ShadowPrefixLen]; !isPrefixUsed(shadowsInBatch, prefix) {
