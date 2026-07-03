@@ -61,7 +61,7 @@ The binary (`cmd/kloak/main.go`) has two subcommands via cobra:
 ### Labels & Annotations
 
 - `getkloak.io/enabled=true` — enable on secrets (label), pods (annotation), namespaces (label), or workloads (label/annotation)
-- `getkloak.io/hosts=host1,host2` — restrict which hosts a secret can be sent to
+- `getkloak.io/hosts=<host>` — restrict which host a secret can be sent to. Accepts a single hostname, a single IP, or `*` (any). A comma-separated list is **not** supported yet — the validating webhook rejects it and the data plane would treat it as one bogus hostname (see spinningfactory/kloak#102 for multi-host support)
 - `getkloak.io/managed=true` — marks shadow secrets created by Kloak
 
 ## Project Layout
