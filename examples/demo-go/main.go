@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -77,12 +78,21 @@ func main() {
 	// fresh connection per request means a late attach is picked up on the very
 	// next request instead. ForceAttemptHTTP2 keeps the h2 path the HPACK test
 	// exercises.
+	transport := &http.Transport{
+		DisableKeepAlives: true,
+		ForceAttemptHTTP2: true,
+	}
+	// INSECURE_SKIP_VERIFY is opt-in and defaults off, so the standalone/
+	// human demo against a real endpoint (httpbin.org) keeps full cert
+	// verification. The e2e suite sets it to "true" because it retargets
+	// this demo at an in-cluster echo server that presents a self-signed
+	// cert — a test-only concession, never enabled by default.
+	if os.Getenv("INSECURE_SKIP_VERIFY") == "true" {
+		transport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	}
 	client := &http.Client{
-		Timeout: 10 * time.Second,
-		Transport: &http.Transport{
-			DisableKeepAlives: true,
-			ForceAttemptHTTP2: true,
-		},
+		Timeout:   10 * time.Second,
+		Transport: transport,
 	}
 
 	requestCount := 0

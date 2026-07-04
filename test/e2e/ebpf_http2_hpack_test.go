@@ -63,8 +63,15 @@ func TestEBPFHttp2HpackOverPadding(t *testing.T) {
 	allowedData := map[string][]byte{"api-key": []byte(realLowDensity)}
 	blockedData := map[string][]byte{"api-key": []byte("REAL-BLOCKED-KEY-67890")}
 
+	// Hermetic HTTP/2 target. The in-cluster echo serves h2 via Go's stdlib
+	// server, whose HPACK decoder is strict about EOS padding (RFC 7541 §5.2)
+	// exactly like the AWS ALB that used to front httpbin.org — so this stays
+	// a real over-padding regression guard while dropping the internet
+	// dependency that made the Go nightly flaky.
+	echoFQDN := deployHTTPEchoServer(t)
+
 	createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{
-		"getkloak.io/hosts": "httpbin.org",
+		"getkloak.io/hosts": echoFQDN,
 	})
 	createEnabledSecret(t, "secret-blocked", blockedData, nil, map[string]string{
 		"getkloak.io/hosts": "example.com",
@@ -74,10 +81,10 @@ func TestEBPFHttp2HpackOverPadding(t *testing.T) {
 	assertShadowSecret(t, "secret-blocked", blockedData)
 
 	// demo-go specifically: its http.Client negotiates HTTP/2 over ALPN
-	// against httpbin.org. demo-python (requests) and demo-js (node
+	// against the in-cluster echo. demo-python (requests) and demo-js (node
 	// http) default to HTTP/1.1 and so don't exercise HPACK at all.
 	demoManifest := filepath.Join(repoRoot, "examples", "demo-go", "deployment.yaml")
-	if err := applyManifest(t, demoManifest); err != nil {
+	if err := applyManifestTransformed(t, demoManifest, httpEchoTargetURL(echoFQDN)); err != nil {
 		t.Fatalf("failed to deploy demo-go: %v", err)
 	}
 	t.Cleanup(func() {
@@ -114,7 +121,7 @@ func TestEBPFHttp2HpackOverPadding(t *testing.T) {
 	pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer pollCancel()
 	out := pollDemoLogs(t, pollCtx, "app=demo-go", "http2-hpack-overpad",
-		"timed out waiting for the low-Huffman-density secret in demo-go's response echo — HPACK over-padding bug fired (httpbin's HPACK decoder rejected the stream or the rewritten value didn't decode to the real secret)",
+		"timed out waiting for the low-Huffman-density secret in demo-go's response echo — HPACK over-padding bug fired (the echo's strict HPACK decoder rejected the stream or the rewritten value didn't decode to the real secret)",
 		func(s string) bool { return strings.Contains(s, realLowDensity) })
 	t.Logf("=== demo-go (HTTP/2 HPACK over-pad) logs ===\n%s", out)
 
