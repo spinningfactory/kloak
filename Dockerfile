@@ -67,7 +67,7 @@ RUN if [ "$COVER" = "1" ]; then \
     fi
 
 # Runtime stage — uses the target platform.
-FROM alpine:3.23
+FROM alpine:3.24
 
 RUN apk add --no-cache ca-certificates
 
