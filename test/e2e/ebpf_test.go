@@ -9,10 +9,13 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // e2eImage returns the full image reference, prefixed by E2E_REGISTRY if set.
@@ -34,12 +37,25 @@ func e2ePullPolicy() corev1.PullPolicy {
 // applyManifest applies a k8s manifest YAML, rewriting image references
 // if E2E_REGISTRY is set.
 func applyManifest(t *testing.T, path string) error {
+	return applyManifestTransformed(t, path, nil)
+}
+
+// applyManifestTransformed is applyManifest with an optional post-read
+// transform applied to the raw YAML before the E2E_REGISTRY image rewrite.
+// It lets a test retarget a shared demo manifest (e.g. swap the demo's
+// TARGET_URL from the public internet to an in-cluster echo) without
+// forking the manifest file, which is also consumed by setup-demo.sh.
+func applyManifestTransformed(t *testing.T, path string, transform func(string) string) error {
 	t.Helper()
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return fmt.Errorf("reading manifest %s: %w", path, err)
 	}
 	manifest := string(data)
+
+	if transform != nil {
+		manifest = transform(manifest)
+	}
 
 	if imageRegistry != "" {
 		manifest = strings.ReplaceAll(manifest, "image: kloak-", "image: "+imageRegistry+"/kloak-")
@@ -53,6 +69,149 @@ func applyManifest(t *testing.T, path string) error {
 		return fmt.Errorf("kubectl apply: %s: %w", string(out), err)
 	}
 	return nil
+}
+
+// httpEchoServerName is the name prefix for the in-cluster HTTPS echo server
+// that stands in for httpbin.org in the Go e2e path. See test/e2e/
+// http-echo-server for why. Each deployment appends a unique suffix (below).
+const httpEchoServerName = "httpbin-echo"
+
+// httpEchoSeq gives each echo deployment a unique, short name suffix. Two
+// tests use the echo (TestEBPFSecretRewrite/go and the HTTP/2 HPACK test) and
+// run sequentially; a static name would risk an AlreadyExists collision with
+// the previous deployment still asynchronously Terminating. The suffix is kept
+// short on purpose — the Service FQDN becomes the getkloak.io/hosts value, and
+// kloak truncates host labels at MAX_HOST_LEN (64B), so the whole FQDN must
+// stay well under that for host filtering to match.
+var httpEchoSeq atomic.Uint32
+
+// httpEchoTargetURL retargets a demo manifest's TARGET_URL at the in-cluster
+// echo and enables the demo's opt-in InsecureSkipVerify (the echo presents a
+// self-signed cert). fqdn is the echo Service FQDN returned by
+// deployHTTPEchoServer. Indentation for the injected env entry is derived from
+// the matched line so the transform survives a reformat of the manifest.
+func httpEchoTargetURL(fqdn string) func(string) string {
+	const target = `value: "https://httpbin.org/headers"`
+	newURL := `value: "https://` + fqdn + `:8443/headers"`
+	return func(manifest string) string {
+		idx := strings.Index(manifest, target)
+		if idx == -1 {
+			return manifest
+		}
+		// Whitespace preceding the matched `value:` line. The sibling list
+		// item (`- name:`) sits two columns to its left in YAML.
+		valueIndent := manifest[strings.LastIndexByte(manifest[:idx], '\n')+1 : idx]
+		itemIndent := valueIndent
+		if len(valueIndent) >= 2 {
+			itemIndent = valueIndent[:len(valueIndent)-2]
+		}
+		replacement := newURL + "\n" +
+			itemIndent + "- name: INSECURE_SKIP_VERIFY\n" +
+			valueIndent + `value: "true"`
+		return strings.Replace(manifest, target, replacement, 1)
+	}
+}
+
+// deployHTTPEchoServer creates the in-cluster HTTPS header-echo server (an
+// httpbin.org replacement) as a pod behind a Service, and returns its FQDN.
+// It mirrors deployTLSEchoServer but speaks HTTP/1.1 + HTTP/2 on :8443.
+func deployHTTPEchoServer(t *testing.T) string {
+	t.Helper()
+
+	serverName := fmt.Sprintf("%s-%d", httpEchoServerName, httpEchoSeq.Add(1))
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serverName,
+			Namespace: testNamespace,
+			// Opt the echo out of kloak interception — it is test
+			// infrastructure, not a workload under test.
+			Labels: map[string]string{
+				"app":                 serverName,
+				"getkloak.io/enabled": "false",
+			},
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{{
+				Name:            "echo",
+				Image:           e2eImage("kloak-http-echo", "latest"),
+				ImagePullPolicy: e2ePullPolicy(),
+				Ports:           []corev1.ContainerPort{{ContainerPort: 8443}},
+				ReadinessProbe: &corev1.Probe{
+					ProbeHandler: corev1.ProbeHandler{
+						HTTPGet: &corev1.HTTPGetAction{
+							Path:   "/health",
+							Port:   intstr.FromInt32(8443),
+							Scheme: corev1.URISchemeHTTPS,
+						},
+					},
+					InitialDelaySeconds: 2,
+					PeriodSeconds:       2,
+				},
+			}},
+		},
+	}
+	if _, err := clientset.CoreV1().Pods(testNamespace).Create(
+		context.Background(), pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create http echo pod: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = clientset.CoreV1().Pods(testNamespace).Delete(
+			context.Background(), serverName, metav1.DeleteOptions{})
+	})
+
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      serverName,
+			Namespace: testNamespace,
+		},
+		Spec: corev1.ServiceSpec{
+			Selector: map[string]string{"app": serverName},
+			Ports: []corev1.ServicePort{{
+				Port:       8443,
+				TargetPort: intstr.FromInt32(8443),
+			}},
+		},
+	}
+	if _, err := clientset.CoreV1().Services(testNamespace).Create(
+		context.Background(), svc, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("failed to create http echo service: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = clientset.CoreV1().Services(testNamespace).Delete(
+			context.Background(), serverName, metav1.DeleteOptions{})
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	if err := waitForPodReady(ctx, testNamespace, serverName); err != nil {
+		t.Fatalf("http echo server not ready: %v", err)
+	}
+
+	return fmt.Sprintf("%s.%s.svc.cluster.local", serverName, testNamespace)
+}
+
+// retargetAllowedSecretToEcho replaces the shared httpbin-scoped secret-allowed
+// with one scoped to the in-cluster echo host, so kloak's DNS-verified host
+// filter matches the hermetic target. It recreates (rather than relabels) to
+// force a clean shadow + BPF map resync. The value is unchanged, so the
+// negative assertions elsewhere still hold.
+func retargetAllowedSecretToEcho(t *testing.T, host string) {
+	t.Helper()
+	_ = clientset.CoreV1().Secrets(testNamespace).Delete(
+		context.Background(), "secret-allowed", metav1.DeleteOptions{})
+	gcCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// Wait for both the original and its shadow to clear so the recreate
+	// below can't lose an AlreadyExists race with a still-terminating secret.
+	_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-allowed")
+	_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-allowed-kloak")
+
+	allowedData := map[string][]byte{"api-key": []byte("REAL-ALLOWED-KEY-12345")}
+	createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{
+		"getkloak.io/hosts": host,
+	})
+	assertShadowSecret(t, "secret-allowed", allowedData)
 }
 
 // controllerLogs fetches the latest controller log output.
@@ -100,6 +259,10 @@ type ebpfRewriteTest struct {
 	deploymentName string
 	appLabel       string
 	skip           string // if non-empty, test is skipped with this reason
+	// hermetic retargets the demo at the in-cluster HTTPS echo server instead
+	// of the public httpbin.org, so the test doesn't depend on the internet.
+	// The shared allowed secret is re-scoped to the echo's FQDN for this case.
+	hermetic bool
 }
 
 var ebpfTests = []ebpfRewriteTest{
@@ -120,6 +283,10 @@ var ebpfTests = []ebpfRewriteTest{
 		demoDir:        "demo-go",
 		deploymentName: "demo-go",
 		appLabel:       "app=demo-go",
+		// The Go demo negotiates HTTP/2 and was the flakiest cell in the Go
+		// nightly because it hit the public httpbin.org. Run it against the
+		// in-cluster echo instead.
+		hermetic: true,
 	},
 	{
 		name:           "go-boringssl",
@@ -370,7 +537,19 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 		t.Skip(tc.skip)
 	}
 	demoManifest := filepath.Join(repoRoot, "examples", tc.demoDir, "deployment.yaml")
-	if err := applyManifest(t, demoManifest); err != nil {
+
+	// Hermetic cases retarget the demo at the in-cluster HTTPS echo so the
+	// test never depends on httpbin.org (the dominant Go-nightly flake). This
+	// re-scopes the shared allowed secret to the echo's FQDN and rewrites the
+	// manifest's TARGET_URL + skip-verify at apply time.
+	var transform func(string) string
+	if tc.hermetic {
+		echoFQDN := deployHTTPEchoServer(t)
+		retargetAllowedSecretToEcho(t, echoFQDN)
+		transform = httpEchoTargetURL(echoFQDN)
+	}
+
+	if err := applyManifestTransformed(t, demoManifest, transform); err != nil {
 		t.Fatalf("failed to deploy %s: %v", tc.demoDir, err)
 	}
 	t.Cleanup(func() {
@@ -387,7 +566,7 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 
 	// Two-phase wait. The 90s single-budget approach was flaky on slow CI
 	// runners because it conflated three distinct delays (Node.js cold-
-	// start / TLS module init, DNS+RTT to httpbin.org, and the uprobe
+	// start / TLS module init, DNS+RTT to the target, and the uprobe
 	// attach race) into one ceiling. Splitting them gives a clearer signal
 	// when something does break:
 	//
@@ -398,8 +577,9 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 	//   window on long phase-1 waits. Two requests means the runtime is
 	//   alive AND the uprobe-attach race window has closed at least once,
 	//   so any subsequent rewrite failure points at the eBPF path rather
-	//   than at startup. 120s budget covers Node.js cold-start + first
-	//   public-internet RTT under load.
+	//   than at startup. 120s budget covers Node.js cold-start; the Go
+	//   case now hits an in-cluster echo (sub-ms RTT) rather than the
+	//   public internet, so its own budget is comfortably slack.
 	//
 	//   Phase 2 — poll for the rewritten secret in the demo logs. 180s
 	//   budget; the original 90s sat exactly at the failure edge for JS

@@ -376,6 +376,13 @@ jobs:
             --cache-to type=registry,ref=${CACHE}:tls-echo,mode=max,ignore-error=true \
             -t kloak-tls-echo:latest ./test/e2e/tls-echo-server/
 
+          # HTTPS header-echo server (httpbin.org replacement) for the Go +
+          # HTTP/2 HPACK e2e paths. See test/e2e/http-echo-server.
+          docker buildx build --load \
+            --cache-from type=registry,ref=${CACHE}:http-echo \
+            --cache-to type=registry,ref=${CACHE}:http-echo,mode=max,ignore-error=true \
+            -t kloak-http-echo:latest ./test/e2e/http-echo-server/
+
           # demo-bun downloads the Bun profile build at image-build time; the
           # registry cache avoids re-downloading on every CI run.
           docker buildx build --load \
@@ -387,7 +394,8 @@ jobs:
             kloak-demo-js:latest kloak-demo-go-boring:latest \
             kloak-demo-gnutls:latest kloak-demo-python-raw-tls:latest \
             kloak-demo-boringssl:latest kloak-demo-bun:latest \
-            kloak-tls-echo:latest | sudo k3s ctr -n k8s.io images import -
+            kloak-tls-echo:latest kloak-http-echo:latest \
+            | sudo k3s ctr -n k8s.io images import -
 
       - name: Install Helm
         uses: azure/setup-helm@v5

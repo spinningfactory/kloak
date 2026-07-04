@@ -169,7 +169,15 @@ jobs:
             --cache-to type=registry,ref=${CACHE}:demo-go-${{ matrix.go }},mode=max,ignore-error=true \
             -t kloak-demo-go:latest ./examples/demo-go/
 
-          docker save kloak:e2e kloak-demo-go:latest \
+          # In-cluster HTTPS echo server: the Go e2e retargets demo-go at this
+          # instead of the public httpbin.org, which was the dominant flake
+          # source for this nightly (see test/e2e/http-echo-server).
+          docker buildx build --load \
+            --cache-from type=registry,ref=${CACHE}:http-echo \
+            --cache-to type=registry,ref=${CACHE}:http-echo,mode=max,ignore-error=true \
+            -t kloak-http-echo:latest ./test/e2e/http-echo-server/
+
+          docker save kloak:e2e kloak-demo-go:latest kloak-http-echo:latest \
             | sudo k3s ctr -n k8s.io images import -
 
       - name: Install Helm
