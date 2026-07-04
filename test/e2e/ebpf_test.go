@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -70,27 +71,44 @@ func applyManifestTransformed(t *testing.T, path string, transform func(string) 
 	return nil
 }
 
-// httpEchoServerName is the in-cluster HTTPS echo server that stands in for
-// httpbin.org in the Go e2e path. See test/e2e/http-echo-server for why.
+// httpEchoServerName is the name prefix for the in-cluster HTTPS echo server
+// that stands in for httpbin.org in the Go e2e path. See test/e2e/
+// http-echo-server for why. Each deployment appends a unique suffix (below).
 const httpEchoServerName = "httpbin-echo"
+
+// httpEchoSeq gives each echo deployment a unique, short name suffix. Two
+// tests use the echo (TestEBPFSecretRewrite/go and the HTTP/2 HPACK test) and
+// run sequentially; a static name would risk an AlreadyExists collision with
+// the previous deployment still asynchronously Terminating. The suffix is kept
+// short on purpose — the Service FQDN becomes the getkloak.io/hosts value, and
+// kloak truncates host labels at MAX_HOST_LEN (64B), so the whole FQDN must
+// stay well under that for host filtering to match.
+var httpEchoSeq atomic.Uint32
 
 // httpEchoTargetURL retargets a demo manifest's TARGET_URL at the in-cluster
 // echo and enables the demo's opt-in InsecureSkipVerify (the echo presents a
 // self-signed cert). fqdn is the echo Service FQDN returned by
-// deployHTTPEchoServer.
+// deployHTTPEchoServer. Indentation for the injected env entry is derived from
+// the matched line so the transform survives a reformat of the manifest.
 func httpEchoTargetURL(fqdn string) func(string) string {
+	const target = `value: "https://httpbin.org/headers"`
+	newURL := `value: "https://` + fqdn + `:8443/headers"`
 	return func(manifest string) string {
-		manifest = strings.ReplaceAll(manifest,
-			`value: "https://httpbin.org/headers"`,
-			`value: "https://`+fqdn+`:8443/headers"`)
-		// Inject the skip-verify env right after the (now-rewritten) TARGET_URL
-		// value line so the demo trusts the echo's self-signed cert.
-		manifest = strings.ReplaceAll(manifest,
-			`value: "https://`+fqdn+`:8443/headers"`,
-			`value: "https://`+fqdn+`:8443/headers"`+"\n"+
-				`            - name: INSECURE_SKIP_VERIFY`+"\n"+
-				`              value: "true"`)
-		return manifest
+		idx := strings.Index(manifest, target)
+		if idx == -1 {
+			return manifest
+		}
+		// Whitespace preceding the matched `value:` line. The sibling list
+		// item (`- name:`) sits two columns to its left in YAML.
+		valueIndent := manifest[strings.LastIndexByte(manifest[:idx], '\n')+1 : idx]
+		itemIndent := valueIndent
+		if len(valueIndent) >= 2 {
+			itemIndent = valueIndent[:len(valueIndent)-2]
+		}
+		replacement := newURL + "\n" +
+			itemIndent + "- name: INSECURE_SKIP_VERIFY\n" +
+			valueIndent + `value: "true"`
+		return strings.Replace(manifest, target, replacement, 1)
 	}
 }
 
@@ -100,14 +118,16 @@ func httpEchoTargetURL(fqdn string) func(string) string {
 func deployHTTPEchoServer(t *testing.T) string {
 	t.Helper()
 
+	serverName := fmt.Sprintf("%s-%d", httpEchoServerName, httpEchoSeq.Add(1))
+
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      httpEchoServerName,
+			Name:      serverName,
 			Namespace: testNamespace,
 			// Opt the echo out of kloak interception — it is test
 			// infrastructure, not a workload under test.
 			Labels: map[string]string{
-				"app":                 httpEchoServerName,
+				"app":                 serverName,
 				"getkloak.io/enabled": "false",
 			},
 		},
@@ -137,16 +157,16 @@ func deployHTTPEchoServer(t *testing.T) string {
 	}
 	t.Cleanup(func() {
 		_ = clientset.CoreV1().Pods(testNamespace).Delete(
-			context.Background(), httpEchoServerName, metav1.DeleteOptions{})
+			context.Background(), serverName, metav1.DeleteOptions{})
 	})
 
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      httpEchoServerName,
+			Name:      serverName,
 			Namespace: testNamespace,
 		},
 		Spec: corev1.ServiceSpec{
-			Selector: map[string]string{"app": httpEchoServerName},
+			Selector: map[string]string{"app": serverName},
 			Ports: []corev1.ServicePort{{
 				Port:       8443,
 				TargetPort: intstr.FromInt32(8443),
@@ -159,16 +179,16 @@ func deployHTTPEchoServer(t *testing.T) string {
 	}
 	t.Cleanup(func() {
 		_ = clientset.CoreV1().Services(testNamespace).Delete(
-			context.Background(), httpEchoServerName, metav1.DeleteOptions{})
+			context.Background(), serverName, metav1.DeleteOptions{})
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	if err := waitForPodReady(ctx, testNamespace, httpEchoServerName); err != nil {
+	if err := waitForPodReady(ctx, testNamespace, serverName); err != nil {
 		t.Fatalf("http echo server not ready: %v", err)
 	}
 
-	return fmt.Sprintf("%s.%s.svc.cluster.local", httpEchoServerName, testNamespace)
+	return fmt.Sprintf("%s.%s.svc.cluster.local", serverName, testNamespace)
 }
 
 // retargetAllowedSecretToEcho replaces the shared httpbin-scoped secret-allowed
