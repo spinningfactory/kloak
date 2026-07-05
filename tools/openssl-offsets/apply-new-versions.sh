@@ -58,10 +58,14 @@ for v in "${NEW_VERSIONS[@]}"; do
     wrl_to_enc=$(jq -r '.kloak_config.WRLToEncCtx' "$json")
     enc_to_algctx=$(jq -r '.kloak_config.EncCtxToAlgctx' "$json")
     algctx_to_h=$(jq -r '.kloak_config.AlgctxToH' "$json")
+    # AlgctxToAESKey powers the AES-round-key H fallback (issue #275). It MUST be
+    # carried into new table entries — a missing/zero value silently disables the
+    # fallback for the new version, re-exposing the lazy-H rewrite-skip flake.
+    algctx_to_aeskey=$(jq -r '.kloak_config.AlgctxToAESKey' "$json")
     ssl_to_ver=$(jq -r '.kloak_config.SSLToVersion' "$json")
     ssl_to_wbio=$(jq -r '.kloak_config.SSLToWBIO' "$json")
 
-    for field in ssl_to_wrl wrl_to_enc enc_to_algctx algctx_to_h ssl_to_ver ssl_to_wbio; do
+    for field in ssl_to_wrl wrl_to_enc enc_to_algctx algctx_to_h algctx_to_aeskey ssl_to_ver ssl_to_wbio; do
       val="${!field}"
       if [ -z "$val" ] || [ "$val" = "null" ]; then
         echo "ERROR: $json is missing field $field — re-run offset discovery" >&2
@@ -69,8 +73,8 @@ for v in "${NEW_VERSIONS[@]}"; do
       fi
     done
 
-    entry=$(printf '\t"%s": {SSLToWRL: %s, WRLToEncCtx: %s, EncCtxToAlgctx: %s, AlgctxToH: %s, SSLToVersion: %s, SSLToWBIO: %s},' \
-      "$major_minor" "$ssl_to_wrl" "$wrl_to_enc" "$enc_to_algctx" "$algctx_to_h" "$ssl_to_ver" "$ssl_to_wbio")
+    entry=$(printf '\t"%s": {SSLToWRL: %s, WRLToEncCtx: %s, EncCtxToAlgctx: %s, AlgctxToH: %s, SSLToVersion: %s, SSLToWBIO: %s, AlgctxToAESKey: %s},' \
+      "$major_minor" "$ssl_to_wrl" "$wrl_to_enc" "$enc_to_algctx" "$algctx_to_h" "$ssl_to_ver" "$ssl_to_wbio" "$algctx_to_aeskey")
 
     # Insert before the first existing entry so new (newer) versions land at the
     # top of the table, keeping it in descending version order.
