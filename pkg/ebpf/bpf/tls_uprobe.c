@@ -590,6 +590,17 @@ struct tls_offsets {
   __u32 bssl_ssl_to_s3;
   __u32 bssl_s3_to_aead;
   __u32 bssl_aead_to_aeskey;
+
+  // OpenSSL AES-GCM robustness fallback (issue #275). algctx (PROV_AES_GCM_CTX)*
+  // + off → AES_KEY.rd_key (round-key schedule, direct read). OpenSSL's raw H
+  // field at algctx_to_h is populated lazily and, on some impl paths / under
+  // load, reads all-zero at SSL_write time — which used to silently skip the
+  // rewrite. When the direct H read is zero we recompute H = AES_encrypt(0)
+  // from these round keys (always materialised by the time a write encrypts),
+  // exactly as the BoringSSL chain does. 0 = not calibrated → fallback disabled
+  // (preserves prior behaviour). Appended last so the struct prefix — and thus
+  // every existing field offset — is unchanged.
+  __u32 openssl_algctx_to_aeskey;
 };
 
 #define TLS_LIB_OPENSSL 0
@@ -729,6 +740,44 @@ static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_
   }
 #ifdef KLOAK_DEBUG
   bpf_printk("kloak [BSSL] H ok rounds=%u h0=%llx h1=%llx", rounds, bh[0], bh[1]);
+#endif
+  return 1;
+}
+
+// openssl_recover_h recomputes the GHASH subkey H = AES_encrypt(0) from the
+// OpenSSL provider's AES round-key schedule, for the case where the raw H
+// field (algctx_to_h) reads zero (lazily populated — issue #275). Given the
+// already-walked algctx (PROV_AES_GCM_CTX*), it reads AES_KEY.rd_key at
+// algctx + algctx_to_aeskey and the round count 240 bytes past it, then calls
+// the shared aes_recover_h. Writes 16 bytes to h_out (already in GHASH byte
+// order, so callers must NOT byte-swap — matching bssl_recover_h). Returns 1
+// on success, 0 on any failure (including non-GCM ciphers, whose round count
+// won't validate). __noinline for its own stack frame, mirroring
+// bssl_recover_h.
+static __attribute__((noinline)) int openssl_recover_h(__u64 algctx,
+                                                       __u32 algctx_to_aeskey,
+                                                       __u8 *h_out) {
+  __u32 zk = 0;
+  struct aes_scratch_buf *ab = bpf_map_lookup_elem(&aes_scratch, &zk);
+  if (!ab)
+    return 0;
+
+  __u64 aeskey = algctx + algctx_to_aeskey;
+  if (bpf_probe_read_user(ab->rd_key, BSSL_AES_RDKEY_BYTES, (void *)aeskey) < 0)
+    return 0;
+  __u32 rounds = 0;
+  if (bpf_probe_read_user(&rounds, 4, (void *)(aeskey + BSSL_AESKEY_ROUNDS_OFF)) < 0)
+    return 0;
+
+  if (!aes_recover_h(ab->rd_key, rounds, h_out))
+    return 0;
+
+  __u64 *bh = (__u64 *)h_out;
+  if (bh[0] == 0 && bh[1] == 0)
+    return 0;
+#ifdef KLOAK_DEBUG
+  bpf_printk("kloak [OSSL] H recovered from AES key rounds=%u h0=%llx h1=%llx",
+             rounds, bh[0], bh[1]);
 #endif
   return 1;
 }
@@ -1929,20 +1978,33 @@ int bpf_h_extract(void *ctx) {
       dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
       return 0;
     }
+
+    // Fast path: read the provider's raw H field directly. OpenSSL stores it
+    // little-endian; GHASH wants big-endian (matches the uretprobe and
+    // kprobe-walk representations).
+    int have_h = 0;
     if (bpf_probe_read_user(ghash_h, 16,
-                            (void *)(algctx + offsets->algctx_to_h)) < 0) {
+                            (void *)(algctx + offsets->algctx_to_h)) == 0 &&
+        !(ghash_h64[0] == 0 && ghash_h64[1] == 0)) {
+      ghash_h64[0] = __builtin_bswap64(ghash_h64[0]);
+      ghash_h64[1] = __builtin_bswap64(ghash_h64[1]);
+      have_h = 1;
+    } else if (offsets->openssl_algctx_to_aeskey != 0) {
+      // Robust fallback (issue #275): the raw H field is populated lazily and
+      // reads zero here on some impl paths / under load — the dominant
+      // openssl-nightly flake and a real data-plane gap. Recompute
+      // H = AES_encrypt(0) from the provider's AES round keys, which are always
+      // materialised by the time a write encrypts. openssl_recover_h yields H
+      // already in GHASH byte order, so no bswap (matches the BoringSSL path).
+      // A non-GCM cipher (e.g. ChaCha20-Poly1305) fails validation inside
+      // openssl_recover_h and leaves have_h=0.
+      if (openssl_recover_h(algctx, offsets->openssl_algctx_to_aeskey, ghash_h))
+        have_h = 1;
+    }
+    if (!have_h) {
       dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
       return 0;
     }
-    // Non-GCM ciphers (or H not yet populated) read as zero here.
-    if (ghash_h64[0] == 0 && ghash_h64[1] == 0) {
-      dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
-      return 0;
-    }
-    // OpenSSL stores H little-endian; GHASH wants big-endian (matches the
-    // uretprobe and kprobe-walk representations).
-    ghash_h64[0] = __builtin_bswap64(ghash_h64[0]);
-    ghash_h64[1] = __builtin_bswap64(ghash_h64[1]);
     cipher_type = KLOAK_CIPHER_AES_GCM;
 
     // Backfill the cache so subsequent writes on this enc_ctx take the

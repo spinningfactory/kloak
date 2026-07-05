@@ -103,6 +103,22 @@ SIZEOF_EVP_CIPHER_CTX=$(get_sizeof "$EVP_OBJ" "evp_cipher_ctx_st")
 SIZEOF_GCM128=$(get_sizeof "$MODES_OBJ" "gcm128_context")
 SIZEOF_PROV_GCM=$(get_sizeof "$PROV_OBJ" "prov_gcm_ctx_st" 2>/dev/null)
 
+# PROV_AES_GCM_CTX.ks — the embedded AES_KEY round-key schedule. Consumed by the
+# BPF AES-round-key H fallback (issue #275): when OpenSSL's lazily-populated raw
+# H field reads zero at SSL_write time, the data plane recomputes
+# H = AES_encrypt(0) from these round keys. Prefer the authoritative pahole
+# offset of the `ks` union in prov_aes_gcm_ctx_st; fall back to
+# ALIGN_UP(sizeof(PROV_GCM_CTX), 16), since
+# PROV_AES_GCM_CTX = { PROV_GCM_CTX base; union { OSSL_UNION_ALIGN; AES_KEY ks; } }.
+AES_OBJ=$(find . -name '*cipher_aes_gcm.o' | head -1)
+ALGCTX_TO_AESKEY=""
+if [ -n "$AES_OBJ" ]; then
+    ALGCTX_TO_AESKEY=$(get_offset "$AES_OBJ" "prov_aes_gcm_ctx_st" "ks")
+fi
+if [ -z "$ALGCTX_TO_AESKEY" ] && [ -n "$SIZEOF_PROV_GCM" ]; then
+    ALGCTX_TO_AESKEY=$(( ( (SIZEOF_PROV_GCM + 15) / 16) * 16 ))
+fi
+
 cat <<EOF
 {
   "openssl_version": "${OPENSSL_VERSION}",
@@ -116,6 +132,7 @@ cat <<EOF
     "algctx_to_gcm": ${ALGCTX_TO_GCM:-null},
     "gcm128_h_offset": ${GCM128_H_OFFSET:-null},
     "algctx_to_h": ${ALGCTX_TO_H:-null},
+    "algctx_to_aeskey": ${ALGCTX_TO_AESKEY:-null},
     "ssl_to_version": ${SSL_TO_VERSION:-null},
     "ssl_to_wbio": ${SSL_TO_WBIO:-null}
   },
@@ -135,6 +152,7 @@ else
 fi)
     "EncCtxToAlgctx": ${ENC_CTX_TO_ALGCTX:-null},
     "AlgctxToH": ${ALGCTX_TO_H:-null},
+    "AlgctxToAESKey": ${ALGCTX_TO_AESKEY:-null},
     "SSLToVersion": ${SSL_TO_VERSION:-null},
     "SSLToWBIO": ${SSL_TO_WBIO:-null}
   }

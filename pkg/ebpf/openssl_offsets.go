@@ -38,6 +38,17 @@ type TLSOffsets struct {
 	// which silently broke every 3.0/3.1 workload by reading garbage and
 	// tripping the server-mode guard in bpf_uprobe_ssl_write.
 	SSLToWBIO uint32
+	// AlgctxToAESKey is the offset from algctx (PROV_AES_GCM_CTX*) to the
+	// embedded AES_KEY.rd_key round-key schedule. Used by the BPF data plane
+	// as a robustness fallback (issue #275): OpenSSL's raw H field (AlgctxToH)
+	// is populated lazily and sometimes reads zero at SSL_write time, silently
+	// skipping the rewrite; when that happens the data plane recomputes
+	// H = AES_encrypt(0) from these round keys, exactly as the BoringSSL chain
+	// does. Derived as ALIGN_UP(sizeof(PROV_GCM_CTX), 16): PROV_AES_GCM_CTX is
+	// { PROV_GCM_CTX base; union { OSSL_UNION_ALIGN; AES_KEY ks; } }, so ks
+	// begins at the first 16-aligned offset past the base. 0 = uncalibrated
+	// (fallback disabled).
+	AlgctxToAESKey uint32
 }
 
 // opensslOffsetTable maps OpenSSL major.minor version strings to their TLS
@@ -63,24 +74,28 @@ var opensslOffsetTable = map[string]TLSOffsets{
 	// moved wbio to 88. Before this field was added, the BPF program
 	// hardcoded 88 — which silently broke every 3.0/3.1 caller.
 
-	"4.0": {SSLToWRL: 3648, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
-	"3.6": {SSLToWRL: 3216, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
+	// AlgctxToAESKey=704 across every tracked version: sizeof(PROV_GCM_CTX) is
+	// 704 on both arches (see tools/openssl-offsets/results/*.json), and the
+	// PROV_AES_GCM_CTX.ks union follows the base at that already-16-aligned
+	// offset. Powers the AES-round-key H fallback (issue #275).
+	"4.0": {SSLToWRL: 3648, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88, AlgctxToAESKey: 704},
+	"3.6": {SSLToWRL: 3216, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88, AlgctxToAESKey: 704},
 	// OpenSSL 3.5.x — SSLToWRL grew due to new fields in SSL_CONNECTION.
 	// SSLToVersion=72: ssl_connection_st.version (after 64-byte embedded ssl_st).
-	"3.5": {SSLToWRL: 3208, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
+	"3.5": {SSLToWRL: 3208, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88, AlgctxToAESKey: 704},
 
 	// OpenSSL 3.2.x–3.4.x — identical offsets across these versions.
 	// SSLToVersion=72: verified via pahole on aarch64 and x86_64 (openssl-offsets workflow).
-	"3.4": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
-	"3.3": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
-	"3.2": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88},
+	"3.4": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88, AlgctxToAESKey: 704},
+	"3.3": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88, AlgctxToAESKey: 704},
+	"3.2": {SSLToWRL: 3056, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88, AlgctxToAESKey: 704},
 
 	// OpenSSL 3.0.x–3.1.x — 3-hop chain (no record layer indirection).
 	// SSLToWRL stores enc_write_ctx=2168; WRLToEncCtx=0 signals 3-hop to BPF.
 	// SSLToVersion=0: ssl_st.version is at offset 0 (verified via pahole on Debian bookworm).
 	// SSLToWBIO=24: empirically confirmed on Ubuntu 24.04's libssl3 (3.0.13).
-	"3.1": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0, SSLToWBIO: 24},
-	"3.0": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0, SSLToWBIO: 24},
+	"3.1": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0, SSLToWBIO: 24, AlgctxToAESKey: 704},
+	"3.0": {SSLToWRL: 2168, WRLToEncCtx: 0, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 0, SSLToWBIO: 24, AlgctxToAESKey: 704},
 }
 
 // DetectOpenSSLVersion reads an OpenSSL/libssl shared library from a
