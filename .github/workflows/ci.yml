@@ -139,7 +139,7 @@ jobs:
       actions: read
       pull-requests: write
     steps:
-      - uses: fgrosse/go-coverage-report@v1.3.0
+      - uses: fgrosse/go-coverage-report@v1.3.1
         with:
           coverage-artifact-name: combined-coverage
           coverage-file-name: combined-coverage.out
