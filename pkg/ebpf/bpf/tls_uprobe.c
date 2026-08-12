@@ -1561,6 +1561,9 @@ static __always_inline __u32 ssl_read_fd(__u64 ssl_ptr) {
   __u64 wbio = 0;
   if (bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + wbio_off)) < 0 || !wbio) {
     dbg_inc(DBG_SSL_READ_FD_WBIO_FAIL);
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak ssl_read_fd: wbio fail ssl=%llx off=%u", ssl_ptr, wbio_off);
+#endif
     return 0;
   }
   __u32 fd = 0;
@@ -1569,6 +1572,9 @@ static __always_inline __u32 ssl_read_fd(__u64 ssl_ptr) {
     return 0;
   }
   dbg_inc(DBG_SSL_READ_FD_OK);
+#ifdef KLOAK_DEBUG
+  bpf_printk("kloak ssl_read_fd: ok ssl=%llx fd=%u", ssl_ptr, fd);
+#endif
   return fd;
 }
 
@@ -1633,6 +1639,12 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
       fd = *vfd;
       found = 1;
       dbg_inc(DBG_RESOLVE_LAST_VFD_HIT);
+#ifdef KLOAK_DEBUG
+      // Loud on the leak path: an OpenSSL write (ssl_ptr!=0) whose own fd we
+      // could not read, attributed to a DIFFERENT connection's verified fd.
+      if (ssl_ptr != 0)
+        bpf_printk("kloak resolve: LAST_VFD for openssl ssl=%llx tgid=%u vfd=%u", ssl_ptr, tgid, fd);
+#endif
 
       if (ssl_ptr != 0) {
         struct ssl_fd_key sfk;

@@ -244,6 +244,8 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
+          build-args: |
+            BPF_DEBUG=1
           tags: |
             ghcr.io/${{ github.repository }}:sha-${{ github.sha }}
             ${{ github.event_name == 'pull_request' && format('ghcr.io/{0}:pr-{1}', github.repository, github.event.pull_request.number) || format('ghcr.io/{0}:dev', github.repository) }}
