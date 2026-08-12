@@ -860,6 +860,19 @@ struct {
   __type(value, struct ghash_work);
 } ghash_scratch SEC(".maps");
 
+// Per-CPU scratch for the tls_conn_state that bpf_kprobe_tcp_sendmsg builds
+// before committing it to the tls_conn_state map. Kept off the stack: the
+// struct is ~284 bytes (h_powers[16][16]), and holding it on the kprobe's
+// frame pushed the combined stack across the bpf-to-bpf call into
+// bssl_recover_h over the verifier's 512-byte limit on some kernels
+// ("combined stack size of 2 calls is 768. Too large").
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct tls_conn_state);
+} conn_state_scratch SEC(".maps");
+
 // Per-CPU array of H^(2^i) power entries (16 bytes each).
 // Separate map so callbacks can look up individual entries without
 // array indexing into ghash_work (which the verifier can't bound).
@@ -2424,8 +2437,12 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   // Extract H BEFORE creating tc_pending. If H extraction fails, we must NOT
   // create tc_pending — otherwise tc_egress would XOR-patch the ciphertext
   // without being able to recompute the GHASH tag, causing "bad record MAC".
-  struct tls_conn_state new_conn;
-  __builtin_memset(&new_conn, 0, sizeof(new_conn));
+  // new_conn lives in a per-CPU scratch map, not on the stack — see
+  // conn_state_scratch. BPF programs run with preemption disabled, so the
+  // per-CPU slot cannot be re-entered while this kprobe is executing.
+  struct tls_conn_state *new_conn = bpf_map_lookup_elem(&conn_state_scratch, &zero);
+  if (!new_conn) return 0;
+  __builtin_memset(new_conn, 0, sizeof(*new_conn));
   __u64 wrl_val = 0;
 
   if (chain == CHAIN_GO_TLS) {
@@ -2525,26 +2542,26 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 
     // Convert from register representation (byte-reversed per 8-byte lane
     // by PSHUFB/VREV64) to standard big-endian GHASH H.
-    *(__u64 *)&new_conn.ghash_h[0] = __builtin_bswap64(hi);
-    *(__u64 *)&new_conn.ghash_h[8] = __builtin_bswap64(lo);
+    *(__u64 *)&new_conn->ghash_h[0] = __builtin_bswap64(hi);
+    *(__u64 *)&new_conn->ghash_h[8] = __builtin_bswap64(lo);
 
-    new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
+    new_conn->cipher_type = KLOAK_CIPHER_AES_GCM;
 
     // Read negotiated TLS version from Conn.vers for nonce_len determination.
     // TLS 1.3 (0x0304) has no explicit nonce; TLS 1.2 (0x0303) has 8-byte nonce.
     __u16 go_tls_ver = 0;
     if (go_off->conn_vers_off > 0)
       bpf_probe_read_user(&go_tls_ver, 2, (void *)(ssl_ptr + go_off->conn_vers_off));
-    new_conn.nonce_len = (go_tls_ver >= 0x0304) ? 0 : 8;
+    new_conn->nonce_len = (go_tls_ver >= 0x0304) ? 0 : 8;
   } else if (pending->h_valid && pending->cipher_type == KLOAK_CIPHER_AES_GCM) {
     // Libcrypto-hook hot path: H was captured at EVP_CipherInit_ex time and
     // carried through xor_pending. No chain walk needed. (h_extract already
     // looked up evp_h_cache and tls_conn_state has the same H — but we copy
     // from pending here so the kprobe doesn't depend on tls_conn_state still
     // being there for the same (tgid, ssl_ptr).)
-    __builtin_memcpy(new_conn.ghash_h, pending->ghash_h, 16);
-    new_conn.cipher_type = pending->cipher_type;
-    new_conn.nonce_len = pending->nonce_len;
+    __builtin_memcpy(new_conn->ghash_h, pending->ghash_h, 16);
+    new_conn->cipher_type = pending->cipher_type;
+    new_conn->nonce_len = pending->nonce_len;
     dbg_inc(DBG_KPROBE_BRIDGE_FROM_PENDING);
   } else {
     // STRATEGY_KPROBE_WALK path (BoringSSL, statically-linked OpenSSL, or
@@ -2578,19 +2595,19 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
       dbg_inc(DBG_BSSL_REACHED);
       if (!bssl_recover_h(ssl_ptr, offsets->bssl_ssl_to_s3,
                           offsets->bssl_s3_to_aead, offsets->bssl_aead_to_aeskey,
-                          new_conn.ghash_h)) {
+                          new_conn->ghash_h)) {
         dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
         return 0;
       }
       dbg_inc(DBG_BSSL_H_OK);
-      new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
-      new_conn.wrl_ptr = 0;
+      new_conn->cipher_type = KLOAK_CIPHER_AES_GCM;
+      new_conn->wrl_ptr = 0;
       if (offsets->ssl_to_version != 0xFFFFFFFF) {
         __u32 ssl_ver = 0;
         bpf_probe_read_user(&ssl_ver, 4, (void *)(ssl_ptr + offsets->ssl_to_version));
-        new_conn.nonce_len = (ssl_ver >= 0x0304) ? 0 : 8;
+        new_conn->nonce_len = (ssl_ver >= 0x0304) ? 0 : 8;
       } else {
-        new_conn.nonce_len = 0xFF;
+        new_conn->nonce_len = 0xFF;
       }
       goto h_ready;
     }
@@ -2628,7 +2645,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 #endif
       return 0;
     }
-    if (bpf_probe_read_user(new_conn.ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0) {
+    if (bpf_probe_read_user(new_conn->ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0) {
 #ifdef KLOAK_DEBUG
       bpf_printk("kloak [2-KPROBE] H-fail: H read failed ptr=%llx off=%u",
                  ptr, offsets->algctx_to_h);
@@ -2637,7 +2654,7 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
       return 0;
     }
 
-    __u64 *h64 = (__u64 *)new_conn.ghash_h;
+    __u64 *h64 = (__u64 *)new_conn->ghash_h;
     if (h64[0] == 0 && h64[1] == 0) {
 #ifdef KLOAK_DEBUG
       bpf_printk("kloak [2-KPROBE] H-fail: H zero ptr=%llx off=%u",
@@ -2649,15 +2666,15 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     h64[0] = __builtin_bswap64(h64[0]);
     h64[1] = __builtin_bswap64(h64[1]);
 
-    new_conn.cipher_type = KLOAK_CIPHER_AES_GCM;
-    new_conn.wrl_ptr = wrl_val;
+    new_conn->cipher_type = KLOAK_CIPHER_AES_GCM;
+    new_conn->wrl_ptr = wrl_val;
 
     if (offsets->ssl_to_version != 0xFFFFFFFF) {
       __u32 ssl_ver = 0;
       bpf_probe_read_user(&ssl_ver, 4, (void *)(ssl_ptr + offsets->ssl_to_version));
-      new_conn.nonce_len = (ssl_ver >= 0x0304) ? 0 : 8;
+      new_conn->nonce_len = (ssl_ver >= 0x0304) ? 0 : 8;
     } else {
-      new_conn.nonce_len = 0xFF;
+      new_conn->nonce_len = 0xFF;
     }
   }
 
@@ -2668,9 +2685,9 @@ h_ready:;
   ck.ssl_ptr = ssl_ptr;
   struct tls_conn_state *existing = bpf_map_lookup_elem(&tls_conn_state, &ck);
   if (!existing ||
-      ((__u64 *)existing->ghash_h)[0] != ((__u64 *)new_conn.ghash_h)[0] ||
-      ((__u64 *)existing->ghash_h)[1] != ((__u64 *)new_conn.ghash_h)[1]) {
-    bpf_map_update_elem(&tls_conn_state, &ck, &new_conn, BPF_ANY);
+      ((__u64 *)existing->ghash_h)[0] != ((__u64 *)new_conn->ghash_h)[0] ||
+      ((__u64 *)existing->ghash_h)[1] != ((__u64 *)new_conn->ghash_h)[1]) {
+    bpf_map_update_elem(&tls_conn_state, &ck, new_conn, BPF_ANY);
   }
 
   // Now safe to create tc_pending — tc_egress can always find H.
