@@ -47,6 +47,11 @@ controller:
     limits:
       cpu: 500m
       memory: 512Mi
+  # Restrict the privileged controller DaemonSet to a subset of nodes. Empty
+  # runs it on every node (default DaemonSet behavior); set a label selector to
+  # confine the privileged/hostPID footprint to designated nodes.
+  nodeSelector: {}
+  tolerations: []
 
 webhook:
   replicas: 1
@@ -57,6 +62,8 @@ webhook:
     limits:
       cpu: 500m
       memory: 128Mi
+  nodeSelector: {}
+  tolerations: []
 
 certificates:
   mode: auto  # auto | certManager | provided

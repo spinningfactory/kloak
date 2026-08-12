@@ -18,6 +18,14 @@ spec:
         app.kubernetes.io/component: controller
     spec:
       serviceAccountName: kloak-controller
+      {{- with .Values.controller.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.controller.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       hostPID: true
       # 60s gives the controller-runtime manager time to finish its shutdown
       # path (uprobe detach, BPF program close) on SIGTERM, so Go's coverage
