@@ -1752,6 +1752,7 @@ var debugCounterNames = []string{
 	"h_extract_live_walk",
 	"bssl_reached", "bssl_h_ok",
 	"bssl_s3_null", "bssl_aead_null", "bssl_rdkey_fail", "bssl_rounds_bad", "bssl_hzero",
+	"ssl_read_fd_wbio_fail", "ssl_read_fd_num_fail", "ssl_read_fd_ok",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

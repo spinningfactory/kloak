@@ -206,6 +206,9 @@ enum {
   DBG_BSSL_RDKEY_FAIL,       // bssl: AES_KEY.rd_key read failed
   DBG_BSSL_ROUNDS_BAD,       // bssl: AES_KEY.rounds not in {9,10,12,13,14}
   DBG_BSSL_HZERO,            // bssl: recovered H was all-zero
+  DBG_SSL_READ_FD_WBIO_FAIL, // ssl_read_fd: wbio read failed / null
+  DBG_SSL_READ_FD_NUM_FAIL,  // ssl_read_fd: BIO.num read failed
+  DBG_SSL_READ_FD_OK,        // ssl_read_fd: fd read successfully
   DBG_MAX,
 };
 
@@ -1556,11 +1559,16 @@ static __always_inline __u32 ssl_read_fd(__u64 ssl_ptr) {
   if (!ssl_ptr) return 0;
   __u32 wbio_off = resolve_wbio_offset();
   __u64 wbio = 0;
-  if (bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + wbio_off)) < 0 || !wbio)
+  if (bpf_probe_read_user(&wbio, 8, (void *)(ssl_ptr + wbio_off)) < 0 || !wbio) {
+    dbg_inc(DBG_SSL_READ_FD_WBIO_FAIL);
     return 0;
+  }
   __u32 fd = 0;
-  if (bpf_probe_read_user(&fd, 4, (void *)(wbio + BIO_NUM_OFFSET)) < 0)
+  if (bpf_probe_read_user(&fd, 4, (void *)(wbio + BIO_NUM_OFFSET)) < 0) {
+    dbg_inc(DBG_SSL_READ_FD_NUM_FAIL);
     return 0;
+  }
+  dbg_inc(DBG_SSL_READ_FD_OK);
   return fd;
 }
 
