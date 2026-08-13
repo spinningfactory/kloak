@@ -59,9 +59,10 @@ func init() {
 	controllerCmd.Flags().StringVar(&cgroupPath, "cgroup-path", "/sys/fs/cgroup", "Path to cgroup v2 filesystem.")
 	controllerCmd.Flags().StringVar(&trustedDNSServers, "trusted-dns-servers", "", "Comma-separated trusted DNS server IPs. If empty, auto-discovers kube-dns.")
 	controllerCmd.Flags().StringVar(&egressInterface, "egress-interface", "auto",
-		"Network interface for tc-egress attachment inside each tracked netns. "+
-			`"auto" detects from the default IPv4 route (works for CNI veth "eth0" AND host-mode netns with non-standard names like wlp3s0/enp0s3). `+
-			`Use an explicit name (e.g., "eth0") to pin, or "none"/"lo-only" to attach only to loopback.`)
+		"Container interface whose host-side veth peer gets the tc patch program (tc ingress). "+
+			`"auto" detects from the default IPv4 route in the container netns (works for CNI veth "eth0" AND host-mode netns with non-standard names like wlp3s0/enp0s3). `+
+			`Use an explicit name (e.g., "eth0") to pin, or "none"/"lo-only" to disable external attachment. `+
+			`Loopback is never patched.`)
 }
 
 func runController(cmd *cobra.Command, args []string) {

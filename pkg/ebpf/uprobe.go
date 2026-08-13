@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -107,8 +108,8 @@ type TLSUprobeManager struct {
 	secretSource secrets.Source
 	// cgroupRoot is the path to the cgroup v2 filesystem (e.g. /sys/fs/cgroup)
 	cgroupRoot string
-	// egressInterface selects which NIC inside the target's netns gets the
-	// tc-egress patch program attached:
+	// egressInterface selects which container-netns NIC is used to locate
+	// the tc patch attach point (the host side of its veth pair):
 	//
 	//	"" or "auto"     — read /proc/net/route inside the netns and pick
 	//	                   the interface backing the default IPv4 route.
@@ -116,15 +117,14 @@ type TLSUprobeManager struct {
 	//	                   convention AND for host-mode netns where the
 	//	                   default route exits via e.g. enp0s3 / wlp3s0.
 	//	"none","lo-only" — explicit opt-out of external interface
-	//	                   attachment; lo only. Useful for tests and
-	//	                   loopback-only workloads.
+	//	                   attachment. Useful for tests.
 	//	any other value  — exact interface name (e.g., "eth0", "wlp3s0").
 	//	                   Fail closed if the named interface is not found
 	//	                   in the netns.
 	//
-	// `lo` is always attached in addition to whichever external interface
-	// the above resolves — covers intra-pod loopback (e.g., sidecar →
-	// sidecar via a ClusterIP Service that DNATs back to the same pod).
+	// Loopback is never attached: lo traffic cannot be patched from the
+	// host side, and patching it in-pod would expose the rewritten
+	// ciphertext to in-pod AF_PACKET capture (see attachTCEgress).
 	egressInterface string
 	// cgroupPaths maps cgroup inode ID -> filesystem path.
 	// Populated by TrackCgroup.
@@ -420,13 +420,37 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	return nil
 }
 
-// attachTCEgress attaches the tc egress BPF program to eth0 and lo inside a
-// container's network namespace. eth0 covers external traffic; lo covers
-// intra-pod traffic (e.g. sidecar → sidecar via a ClusterIP Service that
-// DNATs back to the same pod, routing through loopback).
+// attachTCEgress attaches the tc patch program where a container's outbound
+// traffic leaves the pod: tc INGRESS on the host side of the pod's veth pair.
 //
-// The controller enters the container's netns via /proc/<pid>/ns/net
-// (requires hostPID: true), attaches tc, then returns to its own netns.
+// Why host-side and not tc egress inside the pod netns (the previous design):
+// in the pod netns the tc egress hook runs before the AF_PACKET tap
+// (dev_queue_xmit_nit fires in xmit_one, after sch_handle_egress), so a
+// compromised container with CAP_NET_RAW — in the default Docker/containerd
+// capability set — could capture its own patched ciphertext and decrypt it
+// with its own TLS session keys, recovering the real secret. Patching on the
+// host side of the veth puts the rewrite out of reach of in-pod capture.
+//
+// Pod attribution is preserved: the skb keeps its socket across the veth
+// boundary (veth_forward_skb does not orphan it), so bpf_skb_cgroup_id() at
+// host-veth ingress still returns the container's cgroup ID and the
+// (dst_ip, src_port, cgroup_id) tc_pending key built by the tcp_sendmsg
+// kprobe matches unchanged. The host-veth ingress point is also pre-NAT, so
+// dst_ip/src_port still hold the values the kprobe recorded.
+//
+// Loopback is intentionally no longer patched: lo traffic never crosses the
+// veth, and injecting real secrets into same-pod traffic would make them
+// readable by any process in the pod — contradicting the isolation model.
+// Same-pod localhost destinations receive the placeholder.
+//
+// Interfaces without a veth peer (hostNetwork pods, physical NICs in
+// host-mode netns) have no host side to attach to; those keep the legacy
+// in-netns egress attach and remain exposed to in-pod capture (drop NET_RAW
+// for such workloads).
+//
+// The controller enters the container's netns via /proc/<pid>/ns/net to
+// resolve the veth peer ifindex, then switches to the root netns
+// (/proc/1/ns/net — requires hostPID: true) to attach.
 func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	// Check if this network namespace already has tc attached by reading
 	// the netns inode. We keep an open fd to the netns file — this prevents
@@ -501,6 +525,17 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	}
 	defer func() { _ = selfNS.Close() }()
 
+	// The host-side veth peer lives in the root network namespace. With
+	// hostPID: true, /proc/1/ns/net is the node init's netns (in kind/k3d,
+	// the node container's netns — which is where the CNI places pod veth
+	// peers there too).
+	rootNS, err := os.Open("/proc/1/ns/net")
+	if err != nil {
+		_ = containerNS.Close()
+		return fmt.Errorf("opening root netns /proc/1/ns/net: %w", err)
+	}
+	defer func() { _ = rootNS.Close() }()
+
 	// Run the netns-entered work in a dedicated worker goroutine, NOT on
 	// the caller's goroutine. Per Go runtime contract
 	// (https://pkg.go.dev/runtime#LockOSThread), if a goroutine exits
@@ -551,52 +586,138 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 			}
 		}()
 
-		// Resolve which external interface to attach tc egress on. We're
-		// now inside the target netns (setns above), so net.InterfaceByName
-		// and /proc/net/route both see the netns-local view.
+		// Phase 1: inside the container netns, resolve the egress
+		// interface(s) and their host-side veth peers. net.InterfaceByName
+		// (netlink) and /proc/net/route (procfs) follow the thread's current
+		// netns; the iflink read goes through /proc/<pid>/root instead —
+		// /sys/class/net is scoped to the sysfs mount's netns and does NOT
+		// follow setns (see vethPeerIfindex).
 		ifNames := m.resolveEgressInterfaces(pid)
 
-		// Pre-validate every interface before attaching any. If we
-		// attached the first interface and then failed on the second, the
-		// kernel-side TCX attachment would stay live but the CAS below
-		// would never run, so the reconciler's next retry would miss the
-		// dedup and re-attach the same TCX program a second time.
-		// link.AttachTCX stacks attachments → wrong GHASH.
-		ifaces := make([]*net.Interface, 0, len(ifNames))
+		// hostPeer is a container interface whose veth peer gets the tc
+		// ingress attach in the root netns.
+		type hostPeer struct {
+			ifName    string // container-side name (for logs)
+			podIfidx  int    // container-side ifindex (peer validation)
+			hostIfidx int    // peer ifindex in the root netns
+		}
+		var peers []hostPeer
+		// legacy holds interfaces without a veth peer (hostNetwork pods,
+		// physical NICs): no host side exists, so they keep the in-netns
+		// egress attach.
+		var legacy []*net.Interface
+
+		// Resolve and validate everything before attaching anything:
+		// link.AttachTCX stacks attachments, so a retry after a partial
+		// attach would double-attach the same program and corrupt GHASH.
 		for _, ifName := range ifNames {
+			if ifName == "lo" {
+				// Loopback is deliberately not patched — see the
+				// attachTCEgress doc comment.
+				continue
+			}
 			iface, err := net.InterfaceByName(ifName)
 			if err != nil {
-				if ifName == "lo" {
-					resultCh <- tcResult{err: fmt.Errorf("finding %s in container netns: %w", ifName, err)}
-					return
-				}
 				resultCh <- tcResult{err: fmt.Errorf("egress interface %q not found in pid %d netns (configured via --egress-interface or controller.ebpf.egressInterface): %w", ifName, pid, err)}
 				return
 			}
-			ifaces = append(ifaces, iface)
+			peerIdx, err := vethPeerIfindex(fmt.Sprintf("/proc/%d/root", pid), ifName)
+			if err != nil {
+				resultCh <- tcResult{err: fmt.Errorf("resolving host-side peer of %s in pid %d netns: %w", ifName, pid, err)}
+				return
+			}
+			if peerIdx == 0 || peerIdx == iface.Index {
+				// No peer: physical NIC, host-mode netns, or tunnel.
+				legacy = append(legacy, iface)
+				continue
+			}
+			peers = append(peers, hostPeer{ifName: ifName, podIfidx: iface.Index, hostIfidx: peerIdx})
 		}
 
 		// Track links attached during this call locally. On a partial
 		// failure close them all and return; the caller won't splice
 		// them into m.links so a retry doesn't see a half-attached netns.
-		attachedHere := make([]link.Link, 0, len(ifaces))
-		for i, iface := range ifaces {
+		attachedHere := make([]link.Link, 0, len(peers)+len(legacy))
+		closeOnFail := func() {
+			for _, prior := range attachedHere {
+				if cerr := prior.Close(); cerr != nil {
+					m.log.Warnw("rollback: failed to close partially-attached tc link", "error", cerr, "pid", pid)
+				}
+			}
+		}
+
+		// Legacy fallback first, while still inside the container netns.
+		for _, iface := range legacy {
 			tcLink, err := link.AttachTCX(link.TCXOptions{
 				Interface: iface.Index,
 				Program:   m.objs.TcEgressPatch,
 				Attach:    ebpf.AttachTCXEgress,
 			})
 			if err != nil {
-				for _, prior := range attachedHere {
-					if cerr := prior.Close(); cerr != nil {
-						m.log.Warnw("rollback: failed to close partially-attached tc egress link", "error", cerr, "pid", pid)
-					}
-				}
-				resultCh <- tcResult{err: fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", ifNames[i], iface.Index, pid, err)}
+				closeOnFail()
+				resultCh <- tcResult{err: fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", iface.Name, iface.Index, pid, err)}
 				return
 			}
 			attachedHere = append(attachedHere, tcLink)
-			m.log.Debugw("Attached tc egress to container", "pid", pid, "interface", ifNames[i], "ifindex", iface.Index)
+			m.log.Warnw("interface has no veth peer — attached tc egress inside the pod netns; "+
+				"patched traffic remains capturable by in-pod AF_PACKET (drop NET_RAW)",
+				"pid", pid, "interface", iface.Name, "ifindex", iface.Index)
+		}
+
+		// Phase 2: switch to the root netns and attach tc ingress on each
+		// host-side veth peer.
+		if len(peers) > 0 {
+			if err := unix.Setns(int(rootNS.Fd()), unix.CLONE_NEWNET); err != nil {
+				closeOnFail()
+				resultCh <- tcResult{err: fmt.Errorf("setns to root netns: %w", err)}
+				return
+			}
+			// Pre-validate every peer before attaching any: the peer must
+			// exist and point back at the pod interface. The back-pointer
+			// check guards against ifindex reuse and against non-veth
+			// interfaces whose iflink references a lower device (tunnels).
+			for _, p := range peers {
+				peerIface, err := net.InterfaceByIndex(p.hostIfidx)
+				if err != nil {
+					closeOnFail()
+					resultCh <- tcResult{err: fmt.Errorf("host-side veth peer ifindex %d (pod %s) not found in root netns: %w", p.hostIfidx, p.ifName, err)}
+					return
+				}
+				backIdx, err := vethPeerIfindex("/proc/1/root", peerIface.Name)
+				if err != nil || backIdx != p.podIfidx {
+					closeOnFail()
+					resultCh <- tcResult{err: fmt.Errorf("host-side peer %s (ifindex %d) does not point back at pod %s (ifindex %d); refusing to attach", peerIface.Name, p.hostIfidx, p.ifName, p.podIfidx)}
+					return
+				}
+			}
+			for _, p := range peers {
+				tcLink, err := link.AttachTCX(link.TCXOptions{
+					Interface: p.hostIfidx,
+					Program:   m.objs.TcEgressPatch,
+					Attach:    ebpf.AttachTCXIngress,
+				})
+				if err != nil {
+					closeOnFail()
+					resultCh <- tcResult{err: fmt.Errorf("attaching tc ingress to host veth ifindex %d (pod %s): %w", p.hostIfidx, p.ifName, err)}
+					return
+				}
+				attachedHere = append(attachedHere, tcLink)
+				m.log.Debugw("Attached tc patch to host-side veth", "pid", pid, "podInterface", p.ifName, "hostIfindex", p.hostIfidx)
+			}
+		}
+
+		if len(attachedHere) == 0 {
+			optOut := strings.EqualFold(m.egressInterface, "none") || strings.EqualFold(m.egressInterface, "lo-only")
+			if optOut {
+				// Explicit opt-out: nothing to attach, report success.
+				resultCh <- tcResult{links: nil}
+				return
+			}
+			// No external interface resolved (e.g. no default route yet,
+			// mid-CNI-setup). Fail so a later exec/reconcile retries
+			// instead of marking the netns attached with no coverage.
+			resultCh <- tcResult{err: fmt.Errorf("no external interface resolved in pid %d netns; nothing attached", pid)}
+			return
 		}
 		resultCh <- tcResult{links: attachedHere}
 	}()
@@ -634,13 +755,16 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	return nil
 }
 
-// resolveEgressInterfaces returns the ordered interface names tc egress
-// should attach to inside the current netns. Must be called AFTER setns
+// resolveEgressInterfaces returns the ordered interface names used to locate
+// tc attach points for the current netns. Must be called AFTER setns
 // to the target netns, since the resolution reads /proc/net/route and
 // performs netns-local interface lookups.
 //
-// Always includes "lo" at the end (intra-pod loopback + local-echo-server
-// test fixtures rely on it). The leading external interface is chosen by:
+// The list may include "lo" for backward compatibility with the flag
+// semantics below, but the caller never attaches to it: loopback traffic
+// never crosses the pod's veth pair, so it cannot be patched from the host
+// side (see the attachTCEgress doc comment). The external interface is
+// chosen by:
 //
 //   - empty / "auto": parse /proc/net/route inside the netns and pick
 //     the interface whose Destination is 0.0.0.0 (the default IPv4
@@ -685,6 +809,29 @@ func (m *TLSUprobeManager) resolveEgressInterfaces(pid int) []string {
 		return []string{"lo"}
 	}
 	return []string{external, "lo"}
+}
+
+// vethPeerIfindex reads the interface's iflink attribute and returns the
+// ifindex of its veth peer in the parent (host) netns. Returns 0 — or the
+// interface's own ifindex — for interfaces without a peer (physical NICs,
+// lo), which callers treat as "not a veth".
+//
+// sysRoot selects WHICH netns's view to read, because /sys/class/net is
+// scoped to the netns of the sysfs MOUNT, not the reader's current netns —
+// setns() does not change what a given /sys mount shows. Reading through
+// /proc/<pid>/root follows the target process's mount namespace instead:
+// pass fmt.Sprintf("/proc/%d/root", pid) for a container's view and
+// "/proc/1/root" for the root netns's view.
+func vethPeerIfindex(sysRoot, ifName string) (int, error) {
+	data, err := os.ReadFile(filepath.Join(sysRoot, "sys", "class", "net", ifName, "iflink"))
+	if err != nil {
+		return 0, fmt.Errorf("reading iflink for %s under %s: %w", ifName, sysRoot, err)
+	}
+	idx, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		return 0, fmt.Errorf("parsing iflink for %s under %s: %q: %w", ifName, sysRoot, strings.TrimSpace(string(data)), err)
+	}
+	return idx, nil
 }
 
 // findDefaultRouteInterface reads /proc/net/route in the current netns
