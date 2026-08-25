@@ -248,7 +248,15 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      # The PR edits .github/workflows/go-tls-offsets.yml and this workflow
+      # itself, and GitHub refuses to let the default GITHUB_TOKEN push changes
+      # to workflow files (needs the `workflow` scope, which GITHUB_TOKEN cannot
+      # have). So both the checkout and the PR creation use AUTOMATION_PAT — a
+      # PAT (or GitHub App token) with `repo` + `workflow` scopes, stored as a
+      # repo secret. See the "Open PR" step below.
       - uses: actions/checkout@v7
+        with:
+          token: ${{ secrets.AUTOMATION_PAT }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
@@ -318,6 +326,20 @@ jobs:
         if: steps.find.outputs.new != ''
         uses: peter-evans/create-pull-request@v8
         with:
+          # PAT/App token with `repo` + `workflow` scopes. Required because the
+          # PR edits .github/workflows/go-tls-offsets.yml and
+          # .github/workflows/go-versions-nightly.yml, which the default
+          # GITHUB_TOKEN is forbidden from pushing.
+          token: ${{ secrets.AUTOMATION_PAT }}
+          # Only commit the intended artifacts. The "Find new minor versions"
+          # step writes scratch files (upstream-minors.txt, tracked-minors.txt,
+          # new-minors.txt) to the repo root; without this, create-pull-request
+          # sweeps them into the PR via `git add -A`.
+          add-paths: |
+            tools/go-tls-offsets/results
+            pkg/ebpf/go_tls_offsets.go
+            .github/workflows/go-tls-offsets.yml
+            .github/workflows/go-versions-nightly.yml
           commit-message: "chore(go): add offset support for Go ${{ steps.find.outputs.new }}"
           branch: auto/go-versions/${{ steps.find.outputs.new }}
           delete-branch: true
@@ -339,6 +361,3 @@ jobs:
             - [ ] Diff the JSONs — offsets in expected ranges, no `notes:` field set.
             - [ ] `go test ./pkg/ebpf -run TestGoTLSOffsets` passes locally.
             - [ ] Spot-check that the on-demand `go-tls-offsets.yml` workflow's matrix matches.
-
-            Note: this PR is opened by the default `GITHUB_TOKEN`; CI may not auto-trigger on push.
-            Push an empty commit or close-and-reopen the PR to kick the per-PR checks if needed.
