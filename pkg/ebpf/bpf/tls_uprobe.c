@@ -752,8 +752,16 @@ static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_
 // the shared aes_recover_h. Writes 16 bytes to h_out (already in GHASH byte
 // order, so callers must NOT byte-swap — matching bssl_recover_h). Returns 1
 // on success, 0 on any failure (including non-GCM ciphers, whose round count
-// won't validate). __noinline for its own stack frame, mirroring
-// bssl_recover_h.
+// won't validate).
+//
+// __noinline for its own stack frame, mirroring bssl_recover_h — the unrolled
+// AES round function needs a dedicated frame (inlining it blows the 512-byte
+// BPF stack at compile time). Because of that, it must ONLY be called from
+// programs that do NOT use bpf_tail_call: the kernel caps the combined stack of
+// a tail-call program plus its BPF-to-BPF callees far below 512 bytes ("combined
+// stack size of 2 calls is 640. Too large"). So it is invoked from the
+// EVP_CipherInit_ex uretprobe and the tcp_sendmsg kprobe, never from the
+// tail-called bpf_h_extract.
 static __attribute__((noinline)) int openssl_recover_h(__u64 algctx,
                                                        __u32 algctx_to_aeskey,
                                                        __u8 *h_out) {
@@ -1884,15 +1892,28 @@ int bpf_uretprobe_evp_cipher_init(void *ctx) {
     return 0;
   }
 
-  // Filter non-GCM ciphers: their EVP_CIPHER_CTX has zeros at the algctx→H offset.
   __u64 *h64 = (__u64 *)val.ghash_h;
   if (h64[0] == 0 && h64[1] == 0) {
+    // The raw H field reads zero: either a non-GCM cipher, or an AES-GCM cipher
+    // whose H is populated lazily (issue #275 — the dominant openssl-nightly
+    // flake). Recompute H = AES_encrypt(0) from the provider's AES round keys,
+    // which ARE set by the time EVP_CipherInit_ex returns, so this source is
+    // race-proof. A non-GCM cipher fails the round-count validation inside
+    // openssl_recover_h and we skip caching (as before). This uretprobe is a
+    // small, non-tail-call program, so openssl_recover_h's stack frame fits
+    // here (it does not in the tail-called bpf_h_extract). Caching a valid H
+    // here means the SSL_write's h_extract cache lookup hits and the flaky live
+    // walk is skipped entirely. Recovered H is already in GHASH byte order, so
+    // the bswap is applied only to the direct-read case.
     dbg_inc(DBG_EVP_INIT_H_ZERO);
-    return 0;
+    if (offsets->openssl_algctx_to_aeskey == 0 ||
+        !openssl_recover_h(algctx, offsets->openssl_algctx_to_aeskey, val.ghash_h))
+      return 0;
+  } else {
+    // OpenSSL stores H in native (little-endian) byte order; GHASH wants big-endian.
+    h64[0] = __builtin_bswap64(h64[0]);
+    h64[1] = __builtin_bswap64(h64[1]);
   }
-  // OpenSSL stores H in native (little-endian) byte order; GHASH wants big-endian.
-  h64[0] = __builtin_bswap64(h64[0]);
-  h64[1] = __builtin_bswap64(h64[1]);
 
   val.cipher_type = KLOAK_CIPHER_AES_GCM;
   val.nonce_len = 0xFF; // actual nonce_len is determined per-connection in h_extract.
@@ -1992,32 +2013,25 @@ int bpf_h_extract(void *ctx) {
       return 0;
     }
 
-    // Fast path: read the provider's raw H field directly. OpenSSL stores it
-    // little-endian; GHASH wants big-endian (matches the uretprobe and
-    // kprobe-walk representations).
-    int have_h = 0;
     if (bpf_probe_read_user(ghash_h, 16,
-                            (void *)(algctx + offsets->algctx_to_h)) == 0 &&
-        !(ghash_h64[0] == 0 && ghash_h64[1] == 0)) {
-      ghash_h64[0] = __builtin_bswap64(ghash_h64[0]);
-      ghash_h64[1] = __builtin_bswap64(ghash_h64[1]);
-      have_h = 1;
-    } else if (offsets->openssl_algctx_to_aeskey != 0) {
-      // Robust fallback (issue #275): the raw H field is populated lazily and
-      // reads zero here on some impl paths / under load — the dominant
-      // openssl-nightly flake and a real data-plane gap. Recompute
-      // H = AES_encrypt(0) from the provider's AES round keys, which are always
-      // materialised by the time a write encrypts. openssl_recover_h yields H
-      // already in GHASH byte order, so no bswap (matches the BoringSSL path).
-      // A non-GCM cipher (e.g. ChaCha20-Poly1305) fails validation inside
-      // openssl_recover_h and leaves have_h=0.
-      if (openssl_recover_h(algctx, offsets->openssl_algctx_to_aeskey, ghash_h))
-        have_h = 1;
-    }
-    if (!have_h) {
+                            (void *)(algctx + offsets->algctx_to_h)) < 0) {
       dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
       return 0;
     }
+    // Non-GCM ciphers (or H not yet populated) read as zero here. The
+    // AES-round-key fallback for the zero case (issue #275) can't run in this
+    // program — bpf_h_extract is a tail-call target, and openssl_recover_h
+    // needs its own (too-large-to-combine) stack frame. It runs instead in the
+    // EVP_CipherInit_ex uretprobe, which backfills evp_h_cache so the cache
+    // lookup above hits and this live walk is skipped entirely.
+    if (ghash_h64[0] == 0 && ghash_h64[1] == 0) {
+      dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
+      return 0;
+    }
+    // OpenSSL stores H little-endian; GHASH wants big-endian (matches the
+    // uretprobe and kprobe-walk representations).
+    ghash_h64[0] = __builtin_bswap64(ghash_h64[0]);
+    ghash_h64[1] = __builtin_bswap64(ghash_h64[1]);
     cipher_type = KLOAK_CIPHER_AES_GCM;
 
     // Backfill the cache so subsequent writes on this enc_ctx take the
