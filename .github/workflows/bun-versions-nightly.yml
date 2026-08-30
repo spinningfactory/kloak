@@ -51,10 +51,13 @@ jobs:
 
       - name: Resolve recent stable Bun versions
         id: resolve
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           curl -fsS \
             -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
             "https://api.github.com/repos/oven-sh/bun/releases?per_page=50" \
             | jq -r '.[] | select(.prerelease==false and .draft==false) | .tag_name' \
             | grep '^bun-v[0-9]' \
@@ -283,10 +286,13 @@ jobs:
 
       - name: Find new Bun versions
         id: find
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           curl -fsS \
             -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
             "https://api.github.com/repos/oven-sh/bun/releases?per_page=50" \
             | jq -r '.[] | select(.prerelease==false and .draft==false) | .tag_name' \
             | grep '^bun-v[0-9]' \
