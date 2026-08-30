@@ -44,12 +44,16 @@ echo "==> Downloading $URL ..." >&2
 curl -fsSL "$URL" -o "$TMPDIR/bun.zip"
 unzip -j "$TMPDIR/bun.zip" -d "$TMPDIR/" >&2
 
-BUN_BIN=$(find "$TMPDIR" -maxdepth 1 -name "bun*" -not -name "*.json" -not -name "*.map" -type f | head -1)
+BUN_BIN=$(find "$TMPDIR" -maxdepth 1 -name "bun*" -not -name "*.json" -not -name "*.zip" -not -name "*.linker-map" -type f | head -1)
 [[ -n "$BUN_BIN" ]] || { echo "ERROR: bun binary not found in zip" >&2; exit 1; }
 chmod +x "$BUN_BIN"
 
 # Extract SSL_write virtual address from the symbol table.
-SSL_VA=$(nm "$BUN_BIN" 2>/dev/null | awk '/[[:space:]][Tt][[:space:]]SSL_write$/ {print "0x"$1; exit}')
+# awk exits as soon as it prints the match, closing the pipe while nm is
+# still writing the rest of a very large symbol table — nm then dies from
+# SIGPIPE (exit 141). That's expected, not a real failure; `|| true` keeps
+# it from tripping `set -e` before the emptiness check below can run.
+SSL_VA=$(nm "$BUN_BIN" 2>/dev/null | awk '/[[:space:]][Tt][[:space:]]SSL_write$/ {print "0x"$1; exit}' || true)
 [[ -n "$SSL_VA" ]] || { echo "ERROR: SSL_write not found in $BUN_BIN — check if this version ships a profile build" >&2; exit 1; }
 echo "==> SSL_write VA: $SSL_VA" >&2
 
