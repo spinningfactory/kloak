@@ -10,6 +10,7 @@
     "algctx_to_gcm": 248,
     "gcm128_h_offset": 80,
     "algctx_to_h": 328,
+    "algctx_to_aeskey": 704,
     "ssl_to_version": 0,
     "ssl_to_wbio": 24
   },
@@ -24,6 +25,7 @@
     "WRLToEncCtx": 0,
     "EncCtxToAlgctx": 168,
     "AlgctxToH": 328,
+    "AlgctxToAESKey": 704,
     "SSLToVersion": 0,
     "SSLToWBIO": 24
   }

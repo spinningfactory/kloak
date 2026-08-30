@@ -590,6 +590,17 @@ struct tls_offsets {
   __u32 bssl_ssl_to_s3;
   __u32 bssl_s3_to_aead;
   __u32 bssl_aead_to_aeskey;
+
+  // OpenSSL AES-GCM robustness fallback (issue #275). algctx (PROV_AES_GCM_CTX)*
+  // + off → AES_KEY.rd_key (round-key schedule, direct read). OpenSSL's raw H
+  // field at algctx_to_h is populated lazily and, on some impl paths / under
+  // load, reads all-zero at SSL_write time — which used to silently skip the
+  // rewrite. When the direct H read is zero we recompute H = AES_encrypt(0)
+  // from these round keys (always materialised by the time a write encrypts),
+  // exactly as the BoringSSL chain does. 0 = not calibrated → fallback disabled
+  // (preserves prior behaviour). Appended last so the struct prefix — and thus
+  // every existing field offset — is unchanged.
+  __u32 openssl_algctx_to_aeskey;
 };
 
 #define TLS_LIB_OPENSSL 0
@@ -729,6 +740,52 @@ static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_
   }
 #ifdef KLOAK_DEBUG
   bpf_printk("kloak [BSSL] H ok rounds=%u h0=%llx h1=%llx", rounds, bh[0], bh[1]);
+#endif
+  return 1;
+}
+
+// openssl_recover_h recomputes the GHASH subkey H = AES_encrypt(0) from the
+// OpenSSL provider's AES round-key schedule, for the case where the raw H
+// field (algctx_to_h) reads zero (lazily populated — issue #275). Given the
+// already-walked algctx (PROV_AES_GCM_CTX*), it reads AES_KEY.rd_key at
+// algctx + algctx_to_aeskey and the round count 240 bytes past it, then calls
+// the shared aes_recover_h. Writes 16 bytes to h_out (already in GHASH byte
+// order, so callers must NOT byte-swap — matching bssl_recover_h). Returns 1
+// on success, 0 on any failure (including non-GCM ciphers, whose round count
+// won't validate).
+//
+// __noinline for its own stack frame, mirroring bssl_recover_h — the unrolled
+// AES round function needs a dedicated frame (inlining it blows the 512-byte
+// BPF stack at compile time). Because of that, it must ONLY be called from
+// programs that do NOT use bpf_tail_call: the kernel caps the combined stack of
+// a tail-call program plus its BPF-to-BPF callees far below 512 bytes ("combined
+// stack size of 2 calls is 640. Too large"). So it is invoked from the
+// EVP_CipherInit_ex uretprobe and the tcp_sendmsg kprobe, never from the
+// tail-called bpf_h_extract.
+static __attribute__((noinline)) int openssl_recover_h(__u64 algctx,
+                                                       __u32 algctx_to_aeskey,
+                                                       __u8 *h_out) {
+  __u32 zk = 0;
+  struct aes_scratch_buf *ab = bpf_map_lookup_elem(&aes_scratch, &zk);
+  if (!ab)
+    return 0;
+
+  __u64 aeskey = algctx + algctx_to_aeskey;
+  if (bpf_probe_read_user(ab->rd_key, BSSL_AES_RDKEY_BYTES, (void *)aeskey) < 0)
+    return 0;
+  __u32 rounds = 0;
+  if (bpf_probe_read_user(&rounds, 4, (void *)(aeskey + BSSL_AESKEY_ROUNDS_OFF)) < 0)
+    return 0;
+
+  if (!aes_recover_h(ab->rd_key, rounds, h_out))
+    return 0;
+
+  __u64 *bh = (__u64 *)h_out;
+  if (bh[0] == 0 && bh[1] == 0)
+    return 0;
+#ifdef KLOAK_DEBUG
+  bpf_printk("kloak [OSSL] H recovered from AES key rounds=%u h0=%llx h1=%llx",
+             rounds, bh[0], bh[1]);
 #endif
   return 1;
 }
@@ -1835,15 +1892,28 @@ int bpf_uretprobe_evp_cipher_init(void *ctx) {
     return 0;
   }
 
-  // Filter non-GCM ciphers: their EVP_CIPHER_CTX has zeros at the algctx→H offset.
   __u64 *h64 = (__u64 *)val.ghash_h;
   if (h64[0] == 0 && h64[1] == 0) {
+    // The raw H field reads zero: either a non-GCM cipher, or an AES-GCM cipher
+    // whose H is populated lazily (issue #275 — the dominant openssl-nightly
+    // flake). Recompute H = AES_encrypt(0) from the provider's AES round keys,
+    // which ARE set by the time EVP_CipherInit_ex returns, so this source is
+    // race-proof. A non-GCM cipher fails the round-count validation inside
+    // openssl_recover_h and we skip caching (as before). This uretprobe is a
+    // small, non-tail-call program, so openssl_recover_h's stack frame fits
+    // here (it does not in the tail-called bpf_h_extract). Caching a valid H
+    // here means the SSL_write's h_extract cache lookup hits and the flaky live
+    // walk is skipped entirely. Recovered H is already in GHASH byte order, so
+    // the bswap is applied only to the direct-read case.
     dbg_inc(DBG_EVP_INIT_H_ZERO);
-    return 0;
+    if (offsets->openssl_algctx_to_aeskey == 0 ||
+        !openssl_recover_h(algctx, offsets->openssl_algctx_to_aeskey, val.ghash_h))
+      return 0;
+  } else {
+    // OpenSSL stores H in native (little-endian) byte order; GHASH wants big-endian.
+    h64[0] = __builtin_bswap64(h64[0]);
+    h64[1] = __builtin_bswap64(h64[1]);
   }
-  // OpenSSL stores H in native (little-endian) byte order; GHASH wants big-endian.
-  h64[0] = __builtin_bswap64(h64[0]);
-  h64[1] = __builtin_bswap64(h64[1]);
 
   val.cipher_type = KLOAK_CIPHER_AES_GCM;
   val.nonce_len = 0xFF; // actual nonce_len is determined per-connection in h_extract.
@@ -1942,12 +2012,18 @@ int bpf_h_extract(void *ctx) {
       dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
       return 0;
     }
+
     if (bpf_probe_read_user(ghash_h, 16,
                             (void *)(algctx + offsets->algctx_to_h)) < 0) {
       dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
       return 0;
     }
-    // Non-GCM ciphers (or H not yet populated) read as zero here.
+    // Non-GCM ciphers (or H not yet populated) read as zero here. The
+    // AES-round-key fallback for the zero case (issue #275) can't run in this
+    // program — bpf_h_extract is a tail-call target, and openssl_recover_h
+    // needs its own (too-large-to-combine) stack frame. It runs instead in the
+    // EVP_CipherInit_ex uretprobe, which backfills evp_h_cache so the cache
+    // lookup above hits and this live walk is skipped entirely.
     if (ghash_h64[0] == 0 && ghash_h64[1] == 0) {
       dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
       return 0;

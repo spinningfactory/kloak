@@ -81,6 +81,7 @@ type opensslReferenceJSON struct {
 		WRLToEncCtx    *uint32 `json:"WRLToEncCtx"`
 		EncCtxToAlgctx *uint32 `json:"EncCtxToAlgctx"`
 		AlgctxToH      *uint32 `json:"AlgctxToH"`
+		AlgctxToAESKey *uint32 `json:"AlgctxToAESKey"`
 		SSLToVersion   *uint32 `json:"SSLToVersion"`
 		SSLToWBIO      *uint32 `json:"SSLToWBIO"`
 	} `json:"kloak_config"`
@@ -159,6 +160,17 @@ func TestOpenSSLOffsets_AgainstReferenceJSON(t *testing.T) {
 			}
 			if entry.AlgctxToH != *ref.KloakConfig.AlgctxToH {
 				t.Errorf("AlgctxToH mismatch: table=%d ref=%d", entry.AlgctxToH, *ref.KloakConfig.AlgctxToH)
+			}
+			// AlgctxToAESKey powers the AES-round-key H fallback (issue #275).
+			// Nil-tolerant: a reference JSON predating the field is treated as
+			// "not yet discovered" rather than a hard failure, so older cells
+			// don't block until the discovery workflow backfills them.
+			if ref.KloakConfig.AlgctxToAESKey != nil {
+				if entry.AlgctxToAESKey != *ref.KloakConfig.AlgctxToAESKey {
+					t.Errorf("AlgctxToAESKey mismatch: table=%d ref=%d", entry.AlgctxToAESKey, *ref.KloakConfig.AlgctxToAESKey)
+				}
+			} else if entry.AlgctxToAESKey != 0 {
+				t.Logf("AlgctxToAESKey for %s not in reference JSON (table=%d); re-run discovery to record it", majorMinor, entry.AlgctxToAESKey)
 			}
 			// SSLToVersion: 0xFFFFFFFF in the table means "not yet verified, BPF uses
 			// heuristic". If the JSON has a real offset, update the table entry.

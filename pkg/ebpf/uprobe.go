@@ -1349,13 +1349,14 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, cgroupID uint64, containerLib
 		// OpenSSL: read the version string, look up the 3-/4-hop chain offsets.
 		if version, offsets, err := DetectOpenSSLVersion(pid, libPath); err == nil {
 			val := bpfTLSOffsets{
-				SSLToWRL:       offsets.SSLToWRL,
-				WRLToEncCtx:    offsets.WRLToEncCtx,
-				EncCtxToAlgctx: offsets.EncCtxToAlgctx,
-				AlgctxToH:      offsets.AlgctxToH,
-				SSLToVersion:   offsets.SSLToVersion,
-				SSLToWBIO:      offsets.SSLToWBIO,
-				TLSLib:         bpfTLSLibOpenSSL,
+				SSLToWRL:              offsets.SSLToWRL,
+				WRLToEncCtx:           offsets.WRLToEncCtx,
+				EncCtxToAlgctx:        offsets.EncCtxToAlgctx,
+				AlgctxToH:             offsets.AlgctxToH,
+				SSLToVersion:          offsets.SSLToVersion,
+				SSLToWBIO:             offsets.SSLToWBIO,
+				TLSLib:                bpfTLSLibOpenSSL,
+				OpenSSLAlgctxToAESKey: offsets.AlgctxToAESKey,
 			}
 			m.pushOffsetVal(val, cgroupID, exeInode)
 			m.log.Debugw("Pushed TLS offsets for XOR-patch path",
@@ -1412,6 +1413,9 @@ type bpfTLSOffsets struct {
 	BsslSSLToS3      uint32
 	BsslS3ToAEAD     uint32
 	BsslAEADToAESKey uint32
+	// OpenSSL AES-round-key H fallback (issue #275). Appended last to match the
+	// C struct, which appends it after the BoringSSL fields.
+	OpenSSLAlgctxToAESKey uint32
 }
 
 // pushOffsetVal writes the offsets for this binary (keyed by exe inode) plus a
