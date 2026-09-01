@@ -1,7 +1,7 @@
 # eBPF + Go build stage.
 # Runs on the BUILD platform (host arch) regardless of target platform.
 # Cross-compiles both eBPF objects and Go binary for the target.
-FROM --platform=$BUILDPLATFORM golang:1.26 AS builder
+FROM --platform=$BUILDPLATFORM golang:1.27 AS builder
 
 WORKDIR /app
 
