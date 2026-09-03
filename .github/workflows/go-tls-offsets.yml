@@ -34,7 +34,7 @@ jobs:
         # but a workflow matrix can't dynamically resolve at parse time. The
         # nightly `go-versions-nightly.yml` workflow (PR 3) detects new
         # versions and opens an auto-PR that updates this list.
-        go: ["1.20", "1.21", "1.22", "1.23", "1.24", "1.25", "1.26"]
+        go: ["1.20", "1.21", "1.22", "1.23", "1.24", "1.25", "1.26", "1.27"]
     steps:
       - uses: actions/checkout@v7
 

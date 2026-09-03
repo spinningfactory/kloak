@@ -78,6 +78,7 @@ var goTLSOffsetTableBase = map[string]goTLSOffsetEntry{
 	"1.24": {ConnToCipher: 576, AEADIfaceOff: 24, PDBase: 728, ConnVersOff: 72},
 	"1.25": {ConnToCipher: 560, AEADIfaceOff: 24, PDBase: 728, ConnVersOff: 72},
 	"1.26": {ConnToCipher: 560, AEADIfaceOff: 24, PDBase: 728, ConnVersOff: 72},
+	"1.27": {ConnToCipher: 584, AEADIfaceOff: 24, PDBase: 728, ConnVersOff: 72},
 }
 
 // goTLSOffsetsForArch converts a base entry to arch-specific GoTLSOffsets
