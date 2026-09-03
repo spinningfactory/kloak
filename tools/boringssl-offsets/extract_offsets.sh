@@ -61,19 +61,26 @@ SSL_OBJ=$(find "$BUILD_DIR" -name 'ssl_lib.cc.o' -o -name 'ssl_lib.c.o' 2>/dev/n
 T13_OBJ=$(find "$BUILD_DIR" -name 'tls13_enc.cc.o' -o -name 'tls_record.cc.o' 2>/dev/null | head -1)
 CRYPTO_OBJ=$(find "$BUILD_DIR" -name 'gcm.c.o' -o -name 'gcm.cc.o' -o -name 'e_aes.c.o' -o -name 'cipher_extra.c.o' 2>/dev/null | head -1)
 [ -z "$CRYPTO_OBJ" ] && CRYPTO_OBJ=$(find "$BUILD_DIR" -path '*crypto*' -name '*.o' 2>/dev/null | head -1)
+BIO_OBJ=$(find "$BUILD_DIR" -name 'bio.cc.o' -o -name 'bio.c.o' 2>/dev/null | head -1)
 
 echo "=== BoringSSL Offset Discovery ===" >&2
 echo "Version: $VERSION  Arch: $ARCH" >&2
 echo "SSL object:    $SSL_OBJ" >&2
 echo "TLS13 object:  $T13_OBJ" >&2
 echo "Crypto object: $CRYPTO_OBJ" >&2
+echo "BIO object:    $BIO_OBJ" >&2
 
 # SSL* -> s3
-r=$(get_offset_multi "$SSL_OBJ" "s3" "ssl_st" "bssl::SSL" "SSL")
+# BoringSSL 0.20260803.0+ refactored the C shim: `ssl_st` became a 1-byte
+# opaque shell (DECLARE_OPAQUE_STRUCT) and the real fields moved to
+# bssl::SSLImpl, which derives from it. The empty base contributes zero
+# bytes, so the numeric offsets are unchanged — only the DWARF name moved.
+# Candidates are tried in order, so older tags still resolve via ssl_st.
+r=$(get_offset_multi "$SSL_OBJ" "s3" "ssl_st" "SSLImpl" "bssl::SSL" "SSL")
 SSL_TO_S3="${r%%|*}"; SSL_STRUCT="${r##*|}"
 
 # SSL* -> wbio (socket fd recovery)
-r=$(get_offset_multi "$SSL_OBJ" "wbio" "ssl_st" "bssl::SSL" "SSL")
+r=$(get_offset_multi "$SSL_OBJ" "wbio" "ssl_st" "SSLImpl" "bssl::SSL" "SSL")
 SSL_TO_WBIO="${r%%|*}"
 
 # SSL3_STATE -> aead_write_ctx
@@ -124,8 +131,12 @@ if [ -n "$AEAD_TO_CTX" ] && [ -n "$CTX_TO_STATE" ] && [ -n "$AEAD_GCM_KEY" ] && 
     AEAD_TO_AESKEY=$((AEAD_TO_CTX + CTX_TO_STATE + AEAD_GCM_KEY + GCM_AES_OFF))
 fi
 
-# BIO -> num (socket fd)
-r=$(get_offset_multi "$SSL_OBJ" "num" "bio_st" "bssl::BIO" "BIO")
+# BIO -> num (socket fd). The same 0.20260803.0+ refactor renamed the real BIO
+# struct to bssl::Bio (opaque `bio_st` shell), and the definition only lands
+# in bio.cc.o's DWARF — ssl_lib/gcm TUs reference BIO only as an opaque
+# pointer, which is why this never resolved pre-refactor.
+r=$(get_offset_multi "$BIO_OBJ" "num" "bio_st" "Bio" "bssl::BIO" "BIO")
+[ -z "${r%%|*}" ] && r=$(get_offset_multi "$SSL_OBJ" "num" "bio_st" "bssl::BIO" "BIO")
 [ -z "${r%%|*}" ] && r=$(get_offset_multi "$CRYPTO_OBJ" "num" "bio_st" "BIO")
 BIO_NUM="${r%%|*}"
 
