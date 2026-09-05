@@ -39,6 +39,10 @@ var bunOffsetTable = map[string]BunOffsets{
 	"1.3.13/arm64": {SSLWriteOffset: 77478272, BoringSSL: BoringSSLOffsets{SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32}}, // discovered from bun-v1.3.13 profile build
 	"1.4.0/amd64":  {SSLWriteOffset: 35821600, BoringSSL: BoringSSLOffsets{SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32}}, // discovered from bun-v1.4.0 profile build
 	"1.4.0/arm64":  {SSLWriteOffset: 34985344, BoringSSL: BoringSSLOffsets{SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32}}, // discovered from bun-v1.4.0 profile build
+	"1.4.1/amd64":  {SSLWriteOffset: 41201600, BoringSSL: BoringSSLOffsets{SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32}}, // discovered from bun-v1.4.1 profile build
+	"1.4.1/arm64":  {SSLWriteOffset: 40102080, BoringSSL: BoringSSLOffsets{SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32}}, // discovered from bun-v1.4.1 profile build
+	"1.4.2/amd64":  {SSLWriteOffset: 41104816, BoringSSL: BoringSSLOffsets{SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32}}, // discovered from bun-v1.4.2 profile build
+	"1.4.2/arm64":  {SSLWriteOffset: 40058880, BoringSSL: BoringSSLOffsets{SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32}}, // discovered from bun-v1.4.2 profile build
 }
 
 var bunVersionRe = regexp.MustCompile(`bun/(\d+\.\d+\.\d+)`)
