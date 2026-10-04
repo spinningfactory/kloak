@@ -85,6 +85,14 @@ func TestMain(m *testing.M) {
 				"--set", "image.pullPolicy=Always",
 			)
 		}
+		// E2E_HELM_SET adds comma-separated key=value overrides, e.g.
+		// "controller.ebpf.tcAttachMode=clsact" to run the suite against the
+		// clsact tc fallback on a TCX-capable kernel.
+		for _, kv := range strings.Split(os.Getenv("E2E_HELM_SET"), ",") {
+			if kv = strings.TrimSpace(kv); kv != "" {
+				helmArgs = append(helmArgs, "--set", kv)
+			}
+		}
 		if _, err := helm(helmArgs...); err != nil {
 			fmt.Fprintf(os.Stderr, "failed to deploy kloak: %v\n", err)
 			os.Exit(1)

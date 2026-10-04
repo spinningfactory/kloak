@@ -38,6 +38,10 @@ controller:
     # external attachment. Loopback is never patched: same-pod traffic
     # always receives the placeholder.
     egressInterface: auto
+    # How the tc patch program is attached. "auto" uses TCX on Linux 6.6+
+    # and falls back to a clsact qdisc + cls_bpf filter on older kernels
+    # (5.17+). "tcx" requires TCX; "clsact" always uses the classic filter.
+    tcAttachMode: auto
   cgroupPath: /host/sys/fs/cgroup
   dns:
     # Trusted DNS server IPs. Only DNS responses from these servers are used

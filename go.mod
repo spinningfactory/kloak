@@ -6,6 +6,8 @@ require (
 	github.com/cilium/ebpf v0.22.0
 	github.com/go-logr/zapr v1.3.0
 	github.com/spf13/cobra v1.10.2
+	github.com/vishvananda/netlink v1.3.1
+	github.com/vishvananda/netns v0.0.5
 	go.uber.org/zap v1.28.0
 	golang.org/x/net v0.59.0
 	golang.org/x/sys v0.48.0

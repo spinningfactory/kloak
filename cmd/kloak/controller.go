@@ -51,6 +51,7 @@ var (
 	cgroupPath          string
 	trustedDNSServers   string
 	egressInterface     string
+	tcAttachMode        string
 )
 
 func init() {
@@ -63,12 +64,22 @@ func init() {
 			`"auto" detects from the default IPv4 route in the container netns (works for CNI veth "eth0" AND host-mode netns with non-standard names like wlp3s0/enp0s3). `+
 			`Use an explicit name (e.g., "eth0") to pin, or "none"/"lo-only" to disable external attachment. `+
 			`Loopback is never patched.`)
+	controllerCmd.Flags().StringVar(&tcAttachMode, "tc-attach-mode", "auto",
+		`How the tc patch program is attached: "auto" uses TCX on Linux 6.6+ and falls back to a clsact qdisc + cls_bpf filter on older kernels; `+
+			`"tcx" requires TCX; "clsact" always uses the classic filter.`)
 }
 
 func runController(cmd *cobra.Command, args []string) {
 	setupLog := logging.Setup().Named("setup")
 
-	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface)
+	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface, "tcAttachMode", tcAttachMode)
+
+	tcMode, err := ebpf.ParseTCAttachMode(tcAttachMode)
+	if err != nil {
+		setupLog.Errorw("invalid --tc-attach-mode", "error", err)
+		_ = setupLog.Sync()
+		os.Exit(1)
+	}
 
 	// 30 s is well under the daemonset's 60 s terminationGracePeriodSeconds,
 	// leaving headroom for our own cleanup (uprobe/link Close) and any final
@@ -97,6 +108,7 @@ func runController(cmd *cobra.Command, args []string) {
 			_ = setupLog.Sync()
 			os.Exit(1)
 		}
+		uprobeMgr.SetTCAttachMode(tcMode)
 		setupLog.Infow("eBPF TLS uprobes enabled")
 	} else {
 		setupLog.Infow("eBPF disabled")

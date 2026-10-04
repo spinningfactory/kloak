@@ -259,9 +259,16 @@ jobs:
             ghcr.io/${{ github.repository }}-demo-go:sha-${{ github.sha }}
 
   e2e:
-    name: E2E Tests
+    # "auto" keeps the original check name so required status checks still
+    # match; "clsact" reruns the suite with the pre-6.6-kernel tc fallback
+    # forced on, since CI kernels support TCX and would never exercise it.
+    name: ${{ matrix.tc-attach-mode == 'auto' && 'E2E Tests' || format('E2E Tests (tc {0})', matrix.tc-attach-mode) }}
     runs-on: ubuntu-latest
     needs: [build, test]
+    strategy:
+      fail-fast: false
+      matrix:
+        tc-attach-mode: [auto, clsact]
     permissions:
       contents: read
       packages: write
@@ -427,6 +434,7 @@ jobs:
         run: go test -v -timeout 1500s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
           KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
+          E2E_HELM_SET: controller.ebpf.tcAttachMode=${{ matrix.tc-attach-mode }}
 
       - name: Stop BPF trace capture
         if: always()
@@ -444,7 +452,7 @@ jobs:
           ls -la /tmp/bpf-trace.log 2>/dev/null || true
 
       - name: Collect e2e coverage
-        if: always()
+        if: always() && matrix.tc-attach-mode == 'auto'
         env:
           KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
         run: |
@@ -473,7 +481,7 @@ jobs:
         # `continue-on-error` so a re-run of just this job after the artifact
         # has been GC'd doesn't fail the whole workflow — we'll fall back to
         # e2e-only coverage in the merge step below.
-        if: always()
+        if: always() && matrix.tc-attach-mode == 'auto'
         continue-on-error: true
         uses: actions/download-artifact@v8
         with:
@@ -481,7 +489,7 @@ jobs:
           path: /tmp/unit-coverage
 
       - name: Merge unit and e2e coverage
-        if: always()
+        if: always() && matrix.tc-attach-mode == 'auto'
         run: |
           # Convert e2e covdata (binary) to Go text format.
           if ls /tmp/e2e-covdata/covcounters.* 1>/dev/null 2>&1; then
@@ -528,7 +536,7 @@ jobs:
           go tool cover -func="$OUT" | tail -1
 
       - name: Upload combined coverage
-        if: always()
+        if: always() && matrix.tc-attach-mode == 'auto'
         uses: actions/upload-artifact@v7
         with:
           name: combined-coverage
@@ -580,7 +588,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bpf-trace
+          name: bpf-trace-${{ matrix.tc-attach-mode }}
           path: /tmp/bpf-trace.log
           retention-days: 7
           if-no-files-found: ignore
