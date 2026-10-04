@@ -260,6 +260,33 @@ HELPER_INLINE void gf128_h_power_table_ws(const __u8 h_powers[11][16],
   }
 }
 
+// gf128_halve_to_h recovers the GHASH subkey H from the doubled value that
+// carry-less-multiply GHASH implementations precompute at key setup:
+//
+//   V = (bswap128(H) << 1) ^ (MSB ? POLY : 0),  POLY = {hi: 0xC2<<56, lo: 1}
+//
+// Both Go's gcmAesInit (crypto/aes, the "H·2" register value) and OpenSSL's
+// AVX-512 GCM (HashKey_1 in GCM128_CONTEXT.Htable, see ossl_read_gcm_h) store
+// H in this form instead of the raw subkey. lo/hi are V's low/high 64-bit
+// lanes as loaded from memory. Writes H as the 16-byte big-endian GHASH string.
+//
+// Reduction indicator: the left shift always clears bit 0, and POLY sets it,
+// so lo.bit0 says whether POLY was XORed in. Undo that, then undo the 128-bit
+// shift, restoring the MSB that the reduction consumed.
+HELPER_INLINE void gf128_halve_to_h(__u64 lo, __u64 hi, __u8 out[16]) {
+  __u64 reduced = lo & 1;
+  if (reduced) {
+    hi ^= 0xC200000000000000ULL;
+    lo ^= 0x0000000000000001ULL;
+  }
+  lo = (lo >> 1) | (hi << 63);
+  hi = (hi >> 1) | (reduced << 63);
+  for (int i = 0; i < 8; i++) {
+    out[i] = (__u8)(hi >> (56 - 8 * i));
+    out[8 + i] = (__u8)(lo >> (56 - 8 * i));
+  }
+}
+
 // Kloak internal cipher type enum (not TLS cipher suite IDs).
 // The cipher type is determined implicitly: successful H extraction = AES-GCM.
 #define KLOAK_CIPHER_UNKNOWN 0

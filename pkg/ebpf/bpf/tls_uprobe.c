@@ -192,7 +192,7 @@ enum {
   DBG_KPROBE_BRIDGE_H_FAIL,   // kprobe H extraction failed (no tc_pending written)
   DBG_EVP_INIT_ENTRY,         // EVP_CipherInit_ex entry uprobe fired (cipher init started)
   DBG_EVP_INIT_H_OK,          // EVP_CipherInit_ex uretprobe extracted non-zero H
-  DBG_EVP_INIT_H_ZERO,        // EVP_CipherInit_ex uretprobe found zero H (non-GCM cipher)
+  DBG_EVP_INIT_H_ZERO,        // EVP_CipherInit_ex uretprobe found no usable H (non-GCM / unkeyed ctx)
   DBG_EVP_INIT_CHAIN_FAIL,    // EVP_CipherInit_ex uretprobe failed at evp_ctx → algctx hop
   DBG_H_EXTRACT_CACHE_HIT,    // bpf_h_extract found H in evp_h_cache
   DBG_H_EXTRACT_CACHE_MISS,   // bpf_h_extract walked SSL→wrl→enc_ctx but cache had no entry
@@ -206,6 +206,8 @@ enum {
   DBG_BSSL_RDKEY_FAIL,       // bssl: AES_KEY.rd_key read failed
   DBG_BSSL_ROUNDS_BAD,       // bssl: AES_KEY.rounds not in {9,10,12,13,14}
   DBG_BSSL_HZERO,            // bssl: recovered H was all-zero
+  DBG_OSSL_GCM_GATE_FAIL,    // OpenSSL: algctx failed the gcm.key == &ks check (not a keyed GCM ctx)
+  DBG_OSSL_H_FROM_HKEY1,     // OpenSSL: H recovered from the AVX-512 HashKey_1 slot (raw H field zero)
   DBG_MAX,
 };
 
@@ -590,6 +592,18 @@ struct tls_offsets {
   __u32 bssl_ssl_to_s3;
   __u32 bssl_s3_to_aead;
   __u32 bssl_aead_to_aeskey;
+
+  // OpenSSL provider GCM context (algctx) layout used by ossl_read_gcm_h.
+  // Appended last so every field above keeps its offset; 0 = not calibrated.
+  //   ossl_algctx_to_gcm_key:    algctx + off → GCM128_CONTEXT.key (AES_KEY*)
+  //   ossl_algctx_to_ks:         algctx + off → PROV_AES_GCM_CTX.ks, which every
+  //                              keyed GCM ctx points gcm.key at (self-pointer)
+  //   ossl_algctx_to_vaes_hkey1: algctx + off → GCM128_CONTEXT.Htable[15], where
+  //                              the AVX-512 GCM path stores HashKey_1 instead
+  //                              of writing the raw H field (issue #275)
+  __u32 ossl_algctx_to_gcm_key;
+  __u32 ossl_algctx_to_ks;
+  __u32 ossl_algctx_to_vaes_hkey1;
 };
 
 #define TLS_LIB_OPENSSL 0
@@ -604,6 +618,71 @@ struct tls_offsets {
 #define OFFSETS_UNCALIBRATED(o)                                                 \
   ((o)->ssl_to_wrl == 0 &&                                                      \
    !((o)->tls_lib == TLS_LIB_BORINGSSL && (o)->bssl_ssl_to_s3 != 0))
+
+// ossl_read_gcm_h results. Only RAW and HKEY1 yield a usable H.
+#define OSSL_H_READ_FAIL 0 // a probe read faulted
+#define OSSL_H_ZERO      1 // no H available (raw field zero, no recovery path)
+#define OSSL_H_NOT_GCM   2 // definite gate mismatch: not a keyed GCM context
+#define OSSL_H_RAW       3 // H read from GCM128_CONTEXT.H
+#define OSSL_H_HKEY1     4 // H recovered from the AVX-512 HashKey_1 slot
+#define OSSL_H_OK(r) ((r) >= OSSL_H_RAW)
+
+// ossl_read_gcm_h reads the GHASH subkey H for an OpenSSL provider GCM
+// context, writing it to h as the 16-byte big-endian GHASH string.
+//
+// Gate: every keyed OpenSSL GCM context has gcm.key pointing at its own
+// PROV_AES_GCM_CTX.ks (CRYPTO_gcm128_init / vaes_gcm_setkey). Garbage at the
+// H offset of a non-GCM context (AES-CTR DRBG, ChaCha20, …) or of a context
+// not keyed yet cannot satisfy that self-pointer. Uncalibrated gate offsets
+// fall back to the legacy heuristic (raw H non-zero ⇒ GCM).
+//
+// H source: OpenSSL's generic and AES-NI GCM paths write GCM128_CONTEXT.H at
+// key setup. On x86-64 CPUs with AVX-512 + VAES + VPCLMULQDQ, OpenSSL ≥ 3.1
+// uses vaes_gcm instead: vaes_gcm_setkey zeroes the GCM128_CONTEXT and
+// ossl_aes_gcm_init_avx512 only fills Htable, storing
+// HashKey_1 = (bswap128(H) << 1) ^ (MSB ? POLY : 0) in Htable[15] — so the raw
+// H field is always zero there. That slot is inverted with gf128_halve_to_h.
+// arm64 GCM paths always write raw H, so a zero there means an unknown
+// implementation and fails closed.
+//
+// Always inline, and h is the caller's buffer (no locals beyond scalars):
+// bpf_h_extract is a tail-call program and the tcp_sendmsg kprobe is close to
+// the 512-byte stack limit, so neither can afford a BPF-to-BPF call frame.
+static __always_inline int ossl_read_gcm_h(__u64 algctx,
+                                           const struct tls_offsets *o,
+                                           __u64 h[2]) {
+  int gated = o->ossl_algctx_to_gcm_key != 0 && o->ossl_algctx_to_ks != 0;
+  if (gated) {
+    if (bpf_probe_read_user(&h[0], 8, (void *)(algctx + o->ossl_algctx_to_gcm_key)) < 0)
+      return OSSL_H_READ_FAIL;
+    if (h[0] != algctx + o->ossl_algctx_to_ks) {
+      dbg_inc(DBG_OSSL_GCM_GATE_FAIL);
+      return OSSL_H_NOT_GCM;
+    }
+  }
+
+  if (bpf_probe_read_user(h, 16, (void *)(algctx + o->algctx_to_h)) < 0)
+    return OSSL_H_READ_FAIL;
+  if (h[0] | h[1]) {
+    // GCM128_CONTEXT.H holds H as native u64 halves; GHASH wants big-endian.
+    h[0] = __builtin_bswap64(h[0]);
+    h[1] = __builtin_bswap64(h[1]);
+    return OSSL_H_RAW;
+  }
+
+#if defined(bpf_target_x86)
+  if (gated && o->ossl_algctx_to_vaes_hkey1 != 0) {
+    if (bpf_probe_read_user(h, 16, (void *)(algctx + o->ossl_algctx_to_vaes_hkey1)) < 0)
+      return OSSL_H_READ_FAIL;
+    if (h[0] | h[1]) {
+      gf128_halve_to_h(h[0], h[1], (__u8 *)h);
+      dbg_inc(DBG_OSSL_H_FROM_HKEY1);
+      return OSSL_H_HKEY1;
+    }
+  }
+#endif
+  return OSSL_H_ZERO;
+}
 
 // Per-CPU scratch for reading BoringSSL's AES round-key schedule off the BPF
 // stack (240 bytes would otherwise crowd the kprobe stack frame).
@@ -1801,9 +1880,10 @@ int bpf_uretprobe_evp_cipher_init(void *ctx) {
   __u64 evp_ctx_ptr = *evp_ctx_p;
   bpf_map_delete_elem(&evp_init_scratch, &pid_tgid);
 
-  // Look up offsets — we need enc_ctx_to_algctx + algctx_to_h. The EVP_CIPHER_CTX
-  // layout is the same internal struct that the kprobe walks through to today,
-  // so the existing offsets table covers it.
+  // Look up offsets — we need enc_ctx_to_algctx + the GCM H offsets read by
+  // ossl_read_gcm_h. The EVP_CIPHER_CTX layout is the same internal struct
+  // that the kprobe walks through to today, so the existing offsets table
+  // covers it.
   struct tls_binary_key bk = {};
   bk.cgroup_id = bpf_get_current_cgroup_id();
   struct task_struct *task = (struct task_struct *)bpf_get_current_task();
@@ -1827,31 +1907,30 @@ int bpf_uretprobe_evp_cipher_init(void *ctx) {
     return 0;
   }
 
+  struct evp_h_key key = {};
+  key.tgid = (__u32)(pid_tgid >> 32);
+  key.evp_ctx_ptr = evp_ctx_ptr;
+
+  __u64 h[2] = {0, 0};
+  int src = ossl_read_gcm_h(algctx, offsets, h);
+  if (!OSSL_H_OK(src)) {
+    dbg_inc(src == OSSL_H_READ_FAIL ? DBG_EVP_INIT_CHAIN_FAIL : DBG_EVP_INIT_H_ZERO);
+    // A definite gate mismatch means this ctx is not (or no longer) a keyed
+    // GCM context — the key-less first init of a cipher switch, or an
+    // EVP_CIPHER_CTX* reused for another cipher. Drop any H cached for the
+    // pointer so h_extract cannot serve a stale value. Read failures and
+    // uncalibrated offsets prove nothing, so they leave the cache alone.
+    if (src == OSSL_H_NOT_GCM)
+      bpf_map_delete_elem(&evp_h_cache, &key);
+    return 0;
+  }
+
   struct evp_h_val val;
   __builtin_memset(&val, 0, sizeof(val));
-  if (bpf_probe_read_user(val.ghash_h, 16,
-                          (void *)(algctx + offsets->algctx_to_h)) < 0) {
-    dbg_inc(DBG_EVP_INIT_CHAIN_FAIL);
-    return 0;
-  }
-
-  // Filter non-GCM ciphers: their EVP_CIPHER_CTX has zeros at the algctx→H offset.
-  __u64 *h64 = (__u64 *)val.ghash_h;
-  if (h64[0] == 0 && h64[1] == 0) {
-    dbg_inc(DBG_EVP_INIT_H_ZERO);
-    return 0;
-  }
-  // OpenSSL stores H in native (little-endian) byte order; GHASH wants big-endian.
-  h64[0] = __builtin_bswap64(h64[0]);
-  h64[1] = __builtin_bswap64(h64[1]);
-
+  __builtin_memcpy(val.ghash_h, h, 16);
   val.cipher_type = KLOAK_CIPHER_AES_GCM;
   val.nonce_len = 0xFF; // actual nonce_len is determined per-connection in h_extract.
 
-  __u32 tgid = (__u32)(pid_tgid >> 32);
-  struct evp_h_key key = {};
-  key.tgid = tgid;
-  key.evp_ctx_ptr = evp_ctx_ptr;
   bpf_map_update_elem(&evp_h_cache, &key, &val, BPF_ANY);
   dbg_inc(DBG_EVP_INIT_H_OK);
   return 0;
@@ -1924,9 +2003,10 @@ int bpf_h_extract(void *ctx) {
   // the same enc_ctx → algctx → H chain the uretprobe and the kprobe-walk
   // fallback use. The cache is therefore a pure optimisation, not a
   // correctness dependency.
-  // 8-byte-aligned backing store: the zero-check and bswap operate on it as
-  // __u64, so an under-aligned __u8[16] could trip strict-alignment arches or
-  // the BPF verifier.
+  // 8-byte-aligned backing store: ossl_read_gcm_h operates on it as __u64, so
+  // an under-aligned __u8[16] could trip strict-alignment arches or the BPF
+  // verifier. It is also that routine's only scratch space — this tail-call
+  // program has no stack to spare.
   __u64 ghash_h64[2] = {0};
   __u8 *ghash_h = (__u8 *)ghash_h64;
   __u8 cipher_type;
@@ -1942,20 +2022,13 @@ int bpf_h_extract(void *ctx) {
       dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
       return 0;
     }
-    if (bpf_probe_read_user(ghash_h, 16,
-                            (void *)(algctx + offsets->algctx_to_h)) < 0) {
+    // Same H source as the uretprobe and the kprobe walk, including the
+    // AVX-512 HashKey_1 recovery — so a VAES context whose raw H field is
+    // zero is still rewritable on a cache miss.
+    if (!OSSL_H_OK(ossl_read_gcm_h(algctx, offsets, ghash_h64))) {
       dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
       return 0;
     }
-    // Non-GCM ciphers (or H not yet populated) read as zero here.
-    if (ghash_h64[0] == 0 && ghash_h64[1] == 0) {
-      dbg_inc(DBG_H_EXTRACT_CACHE_MISS);
-      return 0;
-    }
-    // OpenSSL stores H little-endian; GHASH wants big-endian (matches the
-    // uretprobe and kprobe-walk representations).
-    ghash_h64[0] = __builtin_bswap64(ghash_h64[0]);
-    ghash_h64[1] = __builtin_bswap64(ghash_h64[1]);
     cipher_type = KLOAK_CIPHER_AES_GCM;
 
     // Backfill the cache so subsequent writes on this enc_ctx take the
@@ -2514,36 +2587,12 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     bpf_printk("kloak [2-KPROBE-GO] H-ok hi=%llx lo=%llx", hi, lo);
 #endif
 
-    // GF(2^128) halving: recover H from H×2.
-    //
-    // Go's gcmAesInit computes H×2 as a 128-bit GF(2^128) left shift with
-    // conditional reduction. The 128-bit value V = hi * 2^64 + lo, where:
+    // Go's gcmAesInit stores H×2: V' = (V << 1) ^ (V.MSB ? poly : 0), with
+    // the 128-bit value V = hi * 2^64 + lo where
     //   - AMD64: hi = XMM[64:127], lo = XMM[0:63]
     //   - ARM64: hi = D[0], lo = D[1]
-    //
-    // The doubling was: V' = (V << 1) ^ (V.MSB ? poly : 0)
-    //   poly = {hi: 0xC200000000000000, lo: 0x0000000000000001}
-    //
-    // Reduction indicator: lo.bit0. During left-shift, lo.bit0 becomes 0.
-    // If reduction happened, poly.lo.bit0 = 1 is XORed in, so lo.bit0 = 1.
-    // The carry from hi to lo doesn't affect lo.bit0 (it goes to lo.bit63).
-    int reduced = lo & 1;
-    if (reduced) {
-      hi ^= 0xC200000000000000ULL;
-      lo ^= 0x0000000000000001ULL;
-    }
-    // V is now (H << 1) without reduction. Undo the 128-bit left shift:
-    // Carry from hi.bit0 → lo.bit63 (the bit that crossed the word boundary).
-    __u64 carry = hi & 1;
-    hi >>= 1;
-    lo = (lo >> 1) | (carry << 63);
-    if (reduced)
-      hi |= (1ULL << 63); // Restore GF MSB that was shifted out.
-
-    // Convert from register representation (byte-reversed per 8-byte lane
-    // by PSHUFB/VREV64) to standard big-endian GHASH H.
-    *(__u64 *)&new_conn->ghash_h[0] = __builtin_bswap64(hi);
-    *(__u64 *)&new_conn->ghash_h[8] = __builtin_bswap64(lo);
+    // gf128_halve_to_h undoes the doubling and emits big-endian GHASH H.
+    gf128_halve_to_h(lo, hi, new_conn->ghash_h);
 
     new_conn->cipher_type = KLOAK_CIPHER_AES_GCM;
 
@@ -2645,26 +2694,18 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 #endif
       return 0;
     }
-    if (bpf_probe_read_user(new_conn->ghash_h, 16, (void *)(ptr + offsets->algctx_to_h)) < 0) {
+    // new_conn lives in the per-CPU conn_state_scratch map, so its ghash_h
+    // doubles as ossl_read_gcm_h's scratch without touching this program's
+    // stack (already close to the 512-byte limit with bssl_recover_h).
+    int h_src = ossl_read_gcm_h(ptr, offsets, (__u64 *)new_conn->ghash_h);
+    if (!OSSL_H_OK(h_src)) {
 #ifdef KLOAK_DEBUG
-      bpf_printk("kloak [2-KPROBE] H-fail: H read failed ptr=%llx off=%u",
-                 ptr, offsets->algctx_to_h);
+      bpf_printk("kloak [2-KPROBE] H-fail: src=%d algctx=%llx off=%u",
+                 h_src, ptr, offsets->algctx_to_h);
 #endif
       dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
       return 0;
     }
-
-    __u64 *h64 = (__u64 *)new_conn->ghash_h;
-    if (h64[0] == 0 && h64[1] == 0) {
-#ifdef KLOAK_DEBUG
-      bpf_printk("kloak [2-KPROBE] H-fail: H zero ptr=%llx off=%u",
-                 ptr, offsets->algctx_to_h);
-#endif
-      dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
-      return 0;
-    }
-    h64[0] = __builtin_bswap64(h64[0]);
-    h64[1] = __builtin_bswap64(h64[1]);
 
     new_conn->cipher_type = KLOAK_CIPHER_AES_GCM;
     new_conn->wrl_ptr = wrl_val;

@@ -60,17 +60,28 @@ for v in "${NEW_VERSIONS[@]}"; do
     algctx_to_h=$(jq -r '.kloak_config.AlgctxToH' "$json")
     ssl_to_ver=$(jq -r '.kloak_config.SSLToVersion' "$json")
     ssl_to_wbio=$(jq -r '.kloak_config.SSLToWBIO' "$json")
+    # GCM gate + AVX-512 HashKey_1 offsets (ossl_read_gcm_h, issue #275).
+    # AlgctxToVAESHKey1 may legitimately be 0 (no AVX-512 GCM path); an
+    # "unrecognized" status is surfaced by the Go reference-JSON test.
+    algctx_to_gcm_key=$(jq -r '.kloak_config.AlgctxToGCMKey' "$json")
+    algctx_to_ks=$(jq -r '.kloak_config.AlgctxToKeySched' "$json")
+    algctx_to_vaes_hkey1=$(jq -r '.kloak_config.AlgctxToVAESHKey1' "$json")
 
-    for field in ssl_to_wrl wrl_to_enc enc_to_algctx algctx_to_h ssl_to_ver ssl_to_wbio; do
+    for field in ssl_to_wrl wrl_to_enc enc_to_algctx algctx_to_h ssl_to_ver ssl_to_wbio \
+                 algctx_to_gcm_key algctx_to_ks algctx_to_vaes_hkey1; do
       val="${!field}"
       if [ -z "$val" ] || [ "$val" = "null" ]; then
         echo "ERROR: $json is missing field $field — re-run offset discovery" >&2
         exit 1
       fi
     done
+    if [ "$(jq -r '.vaes_hkey1_status' "$json")" = "unrecognized" ]; then
+      echo "WARNING: $json: AVX-512 GCM layout unrecognized — HashKey_1 recovery disabled for $major_minor until reviewed" >&2
+    fi
 
-    entry=$(printf '\t"%s": {SSLToWRL: %s, WRLToEncCtx: %s, EncCtxToAlgctx: %s, AlgctxToH: %s, SSLToVersion: %s, SSLToWBIO: %s},' \
-      "$major_minor" "$ssl_to_wrl" "$wrl_to_enc" "$enc_to_algctx" "$algctx_to_h" "$ssl_to_ver" "$ssl_to_wbio")
+    entry=$(printf '\t"%s": {SSLToWRL: %s, WRLToEncCtx: %s, EncCtxToAlgctx: %s, AlgctxToH: %s, SSLToVersion: %s, SSLToWBIO: %s, AlgctxToGCMKey: %s, AlgctxToKeySched: %s, AlgctxToVAESHKey1: %s},' \
+      "$major_minor" "$ssl_to_wrl" "$wrl_to_enc" "$enc_to_algctx" "$algctx_to_h" "$ssl_to_ver" "$ssl_to_wbio" \
+      "$algctx_to_gcm_key" "$algctx_to_ks" "$algctx_to_vaes_hkey1")
 
     # Insert before the first existing entry so new (newer) versions land at the
     # top of the table, keeping it in descending version order.

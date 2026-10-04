@@ -408,6 +408,103 @@ static void test_aes_recover_h(void) {
 }
 
 // ============================================================================
+// gf128_halve_to_h (OpenSSL AVX-512 HashKey_1 / Go H·2 → H)
+// ============================================================================
+
+// Literal transcription of ossl_aes_gcm_init_avx512's HashKey_1 precompute
+// (crypto/modes/asm/aes-gcm-avx512.pl, OpenSSL 3.1+), starting from
+// HashKey = AES_K(0):
+//   vpshufb SHUF_MASK         → reverse all 16 bytes
+//   vpsllq $1                 → shift each 64-bit lane left by one
+//   vpsrlq $63 / vpslldq $8   → carry lane0's MSB into lane1's bit 0
+//   vpsrldq $8 / TWOONE / POLY → XOR POLY when lane1's MSB (bit 127) was set
+// The result is stored with vmovdqu64, so lane0/lane1 are the slot's
+// little-endian low/high 8 bytes — exactly what the BPF probe read sees.
+static void vaes_hkey1_forward(const __u8 h[16], __u64 *lo_out, __u64 *hi_out) {
+  __u8 s[16];
+  for (int i = 0; i < 16; i++)
+    s[i] = h[15 - i];
+  __u64 lo = 0, hi = 0;
+  for (int i = 0; i < 8; i++) {
+    lo |= (__u64)s[i] << (8 * i);
+    hi |= (__u64)s[8 + i] << (8 * i);
+  }
+  __u64 carry_out = hi >> 63;
+  hi = (hi << 1) | (lo >> 63);
+  lo <<= 1;
+  if (carry_out) {
+    lo ^= 0x0000000000000001ULL;
+    hi ^= 0xC200000000000000ULL;
+  }
+  *lo_out = lo;
+  *hi_out = hi;
+}
+
+// want_reduced: 1/0 asserts which reduction branch the forward transform
+// took (so each branch is provably covered); -1 skips the check.
+static void check_hkey1_roundtrip(const __u8 h[16], int want_reduced) {
+  __u64 lo, hi;
+  __u8 got[16];
+  vaes_hkey1_forward(h, &lo, &hi);
+  if (want_reduced >= 0)
+    assert((int)(lo & 1) == want_reduced);
+  gf128_halve_to_h(lo, hi, got);
+  if (!bytes_equal(got, h, 16)) {
+    print_hex("want", h, 16);
+    print_hex("got ", got, 16);
+  }
+  assert(bytes_equal(got, h, 16));
+}
+
+static void test_gf128_halve_to_h_aes_keys(void) {
+  __u8 key[32], rk[240], h[16], want[16];
+
+  // NIST GCM test cases 1/2: K = 0^128 → H = 66e94bd4… (MSB clear).
+  memset(key, 0, sizeof(key));
+  aes_kat_expand(key, 4, rk, 10);
+  memset(h, 0, 16);
+  aes_block_encrypt(rk, 10, h);
+  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", want, 16);
+  assert(bytes_equal(h, want, 16));
+  check_hkey1_roundtrip(h, 0);
+
+  // K = 01..10 → H = dbf18411… (MSB set → POLY reduction branch).
+  for (int i = 0; i < 16; i++)
+    key[i] = (__u8)(i + 1);
+  aes_kat_expand(key, 4, rk, 10);
+  memset(h, 0, 16);
+  aes_block_encrypt(rk, 10, h);
+  hex_to_bytes("dbf184112eb9111659712bafcff2ab24", want, 16);
+  assert(bytes_equal(h, want, 16));
+  check_hkey1_roundtrip(h, 1);
+
+  // AES-256, K = 00..1f.
+  for (int i = 0; i < 32; i++)
+    key[i] = (__u8)i;
+  aes_kat_expand(key, 8, rk, 14);
+  memset(h, 0, 16);
+  aes_block_encrypt(rk, 14, h);
+  check_hkey1_roundtrip(h, -1);
+}
+
+static void test_gf128_halve_to_h_edges(void) {
+  static const char *const hs[] = {
+      "80000000000000000000000000000000", // only the bit that triggers reduction
+      "00000000000000000000000000000001",
+      "00000000000000008000000000000000", // carry across the 64-bit lane boundary
+      "00000000000000010000000000000000",
+      "ffffffffffffffffffffffffffffffff",
+      "7fffffffffffffffffffffffffffffff",
+      "0123456789abcdeffedcba9876543210",
+  };
+  __u8 h[16];
+  for (unsigned i = 0; i < sizeof(hs) / sizeof(hs[0]); i++) {
+    hex_to_bytes(hs[i], h, 16);
+    check_hkey1_roundtrip(h, h[0] >> 7);
+  }
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -458,6 +555,10 @@ int main(void) {
   RUN_TEST(test_aes128_fips197);
   RUN_TEST(test_aes256_fips197);
   RUN_TEST(test_aes_recover_h);
+
+  printf("gf128_halve_to_h (OpenSSL AVX-512 / Go H recovery):\n");
+  RUN_TEST(test_gf128_halve_to_h_aes_keys);
+  RUN_TEST(test_gf128_halve_to_h_edges);
 
   printf("\n%d/%d tests passed.\n", tests_passed, tests_run);
   return 0;

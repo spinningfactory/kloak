@@ -1349,13 +1349,16 @@ func (m *TLSUprobeManager) pushTLSOffsets(pid int, cgroupID uint64, containerLib
 		// OpenSSL: read the version string, look up the 3-/4-hop chain offsets.
 		if version, offsets, err := DetectOpenSSLVersion(pid, libPath); err == nil {
 			val := bpfTLSOffsets{
-				SSLToWRL:       offsets.SSLToWRL,
-				WRLToEncCtx:    offsets.WRLToEncCtx,
-				EncCtxToAlgctx: offsets.EncCtxToAlgctx,
-				AlgctxToH:      offsets.AlgctxToH,
-				SSLToVersion:   offsets.SSLToVersion,
-				SSLToWBIO:      offsets.SSLToWBIO,
-				TLSLib:         bpfTLSLibOpenSSL,
+				SSLToWRL:              offsets.SSLToWRL,
+				WRLToEncCtx:           offsets.WRLToEncCtx,
+				EncCtxToAlgctx:        offsets.EncCtxToAlgctx,
+				AlgctxToH:             offsets.AlgctxToH,
+				SSLToVersion:          offsets.SSLToVersion,
+				SSLToWBIO:             offsets.SSLToWBIO,
+				TLSLib:                bpfTLSLibOpenSSL,
+				OsslAlgctxToGCMKey:    offsets.AlgctxToGCMKey,
+				OsslAlgctxToKS:        offsets.AlgctxToKeySched,
+				OsslAlgctxToVAESHKey1: offsets.AlgctxToVAESHKey1,
 			}
 			m.pushOffsetVal(val, cgroupID, exeInode)
 			m.log.Debugw("Pushed TLS offsets for XOR-patch path",
@@ -1412,6 +1415,10 @@ type bpfTLSOffsets struct {
 	BsslSSLToS3      uint32
 	BsslS3ToAEAD     uint32
 	BsslAEADToAESKey uint32
+	// OpenSSL GCM gate + AVX-512 HashKey_1 recovery (see ossl_read_gcm_h).
+	OsslAlgctxToGCMKey    uint32
+	OsslAlgctxToKS        uint32
+	OsslAlgctxToVAESHKey1 uint32
 }
 
 // pushOffsetVal writes the offsets for this binary (keyed by exe inode) plus a
@@ -1899,6 +1906,7 @@ var debugCounterNames = []string{
 	"h_extract_live_walk",
 	"bssl_reached", "bssl_h_ok",
 	"bssl_s3_null", "bssl_aead_null", "bssl_rdkey_fail", "bssl_rounds_bad", "bssl_hzero",
+	"openssl_gcm_gate_fail", "openssl_h_from_hkey1",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

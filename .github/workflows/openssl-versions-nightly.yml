@@ -194,6 +194,14 @@ jobs:
           sudo apt-get install -y clang llvm libbpf-dev
           KVER="$(uname -r)" && sudo apt-get install -y linux-tools-common "linux-tools-${KVER}" 2>/dev/null || true
 
+      # Diagnostic only: on runners with these CPU features OpenSSL >= 3.1
+      # takes its AVX-512 GCM path (raw H never written; see ossl_read_gcm_h),
+      # so record them to correlate any OpenSSL rewrite failure with the CPU.
+      - name: Log CPU features
+        run: |
+          grep -m1 'model name' /proc/cpuinfo || true
+          echo "AVX-512 GCM features: $(grep -owE 'avx512f|avx512dq|avx512bw|avx512vl|vaes|vpclmulqdq' /proc/cpuinfo | sort -u | tr '\n' ' ')"
+
       - name: Generate eBPF bindings
         run: KLOAK_TARGET_ARCH=x86 go generate ./pkg/ebpf/
 
