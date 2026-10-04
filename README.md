@@ -21,12 +21,12 @@
 
 ---
 
-Kloak transparently intercepts outbound TLS traffic in Kubernetes using eBPF uprobes, replacing hashed placeholders with real secrets at the kernel level before encryption. Applications never handle actual credentials, and no sidecars or code changes are required.
+Kloak transparently intercepts outbound TLS traffic in Kubernetes using eBPF uprobes, replacing placeholders with real secrets in-kernel by patching the encrypted TLS record on its way out of the pod. Applications never handle actual credentials, and no sidecars or code changes are required.
 
 ## Features
 
 - **No code changes** -- No SDK, no library, no application modifications. Mount a secret, make HTTPS requests, and Kloak handles the rest.
-- **Secret isolation** -- Applications only see hashed shadow values (`kl::<UUID>`). Real secrets exist solely in eBPF maps and are injected in-kernel at TLS write time.
+- **Secret isolation** -- Applications only see random shadow values (`kl::…`, same length as the real value). The real value is never written into the pod's memory; it is XOR-patched into the AES-GCM ciphertext in-kernel.
 - **Zero overhead** -- eBPF uprobes operate in kernel space with negligible latency impact. No userspace proxy or sidecar in the data path.
 - **Kubernetes native** -- Works with standard Kubernetes Secrets. Enable with a single label.
 - **Host and IP filtering** -- Secrets annotated with `getkloak.io/hosts` are only sent to specific destination hostnames or IP addresses, preventing exfiltration to unauthorized servers.
@@ -37,7 +37,7 @@ Kloak transparently intercepts outbound TLS traffic in Kubernetes using eBPF upr
 
 ### Prerequisites
 
-- Kubernetes cluster (1.28+) with Linux kernel 5.17+
+- Kubernetes cluster (1.28+) with Linux kernel 6.6+ (`bpf_loop` needs 5.17; the tc patch program attaches via TCX, which needs 6.6)
 - [Helm](https://helm.sh/docs/intro/install/) 3.12+
 - `kubectl` configured with cluster access
 
