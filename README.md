@@ -37,7 +37,7 @@ Kloak transparently intercepts outbound TLS traffic in Kubernetes using eBPF upr
 
 ### Prerequisites
 
-- Kubernetes cluster (1.28+) with Linux kernel 6.6+ (`bpf_loop` needs 5.17; the tc patch program attaches via TCX, which needs 6.6)
+- Kubernetes cluster (1.28+) with Linux kernel 5.17+
 - [Helm](https://helm.sh/docs/intro/install/) 3.12+
 - `kubectl` configured with cluster access
 
