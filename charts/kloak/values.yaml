@@ -1,5 +1,7 @@
-# Install: helm install kloak oci://ghcr.io/spinningfactory/kloak/kloak -n kloak-system --create-namespace
-# With demo: helm install kloak oci://ghcr.io/spinningfactory/kloak/kloak -n kloak-system --create-namespace --set demo.enabled=true
+# Install:
+#   helm repo add kloak https://chart.getkloak.io && helm repo update
+#   helm install kloak kloak/kloak -n kloak-system --create-namespace
+# With demo: helm install kloak kloak/kloak -n kloak-system --create-namespace --set demo.enabled=true
 
 image:
   repository: ghcr.io/spinningfactory/kloak
@@ -75,7 +77,7 @@ coverage:
   hostPath: /tmp/kloak-coverage
 
 # Optional demo app deployment for validating kloak is working.
-# Enable with: helm install kloak charts/kloak --set demo.enabled=true
+# Enable with: helm install kloak kloak/kloak -n kloak-system --create-namespace --set demo.enabled=true
 #
 # Deploys a Go app that sends two secrets to httpbin.org as headers.
 # DNS host filtering (via kube-dns, auto-discovered) verifies that

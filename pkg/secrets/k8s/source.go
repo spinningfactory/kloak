@@ -7,6 +7,7 @@ package k8s
 import (
 	"context"
 	"fmt"
+	"sort"
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
@@ -28,6 +29,28 @@ const (
 
 	ShadowSecretSuffix = "-kloak"
 )
+
+// filterAnnotations are the destination filters that are only honored
+// as annotations. Hostnames and port specs are also valid label values,
+// so `kubectl label secret foo getkloak.io/hosts=api.example.com` is
+// accepted by the apiserver even though nothing reads it.
+var filterAnnotations = []string{AnnotationHosts, AnnotationPort}
+
+// MisplacedFilterLabels returns the destination-filter keys (hosts,
+// port) that are set as labels instead of annotations, sorted. A filter
+// set as a label is ignored, and an ignored filter means the secret may
+// be sent to any destination, so callers must treat a non-empty result
+// as a misconfiguration and fail closed rather than proceed unfiltered.
+func MisplacedFilterLabels(labels map[string]string) []string {
+	var out []string
+	for _, k := range filterAnnotations {
+		if _, ok := labels[k]; ok {
+			out = append(out, k)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
 
 // Source implements secrets.Source by listing enabled and managed
 // Secrets from a controller-runtime client and joining them in memory.
@@ -94,6 +117,19 @@ func (s *Source) Snapshot(ctx context.Context) ([]secrets.Secret, error) {
 			continue
 		}
 
+		// Fail closed: a filter set as a label would otherwise be
+		// dropped and the secret synced with no destination restriction.
+		// Skipping it means the app sends the placeholder, not the real
+		// value. The validating webhook rejects this at admission; this
+		// covers clusters where the webhook is missing or bypassed.
+		if misplaced := MisplacedFilterLabels(en.Labels); len(misplaced) > 0 {
+			if s.log != nil {
+				s.log.Errorw("skipping secret: destination filter set as a label, must be an annotation",
+					"namespace", en.Namespace, "secret", en.Name, "labels", misplaced)
+			}
+			continue
+		}
+
 		host, ip := secrets.ParseHost(en.Annotations[AnnotationHosts])
 		var port uint16
 		var proto uint8
@@ -105,6 +141,10 @@ func (s *Source) Snapshot(ctx context.Context) ([]secrets.Secret, error) {
 				// Bad annotation falls back to wildcard rather than failing
 				// the whole snapshot. Surface it via the optional logger so
 				// the operator can find and fix the manifest.
+				//
+				// TODO: this fails open (any port) when the validating
+				// webhook is not installed. Skip the secret instead, like
+				// MisplacedFilterLabels does, once callers can tolerate it.
 				s.log.Warnw("invalid port annotation, treating as wildcard",
 					"namespace", en.Namespace, "secret", en.Name,
 					"annotation", AnnotationPort, "value", raw, "error", err)
