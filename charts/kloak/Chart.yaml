@@ -6,7 +6,7 @@ version: 0.1.0
 appVersion: "0.1.0"
 home: https://getkloak.io
 sources:
-  - https://github.com/getkloak/kloak
+  - https://github.com/spinningfactory/kloak
 keywords:
   - kubernetes
   - ebpf
