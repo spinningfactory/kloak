@@ -76,13 +76,19 @@ func TestOpensslOffsetTable_SSLToWBIO(t *testing.T) {
 type opensslReferenceJSON struct {
 	OpenSSLVersion string `json:"openssl_version"`
 	Arch           string `json:"arch"`
-	KloakConfig    struct {
-		SSLToWRL       *uint32 `json:"SSLToWRL"`
-		WRLToEncCtx    *uint32 `json:"WRLToEncCtx"`
-		EncCtxToAlgctx *uint32 `json:"EncCtxToAlgctx"`
-		AlgctxToH      *uint32 `json:"AlgctxToH"`
-		SSLToVersion   *uint32 `json:"SSLToVersion"`
-		SSLToWBIO      *uint32 `json:"SSLToWBIO"`
+	// VAESHKey1Status is "ok", "not_applicable" (no AVX-512 GCM path) or
+	// "unrecognized" (asm layout changed — HashKey_1 recovery disabled).
+	VAESHKey1Status string `json:"vaes_hkey1_status"`
+	KloakConfig     struct {
+		SSLToWRL          *uint32 `json:"SSLToWRL"`
+		WRLToEncCtx       *uint32 `json:"WRLToEncCtx"`
+		EncCtxToAlgctx    *uint32 `json:"EncCtxToAlgctx"`
+		AlgctxToH         *uint32 `json:"AlgctxToH"`
+		SSLToVersion      *uint32 `json:"SSLToVersion"`
+		SSLToWBIO         *uint32 `json:"SSLToWBIO"`
+		AlgctxToGCMKey    *uint32 `json:"AlgctxToGCMKey"`
+		AlgctxToKeySched  *uint32 `json:"AlgctxToKeySched"`
+		AlgctxToVAESHKey1 *uint32 `json:"AlgctxToVAESHKey1"`
 	} `json:"kloak_config"`
 }
 
@@ -144,8 +150,30 @@ func TestOpenSSLOffsets_AgainstReferenceJSON(t *testing.T) {
 
 			if ref.KloakConfig.SSLToWRL == nil || ref.KloakConfig.WRLToEncCtx == nil ||
 				ref.KloakConfig.EncCtxToAlgctx == nil || ref.KloakConfig.AlgctxToH == nil ||
-				ref.KloakConfig.SSLToVersion == nil || ref.KloakConfig.SSLToWBIO == nil {
+				ref.KloakConfig.SSLToVersion == nil || ref.KloakConfig.SSLToWBIO == nil ||
+				ref.KloakConfig.AlgctxToGCMKey == nil || ref.KloakConfig.AlgctxToKeySched == nil ||
+				ref.KloakConfig.AlgctxToVAESHKey1 == nil {
 				t.Fatalf("one or more offsets are null/missing in reference JSON %s — re-run discovery", base)
+			}
+
+			// The data plane inverts HashKey_1 only for the AVX-512 GCM layout
+			// discovery verified; anything else must keep recovery disabled.
+			switch ref.VAESHKey1Status {
+			case "ok":
+				if *ref.KloakConfig.AlgctxToVAESHKey1 == 0 {
+					t.Errorf("vaes_hkey1_status=ok but AlgctxToVAESHKey1=0 in %s", base)
+				}
+			case "not_applicable":
+				if *ref.KloakConfig.AlgctxToVAESHKey1 != 0 {
+					t.Errorf("vaes_hkey1_status=not_applicable but AlgctxToVAESHKey1=%d in %s", *ref.KloakConfig.AlgctxToVAESHKey1, base)
+				}
+			case "unrecognized":
+				t.Errorf("%s: OpenSSL's AVX-512 GCM layout was not recognised by discovery, so "+
+					"HashKey_1 recovery is disabled and OpenSSL %s cannot be rewritten on AVX-512+VAES CPUs. "+
+					"Review crypto/modes/asm/aes-gcm-avx512.pl against gf128_halve_to_h and update "+
+					"tools/openssl-offsets/extract_offsets.sh", base, version)
+			default:
+				t.Errorf("unexpected vaes_hkey1_status %q in %s — re-run discovery", ref.VAESHKey1Status, base)
 			}
 
 			if entry.SSLToWRL != *ref.KloakConfig.SSLToWRL {
@@ -171,7 +199,31 @@ func TestOpenSSLOffsets_AgainstReferenceJSON(t *testing.T) {
 			if entry.SSLToWBIO != *ref.KloakConfig.SSLToWBIO {
 				t.Errorf("SSLToWBIO mismatch: table=%d ref=%d", entry.SSLToWBIO, *ref.KloakConfig.SSLToWBIO)
 			}
+			if entry.AlgctxToGCMKey != *ref.KloakConfig.AlgctxToGCMKey {
+				t.Errorf("AlgctxToGCMKey mismatch: table=%d ref=%d", entry.AlgctxToGCMKey, *ref.KloakConfig.AlgctxToGCMKey)
+			}
+			if entry.AlgctxToKeySched != *ref.KloakConfig.AlgctxToKeySched {
+				t.Errorf("AlgctxToKeySched mismatch: table=%d ref=%d", entry.AlgctxToKeySched, *ref.KloakConfig.AlgctxToKeySched)
+			}
+			if entry.AlgctxToVAESHKey1 != *ref.KloakConfig.AlgctxToVAESHKey1 {
+				t.Errorf("AlgctxToVAESHKey1 mismatch: table=%d ref=%d", entry.AlgctxToVAESHKey1, *ref.KloakConfig.AlgctxToVAESHKey1)
+			}
 		})
+	}
+}
+
+// TestOpensslOffsetTable_GCMGate checks the invariants ossl_read_gcm_h relies
+// on: every row is gated (so garbage at AlgctxToH in a non-GCM context is never
+// taken for H), and HashKey_1 recovery is only enabled behind that gate.
+func TestOpensslOffsetTable_GCMGate(t *testing.T) {
+	for v, o := range opensslOffsetTable {
+		if o.AlgctxToGCMKey == 0 || o.AlgctxToKeySched == 0 {
+			t.Errorf("%s: GCM gate offsets not calibrated (AlgctxToGCMKey=%d AlgctxToKeySched=%d)",
+				v, o.AlgctxToGCMKey, o.AlgctxToKeySched)
+		}
+		if o.AlgctxToGCMKey == o.AlgctxToH || o.AlgctxToVAESHKey1 == o.AlgctxToH {
+			t.Errorf("%s: gate/HashKey_1 offset aliases the raw H field (%d)", v, o.AlgctxToH)
+		}
 	}
 }
 

@@ -2,6 +2,7 @@
   "openssl_version": "OpenSSL 3.0.16 11 Feb 2025",
   "arch": "aarch64",
   "chain": "3-hop",
+  "vaes_hkey1_status": "not_applicable",
   "offsets": {
     "ssl_to_wrl": null,
     "ssl_to_enc_write_ctx": 2168,
@@ -10,6 +11,11 @@
     "algctx_to_gcm": 248,
     "gcm128_h_offset": 80,
     "algctx_to_h": 328,
+    "gcm128_key_offset": 384,
+    "gcm128_htable_offset": 96,
+    "algctx_to_gcm_key": 632,
+    "algctx_to_ks": 704,
+    "algctx_to_vaes_hkey1": 0,
     "ssl_to_version": 0,
     "ssl_to_wbio": 24
   },
@@ -25,6 +31,9 @@
     "EncCtxToAlgctx": 168,
     "AlgctxToH": 328,
     "SSLToVersion": 0,
-    "SSLToWBIO": 24
+    "SSLToWBIO": 24,
+    "AlgctxToGCMKey": 632,
+    "AlgctxToKeySched": 704,
+    "AlgctxToVAESHKey1": 0
   }
 }

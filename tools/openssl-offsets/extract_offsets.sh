@@ -89,6 +89,138 @@ if [ -n "$ALGCTX_TO_GCM" ] && [ -n "$GCM128_H_OFFSET" ]; then
     ALGCTX_TO_H=$((ALGCTX_TO_GCM + GCM128_H_OFFSET))
 fi
 
+# ---------------------------------------------------------------------------
+# GCM self-pointer gate + AVX-512 HashKey_1 (issue #275), consumed by
+# ossl_read_gcm_h in pkg/ebpf/bpf/tls_uprobe.c.
+# ---------------------------------------------------------------------------
+
+# Like get_offset, but for a member declared as an inline union/struct: pahole
+# prints the members of `union { ... } ks;` first, so the offset of the member
+# itself is on its closing `} ks;` line.
+get_offset_closing() {
+    local obj="$1" struct="$2" field="$3"
+    pahole -C "$struct" "$obj" 2>/dev/null | \
+        grep -E "^[[:space:]]*}[[:space:]]*${field};" | head -1 | \
+        sed -n 's|.*/\*[[:space:]]*\([0-9]*\)[[:space:]].*\*/|\1|p' | tr -d ' '
+}
+
+# GCM128_CONTEXT.key: every keyed OpenSSL GCM context points it at its own
+# PROV_AES_GCM_CTX.ks (CRYPTO_gcm128_init / vaes_gcm_setkey).
+GCM128_KEY_OFFSET=$(get_offset "$MODES_OBJ" "gcm128_context" "key")
+GCM128_HTABLE_OFFSET=$(get_offset "$MODES_OBJ" "gcm128_context" "Htable")
+ALGCTX_TO_GCM_KEY=""
+if [ -n "$ALGCTX_TO_GCM" ] && [ -n "$GCM128_KEY_OFFSET" ]; then
+    ALGCTX_TO_GCM_KEY=$((ALGCTX_TO_GCM + GCM128_KEY_OFFSET))
+fi
+
+# PROV_AES_GCM_CTX.ks — looked up in the AES-GCM objects specifically (the
+# shared PROV_OBJ glob above may resolve to ciphercommon_gcm.o). The union
+# follows the PROV_GCM_CTX base at its 8-byte alignment; anything else means
+# the layout changed, so emit null and fail loudly.
+AES_GCM_OBJ=$(find . -name '*cipher_aes_gcm.o' -o -name '*cipher_aes_gcm_hw.o' | head -1)
+ALGCTX_TO_KS=""
+if [ -n "$AES_GCM_OBJ" ]; then
+    ALGCTX_TO_KS=$(get_offset_closing "$AES_GCM_OBJ" "prov_aes_gcm_ctx_st" "ks")
+fi
+SIZEOF_PROV_GCM_FOR_KS=$(get_sizeof "$PROV_OBJ" "prov_gcm_ctx_st" 2>/dev/null)
+if [ -n "$ALGCTX_TO_KS" ] && [ -n "$SIZEOF_PROV_GCM_FOR_KS" ] && \
+   [ "$ALGCTX_TO_KS" -ne $(( (SIZEOF_PROV_GCM_FOR_KS + 7) / 8 * 8 )) ]; then
+    echo "WARNING: PROV_AES_GCM_CTX.ks at $ALGCTX_TO_KS, expected right after the ${SIZEOF_PROV_GCM_FOR_KS}-byte PROV_GCM_CTX" >&2
+    ALGCTX_TO_KS=""
+fi
+
+# HashKey_1 — OpenSSL >= 3.1 on x86-64 with AVX-512 + VAES + VPCLMULQDQ runs
+# vaes_gcm, which never writes GCM128_CONTEXT.H; ossl_aes_gcm_init_avx512
+# stores HashKey_1 = bswap128(H)<<1 mod POLY in Htable instead, and the data
+# plane inverts it. That inversion is only correct for the exact layout and
+# transform checked below, so the offset is emitted only when every check
+# passes; otherwise 0 (recovery disabled) with status "unrecognized", which
+# fails TestOpenSSLOffsets_AgainstReferenceJSON until a human reviews it. The
+# checks read sources, not built objects, so both arches agree.
+AVX512_PL=crypto/modes/asm/aes-gcm-avx512.pl
+AESNI_INC=providers/implementations/ciphers/cipher_aes_gcm_hw_aesni.inc
+VAES_INC=providers/implementations/ciphers/cipher_aes_gcm_hw_vaes_avx512.inc
+
+# The instruction sequence (comments and whitespace stripped) between
+# HashKey = AES_K(0) and the HashKey_1 store that gf128_halve_to_h inverts.
+VAES_HKEY1_EXPECTED_ASM='vpshufb SHUF_MASK(%rip),%xmm16,%xmm16
+vmovdqa64 %xmm16,%xmm2
+vpsllq \$1,%xmm16,%xmm16
+vpsrlq \$63,%xmm2,%xmm2
+vmovdqa %xmm2,%xmm1
+vpslldq \$8,%xmm2,%xmm2
+vpsrldq \$8,%xmm1,%xmm1
+vporq %xmm2,%xmm16,%xmm16
+vpshufd \$0b00100100,%xmm1,%xmm2
+vpcmpeqd TWOONE(%rip),%xmm2,%xmm2
+vpand POLY(%rip),%xmm2,%xmm2
+vpxorq %xmm2,%xmm16,%xmm16
+vmovdqu64 %xmm16,@{[HashKeyByIdx(1,$arg2)]}'
+
+# Prints "<HashKey_1 offset in GCM128_CONTEXT> <asm Htable offset>" when the
+# tree matches; returns non-zero (printing the reason to stderr) otherwise.
+vaes_hkey1_offset() {
+    # (a) The x86 dispatch still chooses only between these three GCM paths.
+    dispatch=$(sed -n '/^const PROV_GCM_HW \*ossl_prov_aes_hw_gcm/,/^}/p' "$AESNI_INC" | \
+        grep -o 'return &[a-z_]*' | sed 's/return &//' | LC_ALL=C sort -u | tr '\n' ' ')
+    if [ "$dispatch" != "aes_gcm aesni_gcm vaes_gcm " ]; then
+        echo "hkey1: unexpected GCM dispatch: $dispatch" >&2; return 1
+    fi
+    # (b) vaes_gcm_setkey zeroes the context and leaves H to the asm.
+    setkey=$(sed -n '/^static int vaes_gcm_setkey/,/^}/p' "$VAES_INC")
+    for want in 'memset(gcmctx, 0, sizeof(*gcmctx));' 'gcmctx->key = ks;' \
+                'ossl_aes_gcm_init_avx512(ks, gcmctx);'; do
+        if ! printf '%s\n' "$setkey" | grep -qF "$want"; then
+            echo "hkey1: vaes_gcm_setkey lacks: $want" >&2; return 1
+        fi
+    done
+    # (c) HashKey = AES_K(0), then exactly the expected transform and store.
+    init=$(awk '/^ossl_aes_gcm_init_avx512:/{f=1} f{print} f&&/^\.Labort_init:/{exit}' "$AVX512_PL")
+    if ! printf '%s\n' "$init" | grep -qE '"vpxorq[[:space:]]+%xmm16,%xmm16,%xmm16' || \
+       ! printf '%s\n' "$init" | grep -qF 'ENCRYPT_SINGLE_BLOCK("$arg1", "%xmm16"'; then
+        echo "hkey1: HashKey is no longer AES_K(0) of a zeroed xmm16" >&2; return 1
+    fi
+    asm=$(printf '%s\n' "$init" | \
+        awk '/vpshufb[[:space:]]+SHUF_MASK\(%rip\),%xmm16,%xmm16/{p=1} p{print} p&&/HashKeyByIdx\(1,/{exit}' | \
+        sed 's/#.*//' | tr -s ' \t' ' ' | sed 's/^ //;s/ $//' | grep -v '^$')
+    if [ "$asm" != "$VAES_HKEY1_EXPECTED_ASM" ]; then
+        echo "hkey1: HashKey_1 precompute differs from the inverted transform" >&2; return 1
+    fi
+    # (d) The constants that transform depends on.
+    grep -qE '^POLY:[[:space:]]+\.quad[[:space:]]+0x0000000000000001,[[:space:]]*0xC200000000000000[[:space:]]*$' "$AVX512_PL" && \
+    grep -qE '^TWOONE:[[:space:]]+\.quad[[:space:]]+0x0000000000000001,[[:space:]]*0x0000000100000000[[:space:]]*$' "$AVX512_PL" && \
+    grep -A1 '^SHUF_MASK:' "$AVX512_PL" | grep -qE '\.quad[[:space:]]+0x08090A0B0C0D0E0F,[[:space:]]*0x0001020304050607' || {
+        echo "hkey1: POLY/TWOONE/SHUF_MASK constants changed" >&2; return 1; }
+    # (e) Evaluate the asm's own HashKey_1 context offset.
+    perl -e '
+        my $src = do { local $/; <STDIN> };
+        my $code = "";
+        for my $n (qw(AES_BLOCK_SIZE HKEYS_CONTEXT_CAPACITY CTX_OFFSET_HTable)) {
+            $src =~ /^(my \$$n\s*=[^;]*;)/m or die "missing \$$n\n";
+            $code .= "$1\n";
+        }
+        $src =~ /^(sub HashKeyOffsetByIdx \{.*?^\})/ms or die "missing HashKeyOffsetByIdx\n";
+        $code .= "$1\nprint HashKeyOffsetByIdx(1, \"context\"), \" \", \$CTX_OFFSET_HTable, \"\\n\";\n";
+        eval $code; die $@ if $@;
+    ' < "$AVX512_PL"
+}
+
+ALGCTX_TO_VAES_HKEY1=0
+VAES_HKEY1_STATUS="not_applicable"   # no AVX-512 GCM path in this version (3.0)
+if [ -f "$AVX512_PL" ]; then
+    VAES_HKEY1_STATUS="unrecognized"
+    if offs=$(vaes_hkey1_offset); then
+        hkey1_in_gcm=${offs% *}
+        asm_htable=${offs#* }
+        if [ -n "$ALGCTX_TO_GCM" ] && [ "$asm_htable" = "$GCM128_HTABLE_OFFSET" ]; then
+            ALGCTX_TO_VAES_HKEY1=$((ALGCTX_TO_GCM + hkey1_in_gcm))
+            VAES_HKEY1_STATUS="ok"
+        else
+            echo "hkey1: asm Htable offset $asm_htable != pahole $GCM128_HTABLE_OFFSET" >&2
+        fi
+    fi
+fi
+
 # Chain type
 CHAIN="unknown"
 if [ -n "$SSL_TO_WRL" ] && [ -n "$WRL_TO_ENC_CTX" ]; then
@@ -108,6 +240,7 @@ cat <<EOF
   "openssl_version": "${OPENSSL_VERSION}",
   "arch": "${ARCH}",
   "chain": "${CHAIN}",
+  "vaes_hkey1_status": "${VAES_HKEY1_STATUS}",
   "offsets": {
     "ssl_to_wrl": ${SSL_TO_WRL:-null},
     "ssl_to_enc_write_ctx": ${SSL_TO_ENC_WRITE_CTX:-null},
@@ -116,6 +249,11 @@ cat <<EOF
     "algctx_to_gcm": ${ALGCTX_TO_GCM:-null},
     "gcm128_h_offset": ${GCM128_H_OFFSET:-null},
     "algctx_to_h": ${ALGCTX_TO_H:-null},
+    "gcm128_key_offset": ${GCM128_KEY_OFFSET:-null},
+    "gcm128_htable_offset": ${GCM128_HTABLE_OFFSET:-null},
+    "algctx_to_gcm_key": ${ALGCTX_TO_GCM_KEY:-null},
+    "algctx_to_ks": ${ALGCTX_TO_KS:-null},
+    "algctx_to_vaes_hkey1": ${ALGCTX_TO_VAES_HKEY1},
     "ssl_to_version": ${SSL_TO_VERSION:-null},
     "ssl_to_wbio": ${SSL_TO_WBIO:-null}
   },
@@ -136,7 +274,10 @@ fi)
     "EncCtxToAlgctx": ${ENC_CTX_TO_ALGCTX:-null},
     "AlgctxToH": ${ALGCTX_TO_H:-null},
     "SSLToVersion": ${SSL_TO_VERSION:-null},
-    "SSLToWBIO": ${SSL_TO_WBIO:-null}
+    "SSLToWBIO": ${SSL_TO_WBIO:-null},
+    "AlgctxToGCMKey": ${ALGCTX_TO_GCM_KEY:-null},
+    "AlgctxToKeySched": ${ALGCTX_TO_KS:-null},
+    "AlgctxToVAESHKey1": ${ALGCTX_TO_VAES_HKEY1}
   }
 }
 EOF

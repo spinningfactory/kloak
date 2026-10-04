@@ -56,8 +56,10 @@ for version in "${versions[@]}"; do
       -t "kloak-offsets:${version}-${arch}" \
       "$SCRIPT_DIR" 2>/dev/null; then
 
+      # stdout is the JSON; diagnostics (e.g. why the AVX-512 HashKey_1
+      # layout was not recognised) go to stderr so they can't corrupt it.
       docker run --rm --platform "$platform" \
-        "kloak-offsets:${version}-${arch}" > "$outfile" 2>&1
+        "kloak-offsets:${version}-${arch}" > "$outfile"
 
       echo "  Output: $outfile"
       cat "$outfile"
