@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"os"
@@ -99,7 +100,7 @@ type TLSUprobeManager struct {
 	// goroutine and PollExecEvents (incl. its retry goroutine), so unsynchronized
 	// appends could lose entries, double-write the backing array, or race Close().
 	linksMu sync.Mutex
-	links   []link.Link
+	links   []io.Closer // uprobe/kprobe/tracepoint/TCX links and clsact filters
 
 	// secretSource produces snapshots of the secrets the BPF map should
 	// hold. The k8s controller wires a pkg/secrets/k8s.Source here; tests
@@ -126,6 +127,8 @@ type TLSUprobeManager struct {
 	// host side, and patching it in-pod would expose the rewritten
 	// ciphertext to in-pod AF_PACKET capture (see attachTCEgress).
 	egressInterface string
+	// tcMode decides between TCX and the clsact fallback (tc_attach.go).
+	tcMode *tcModeResolver
 	// cgroupPaths maps cgroup inode ID -> filesystem path.
 	// Populated by TrackCgroup.
 	cgroupPaths sync.Map // uint64 -> string
@@ -347,6 +350,7 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		secretSource:    secretSource,
 		cgroupRoot:      cgroupRoot,
 		egressInterface: egressInterface,
+		tcMode:          newTCModeResolver(TCAttachAuto),
 	}
 
 	// Attach tracepoints for DNS interception and connect tracking.
@@ -418,6 +422,13 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	m.log.Debugw("Attached kprobe", "function", "tcp_sendmsg")
 
 	return nil
+}
+
+// SetTCAttachMode selects how the tc patch program is attached (see
+// TCAttachMode). Call it before any pod is tracked; the default is
+// TCAttachAuto.
+func (m *TLSUprobeManager) SetTCAttachMode(mode TCAttachMode) {
+	m.tcMode = newTCModeResolver(mode)
 }
 
 // attachTCEgress attaches the tc patch program where a container's outbound
@@ -553,7 +564,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	//
 	// Do NOT "simplify" this back to inline LockOSThread on the caller.
 	type tcResult struct {
-		links []link.Link
+		links []io.Closer
 		err   error
 	}
 	resultCh := make(chan tcResult, 1)
@@ -608,8 +619,9 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 		var legacy []*net.Interface
 
 		// Resolve and validate everything before attaching anything:
-		// link.AttachTCX stacks attachments, so a retry after a partial
-		// attach would double-attach the same program and corrupt GHASH.
+		// TCX stacks attachments, so a retry after a partial attach would
+		// double-attach the same program and corrupt GHASH. (The clsact
+		// fallback replaces a fixed-handle filter instead, see tc_attach.go.)
 		for _, ifName := range ifNames {
 			if ifName == "lo" {
 				// Loopback is deliberately not patched — see the
@@ -637,7 +649,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 		// Track links attached during this call locally. On a partial
 		// failure close them all and return; the caller won't splice
 		// them into m.links so a retry doesn't see a half-attached netns.
-		attachedHere := make([]link.Link, 0, len(peers)+len(legacy))
+		attachedHere := make([]io.Closer, 0, len(peers)+len(legacy))
 		closeOnFail := func() {
 			for _, prior := range attachedHere {
 				if cerr := prior.Close(); cerr != nil {
@@ -648,11 +660,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 
 		// Legacy fallback first, while still inside the container netns.
 		for _, iface := range legacy {
-			tcLink, err := link.AttachTCX(link.TCXOptions{
-				Interface: iface.Index,
-				Program:   m.objs.TcEgressPatch,
-				Attach:    ebpf.AttachTCXEgress,
-			})
+			tcLink, err := m.attachTCProgram(m.objs.TcEgressPatch, iface.Index, false, containerNS)
 			if err != nil {
 				closeOnFail()
 				resultCh <- tcResult{err: fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", iface.Name, iface.Index, pid, err)}
@@ -691,11 +699,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 				}
 			}
 			for _, p := range peers {
-				tcLink, err := link.AttachTCX(link.TCXOptions{
-					Interface: p.hostIfidx,
-					Program:   m.objs.TcEgressPatch,
-					Attach:    ebpf.AttachTCXIngress,
-				})
+				tcLink, err := m.attachTCProgram(m.objs.TcEgressPatch, p.hostIfidx, true, rootNS)
 				if err != nil {
 					closeOnFail()
 					resultCh <- tcResult{err: fmt.Errorf("attaching tc ingress to host veth ifindex %d (pod %s): %w", p.hostIfidx, p.ifName, err)}
@@ -738,7 +742,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	// unconditional Store would re-insert the entry and leak containerNS,
 	// since UntrackCgroup is the only place that closes the pinned netns fd.
 	// On a lost CAS, close containerNS directly and let Close() take down
-	// the TCX links via m.links at controller shutdown.
+	// the tc attachments via m.links at controller shutdown.
 	if haveIno {
 		finalEntry := &tcAttachEntry{netnsFd: containerNS}
 		if !m.tcAttached.CompareAndSwap(netnsIno, placeholder, finalEntry) {
@@ -1647,7 +1651,7 @@ func (m *TLSUprobeManager) Close() error {
 	if linkCount < workers {
 		workers = linkCount
 	}
-	jobs := make(chan link.Link, workers)
+	jobs := make(chan io.Closer, workers)
 	var wg sync.WaitGroup
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
