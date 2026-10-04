@@ -340,6 +340,79 @@ static void test_is_aes_gcm(void) {
 }
 
 // ============================================================================
+// tls_record_hdr_kind / tls_appdata_reclen_match (tc_egress record selection)
+// ============================================================================
+
+static void test_tls_hdr_appdata(void) {
+  const __u8 h[5] = {0x17, 0x03, 0x03, 0x00, 0x42};
+  __u32 len = 0;
+  assert(tls_record_hdr_kind(h, &len) == TLS_REC_APPDATA);
+  assert(len == 0x42);
+}
+
+static void test_tls_hdr_appdata_too_short(void) {
+  const __u8 h[5] = {0x17, 0x03, 0x03, 0x00, 16};
+  __u32 len = 0;
+  assert(tls_record_hdr_kind(h, &len) == TLS_REC_INVALID);
+}
+
+static void test_tls_hdr_ccs(void) {
+  const __u8 ok[5] = {0x14, 0x03, 0x03, 0x00, 0x01};
+  const __u8 bad[5] = {0x14, 0x03, 0x03, 0x00, 0x02};
+  __u32 len = 0;
+  assert(tls_record_hdr_kind(ok, &len) == TLS_REC_SKIPPABLE);
+  assert(len == 1);
+  assert(tls_record_hdr_kind(bad, &len) == TLS_REC_INVALID);
+}
+
+static void test_tls_hdr_handshake_and_alert(void) {
+  const __u8 hs[5] = {0x16, 0x03, 0x01, 0x05, 0x9b};
+  const __u8 alert[5] = {0x15, 0x03, 0x03, 0x00, 0x02};
+  const __u8 hs_short[5] = {0x16, 0x03, 0x03, 0x00, 0x03};
+  __u32 len = 0;
+  assert(tls_record_hdr_kind(hs, &len) == TLS_REC_SKIPPABLE);
+  assert(len == 0x59b);
+  assert(tls_record_hdr_kind(alert, &len) == TLS_REC_SKIPPABLE);
+  assert(tls_record_hdr_kind(hs_short, &len) == TLS_REC_INVALID);
+}
+
+static void test_tls_hdr_rejects_garbage(void) {
+  const __u8 bad_type[5] = {0x42, 0x03, 0x03, 0x00, 0x42};
+  const __u8 bad_major[5] = {0x17, 0x02, 0x03, 0x00, 0x42};
+  const __u8 bad_minor[5] = {0x17, 0x03, 0x04, 0x00, 0x42};
+  const __u8 too_long[5] = {0x17, 0x03, 0x03, 0x48, 0x01}; // 18433
+  const __u8 max_len[5] = {0x17, 0x03, 0x03, 0x48, 0x00};  // 18432
+  __u32 len = 0;
+  assert(tls_record_hdr_kind(bad_type, &len) == TLS_REC_INVALID);
+  assert(tls_record_hdr_kind(bad_major, &len) == TLS_REC_INVALID);
+  assert(tls_record_hdr_kind(bad_minor, &len) == TLS_REC_INVALID);
+  assert(tls_record_hdr_kind(too_long, &len) == TLS_REC_INVALID);
+  assert(tls_record_hdr_kind(max_len, &len) == TLS_REC_APPDATA);
+}
+
+static void test_tls_reclen_match_known_nonce(void) {
+  __u32 n = 0xAA;
+  assert(tls_appdata_reclen_match(49 + 17, 49, 0, &n) == 1 && n == 0);
+  assert(tls_appdata_reclen_match(49 + 24, 49, 0, &n) == 0);
+  assert(tls_appdata_reclen_match(49 + 24, 49, 8, &n) == 1 && n == 8);
+  assert(tls_appdata_reclen_match(49 + 17, 49, 8, &n) == 0);
+}
+
+static void test_tls_reclen_match_unknown_nonce(void) {
+  __u32 n = 0xAA;
+  assert(tls_appdata_reclen_match(49 + 17, 49, TLS_NONCE_UNKNOWN, &n) == 1 && n == 0);
+  assert(tls_appdata_reclen_match(49 + 24, 49, TLS_NONCE_UNKNOWN, &n) == 1 && n == 8);
+  // Encrypted TLS 1.3 Finished coalesced ahead of the write must not match.
+  assert(tls_appdata_reclen_match(69, 49, TLS_NONCE_UNKNOWN, &n) == 0);
+}
+
+static void test_tls_reclen_match_zero_plaintext(void) {
+  __u32 n = 0xAA;
+  assert(tls_appdata_reclen_match(17, 0, TLS_NONCE_UNKNOWN, &n) == 0);
+  assert(n == 0xAA);
+}
+
+// ============================================================================
 // AES (H recovery for BoringSSL)
 // ============================================================================
 
@@ -550,6 +623,16 @@ int main(void) {
   RUN_TEST(test_gf128_h_power_3);
   RUN_TEST(test_gf128_h_power_table);
   RUN_TEST(test_is_aes_gcm);
+
+  printf("tls record framing (tc_egress):\n");
+  RUN_TEST(test_tls_hdr_appdata);
+  RUN_TEST(test_tls_hdr_appdata_too_short);
+  RUN_TEST(test_tls_hdr_ccs);
+  RUN_TEST(test_tls_hdr_handshake_and_alert);
+  RUN_TEST(test_tls_hdr_rejects_garbage);
+  RUN_TEST(test_tls_reclen_match_known_nonce);
+  RUN_TEST(test_tls_reclen_match_unknown_nonce);
+  RUN_TEST(test_tls_reclen_match_zero_plaintext);
 
   printf("aes (BoringSSL H recovery):\n");
   RUN_TEST(test_aes128_fips197);

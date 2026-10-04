@@ -3062,6 +3062,15 @@ int tp_sched_process_exit(struct trace_event_raw_sched_process_template *ctx) {
 // The encrypted real secret NEVER exists in user-space memory.
 // =============================================================================
 
+// Max non-application_data records (CCS / handshake / alert) skipped at the
+// start of a segment before the first application_data record. 4 covers a
+// TLS 1.2 client's ClientKeyExchange + CCS + Finished and a TLS 1.3 client's
+// CCS + Finished with headroom.
+#define TC_MAX_LEADING_RECORDS 4
+// Max records examined after the first application_data record when looking
+// for the one carrying the staged SSL_write.
+#define TC_MAX_SCAN_RECORDS 4
+
 SEC("tc")
 int tc_egress_patch(struct __sk_buff *skb) {
   dbg_inc(DBG_TC_ENTRY);
@@ -3165,27 +3174,36 @@ int tc_egress_patch(struct __sk_buff *skb) {
     }
   }
 
-  // Check TLS application_data (cheap, no map lookup).
+  // Check TLS record framing (cheap, no map lookup).
   if (payload_len < 5)
     return 0 /* TC_ACT_OK */;
 
-  __u8 tls_hdr[5];
-  if (bpf_skb_load_bytes(skb, payload_off, tls_hdr, 5) < 0)
-    return 0 /* TC_ACT_OK */;
-#ifdef KLOAK_DEBUG
-  bpf_printk("kloak tc tls_hdr=%x ver=%x%x plen=%u", tls_hdr[0], tls_hdr[1], tls_hdr[2], payload_len);
-#endif
-  // Validate TLS application_data record:
-  //   byte 0: content type must be 0x17
-  //   bytes 1-2: version must be 0x0301..0x0303 (TLS 1.0-1.3)
-  //   bytes 3-4: record_len must be sane (> 24 for TLS 1.2 AES-GCM minimum)
-  // This rejects TCP continuation segments where random ciphertext bytes
-  // coincidentally start with 0x17 (1/256 without version check → ~1/5.6M with).
-  if (tls_hdr[0] != 0x17 || tls_hdr[1] != 0x03 || tls_hdr[2] > 0x03)
-    return 0 /* TC_ACT_OK */;
+  // Offset of the TCP payload; ghash_record_tcp_off below is relative to it.
+  __u32 tcp_payload_start = payload_off;
 
-  __u16 record_len = ((__u16)tls_hdr[3] << 8) | (__u16)tls_hdr[4];
-  if (record_len < 17) // minimum: 0 plaintext + 1 content_type + 16 tag (TLS 1.3)
+  // Locate the first application_data record in the segment. A TLS stack may
+  // flush non-application records in the same write as the first
+  // application_data record — a TLS 1.3 client sends ChangeCipherSpec +
+  // encrypted Finished + its first application write as one segment (Bun
+  // >= 1.4.1 does this) — so skip leading CCS / handshake / alert records.
+  // Every header must still validate as a record boundary (version + per-type
+  // length bounds, see tls_record_hdr_kind), which rejects TCP continuation
+  // segments whose ciphertext bytes happen to resemble a header.
+  __u8 tls_hdr[5];
+  __u32 record_len = 0;
+  int rec_kind = TLS_REC_INVALID;
+  for (__u32 i = 0; i <= TC_MAX_LEADING_RECORDS; i++) {
+    if (bpf_skb_load_bytes(skb, payload_off, tls_hdr, 5) < 0)
+      return 0 /* TC_ACT_OK */;
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak tc tls_hdr=%x ver=%x%x plen=%u", tls_hdr[0], tls_hdr[1], tls_hdr[2], payload_len);
+#endif
+    rec_kind = tls_record_hdr_kind(tls_hdr, &record_len);
+    if (rec_kind != TLS_REC_SKIPPABLE)
+      break;
+    payload_off += 5 + record_len;
+  }
+  if (rec_kind != TLS_REC_APPDATA)
     return 0 /* TC_ACT_OK */;
 
   // Now that we know this is a valid TLS application_data record, look up
@@ -3227,51 +3245,55 @@ int tc_egress_patch(struct __sk_buff *skb) {
   // --- Determine nonce_len from tls_conn_state (authoritative) ---
   // TLS 1.3 has no explicit nonce (nonce_len=0); TLS 1.2 has 8-byte nonce.
   // The nonce_len was set during H extraction from the connection struct
-  // (Go Conn.vers or OpenSSL SSL_CONNECTION.version).
-  __u32 nonce_len = 8; // default: TLS 1.2
+  // (Go Conn.vers or OpenSSL SSL_CONNECTION.version). TLS libraries without a
+  // known version offset (OpenSSL versions without ssl_to_version, BoringSSL
+  // in Bun) store 0xFF; the record-length match below then decides.
+  __u32 nonce_len = TLS_NONCE_UNKNOWN;
   {
     struct tls_conn_key ck = {};
     ck.tgid = pending->tgid;
     ck.ssl_ptr = pending->ssl_ptr;
     struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &ck);
-    if (conn && conn->nonce_len != 0xFF)
+    if (conn && conn->nonce_len != TLS_NONCE_UNKNOWN)
       nonce_len = conn->nonce_len;
-    else {
-      // Fallback for OpenSSL (nonce_len=0xFF) or missing conn state:
-      // use plaintext_len heuristic (legacy behavior).
-      __u32 pt = pending->plaintext_len;
-      if (pt > 0 && record_len == pt + 17)
-        nonce_len = 0; // TLS 1.3
-    }
   }
 
-  // --- Scan forward to find the correct TLS record ---
-  // When TCP coalesces multiple TLS records into one segment, the first
-  // record's header may not be the patched one. Use the known nonce_len
-  // and plaintext_len to compute the exact expected record_len.
+  // --- Find the record that carries the staged SSL_write ---
+  // A segment may hold several application_data records (in TLS 1.3 the
+  // encrypted Finished is application_data on the wire too), so the first one
+  // is not necessarily ours. The record whose length exactly fits
+  // plaintext_len (under the known nonce_len, or either TLS 1.2/1.3 layout
+  // when unknown) is the one to patch, and its layout fixes nonce_len.
   __u32 pt_len = pending->plaintext_len;
-  __u32 expected_reclen = (nonce_len == 0)
-      ? pt_len + 17   // TLS 1.3: pt + 1 (content_type) + 16 (tag)
-      : pt_len + 24;  // TLS 1.2: pt + 8 (nonce) + 16 (tag)
-
-  __u32 tcp_payload_start = payload_off; // save before forward scan
-  if (pt_len > 0 && record_len != expected_reclen) {
-    // First record doesn't match — scan forward through coalesced records.
+  __u32 matched_nonce = 0;
+  int matched = tls_appdata_reclen_match(record_len, pt_len, nonce_len, &matched_nonce);
+  if (!matched && pt_len > 0) {
     __u32 scan_off = payload_off + 5 + record_len;
-    for (__u32 i = 0; i < 4; i++) {
+    for (__u32 i = 0; i < TC_MAX_SCAN_RECORDS; i++) {
       __u8 hdr[5];
       if (bpf_skb_load_bytes(skb, scan_off, hdr, 5) < 0) break;
-      if (hdr[0] != 0x17 || hdr[1] != 0x03 || hdr[2] > 0x03) break;
-      __u16 rlen = ((__u16)hdr[3] << 8) | (__u16)hdr[4];
-      if (rlen < 17) break; // TLS 1.3 minimum: 0 plaintext + 1 content_type + 16 tag
-      if (rlen == expected_reclen) {
+      __u32 rlen = 0;
+      int kind = tls_record_hdr_kind(hdr, &rlen);
+      if (kind == TLS_REC_INVALID) break;
+      if (kind == TLS_REC_APPDATA &&
+          tls_appdata_reclen_match(rlen, pt_len, nonce_len, &matched_nonce)) {
         payload_off = scan_off;
         record_len = rlen;
+        matched = 1;
         break;
       }
       scan_off += 5 + rlen;
     }
   }
+  if (matched)
+    nonce_len = matched_nonce;
+  else if (nonce_len == TLS_NONCE_UNKNOWN)
+    // No exact fit (e.g. an SSL_write larger than one record): keep the first
+    // application_data record and assume TLS 1.2, as before.
+    // TODO: derive nonce_len for TLS libraries without an ssl_to_version
+    // offset (BoringSSL/Bun) instead of guessing, so large writes on TLS 1.3
+    // are patched with the right layout.
+    nonce_len = 8;
 
   // Ensure record is large enough for the nonce + tag. For TLS 1.2 (nonce_len=8),
   // minimum is 24; for TLS 1.3 (nonce_len=0), minimum is 17. Without this check,

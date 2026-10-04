@@ -298,6 +298,104 @@ HELPER_INLINE int is_aes_gcm(__u32 cipher_type) {
 }
 
 // ============================================================================
+// TLS record framing (tc_egress record selection)
+// ============================================================================
+
+#define TLS_CT_CHANGE_CIPHER_SPEC 0x14
+#define TLS_CT_ALERT 0x15
+#define TLS_CT_HANDSHAKE 0x16
+#define TLS_CT_APPLICATION_DATA 0x17
+
+// Largest legal TLSCiphertext.length (RFC 5246 §6.2.3: 2^14 + 2048). Anything
+// larger cannot be a record boundary.
+#define TLS_MAX_RECORD_LEN (16384 + 2048)
+
+// Smallest application_data record: TLS 1.3 with 0 plaintext bytes =
+// 1 (inner content type) + 16 (AEAD tag).
+#define TLS_APPDATA_MIN_RECORD_LEN 17
+
+// Per-connection nonce length is not known (no TLS-version offset for this
+// TLS library, e.g. BoringSSL statically linked into Bun). Mirrors the 0xFF
+// sentinel stored in tls_conn_state.nonce_len.
+#define TLS_NONCE_UNKNOWN 0xFF
+
+#define TLS_REC_INVALID 0   // not a record boundary (e.g. continuation bytes)
+#define TLS_REC_SKIPPABLE 1 // plausible CCS / alert / handshake record
+#define TLS_REC_APPDATA 2   // plausible application_data record
+
+// tls_record_hdr_kind classifies the 5-byte TLS record header at hdr and, for
+// any valid header, stores the record body length in *rec_len.
+//
+// tc_egress uses it to walk records coalesced into one TCP segment. A TLS
+// stack may flush non-application records in the same write as the first
+// application_data record — e.g. a TLS 1.3 client's ChangeCipherSpec +
+// encrypted Finished + first application write (Bun >= 1.4.1 does this) — so
+// the record carrying the secret is not necessarily the first in the segment.
+//
+// The checks are deliberately strict (version 0x0300-0x0303, per-type length
+// bounds, CCS body exactly 1 byte) so random ciphertext in a TCP continuation
+// segment is very unlikely to be mistaken for a record boundary.
+HELPER_INLINE int tls_record_hdr_kind(const __u8 *hdr, __u32 *rec_len) {
+  if (hdr[1] != 0x03 || hdr[2] > 0x03)
+    return TLS_REC_INVALID;
+  __u32 len = ((__u32)hdr[3] << 8) | (__u32)hdr[4];
+  if (len > TLS_MAX_RECORD_LEN)
+    return TLS_REC_INVALID;
+
+  int kind;
+  switch (hdr[0]) {
+  case TLS_CT_APPLICATION_DATA:
+    if (len < TLS_APPDATA_MIN_RECORD_LEN)
+      return TLS_REC_INVALID;
+    kind = TLS_REC_APPDATA;
+    break;
+  case TLS_CT_CHANGE_CIPHER_SPEC:
+    // ChangeCipherSpec is always a single 0x01 byte (TLS 1.2 and the TLS 1.3
+    // middlebox-compatibility record alike).
+    if (len != 1)
+      return TLS_REC_INVALID;
+    kind = TLS_REC_SKIPPABLE;
+    break;
+  case TLS_CT_ALERT:
+    // Plaintext alerts are 2 bytes; TLS 1.2 encrypted alerts are larger.
+    if (len < 2)
+      return TLS_REC_INVALID;
+    kind = TLS_REC_SKIPPABLE;
+    break;
+  case TLS_CT_HANDSHAKE:
+    if (len < 4) // handshake message header
+      return TLS_REC_INVALID;
+    kind = TLS_REC_SKIPPABLE;
+    break;
+  default:
+    return TLS_REC_INVALID;
+  }
+  *rec_len = len;
+  return kind;
+}
+
+// tls_appdata_reclen_match reports whether an AES-GCM application_data record
+// of length rec_len carries exactly pt_len plaintext bytes:
+//   TLS 1.3 (nonce_len 0): rec_len = pt_len + 1 (inner type) + 16 (tag)
+//   TLS 1.2 (nonce_len 8): rec_len = pt_len + 8 (explicit nonce) + 16 (tag)
+// With nonce_len == TLS_NONCE_UNKNOWN either layout matches. On a match the
+// nonce length that matched is written to *out_nonce and 1 is returned.
+HELPER_INLINE int tls_appdata_reclen_match(__u32 rec_len, __u32 pt_len,
+                                           __u32 nonce_len, __u32 *out_nonce) {
+  if (pt_len == 0)
+    return 0;
+  if (nonce_len != 8 && rec_len == pt_len + 17) {
+    *out_nonce = 0;
+    return 1;
+  }
+  if (nonce_len != 0 && rec_len == pt_len + 24) {
+    *out_nonce = 8;
+    return 1;
+  }
+  return 0;
+}
+
+// ============================================================================
 // AES single-block encryption — used to recover the GHASH subkey H for
 // BoringSSL.
 //
