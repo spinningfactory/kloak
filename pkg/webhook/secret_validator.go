@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	"github.com/spinningfactory/kloak/pkg/secrets"
+	k8ssecrets "github.com/spinningfactory/kloak/pkg/secrets/k8s"
 )
 
 const (
@@ -69,6 +70,14 @@ func (v *SecretValidator) Handle(ctx context.Context, req admission.Request) adm
 
 	if secret.Labels[LabelEnabled] != "true" {
 		return admission.Allowed("not kloak-enabled")
+	}
+
+	if misplaced := k8ssecrets.MisplacedFilterLabels(secret.Labels); len(misplaced) > 0 {
+		v.log.Warnw("rejecting secret: destination filter set as a label",
+			"namespace", secret.Namespace, "name", secret.Name, "labels", misplaced)
+		return admission.Denied(fmt.Sprintf(
+			"kloak: %s must be set as an annotation, not a label (as a label it is ignored and the secret could be sent to any host)",
+			strings.Join(misplaced, ", ")))
 	}
 
 	if err := validateHostsLabel(secret.Annotations[AnnotationHosts]); err != nil {

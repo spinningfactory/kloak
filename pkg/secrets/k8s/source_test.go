@@ -285,3 +285,72 @@ func TestSeedShadowGenerator_NilReader(t *testing.T) {
 		t.Errorf("nil reader: got %d prefixes, want 0", len(seed))
 	}
 }
+
+func TestMisplacedFilterLabels(t *testing.T) {
+	cases := []struct {
+		name   string
+		labels map[string]string
+		want   []string
+	}{
+		{"nil labels", nil, nil},
+		{"only enabled label", map[string]string{LabelEnabled: "true"}, nil},
+		{"hosts label", map[string]string{LabelEnabled: "true", AnnotationHosts: "api.example.com"}, []string{AnnotationHosts}},
+		{"empty-valued hosts label still flagged", map[string]string{AnnotationHosts: ""}, []string{AnnotationHosts}},
+		{"hosts and port labels", map[string]string{AnnotationPort: "443", AnnotationHosts: "x.io"}, []string{AnnotationHosts, AnnotationPort}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := MisplacedFilterLabels(tc.labels)
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v want %v", got, tc.want)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Fatalf("got %v want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// A destination filter set as a label is ignored by the annotation
+// parser, so syncing the secret would let it reach any host. Snapshot
+// must skip it entirely (fail closed) while still syncing other secrets.
+func TestSnapshot_SkipsFilterSetAsLabel(t *testing.T) {
+	scheme := newScheme(t)
+
+	hostsLabel := makeEnabled("default", "hosts-label", map[string]string{"k": "real-val-1234"}, nil)
+	hostsLabel.Labels[AnnotationHosts] = "api.example.com"
+
+	// Even with the correct annotation present, a conflicting label is
+	// ambiguous and must not be synced.
+	both := makeEnabled("default", "both", map[string]string{"k": "real-val-5678"}, map[string]string{
+		AnnotationHosts: "api.example.com",
+	})
+	both.Labels[AnnotationHosts] = "other.example.com"
+
+	portLabel := makeEnabled("default", "port-label", map[string]string{"k": "real-val-9012"}, nil)
+	portLabel.Labels[AnnotationPort] = "443"
+
+	good := makeEnabled("default", "good", map[string]string{"k": "real-val-3456"}, map[string]string{
+		AnnotationHosts: "api.example.com",
+	})
+
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		hostsLabel, makeShadow("default", "hosts-label", map[string]string{"k": "kl::0011223344"}),
+		both, makeShadow("default", "both", map[string]string{"k": "kl::1122334455"}),
+		portLabel, makeShadow("default", "port-label", map[string]string{"k": "kl::2233445566"}),
+		good, makeShadow("default", "good", map[string]string{"k": "kl::3344556677"}),
+	).Build()
+
+	got, err := NewSource(c).Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("len=%d want 1 (only the correctly annotated secret): %+v", len(got), got)
+	}
+	if got[0].OwnerID != "default/good" || got[0].Host != "api.example.com" {
+		t.Errorf("got OwnerID=%q Host=%q, want default/good api.example.com", got[0].OwnerID, got[0].Host)
+	}
+}
