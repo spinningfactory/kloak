@@ -42,14 +42,14 @@ func newTCTestEnv(t *testing.T) *tcTestEnv {
 	}
 	ns, err := netns.New() // also switches this thread into it
 	if err != nil {
-		orig.Close()
+		_ = orig.Close()
 		runtime.UnlockOSThread()
 		t.Skipf("cannot create netns: %v", err)
 	}
 	t.Cleanup(func() {
 		_ = netns.Set(orig)
-		orig.Close()
-		ns.Close()
+		_ = orig.Close()
+		_ = ns.Close()
 		runtime.UnlockOSThread()
 	})
 
@@ -95,7 +95,7 @@ func (e *tcTestEnv) inTestNS(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer cur.Close()
+	defer func() { _ = cur.Close() }()
 	if !cur.Equal(e.ns) {
 		t.Fatalf("not running in the test netns (current %s, test %s, tid %d); refusing to touch host interfaces",
 			cur.UniqueId(), e.ns.UniqueId(), unix.Gettid())
