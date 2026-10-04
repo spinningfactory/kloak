@@ -31,7 +31,7 @@ Kloak transparently intercepts outbound TLS traffic in Kubernetes using eBPF upr
 - **Kubernetes native** -- Works with standard Kubernetes Secrets. Enable with a single label.
 - **Host and IP filtering** -- Secrets annotated with `getkloak.io/hosts` are only sent to specific destination hostnames or IP addresses, preventing exfiltration to unauthorized servers.
 - **Port-based filtering** -- Secrets annotated with `getkloak.io/port` are restricted to connections on a specific destination port.
-- **Broad runtime support** -- Hooks into OpenSSL, BoringSSL, and Go's native `crypto/tls`. Works with Python, Node.js, Go, Rust, Ruby, PHP, curl, and any OpenSSL-linked runtime.
+- **Broad runtime support** -- Hooks into OpenSSL, BoringSSL, and Go's native `crypto/tls`. Works with Python, Node.js, Bun, Go, Rust, Ruby, PHP, curl, and any OpenSSL-linked runtime.
 
 ## Quick Start
 
@@ -89,13 +89,13 @@ graph TD
 
     subgraph Data_Plane [Data Plane - eBPF in Kernel]
         UP[TLS Uprobes]
-        P2[Phase 2 Rewrite]
+        HX[H Extract]
         XOR[XOR Path]
         KP[DNS Kprobe/Kretprobe]
         TP[Connect/Close Tracepoints]
         PROC[Process Tracepoints]
         TCP[tcp_sendmsg Kprobe]
-        TC[TC Egress Patch]
+        TC[TC Patch - host-side veth]
         GHASH[TC GHASH Update]
     end
 
@@ -105,15 +105,15 @@ graph TD
 
     C -->|Creates shadow secrets and syncs BPF maps| UP
     C -->|Attaches probes to container processes| UP
-    W -->|Rewrites volume mounts to shadow secrets| P
-    P -->|TLS write with kl::UUID| UP
-    UP -->|Tail call: plaintext rewrite| P2
-    UP -->|Tail call: ciphertext rewrite| XOR
+    W -->|Rewrites secret references to shadow secrets| P
+    P -->|TLS write with kl:: placeholder| UP
+    UP -->|Tail call: libcrypto-hook processes| HX
+    UP -->|Tail call| XOR
+    HX -->|Tail call| XOR
     XOR -->|Stores xor_pending| TCP
     TCP -->|Stores tc_pending| TC
     TC -->|Tail call| GHASH
-    P2 -->|Real secret injected| Internet
-    TC -->|Patched ciphertext| Internet
+    GHASH -->|Patched ciphertext + tag| Internet
     KP -->|Populates dns_ip_map| UP
     TP -->|Populates conn_ip_map / last_verified_fd| UP
     PROC -->|Tracks process lifecycle| C
@@ -123,10 +123,11 @@ graph TD
 
 | Component | Description |
 |-----------|-------------|
-| **Controller** (DaemonSet) | Watches Secrets labeled `getkloak.io/enabled=true`, creates shadow secrets with length-matched `kl::<UUID>` placeholders, syncs real values into eBPF maps, and attaches TLS uprobes to container processes via cgroup discovery. |
-| **Webhook** (Deployment) | Mutating admission webhook that intercepts Pod creation. Rewrites Secret volume mounts to point to shadow secrets. Evaluates enablement through pod labels or namespace labels. Rejects pods if the shadow secret has not been created yet (fail-closed). Two webhook entries ensure only kloak-enabled namespaces and pods are affected; non-kloak workloads are never impacted, even when the webhook is down. |
-| **TLS Uprobes** | Attach to `SSL_write` / `SSL_write_ex` (OpenSSL/BoringSSL) and `crypto/tls.(*Conn).Write` (Go native). Intercept outbound TLS writes, scan for `kl::` prefixes. Two rewrite paths: Phase 2 for plaintext rewrite (before encryption), and XOR path for ciphertext patching (after encryption). |
-| **XOR Path + TC Egress** | For Go native TLS: computes XOR diff in the uprobe, bridges through `tcp_sendmsg` kprobe to TC egress, which patches the encrypted packet in-flight and recomputes the GHASH authentication tag via a tail call to `tc_ghash_update`. |
+| **Controller** (DaemonSet) | Watches Secrets labeled `getkloak.io/enabled=true`, creates shadow secrets with random `kl::…` placeholders of the same length as each real value, syncs real values into eBPF maps, and attaches TLS uprobes to container processes via cgroup discovery. |
+| **Webhook** (Deployment) | Mutating admission webhook that intercepts Pod creation. Rewrites Secret volume mounts and environment variable references (`secretKeyRef`, `envFrom`) to point to shadow secrets. Evaluates enablement through pod labels or namespace labels. Rejects pods if the shadow secret has not been created yet (fail-closed). Two webhook entries ensure only kloak-enabled namespaces and pods are affected; non-kloak workloads are never impacted, even when the webhook is down. |
+| **TLS Uprobes** | Attach to `SSL_write` / `SSL_write_ex` (OpenSSL/BoringSSL), `crypto/tls.(*Conn).Write` (Go native), and `SSL_write` at a pre-computed file offset in symbol-stripped Bun binaries. Intercept outbound TLS writes and scan the plaintext for `kl::` placeholders. The plaintext buffer is only read, never modified. |
+| **H Extract** | Recovers the connection's AES-GCM GHASH key `H`, which is needed to fix the authentication tag after patching. For processes whose `libcrypto` exposes `EVP_CipherInit_ex`, a uprobe captures it at cipher init. Otherwise the `tcp_sendmsg` kprobe walks the library's TLS structs to it. BoringSSL keeps only the AES key schedule, so `H = AES_K(0)` is recomputed in-kernel. |
+| **XOR Path + TC Patch** | Used for every runtime. Checks the destination against the secret's host/IP/port policy, then computes `shadow XOR real` for each matched placeholder. This bridges through the `tcp_sendmsg` kprobe to a tc program on the host side of the pod's veth pair, which XOR-patches the AES-GCM ciphertext in the outgoing packet and recomputes the GHASH tag via a tail call to `tc_ghash_update`. The real secret is never written to user-space memory, and patching outside the pod's network namespace keeps the patched ciphertext out of reach of in-pod packet capture. |
 | **DNS Kprobe** | Kprobe/kretprobe on `udp_recvmsg` captures DNS responses system-wide. Parses A/AAAA records for watched hostnames and populates `dns_ip_map` (IP to hostname) with TTL tracking. |
 | **Connect/Close Tracepoints** | Hooks `sys_enter/exit_connect` to track TCP connections (fd to destination IP in `conn_ip_map`). When the destination matches a DNS-verified hostname, caches the fd in `last_verified_fd`. Hooks `sys_enter_close` to clean up stale entries. |
 | **Process Tracepoints** | Hooks `sched_process_exec` and `sched_process_exit` to track container process lifecycle for uprobe attachment and cleanup. |
@@ -136,8 +137,12 @@ graph TD
 | Runtime | TLS Library | Hook Point |
 |---------|------------|------------|
 | Python, Rust, Ruby, PHP, curl | OpenSSL (libssl.so) | `SSL_write` / `SSL_write_ex` uprobe |
-| Node.js | BoringSSL (statically linked) | `SSL_write` uprobe |
+| Node.js | OpenSSL (statically linked into `node`) | `SSL_write` uprobe on the main executable |
+| Apps linked against BoringSSL | BoringSSL (libssl.so) | `SSL_write` uprobe |
+| Bun (incl. single-executable apps) | BoringSSL (statically linked, symbols stripped) | `SSL_write` uprobe at a per-version file offset (`tools/bun-offsets/`) |
 | Go | crypto/tls (native) | `crypto/tls.(*Conn).Write` uprobe |
+
+Secrets are patched into **AES-128-GCM and AES-256-GCM** records (TLS 1.2 and 1.3). Other ciphers (e.g. ChaCha20-Poly1305) and some libraries (GnuTLS, Go built with `GOEXPERIMENT=boringcrypto`) are not supported yet.
 
 ## DNS-Verified Trust Chain
 
@@ -150,7 +155,8 @@ sequenceDiagram
     participant KP as eBPF kprobe
     participant TP as eBPF tracepoint
     participant UP as eBPF uprobe
-    participant P2 as Phase 2 Rewrite
+    participant XOR as XOR Path
+    participant TC as tc patch (host veth)
     participant Srv as api.stripe.com
 
     Note over App,Srv: 1. DNS Resolution
@@ -166,16 +172,18 @@ sequenceDiagram
     Note over App,Srv: 3. TLS Write (Allowed)
     App->>UP: SSL_write with kl::a1b2c3d4
     UP->>UP: resolve_host -> api.stripe.com
-    UP->>P2: Tail call
-    P2->>P2: allowed_host matches -> rewrite secret
-    P2->>Srv: Real secret sent to api.stripe.com
+    UP->>XOR: Tail call
+    XOR->>XOR: allowed_host matches -> stage XOR delta
+    App->>TC: Encrypted record leaves the pod
+    TC->>TC: XOR-patch ciphertext, recompute GCM tag
+    TC->>Srv: Real secret decrypted only by api.stripe.com
 
     Note over App,Srv: 4. TLS Write (Blocked)
     App->>UP: SSL_write to evil.com with kl::a1b2c3d4
     UP->>UP: resolve_host -> evil.com
-    UP->>P2: Tail call
-    P2->>P2: allowed_host mismatch -> BLOCKED
-    P2--xApp: Placeholder sent as-is
+    UP->>XOR: Tail call
+    XOR->>XOR: allowed_host mismatch -> nothing staged
+    App->>Srv: Placeholder sent as-is
 ```
 
 ### How Host Verification Works
@@ -186,7 +194,7 @@ sequenceDiagram
 
 3. **Host resolution** -- At `SSL_write` time, `resolve_host()` chains through verified fd, `conn_ip_map`, and `dns_ip_map` to determine the hostname of the current TLS connection.
 
-4. **Secret filtering** -- Phase 2 compares the resolved hostname against the secret's `allowed_host`. Match: rewrite. Mismatch: placeholder sent as-is, keeping the secret safe.
+4. **Secret filtering** -- The XOR path compares the resolved hostname (and IP/port, if set) against the secret's policy. Match: a patch is staged for the tc program. Mismatch: nothing is staged and the placeholder is sent as-is, keeping the secret safe.
 
 5. **TTL enforcement** -- DNS entries include a TTL. Expired entries are skipped on lookup, requiring re-verification through fresh DNS responses.
 
@@ -194,7 +202,7 @@ sequenceDiagram
 
 ### 1. Label and Annotate Your Secrets
 
-Add `getkloak.io/enabled=true` as a label to enable Kloak. Use annotations for host and port filtering. Kloak generates a shadow secret with `kl::<UUID>` placeholders that are length-matched to the original values.
+Add `getkloak.io/enabled=true` as a label to enable Kloak. Use annotations for host and port filtering. Kloak generates a shadow secret whose values are random `kl::…` placeholders of exactly the same length as the originals.
 
 ```yaml
 apiVersion: v1
@@ -212,22 +220,22 @@ data:
 
 ### 2. Deploy Your Application
 
-The webhook automatically rewrites volume mounts to use the shadow secret. Your application sees only `kl::<UUID>` placeholders and never handles real credentials.
+The webhook automatically rewrites the pod's secret references (volume mounts, `secretKeyRef`, `envFrom`) to use the shadow secret. Your application sees only `kl::…` placeholders and never handles real credentials.
 
 ```
-# What the application reads from the mounted secret:
-kl::a1b2c3d4-e5f6-7890
+# What the application reads from the mounted secret (same length as the real value):
+kl::q7XmB2rTa9
 ```
 
 ### 3. Automatic In-Kernel Rewrite
 
-When the application makes an outbound HTTPS request, the eBPF uprobe intercepts the TLS write, verifies the destination through the DNS trust chain, and replaces the placeholder with the real secret before encryption.
+When the application makes an outbound HTTPS request, the eBPF uprobe reads the TLS write, verifies the destination through the DNS trust chain, and stages a patch. After the TLS library encrypts the record, a tc program on the host side of the pod's veth XOR-patches the ciphertext so that it decrypts to the real secret, and recomputes the AES-GCM tag. The real value never exists in the pod's memory.
 
 ```
-# What the application writes:
-Authorization: Bearer kl::a1b2c3d4-e5f6-7890
+# What the application writes (and what is in its memory):
+Authorization: Bearer kl::q7XmB2rTa9
 
-# What leaves the node (after eBPF rewrite):
+# What api.stripe.com decrypts (after the in-kernel ciphertext patch):
 Authorization: Bearer sk-live-xyz123
 ```
 
