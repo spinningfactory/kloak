@@ -31,15 +31,6 @@ import (
 	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
-// tlsEvent must match the C struct tls_event (lightweight, no data payload)
-type tlsEvent struct {
-	Pid         uint32
-	Tgid        uint32
-	Len         uint32
-	IsRewritten uint8
-	_           [3]byte // padding for alignment
-}
-
 // procEvent must match the C struct kloak_proc_event
 type procEvent struct {
 	Tgid     uint32
@@ -144,6 +135,18 @@ type TLSUprobeManager struct {
 	// Close() waits on it (with a bounded timeout) before tearing down BPF
 	// objects, so a sleeping retry can't fire AttachTLS against a freed map fd.
 	retryWG sync.WaitGroup
+
+	// bindMu guards bindings and lastSnapshot, and serializes every
+	// secret_acl write, so a periodic sync can't prune entries a concurrent
+	// BindPodSecrets just granted.
+	bindMu sync.Mutex
+	// bindings maps pod UID → the secrets that pod may redeem (secret_binding.go).
+	bindings map[string]podBinding
+	// lastSnapshot is the most recent secrets snapshot, used to grant a new
+	// pod's bindings immediately instead of at the next periodic sync.
+	lastSnapshot []secrets.Secret
+	// bindingLogged rate-limits violation logs per (cgroup, placeholder).
+	bindingLogged map[secretACLKey]time.Time
 }
 
 // tcAttachEntry holds an open fd to a network namespace to prevent inode reuse.
@@ -329,7 +332,7 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		// Non-fatal: exec tracepoint falls back to tracked_cgroups
 	}
 
-	reader, err := ringbuf.NewReader(objs.TlsEvents)
+	reader, err := ringbuf.NewReader(objs.SecretBindingEvents)
 	if err != nil {
 		_ = objs.Close()
 		return nil, fmt.Errorf("creating ringbuf reader: %w", err)
@@ -351,6 +354,8 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		cgroupRoot:      cgroupRoot,
 		egressInterface: egressInterface,
 		tcMode:          newTCModeResolver(TCAttachAuto),
+		bindings:        make(map[string]podBinding),
+		bindingLogged:   make(map[secretACLKey]time.Time),
 	}
 
 	// Attach tracepoints for DNS interception and connect tracking.
@@ -1790,9 +1795,10 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 	}
 }
 
-// PollEvents reads TLS events from the ring buffer and periodically syncs secrets to the eBPF map.
+// PollEvents periodically syncs secrets and pod bindings to the eBPF maps,
+// and logs secret-binding violations reported by the data plane.
 func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
-	m.log.Infow("Starting eBPF TLS event poller and secret syncer")
+	m.log.Infow("Starting eBPF secret syncer and binding-violation reader")
 
 	// Trigger an initial sync
 	m.syncSecretsToBPF(ctx)
@@ -1826,17 +1832,12 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 			continue
 		}
 
-		var event tlsEvent
-		if err := binary.Read(bytes.NewReader(record.RawSample), binary.LittleEndian, &event); err != nil {
-			m.log.Errorw("failed to parse ringbuf event", "error", err)
+		var event secretBindingEvent
+		if err := binary.Read(bytes.NewReader(record.RawSample), binary.NativeEndian, &event); err != nil {
+			m.log.Errorw("failed to parse secret binding event", "error", err)
 			continue
 		}
-
-		if event.IsRewritten == 1 {
-			m.log.Debugw("REWRITE SUCCESS: eBPF synchronously rewrote a secret", "pid", event.Pid)
-		} else {
-			m.log.Debugw("Intercepted TLS packet (no rewrite)", "pid", event.Pid, "len", event.Len)
-		}
+		m.logBindingViolation(event)
 	}
 }
 
@@ -1885,9 +1886,117 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 // syncSecretsToBPF updates the eBPF map with the latest shadow secret values
 // and the watched_hosts map with hostnames from secret entries.
 func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
-	if err := syncSecrets(ctx, m.objs.SecretMap, m.objs.WatchedHosts, m.secretSource, m.log); err != nil {
-		m.log.Errorw("failed to sync secrets to BPF map", "error", err)
+	if m.secretSource == nil {
+		return
 	}
+	snapshot, err := m.secretSource.Snapshot(ctx)
+	if err != nil {
+		// Keep the previous map contents; pruning against a failed snapshot
+		// would drop every secret.
+		m.log.Errorw("failed to sync secrets to BPF map", "error", fmt.Errorf("snapshot secrets: %w", err))
+		return
+	}
+	applySecrets(m.objs.SecretMap, m.objs.WatchedHosts, snapshot, m.log)
+
+	m.bindMu.Lock()
+	defer m.bindMu.Unlock()
+	m.lastSnapshot = snapshot
+	syncSecretACL(m.objs.SecretAcl, snapshot, m.bindings, m.log)
+}
+
+// SetSecretBindingMode configures what the data plane does when a process
+// redeems a placeholder of a secret its pod does not reference. The BPF
+// default (an unwritten map) is enforce, so a failed write fails closed.
+func (m *TLSUprobeManager) SetSecretBindingMode(mode SecretBindingMode) {
+	key, val := uint32(0), mode.bpfValue()
+	if err := m.objs.SecretBindingMode.Update(&key, &val, ebpf.UpdateAny); err != nil {
+		m.log.Errorw("failed to set secret binding mode; enforcing", "mode", mode, "error", err)
+	}
+}
+
+// BindPodSecrets records which secrets a pod may redeem and grants them to
+// its container cgroups at once, so the pod's first TLS writes are rewritten.
+// It replaces any previous binding for the pod: cgroups or references that
+// went away are revoked at the next sync. podUID keys the binding; pod
+// (namespace/name) is only used in logs.
+func (m *TLSUprobeManager) BindPodSecrets(podUID, pod string, cgroupIDs []uint64, refs []secrets.Ref) {
+	b := podBinding{pod: pod, cgroupIDs: cgroupIDs, refs: refs}
+
+	m.bindMu.Lock()
+	defer m.bindMu.Unlock()
+	m.bindings[podUID] = b
+
+	allowed := uint8(1)
+	for key := range secretACL(m.lastSnapshot, map[string]podBinding{podUID: b}) {
+		if err := m.objs.SecretAcl.Update(&key, &allowed, ebpf.UpdateAny); err != nil {
+			m.log.Errorw("failed to grant secret binding", "error", err, "pod", pod, "cgroupID", key.CgroupID)
+		}
+	}
+}
+
+// UnbindPod revokes everything a pod could redeem, immediately.
+func (m *TLSUprobeManager) UnbindPod(podUID string) {
+	m.bindMu.Lock()
+	defer m.bindMu.Unlock()
+	b, ok := m.bindings[podUID]
+	if !ok {
+		return
+	}
+	delete(m.bindings, podUID)
+
+	cgroups := make(map[uint64]struct{}, len(b.cgroupIDs))
+	for _, cg := range b.cgroupIDs {
+		cgroups[cg] = struct{}{}
+	}
+	var stale []secretACLKey
+	var k secretACLKey
+	var v uint8
+	iter := m.objs.SecretAcl.Iterate()
+	for iter.Next(&k, &v) {
+		if _, ok := cgroups[k.CgroupID]; ok {
+			stale = append(stale, k)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		m.log.Errorw("error iterating BPF secret_acl", "error", err, "pod", b.pod)
+	}
+	for i := range stale {
+		if err := m.objs.SecretAcl.Delete(&stale[i]); err != nil {
+			m.log.Errorw("failed to revoke secret binding", "error", err, "pod", b.pod)
+		}
+	}
+}
+
+// bindingLogInterval bounds how often the same (cgroup, placeholder)
+// violation is logged.
+const bindingLogInterval = time.Minute
+
+// logBindingViolation reports a placeholder redeemed outside its binding.
+func (m *TLSUprobeManager) logBindingViolation(ev secretBindingEvent) {
+	key := secretACLKey{CgroupID: ev.CgroupID, Key: ev.Key}
+	now := time.Now()
+
+	m.bindMu.Lock()
+	if last, ok := m.bindingLogged[key]; ok && now.Sub(last) < bindingLogInterval {
+		m.bindMu.Unlock()
+		return
+	}
+	m.bindingLogged[key] = now
+	for k, at := range m.bindingLogged {
+		if now.Sub(at) >= bindingLogInterval {
+			delete(m.bindingLogged, k)
+		}
+	}
+	pod, secret := describeBindingEvent(ev, m.bindings, m.lastSnapshot)
+	m.bindMu.Unlock()
+
+	if ev.Audit == 1 {
+		m.log.Warnw("secret binding violation (audit mode, rewrite allowed): pod used a secret it does not reference",
+			"pod", pod, "secret", secret, "tgid", ev.Tgid, "cgroupID", ev.CgroupID)
+		return
+	}
+	m.log.Warnw("secret binding violation (rewrite refused): pod used a secret it does not reference",
+		"pod", pod, "secret", secret, "tgid", ev.Tgid, "cgroupID", ev.CgroupID)
 }
 
 // debugCounterNames maps index to human-readable name (must match C enum in
@@ -1911,6 +2020,7 @@ var debugCounterNames = []string{
 	"bssl_reached", "bssl_h_ok",
 	"bssl_s3_null", "bssl_aead_null", "bssl_rdkey_fail", "bssl_rounds_bad", "bssl_hzero",
 	"openssl_gcm_gate_fail", "openssl_h_from_hkey1",
+	"secret_binding_deny", "secret_binding_audit",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

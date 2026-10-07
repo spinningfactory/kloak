@@ -10,6 +10,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
 )
@@ -109,8 +110,26 @@ func TestCipherSuites(t *testing.T) {
 }
 
 // deployTLSEchoServer creates the Python/OpenSSL echo server pod + service.
+// Several tests use it; the names are fixed, so wait out the previous
+// test's asynchronous cleanup first.
 func deployTLSEchoServer(t *testing.T) string {
 	t.Helper()
+
+	gone, cancelGone := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancelGone()
+	if err := waitForPodAbsent(gone, testNamespace, echoServerName); err != nil {
+		t.Fatalf("previous echo server pod still present: %v", err)
+	}
+	for {
+		_, err := clientset.CoreV1().Services(testNamespace).Get(gone, echoServerName, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			break
+		}
+		if gone.Err() != nil {
+			t.Fatalf("previous echo server service still present: %v", err)
+		}
+		time.Sleep(pollInterval)
+	}
 
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{

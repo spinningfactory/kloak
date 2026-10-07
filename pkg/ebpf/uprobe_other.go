@@ -53,3 +53,7 @@ func (m *TLSUprobeManager) PollEvents(context.Context) error         { return Er
 func (m *TLSUprobeManager) PopulateTrustedDNSServers([]net.IP) error { return ErrNotSupported }
 func (m *TLSUprobeManager) DumpDebugCounters()                       {}
 func (m *TLSUprobeManager) SetTCAttachMode(TCAttachMode)             {}
+func (m *TLSUprobeManager) SetSecretBindingMode(SecretBindingMode)   {}
+func (m *TLSUprobeManager) UnbindPod(string)                         {}
+
+func (m *TLSUprobeManager) BindPodSecrets(string, string, []uint64, []secrets.Ref) {}

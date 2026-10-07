@@ -52,6 +52,7 @@ var (
 	trustedDNSServers   string
 	egressInterface     string
 	tcAttachMode        string
+	secretBinding       string
 )
 
 func init() {
@@ -67,16 +68,25 @@ func init() {
 	controllerCmd.Flags().StringVar(&tcAttachMode, "tc-attach-mode", "auto",
 		`How the tc patch program is attached: "auto" uses TCX on Linux 6.6+ and falls back to a clsact qdisc + cls_bpf filter on older kernels; `+
 			`"tcx" requires TCX; "clsact" always uses the classic filter.`)
+	controllerCmd.Flags().StringVar(&secretBinding, "secret-binding", "enforce",
+		`Which pods may redeem a secret's placeholder: only pods that reference the secret in their spec (Secret volume, env secretKeyRef, envFrom). `+
+			`"enforce" refuses other pods' rewrites; "audit" allows them but logs each violation, to find such workloads before enforcing.`)
 }
 
 func runController(cmd *cobra.Command, args []string) {
 	setupLog := logging.Setup().Named("setup")
 
-	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface, "tcAttachMode", tcAttachMode)
+	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface, "tcAttachMode", tcAttachMode, "secretBinding", secretBinding)
 
 	tcMode, err := ebpf.ParseTCAttachMode(tcAttachMode)
 	if err != nil {
 		setupLog.Errorw("invalid --tc-attach-mode", "error", err)
+		_ = setupLog.Sync()
+		os.Exit(1)
+	}
+	bindingMode, err := ebpf.ParseSecretBindingMode(secretBinding)
+	if err != nil {
+		setupLog.Errorw("invalid --secret-binding", "error", err)
 		_ = setupLog.Sync()
 		os.Exit(1)
 	}
@@ -109,6 +119,7 @@ func runController(cmd *cobra.Command, args []string) {
 			os.Exit(1)
 		}
 		uprobeMgr.SetTCAttachMode(tcMode)
+		uprobeMgr.SetSecretBindingMode(bindingMode)
 		setupLog.Infow("eBPF TLS uprobes enabled")
 	} else {
 		setupLog.Infow("eBPF disabled")

@@ -42,6 +42,13 @@ controller:
     # and falls back to a clsact qdisc + cls_bpf filter on older kernels
     # (5.17+). "tcx" requires TCX; "clsact" always uses the classic filter.
     tcAttachMode: auto
+    # Which pods may redeem a secret's placeholder. A pod can only use the
+    # secrets it references in its spec (Secret volume, env secretKeyRef,
+    # envFrom secretRef); a placeholder sent by any other pod goes out
+    # unchanged. "enforce" (default) refuses such rewrites. "audit" lets
+    # them through but logs each violation in the controller, to find
+    # workloads that use secrets they don't mount before enforcing.
+    secretBinding: enforce
   cgroupPath: /host/sys/fs/cgroup
   dns:
     # Trusted DNS server IPs. Only DNS responses from these servers are used

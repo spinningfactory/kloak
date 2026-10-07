@@ -15,6 +15,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/spinningfactory/kloak/pkg/secrets"
 	k8ssecrets "github.com/spinningfactory/kloak/pkg/secrets/k8s"
 )
 
@@ -501,5 +502,67 @@ func TestSyncSecrets_NilReader(t *testing.T) {
 	// syncSecrets should return nil when reader is nil
 	if err := syncSecrets(context.Background(), m, nil, nil, testLog()); err != nil {
 		t.Fatalf("syncSecrets with nil reader should not error: %v", err)
+	}
+}
+
+func createTestSecretACLMap(t *testing.T) *ciliumebpf.Map {
+	t.Helper()
+	m, err := ciliumebpf.NewMap(&ciliumebpf.MapSpec{
+		Type:       ciliumebpf.Hash,
+		KeySize:    16, // struct secret_acl_key
+		ValueSize:  1,
+		MaxEntries: 64,
+	})
+	if err != nil {
+		t.Skipf("eBPF maps not available: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+	return m
+}
+
+func aclEntries(t *testing.T, m *ciliumebpf.Map) map[secretACLKey]struct{} {
+	t.Helper()
+	out := make(map[secretACLKey]struct{})
+	var k secretACLKey
+	var v uint8
+	iter := m.Iterate()
+	for iter.Next(&k, &v) {
+		out[k] = struct{}{}
+	}
+	if err := iter.Err(); err != nil {
+		t.Fatalf("iterate secret_acl: %v", err)
+	}
+	return out
+}
+
+func TestSyncSecretACL_GrantsAndPrunes(t *testing.T) {
+	m := createTestSecretACLMap(t)
+	snapshot := []secrets.Secret{
+		{OwnerID: "ns/api", Key: "token", Shadow: "kl::token-placeholder-0001"},
+		{OwnerID: "ns/db", Key: "password", Shadow: "kl::db-placeholder-000003"},
+	}
+	bindings := map[string]podBinding{
+		"a": {pod: "ns/a", cgroupIDs: []uint64{1}, refs: []secrets.Ref{{OwnerID: "ns/api"}}},
+		"b": {pod: "ns/b", cgroupIDs: []uint64{2}, refs: []secrets.Ref{{OwnerID: "ns/db"}}},
+	}
+
+	syncSecretACL(m, snapshot, bindings, testLog())
+	if got, want := aclEntries(t, m), secretACL(snapshot, bindings); len(got) != len(want) {
+		t.Fatalf("after first sync: %d entries, want %d", len(got), len(want))
+	}
+
+	// Pod b goes away: its grants must be pruned, pod a's kept.
+	delete(bindings, "b")
+	syncSecretACL(m, snapshot, bindings, testLog())
+	got := aclEntries(t, m)
+	for k := range got {
+		if k.CgroupID == 2 {
+			t.Errorf("stale grant for removed pod survived: %q", k.Key[:])
+		}
+	}
+	for k := range secretACL(snapshot, bindings) {
+		if _, ok := got[k]; !ok {
+			t.Errorf("grant for remaining pod lost: cgroup=%d", k.CgroupID)
+		}
 	}
 }

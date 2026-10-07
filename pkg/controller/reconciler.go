@@ -18,6 +18,7 @@ import (
 	"github.com/spinningfactory/kloak/pkg/cgroups"
 	"github.com/spinningfactory/kloak/pkg/ebpf"
 	"github.com/spinningfactory/kloak/pkg/logging"
+	k8ssecrets "github.com/spinningfactory/kloak/pkg/secrets/k8s"
 )
 
 const (
@@ -158,6 +159,17 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	r.podKeyToUID[req.String()] = string(pod.UID)
 	r.mu.Unlock()
 
+	// Bind before attaching, so that by the time the uprobes fire this pod's
+	// containers can redeem exactly the secrets its spec references. Rebinding
+	// on every reconcile picks up containers restarted with a new cgroup.
+	if r.UprobeManager != nil {
+		ids := make([]uint64, 0, len(cgroupIDs))
+		for id := range cgroupIDs {
+			ids = append(ids, id)
+		}
+		r.UprobeManager.BindPodSecrets(string(pod.UID), req.String(), ids, k8ssecrets.PodSecretRefs(pod))
+	}
+
 	// Attach uprobes outside the lock — this involves filesystem I/O.
 	for _, cgroupID := range needsAttach {
 		cgroupPath, pid := r.attachUprobesToCgroup(cgroupID, pod)
@@ -288,6 +300,7 @@ func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, erro
 	// the process dies, so we no longer have to detach them manually or remove cgroups from maps.
 	// Untrack cgroups from exec/exit tracepoint filtering.
 	if r.UprobeManager != nil {
+		r.UprobeManager.UnbindPod(uid)
 		for cgroupID := range cgroupIDs {
 			if err := r.UprobeManager.UntrackCgroup(cgroupID); err != nil {
 				r.Log.Debugw("failed to untrack cgroup", "cgroupID", cgroupID, "err", err)

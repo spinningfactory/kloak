@@ -29,6 +29,7 @@ Kloak transparently intercepts outbound TLS traffic in Kubernetes using eBPF upr
 - **Secret isolation** -- Applications only see random shadow values (`kl::…`, same length as the real value). The real value is never written into the pod's memory; it is XOR-patched into the AES-GCM ciphertext in-kernel.
 - **Zero overhead** -- eBPF uprobes operate in kernel space with negligible latency impact. No userspace proxy or sidecar in the data path.
 - **Kubernetes native** -- Works with standard Kubernetes Secrets. Enable with a single label.
+- **Per-pod secret binding** -- A pod can only use the secrets it references in its spec (Secret volume, `secretKeyRef`, `envFrom`). A placeholder sent by any other pod, even one that learned it, goes out unchanged.
 - **Host and IP filtering** -- Secrets annotated with `getkloak.io/hosts` are only sent to specific destination hostnames or IP addresses, preventing exfiltration to unauthorized servers.
 - **Port-based filtering** -- Secrets annotated with `getkloak.io/port` are restricted to connections on a specific destination port.
 - **Broad runtime support** -- Hooks into OpenSSL, BoringSSL, and Go's native `crypto/tls`. Works with Python, Node.js, Bun, Go, Rust, Ruby, PHP, curl, and any OpenSSL-linked runtime.
@@ -226,6 +227,8 @@ The webhook automatically rewrites the pod's secret references (volume mounts, `
 # What the application reads from the mounted secret (same length as the real value):
 kl::q7XmB2rTa9
 ```
+
+Only the pods that reference a secret this way can use it. The controller binds each pod's containers to the secrets in its spec, and the data plane refuses to rewrite a placeholder for any other pod: the placeholder goes out unchanged and the controller logs a `secret binding violation`. Apps that read a shadow secret through the Kubernetes API instead of mounting it are refused too. Set `controller.ebpf.secretBinding: audit` to let such rewrites through while logging each one, to find these workloads before enforcing.
 
 ### 3. Automatic In-Kernel Rewrite
 

@@ -83,6 +83,37 @@ struct {
   __type(value, struct secret_value);
 } secret_map SEC(".maps");
 
+// Per-pod secret binding: a placeholder is redeemed only by processes whose
+// cgroup belongs to a pod that references the owning secret in its spec
+// (Secret volume, env secretKeyRef, envFrom secretRef). Keyed by container
+// cgroup and placeholder BPF key; a placeholder's HPACK-Huffman key gets its
+// own entry. Written and pruned by pkg/ebpf/secret_binding.go.
+struct secret_acl_key {
+  __u64 cgroup_id;
+  struct secret_key key;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 65536);
+  __uint(map_flags, BPF_F_RDONLY_PROG);
+  __type(key, struct secret_acl_key);
+  __type(value, __u8);
+} secret_acl SEC(".maps");
+
+// Binding mode, index 0. Enforce is the zero value, so an unconfigured map
+// still enforces.
+#define SECRET_BINDING_ENFORCE 0
+#define SECRET_BINDING_AUDIT 1
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __uint(map_flags, BPF_F_RDONLY_PROG);
+  __type(key, __u32);
+  __type(value, __u32);
+} secret_binding_mode SEC(".maps");
+
 // Per-CPU array used as scratch space for reading and scanning data.
 struct scratch_buf {
   __u64 user_data_ptr;
@@ -136,18 +167,21 @@ struct {
   __type(value, __u32);
 } tc_prog_array SEC(".maps");
 
-// Ringbuffer for lightweight events to userspace (metrics/logging only)
+// Secret-binding violations reported to userspace (see secret_binding_allows).
+// Only the controller's log consumes these, so a full buffer just drops events.
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
-  __uint(max_entries, 256 * 1024);
-} tls_events SEC(".maps");
+  __uint(max_entries, 64 * 1024);
+} secret_binding_events SEC(".maps");
 
-// Lightweight event - no data payload, just metadata
-struct tls_event {
-  __u32 pid;
+// A process redeemed a placeholder of a secret its pod does not reference.
+// Must match secretBindingEvent in pkg/ebpf/secret_binding.go.
+struct secret_binding_event {
+  __u64 cgroup_id;
   __u32 tgid;
-  __u32 len;
-  __u8 is_rewritten; // 1 = secret was rewritten in-kernel
+  __u8 audit; // 1 = audit mode, the rewrite went ahead; 0 = refused
+  __u8 _pad[3];
+  char key[8]; // placeholder BPF key (SECRET_KEY_LEN)
 };
 
 // Debug counters for diagnosing DNS interception issues.
@@ -208,6 +242,8 @@ enum {
   DBG_BSSL_HZERO,            // bssl: recovered H was all-zero
   DBG_OSSL_GCM_GATE_FAIL,    // OpenSSL: algctx failed the gcm.key == &ks check (not a keyed GCM ctx)
   DBG_OSSL_H_FROM_HKEY1,     // OpenSSL: H recovered from the AVX-512 HashKey_1 slot (raw H field zero)
+  DBG_SECRET_BINDING_DENY,   // placeholder redeemed outside its pod binding: refused
+  DBG_SECRET_BINDING_AUDIT,  // same, but audit mode let the rewrite go ahead
   DBG_MAX,
 };
 
@@ -223,6 +259,38 @@ static __always_inline void dbg_inc(__u32 idx) {
   __u64 *val = bpf_map_lookup_elem(&debug_counters, &idx);
   if (val)
     __sync_fetch_and_add(val, 1);
+}
+
+// secret_binding_allows reports whether the current process may redeem the
+// placeholder `key`: its cgroup must be bound to the owning secret in
+// secret_acl. Must run in the writing process's context (the SSL_write /
+// Go Write uprobes and their tail calls). An unbound redemption is refused,
+// or allowed in audit mode; either way it is reported on
+// secret_binding_events so the controller can name the pod and the secret.
+static __always_inline int secret_binding_allows(const struct secret_key *key) {
+  struct secret_acl_key ak = {};
+  ak.cgroup_id = bpf_get_current_cgroup_id();
+  __builtin_memcpy(&ak.key, key, sizeof(ak.key));
+  if (bpf_map_lookup_elem(&secret_acl, &ak))
+    return 1;
+
+  __u32 zero = 0;
+  __u32 *mode = bpf_map_lookup_elem(&secret_binding_mode, &zero);
+  int audit = mode && *mode == SECRET_BINDING_AUDIT;
+  dbg_inc(audit ? DBG_SECRET_BINDING_AUDIT : DBG_SECRET_BINDING_DENY);
+
+  struct secret_binding_event *evt =
+      bpf_ringbuf_reserve(&secret_binding_events, sizeof(*evt), 0);
+  if (evt) {
+    evt->cgroup_id = ak.cgroup_id;
+    evt->tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    evt->audit = (__u8)audit;
+    // Ring buffer memory is not zeroed; don't leak stale kernel bytes.
+    __builtin_memset(evt->_pad, 0, sizeof(evt->_pad));
+    __builtin_memcpy(evt->key, key->prefix, sizeof(evt->key));
+    bpf_ringbuf_submit(evt, 0);
+  }
+  return audit;
 }
 
 // =============================================================================
@@ -2165,6 +2233,12 @@ int bpf_xor_path(void *ctx) {
         goto next;
     }
   }
+
+  // Pod binding last, so a violation is reported only when it is the sole
+  // reason this placeholder is not rewritten. sd, w and val are re-looked-up
+  // below, so the helper's map accesses don't matter here.
+  if (!secret_binding_allows(&key))
+    goto next;
 
   dbg_inc(DBG_XOR_SECRET_FOUND);
 
