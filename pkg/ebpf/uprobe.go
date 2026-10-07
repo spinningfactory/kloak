@@ -1944,16 +1944,16 @@ func (m *TLSUprobeManager) UnbindPod(podUID string) {
 	}
 	delete(m.bindings, podUID)
 
-	cgroups := make(map[uint64]struct{}, len(b.cgroupIDs))
+	podCgroups := make(map[uint64]struct{}, len(b.cgroupIDs))
 	for _, cg := range b.cgroupIDs {
-		cgroups[cg] = struct{}{}
+		podCgroups[cg] = struct{}{}
 	}
 	var stale []secretACLKey
 	var k secretACLKey
 	var v uint8
 	iter := m.objs.SecretAcl.Iterate()
 	for iter.Next(&k, &v) {
-		if _, ok := cgroups[k.CgroupID]; ok {
+		if _, ok := podCgroups[k.CgroupID]; ok {
 			stale = append(stale, k)
 		}
 	}
