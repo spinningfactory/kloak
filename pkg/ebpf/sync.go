@@ -34,7 +34,14 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, sour
 	if err != nil {
 		return fmt.Errorf("snapshot secrets: %w", err)
 	}
+	applySecrets(secretMap, watchedHostsMap, snapshot, log)
+	return nil
+}
 
+// applySecrets writes a snapshot to secret_map and watched_hosts (see
+// syncSecrets). Split out so the manager can reuse the same snapshot for
+// the secret_acl sync.
+func applySecrets(secretMap, watchedHostsMap *ebpf.Map, snapshot []secrets.Secret, log *zap.SugaredLogger) {
 	// newKeys tracks which keys we upsert so we can prune stale entries afterwards.
 	newKeys := make(map[secretKey]struct{})
 	// newHosts tracks unique hostnames to sync to the watched_hosts map.
@@ -213,8 +220,52 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, sour
 	log.Debugw("secret sync complete",
 		"snapshotEntries", len(snapshot), "bpfKeys", len(newKeys),
 		"pruned", len(staleKeys), "watchedHosts", len(newHosts))
+}
 
-	return nil
+// syncSecretACL makes secret_acl hold exactly the entries the bindings grant
+// over the snapshot: missing entries are added, the rest pruned. Pruning is
+// what revokes a binding when a pod goes away, a container restarts with a
+// new cgroup, or a secret's placeholder changes.
+func syncSecretACL(aclMap *ebpf.Map, snapshot []secrets.Secret, bindings map[string]podBinding, log *zap.SugaredLogger) {
+	desired := secretACL(snapshot, bindings)
+
+	var stale []secretACLKey
+	present := make(map[secretACLKey]struct{}, len(desired))
+	var k secretACLKey
+	var v uint8
+	iter := aclMap.Iterate()
+	for iter.Next(&k, &v) {
+		if _, ok := desired[k]; ok {
+			present[k] = struct{}{}
+		} else {
+			stale = append(stale, k)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		log.Errorw("error iterating BPF secret_acl", "error", err)
+	}
+
+	allowed := uint8(1)
+	added := 0
+	for key := range desired {
+		if _, ok := present[key]; ok {
+			continue
+		}
+		if err := aclMap.Update(&key, &allowed, ebpf.UpdateAny); err != nil {
+			// A missing entry fails closed: the pod's placeholder is not rewritten.
+			log.Errorw("failed to grant secret binding", "error", err, "cgroupID", key.CgroupID)
+			continue
+		}
+		added++
+	}
+	for i := range stale {
+		if err := aclMap.Delete(&stale[i]); err != nil {
+			log.Errorw("failed to revoke stale secret binding", "error", err, "cgroupID", stale[i].CgroupID)
+		}
+	}
+
+	logging.Tracew(log, "secret binding sync complete",
+		"bindings", len(bindings), "entries", len(desired), "added", added, "pruned", len(stale))
 }
 
 // syncWatchedHosts updates the watched_hosts BPF map with the given set of

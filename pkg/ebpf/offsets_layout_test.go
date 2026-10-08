@@ -37,3 +37,12 @@ func fieldNames(v any) []string {
 	}
 	return names
 }
+
+// TestSecretACLKeyLayout pins secretACLKey to the generated struct
+// secret_acl_key; a mismatch would make every lookup miss (fail closed for
+// every pod).
+func TestSecretACLKeyLayout(t *testing.T) {
+	if got, want := binary.Size(secretACLKey{}), binary.Size(tlsuprobeSecretAclKey{}); got != want {
+		t.Fatalf("secretACLKey is %d bytes, struct secret_acl_key is %d", got, want)
+	}
+}

@@ -87,6 +87,15 @@ type Inject struct {
 	File string
 }
 
+// Ref names the secret keys a workload is entitled to redeem: the data
+// plane rewrites a placeholder only for processes of a workload holding a
+// Ref to it. OwnerID matches Secret.OwnerID. Keys lists the data keys the
+// workload references; nil means every key of the owner.
+type Ref struct {
+	OwnerID string
+	Keys    []string
+}
+
 // Source produces snapshots of the secrets the data plane should program
 // into its BPF maps. Implementations may be backed by a Kubernetes
 // informer cache, a YAML file, or any other origin.

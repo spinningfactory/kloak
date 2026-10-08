@@ -46,6 +46,7 @@ spec:
             - --cgroup-path={{ .Values.controller.cgroupPath }}
             - --egress-interface={{ .Values.controller.ebpf.egressInterface | default "auto" }}
             - --tc-attach-mode={{ .Values.controller.ebpf.tcAttachMode | default "auto" }}
+            - --secret-binding={{ .Values.controller.ebpf.secretBinding | default "enforce" }}
             {{- if .Values.controller.dns.trustedServers }}
             - --trusted-dns-servers={{ join "," .Values.controller.dns.trustedServers }}
             {{- end }}

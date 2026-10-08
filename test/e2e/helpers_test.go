@@ -55,6 +55,25 @@ func waitForSecret(ctx context.Context, namespace, name string) error {
 }
 
 // waitForSecretAbsent polls until a secret no longer exists.
+// waitForPodAbsent waits until a pod no longer exists, e.g. so a fixed-name
+// pod deleted by an earlier test's cleanup can be recreated.
+func waitForPodAbsent(ctx context.Context, namespace, name string) error {
+	for {
+		_, err := clientset.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("timed out waiting for pod %s/%s to be deleted", namespace, name)
+		case <-time.After(pollInterval):
+		}
+	}
+}
+
 func waitForSecretAbsent(ctx context.Context, namespace, name string) error {
 	for {
 		select {
