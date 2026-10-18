@@ -42,12 +42,12 @@ func TestSNICaptureKernel(t *testing.T) {
 	if err != nil {
 		t.Skipf("cannot attach kprobe tcp_sendmsg: %v", err)
 	}
-	defer kp.Close()
+	defer func() { _ = kp.Close() }()
 	tp, err := link.Tracepoint("sock", "inet_sock_set_state", objs.TpInetSockSetState, nil)
 	if err != nil {
 		t.Skipf("cannot attach tracepoint sock/inet_sock_set_state: %v", err)
 	}
-	defer tp.Close()
+	defer func() { _ = tp.Close() }()
 
 	tgid, tracked := uint32(os.Getpid()), uint8(1)
 	if err := objs.TrackedTgids.Update(tgid, &tracked, 0); err != nil {
@@ -65,7 +65,9 @@ func TestSNICaptureKernel(t *testing.T) {
 	}
 
 	// Closing the connection reaches TCP_CLOSE, which forgets the socket.
-	conn.Close()
+	if err := conn.Close(); err != nil {
+		t.Fatalf("closing TLS connection: %v", err)
+	}
 	if !waitSNIStateGone(t, objs, func(v sniStateVal) bool {
 		return v.Status == sniStatusSeen && hostString(v.SNI) == "api.example.com"
 	}) {
@@ -74,7 +76,7 @@ func TestSNICaptureKernel(t *testing.T) {
 
 	// Go sends no SNI when ServerName is empty.
 	conn = dialTLS(t, addr, "")
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	if !waitSNIState(t, objs, func(v sniStateVal) bool { return v.Status == sniStatusAbsent }) {
 		t.Fatalf("no ABSENT entry in sni_state: %v", dumpSNIState(t, objs))
 	}
@@ -101,7 +103,7 @@ func startTLSServer(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { _ = ln.Close() })
 	go func() {
 		for {
 			c, err := ln.Accept()
@@ -109,7 +111,7 @@ func startTLSServer(t *testing.T) string {
 				return
 			}
 			go func() {
-				defer c.Close()
+				defer func() { _ = c.Close() }()
 				_ = c.(*tls.Conn).Handshake()
 				_, _ = c.Read(make([]byte, 1))
 			}()

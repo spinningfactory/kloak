@@ -1863,7 +1863,7 @@ func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 			m.log.Errorw("failed to parse secret binding event", "error", err)
 			continue
 		}
-		m.logBindingViolation(event)
+		m.logBindingViolation(&event)
 	}
 }
 
@@ -2010,7 +2010,7 @@ const bindingLogInterval = time.Minute
 
 // logBindingViolation reports a placeholder redeemed outside its binding,
 // or on a connection whose SNI is not the secret's host.
-func (m *TLSUprobeManager) logBindingViolation(ev secretBindingEvent) {
+func (m *TLSUprobeManager) logBindingViolation(ev *secretBindingEvent) {
 	key := bindingLogKey{
 		acl:       secretACLKey{CgroupID: ev.CgroupID, Key: ev.Key},
 		reason:    ev.Reason,
@@ -2048,7 +2048,7 @@ func (m *TLSUprobeManager) logBindingViolation(ev secretBindingEvent) {
 
 // logSNIViolation reports a host-restricted secret written on a connection
 // whose ClientHello did not name the host (spinningfactory/kloak#328).
-func (m *TLSUprobeManager) logSNIViolation(ev secretBindingEvent, pod, secret string) {
+func (m *TLSUprobeManager) logSNIViolation(ev *secretBindingEvent, pod, secret string) {
 	reason, sni := describeSNIEvent(ev)
 	fields := []any{"pod", pod, "secret", secret, "reason", reason, "sni", sni,
 		"tgid", ev.Tgid, "cgroupID", ev.CgroupID}

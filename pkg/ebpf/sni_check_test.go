@@ -27,12 +27,12 @@ func TestParseSNICheckMode(t *testing.T) {
 func TestDescribeSNIEvent(t *testing.T) {
 	ev := secretBindingEvent{Reason: secretEventSNI, SNIStatus: 6}
 	copy(ev.SNI[:], "evil.example")
-	reason, sni := describeSNIEvent(ev)
+	reason, sni := describeSNIEvent(&ev)
 	if reason != "SNI does not match the secret's host" || sni != "evil.example" {
 		t.Errorf("describeSNIEvent = (%q, %q)", reason, sni)
 	}
 
-	reason, sni = describeSNIEvent(secretBindingEvent{Reason: secretEventSNI, SNIStatus: 0})
+	reason, sni = describeSNIEvent(&secretBindingEvent{Reason: secretEventSNI, SNIStatus: 0})
 	if reason != "no ClientHello seen on the connection" || sni != "" {
 		t.Errorf("describeSNIEvent(no state) = (%q, %q)", reason, sni)
 	}

@@ -158,7 +158,7 @@ func secretACL(snapshot []secrets.Secret, bindings map[string]podBinding) map[se
 // describeBindingEvent names the pod and secret behind a violation event,
 // for the controller log. bindings and snapshot are best-effort context:
 // a cgroup outside every binding belongs to a pod kloak doesn't track.
-func describeBindingEvent(ev secretBindingEvent, bindings map[string]podBinding, snapshot []secrets.Secret) (pod, secret string) {
+func describeBindingEvent(ev *secretBindingEvent, bindings map[string]podBinding, snapshot []secrets.Secret) (pod, secret string) {
 	pod = fmt.Sprintf("untracked cgroup %d", ev.CgroupID)
 	for _, b := range bindings {
 		for _, cg := range b.cgroupIDs {

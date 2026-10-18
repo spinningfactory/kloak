@@ -63,7 +63,7 @@ var sniStatusNames = map[uint8]string{
 
 // describeSNIEvent returns why an SNI check refused (or, in audit mode,
 // flagged) a rewrite, and the SNI the connection carried, if any.
-func describeSNIEvent(ev secretBindingEvent) (reason, sni string) {
+func describeSNIEvent(ev *secretBindingEvent) (reason, sni string) {
 	reason, ok := sniStatusNames[ev.SNIStatus]
 	if !ok {
 		reason = fmt.Sprintf("SNI status %d", ev.SNIStatus)
