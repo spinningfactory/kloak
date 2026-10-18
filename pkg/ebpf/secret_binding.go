@@ -87,13 +87,22 @@ type secretACLKey struct {
 	Key      placeholderKey
 }
 
+// Values of secret_binding_event.reason (SECRET_EVT_* in tls_uprobe.c).
+const (
+	secretEventBinding uint8 = 0 // the pod does not reference the secret
+	secretEventSNI     uint8 = 1 // the connection's SNI is not the secret's host
+)
+
 // secretBindingEvent must match struct secret_binding_event in tls_uprobe.c.
 type secretBindingEvent struct {
-	CgroupID uint64
-	Tgid     uint32
-	Audit    uint8
-	_        [3]byte
-	Key      placeholderKey
+	CgroupID  uint64
+	Tgid      uint32
+	Audit     uint8
+	Reason    uint8
+	SNIStatus uint8
+	MemoryBIO uint8
+	Key       placeholderKey
+	SNI       [maxHostLen]byte
 }
 
 // podBinding is what a pod is entitled to redeem: every container cgroup

@@ -11,7 +11,9 @@ import (
 
 // ParseHost interprets a host filter string. Empty input or "*" returns
 // ("", nil), meaning no filter. A literal IP returns ("", parsed IP);
-// any other non-empty value returns (hostname, nil).
+// any other non-empty value returns (hostname, nil), lowercased and without
+// a trailing dot: the data plane compares it byte for byte with the TLS SNI,
+// which it normalizes the same way.
 //
 // Used by every Source that accepts host filters as a free-form string
 // (k8s annotation, future YAML, ...).
@@ -23,7 +25,7 @@ func ParseHost(spec string) (host string, ip net.IP) {
 	if parsed := net.ParseIP(trimmed); parsed != nil {
 		return "", parsed
 	}
-	return trimmed, nil
+	return strings.ToLower(strings.TrimSuffix(trimmed, ".")), nil
 }
 
 // PortSpec is the parsed form of a "<port>" or "<port>/<proto>" string.

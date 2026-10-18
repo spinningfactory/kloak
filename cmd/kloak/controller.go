@@ -53,6 +53,7 @@ var (
 	egressInterface     string
 	tcAttachMode        string
 	secretBinding       string
+	sniCheck            string
 )
 
 func init() {
@@ -71,12 +72,15 @@ func init() {
 	controllerCmd.Flags().StringVar(&secretBinding, "secret-binding", "enforce",
 		`Which pods may redeem a secret's placeholder: only pods that reference the secret in their spec (Secret volume, env secretKeyRef, envFrom). `+
 			`"enforce" refuses other pods' rewrites; "audit" allows them but logs each violation, to find such workloads before enforcing.`)
+	controllerCmd.Flags().StringVar(&sniCheck, "sni-check", "enforce",
+		`A secret restricted to a hostname (getkloak.io/hosts) is only rewritten on a connection whose TLS ClientHello names that host (SNI). `+
+			`"enforce" refuses other rewrites; "audit" allows them but logs each violation, to find clients whose SNI differs from the annotation before enforcing.`)
 }
 
 func runController(cmd *cobra.Command, args []string) {
 	setupLog := logging.Setup().Named("setup")
 
-	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface, "tcAttachMode", tcAttachMode, "secretBinding", secretBinding)
+	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface, "tcAttachMode", tcAttachMode, "secretBinding", secretBinding, "sniCheck", sniCheck)
 
 	tcMode, err := ebpf.ParseTCAttachMode(tcAttachMode)
 	if err != nil {
@@ -87,6 +91,12 @@ func runController(cmd *cobra.Command, args []string) {
 	bindingMode, err := ebpf.ParseSecretBindingMode(secretBinding)
 	if err != nil {
 		setupLog.Errorw("invalid --secret-binding", "error", err)
+		_ = setupLog.Sync()
+		os.Exit(1)
+	}
+	sniMode, err := ebpf.ParseSNICheckMode(sniCheck)
+	if err != nil {
+		setupLog.Errorw("invalid --sni-check", "error", err)
 		_ = setupLog.Sync()
 		os.Exit(1)
 	}
@@ -120,6 +130,7 @@ func runController(cmd *cobra.Command, args []string) {
 		}
 		uprobeMgr.SetTCAttachMode(tcMode)
 		uprobeMgr.SetSecretBindingMode(bindingMode)
+		uprobeMgr.SetSNICheckMode(sniMode)
 		setupLog.Infow("eBPF TLS uprobes enabled")
 	} else {
 		setupLog.Infow("eBPF disabled")

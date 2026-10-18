@@ -145,8 +145,16 @@ type TLSUprobeManager struct {
 	// lastSnapshot is the most recent secrets snapshot, used to grant a new
 	// pod's bindings immediately instead of at the next periodic sync.
 	lastSnapshot []secrets.Secret
-	// bindingLogged rate-limits violation logs per (cgroup, placeholder).
-	bindingLogged map[secretACLKey]time.Time
+	// bindingLogged rate-limits violation logs per (cgroup, placeholder,
+	// reason).
+	bindingLogged map[bindingLogKey]time.Time
+}
+
+// bindingLogKey identifies a logged binding or SNI violation.
+type bindingLogKey struct {
+	acl       secretACLKey
+	reason    uint8
+	sniStatus uint8
 }
 
 // tcAttachEntry holds an open fd to a network namespace to prevent inode reuse.
@@ -355,7 +363,7 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		egressInterface: egressInterface,
 		tcMode:          newTCModeResolver(TCAttachAuto),
 		bindings:        make(map[string]podBinding),
-		bindingLogged:   make(map[secretACLKey]time.Time),
+		bindingLogged:   make(map[bindingLogKey]time.Time),
 	}
 
 	// Attach tracepoints for DNS interception and connect tracking.
@@ -425,6 +433,24 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 	m.links = append(m.links, tkp)
 	m.linksMu.Unlock()
 	m.log.Debugw("Attached kprobe", "function", "tcp_sendmsg")
+
+	// SNI check: record each connection's ClientHello SNI (a second kprobe
+	// on tcp_sendmsg) and forget it when the socket reconnects or closes.
+	skp, err := link.Kprobe("tcp_sendmsg", m.objs.BpfKprobeTcpSendmsgSni, nil)
+	if err != nil {
+		return fmt.Errorf("attaching SNI kprobe tcp_sendmsg: %w", err)
+	}
+	m.linksMu.Lock()
+	m.links = append(m.links, skp)
+	m.linksMu.Unlock()
+	stp, err := link.Tracepoint("sock", "inet_sock_set_state", m.objs.TpInetSockSetState, nil)
+	if err != nil {
+		return fmt.Errorf("attaching tracepoint sock/inet_sock_set_state: %w", err)
+	}
+	m.linksMu.Lock()
+	m.links = append(m.links, stp)
+	m.linksMu.Unlock()
+	m.log.Debugw("Attached SNI capture", "kprobe", "tcp_sendmsg", "tracepoint", "sock/inet_sock_set_state")
 
 	return nil
 }
@@ -1914,6 +1940,17 @@ func (m *TLSUprobeManager) SetSecretBindingMode(mode SecretBindingMode) {
 	}
 }
 
+// SetSNICheckMode configures what the data plane does when a secret
+// restricted to a hostname is written on a connection whose ClientHello did
+// not name that host. The BPF default (an unwritten map) is enforce, so a
+// failed write fails closed.
+func (m *TLSUprobeManager) SetSNICheckMode(mode SNICheckMode) {
+	key, val := uint32(0), mode.bpfValue()
+	if err := m.objs.SniCheckMode.Update(&key, &val, ebpf.UpdateAny); err != nil {
+		m.log.Errorw("failed to set SNI check mode; enforcing", "mode", mode, "error", err)
+	}
+}
+
 // BindPodSecrets records which secrets a pod may redeem and grants them to
 // its container cgroups at once, so the pod's first TLS writes are rewritten.
 // It replaces any previous binding for the pod: cgroups or references that
@@ -1971,9 +2008,14 @@ func (m *TLSUprobeManager) UnbindPod(podUID string) {
 // violation is logged.
 const bindingLogInterval = time.Minute
 
-// logBindingViolation reports a placeholder redeemed outside its binding.
+// logBindingViolation reports a placeholder redeemed outside its binding,
+// or on a connection whose SNI is not the secret's host.
 func (m *TLSUprobeManager) logBindingViolation(ev secretBindingEvent) {
-	key := secretACLKey{CgroupID: ev.CgroupID, Key: ev.Key}
+	key := bindingLogKey{
+		acl:       secretACLKey{CgroupID: ev.CgroupID, Key: ev.Key},
+		reason:    ev.Reason,
+		sniStatus: ev.SNIStatus,
+	}
 	now := time.Now()
 
 	m.bindMu.Lock()
@@ -1990,6 +2032,11 @@ func (m *TLSUprobeManager) logBindingViolation(ev secretBindingEvent) {
 	pod, secret := describeBindingEvent(ev, m.bindings, m.lastSnapshot)
 	m.bindMu.Unlock()
 
+	if ev.Reason == secretEventSNI {
+		m.logSNIViolation(ev, pod, secret)
+		return
+	}
+
 	if ev.Audit == 1 {
 		m.log.Warnw("secret binding violation (audit mode, rewrite allowed): pod used a secret it does not reference",
 			"pod", pod, "secret", secret, "tgid", ev.Tgid, "cgroupID", ev.CgroupID)
@@ -1997,6 +2044,25 @@ func (m *TLSUprobeManager) logBindingViolation(ev secretBindingEvent) {
 	}
 	m.log.Warnw("secret binding violation (rewrite refused): pod used a secret it does not reference",
 		"pod", pod, "secret", secret, "tgid", ev.Tgid, "cgroupID", ev.CgroupID)
+}
+
+// logSNIViolation reports a host-restricted secret written on a connection
+// whose ClientHello did not name the host (spinningfactory/kloak#328).
+func (m *TLSUprobeManager) logSNIViolation(ev secretBindingEvent, pod, secret string) {
+	reason, sni := describeSNIEvent(ev)
+	fields := []any{"pod", pod, "secret", secret, "reason", reason, "sni", sni,
+		"tgid", ev.Tgid, "cgroupID", ev.CgroupID}
+	if ev.MemoryBIO == 1 {
+		// Memory-BIO writers (Node.js, Bun) are matched to a socket by the
+		// next tcp_sendmsg of the process, which may belong to another
+		// connection; the write is retried on its own socket.
+		fields = append(fields, "note", "memory-BIO process: the refused socket may be another connection of the same process")
+	}
+	if ev.Audit == 1 {
+		m.log.Warnw("SNI check violation (audit mode, rewrite allowed): connection's TLS SNI is not the secret's host", fields...)
+		return
+	}
+	m.log.Warnw("SNI check violation (rewrite refused): connection's TLS SNI is not the secret's host", fields...)
 }
 
 // debugCounterNames maps index to human-readable name (must match C enum in
@@ -2021,6 +2087,7 @@ var debugCounterNames = []string{
 	"bssl_s3_null", "bssl_aead_null", "bssl_rdkey_fail", "bssl_rounds_bad", "bssl_hzero",
 	"openssl_gcm_gate_fail", "openssl_h_from_hkey1",
 	"secret_binding_deny", "secret_binding_audit",
+	"sni_captured", "sni_deny", "sni_audit",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

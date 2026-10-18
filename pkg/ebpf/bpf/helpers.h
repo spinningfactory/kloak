@@ -396,6 +396,192 @@ HELPER_INLINE int tls_appdata_reclen_match(__u32 rec_len, __u32 pt_len,
 }
 
 // ============================================================================
+// TLS ClientHello SNI extraction (SNI check, spinningfactory/kloak#328)
+//
+// A secret restricted to a hostname is only rewritten on a connection whose
+// first ClientHello named that host, so a shared front end (CDN, cloud load
+// balancer) cannot route the real value to another tenant. The ClientHello is
+// sent in the clear; tls_parse_sni reads it from the first bytes of a
+// tcp_sendmsg buffer copied into a TLS_SNI_BUF_LEN scratch buffer.
+// ============================================================================
+
+// Copy size for the ClientHello prefix. Post-quantum key shares
+// (X25519MLKEM768) push ClientHellos to ~1.2-1.8 KB, and server_name may come
+// after key_share. Must be a power of two: offsets are masked with it for the
+// verifier.
+#define TLS_SNI_BUF_LEN 2048
+#define TLS_SNI_BUF_MASK (TLS_SNI_BUF_LEN - 1)
+// Extensions walked before giving up. Real ClientHellos carry ~10-20.
+#define TLS_SNI_MAX_EXTS 32
+
+#define TLS_HS_CLIENT_HELLO 0x01
+#define TLS_EXT_SERVER_NAME 0x0000
+#define TLS_EXT_ECH 0xfe0d
+
+// tls_parse_sni results. SNI_STATUS_NONE is the zero value, so a zeroed
+// sni_state entry reads as "no ClientHello seen yet".
+#define SNI_STATUS_NONE 0       // no ClientHello seen on this connection
+#define SNI_STATUS_SEEN 1       // ClientHello with a valid host_name
+#define SNI_STATUS_ABSENT 2     // ClientHello without server_name
+#define SNI_STATUS_ECH 3        // encrypted ClientHello: the outer SNI is not the real host
+#define SNI_STATUS_TRUNCATED 4  // server_name not within the copied bytes
+#define SNI_STATUS_MALFORMED 5  // lengths inconsistent or host_name invalid
+#define SNI_STATUS_MISMATCH 6   // a later ClientHello (HelloRetryRequest) named another host
+#define SNI_NOT_CLIENT_HELLO 0xFF // buffer does not start with a ClientHello
+
+// sni_idx masks a buffer offset. The empty asm hides the value from the
+// compiler: it can often prove off < TLS_SNI_BUF_LEN from an earlier
+// `off + k > len` check and drop the mask, but the verifier loses that link
+// once the register is spilled, and rejects the access.
+HELPER_INLINE __u32 sni_idx(__u32 off) {
+#ifdef __BPF__
+  asm volatile("" : "+r"(off));
+#endif
+  return off & TLS_SNI_BUF_MASK;
+}
+
+HELPER_INLINE __u32 sni_rd16(const __u8 *b, __u32 off) {
+  return ((__u32)b[sni_idx(off)] << 8) | (__u32)b[sni_idx(off + 1)];
+}
+
+// A host_name byte the SNI check accepts: lowercase LDH, '.', '_'.
+// Rejecting everything else (notably NUL) keeps a host such as
+// "api.example.com\0evil" from comparing equal to a zero-padded
+// "api.example.com" in hosts_match.
+HELPER_INLINE int sni_host_char_ok(__u8 c) {
+  return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' ||
+         c == '.' || c == '_';
+}
+
+// tls_parse_sni parses the TLS record at buf[0..len) as a ClientHello and, on
+// SNI_STATUS_SEEN, writes the lowercased host_name without a trailing dot to
+// host_out (MAX_HOST_LEN bytes, zeroed by the caller) and its length to
+// *host_len. Returns SNI_NOT_CLIENT_HELLO when the buffer does not start with
+// a handshake record carrying a ClientHello, otherwise an SNI_STATUS_* value.
+// An ECH extension wins over a readable server_name: with ECH the outer SNI
+// is the front end's public name, not the host the request is for.
+HELPER_INLINE __u32 tls_parse_sni(const __u8 *buf, __u32 len, char *host_out,
+                                  __u32 *host_len) {
+  *host_len = 0;
+  if (len > TLS_SNI_BUF_LEN)
+    len = TLS_SNI_BUF_LEN;
+  // Record header (5) + handshake header (4).
+  if (len < 9)
+    return SNI_NOT_CLIENT_HELLO;
+  if (buf[0] != TLS_CT_HANDSHAKE || buf[1] != 0x03 ||
+      buf[5] != TLS_HS_CLIENT_HELLO)
+    return SNI_NOT_CLIENT_HELLO;
+
+  __u32 rec_end = 5 + sni_rd16(buf, 3);
+  __u32 hs_end = 9 + (((__u32)buf[6] << 16) | sni_rd16(buf, 7));
+  // A ClientHello fragmented across records is legal but never seen in
+  // practice; refuse rather than reassemble.
+  if (hs_end > rec_end)
+    return SNI_STATUS_MALFORMED;
+
+  // client_version (2) + random (32).
+  __u32 off = 9 + 2 + 32;
+  // session_id
+  if (off + 1 > len)
+    return SNI_STATUS_TRUNCATED;
+  off += 1 + buf[sni_idx(off)];
+  // cipher_suites
+  if (off + 2 > len)
+    return SNI_STATUS_TRUNCATED;
+  off += 2 + sni_rd16(buf, off);
+  // compression_methods
+  if (off + 1 > len)
+    return SNI_STATUS_TRUNCATED;
+  off += 1 + buf[sni_idx(off)];
+  if (off > hs_end)
+    return SNI_STATUS_MALFORMED;
+  if (off == hs_end)
+    return SNI_STATUS_ABSENT; // no extensions at all
+  if (off + 2 > len)
+    return SNI_STATUS_TRUNCATED;
+  __u32 ext_end = off + 2 + sni_rd16(buf, off);
+  if (ext_end != hs_end)
+    return SNI_STATUS_MALFORMED;
+  off += 2;
+
+  int ech = 0;
+  int found = 0;
+  int truncated = 0;
+  __u32 n = 0, name_off = 0;
+  for (__u32 i = 0; i < TLS_SNI_MAX_EXTS; i++) {
+    if (off >= ext_end)
+      break;
+    if (off + 4 > ext_end)
+      return SNI_STATUS_MALFORMED;
+    if (off + 4 > len) {
+      truncated = 1;
+      break;
+    }
+    __u32 type = sni_rd16(buf, off);
+    __u32 elen = sni_rd16(buf, off + 2);
+    off += 4;
+    if (off + elen > ext_end)
+      return SNI_STATUS_MALFORMED;
+
+    if (type == TLS_EXT_ECH)
+      ech = 1;
+
+    if (type == TLS_EXT_SERVER_NAME) {
+      // A second server_name extension is illegal (RFC 8446 §4.2).
+      if (found)
+        return SNI_STATUS_MALFORMED;
+      if (off + elen > len) {
+        truncated = 1;
+        break;
+      }
+      // ServerNameList: list_len (2), name_type (1), name_len (2), name.
+      // Only a single host_name entry is accepted.
+      if (elen < 5 || sni_rd16(buf, off) != elen - 2 ||
+          buf[sni_idx(off + 2)] != 0)
+        return SNI_STATUS_MALFORMED;
+      n = sni_rd16(buf, off + 3);
+      if (n == 0 || n + 5 != elen || n >= MAX_HOST_LEN)
+        return SNI_STATUS_MALFORMED;
+      // Copied after the walk: a copy loop nested in this one multiplies the
+      // paths the BPF verifier explores past its instruction budget.
+      name_off = off + 5;
+      found = 1;
+    }
+    off += elen;
+  }
+
+  if (ech)
+    return SNI_STATUS_ECH;
+  // ECH may sit after the copied bytes or past the walk limit: only trust
+  // a server_name when every extension was seen.
+  if (truncated)
+    return SNI_STATUS_TRUNCATED;
+  if (off < ext_end)
+    return SNI_STATUS_MALFORMED; // more than TLS_SNI_MAX_EXTS extensions
+  if (!found)
+    return SNI_STATUS_ABSENT;
+
+  for (__u32 j = 0; j < MAX_HOST_LEN; j++) {
+    if (j >= n)
+      break;
+    __u8 c = buf[sni_idx(name_off + j)];
+    if (c >= 'A' && c <= 'Z')
+      c = c - 'A' + 'a';
+    if (!sni_host_char_ok(c))
+      return SNI_STATUS_MALFORMED;
+    host_out[j & (MAX_HOST_LEN - 1)] = (char)c;
+  }
+  if (host_out[(n - 1) & (MAX_HOST_LEN - 1)] == '.') {
+    host_out[(n - 1) & (MAX_HOST_LEN - 1)] = 0;
+    n--;
+  }
+  if (n == 0)
+    return SNI_STATUS_MALFORMED;
+  *host_len = n;
+  return SNI_STATUS_SEEN;
+}
+
+// ============================================================================
 // AES single-block encryption — used to recover the GHASH subkey H for
 // BoringSSL.
 //

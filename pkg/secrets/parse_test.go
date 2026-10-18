@@ -18,6 +18,9 @@ func TestParseHost(t *testing.T) {
 		{"  ", "", nil},
 		{"api.stripe.com", "api.stripe.com", nil},
 		{"  api.stripe.com  ", "api.stripe.com", nil},
+		// Normalized like the SNI the data plane compares it with.
+		{"API.Stripe.com", "api.stripe.com", nil},
+		{"api.stripe.com.", "api.stripe.com", nil},
 		{"127.0.0.1", "", net.ParseIP("127.0.0.1")},
 		{"::1", "", net.ParseIP("::1")},
 	}

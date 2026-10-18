@@ -42,8 +42,14 @@ spec:
               value: "/etc/secrets/allowed/api-key"
             - name: SECRET_BLOCKED_FILE
               value: "/etc/secrets/blocked/api-key"
+            # Full Service name, not "tls-bun": kloak only rewrites a secret on a
+            # connection whose TLS SNI is the secret's getkloak.io/hosts value.
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
             - name: TARGET_HOST
-              value: "tls-bun"
+              value: "tls-bun.$(POD_NAMESPACE).svc.cluster.local"
             - name: REQUEST_INTERVAL
               value: "5"
           volumeMounts:

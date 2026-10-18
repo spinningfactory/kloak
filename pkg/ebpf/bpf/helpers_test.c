@@ -581,6 +581,228 @@ static void test_gf128_halve_to_h_edges(void) {
 // main
 // ============================================================================
 
+// ============================================================================
+// tls_parse_sni
+// ============================================================================
+
+#include "tls_sni_fixtures.h"
+
+static __u32 parse_sni(const unsigned char *ch, __u32 len, char host[MAX_HOST_LEN],
+                       __u32 *host_len) {
+  // The BPF caller parses a TLS_SNI_BUF_LEN scratch copy; mirror that.
+  static __u8 buf[TLS_SNI_BUF_LEN];
+  memset(buf, 0, sizeof(buf));
+  memcpy(buf, ch, len < sizeof(buf) ? len : sizeof(buf));
+  memset(host, 0, MAX_HOST_LEN);
+  return tls_parse_sni(buf, len, host, host_len);
+}
+
+static void assert_sni(const unsigned char *ch, __u32 len, const char *want) {
+  char host[MAX_HOST_LEN];
+  __u32 n = 0;
+  assert(parse_sni(ch, len, host, &n) == SNI_STATUS_SEEN);
+  assert(n == strlen(want));
+  assert(memcmp(host, want, n) == 0);
+  // Zero-padded, so hosts_match against a synced allowed_host works.
+  for (__u32 i = n; i < MAX_HOST_LEN; i++)
+    assert(host[i] == 0);
+}
+
+static void test_sni_go(void) { assert_sni(ch_go, sizeof(ch_go), "api.example.com"); }
+static void test_sni_node(void) { assert_sni(ch_node, sizeof(ch_node), "api.example.com"); }
+static void test_sni_bun(void) { assert_sni(ch_bun, sizeof(ch_bun), "api.example.com"); }
+
+static void test_sni_lowercase_trailing_dot(void) {
+  // Python sent "API.Example.com." verbatim.
+  assert_sni(ch_py, sizeof(ch_py), "api.example.com");
+}
+
+static void test_sni_absent(void) {
+  char host[MAX_HOST_LEN];
+  __u32 n = 7;
+  assert(parse_sni(ch_py_nosni, sizeof(ch_py_nosni), host, &n) == SNI_STATUS_ABSENT);
+  assert(n == 0);
+}
+
+static void test_sni_truncated_real(void) {
+  // A prefix of a real ClientHello is TRUNCATED until every extension header
+  // (type + length) is inside it: an unseen header could be ECH. Only the
+  // body of the last extension may be cut (Go's ~1.2 KB key_share ends the
+  // list), since bodies other than server_name are skipped, not read.
+  char host[MAX_HOST_LEN];
+  __u32 n;
+  int seen = 0;
+  for (__u32 len = 0; len < sizeof(ch_go); len++) {
+    __u32 st = parse_sni(ch_go, len, host, &n);
+    if (st == SNI_STATUS_SEEN) {
+      seen = 1;
+      assert(n == 15 && memcmp(host, "api.example.com", 15) == 0);
+      continue;
+    }
+    assert(!seen); // once every header is in, longer prefixes stay SEEN
+    assert(st == SNI_STATUS_TRUNCATED || st == SNI_NOT_CLIENT_HELLO);
+  }
+}
+
+static void test_sni_not_client_hello(void) {
+  char host[MAX_HOST_LEN];
+  __u32 n;
+  unsigned char appdata[64] = {0x17, 0x03, 0x03, 0x00, 0x3b};
+  assert(parse_sni(appdata, sizeof(appdata), host, &n) == SNI_NOT_CLIENT_HELLO);
+  unsigned char server_hello[64] = {0x16, 0x03, 0x03, 0x00, 0x3b, 0x02};
+  assert(parse_sni(server_hello, sizeof(server_hello), host, &n) == SNI_NOT_CLIENT_HELLO);
+  unsigned char http[] = "GET / HTTP/1.1\r\nHost: api.example.com\r\n\r\n";
+  assert(parse_sni(http, sizeof(http) - 1, host, &n) == SNI_NOT_CLIENT_HELLO);
+}
+
+// build_ch wraps an extensions block in a minimal ClientHello record.
+static __u32 build_ch(unsigned char *out, const unsigned char *exts, __u32 exts_len) {
+  __u32 body = 2 + 32 + 1 + 4 + 2 + 2 + exts_len; // version..compression + ext len
+  __u32 o = 0;
+  out[o++] = 0x16; out[o++] = 0x03; out[o++] = 0x01;
+  out[o++] = (unsigned char)((body + 4) >> 8); out[o++] = (unsigned char)(body + 4);
+  out[o++] = 0x01;
+  out[o++] = 0; out[o++] = (unsigned char)(body >> 8); out[o++] = (unsigned char)body;
+  out[o++] = 0x03; out[o++] = 0x03;
+  memset(out + o, 0xAB, 32); o += 32;  // random
+  out[o++] = 0;                        // session_id
+  out[o++] = 0; out[o++] = 2; out[o++] = 0x13; out[o++] = 0x01; // one cipher suite
+  out[o++] = 1; out[o++] = 0;          // null compression
+  out[o++] = (unsigned char)(exts_len >> 8); out[o++] = (unsigned char)exts_len;
+  memcpy(out + o, exts, exts_len);
+  return o + exts_len;
+}
+
+// sni_ext appends a server_name extension with one host_name entry.
+static __u32 sni_ext(unsigned char *out, const char *name, __u32 name_len) {
+  __u32 o = 0;
+  out[o++] = 0; out[o++] = 0;
+  out[o++] = (unsigned char)((name_len + 5) >> 8); out[o++] = (unsigned char)(name_len + 5);
+  out[o++] = (unsigned char)((name_len + 3) >> 8); out[o++] = (unsigned char)(name_len + 3);
+  out[o++] = 0;
+  out[o++] = (unsigned char)(name_len >> 8); out[o++] = (unsigned char)name_len;
+  memcpy(out + o, name, name_len);
+  return o + name_len;
+}
+
+static __u32 dummy_ext(unsigned char *out, __u32 type, __u32 len) {
+  out[0] = (unsigned char)(type >> 8); out[1] = (unsigned char)type;
+  out[2] = (unsigned char)(len >> 8); out[3] = (unsigned char)len;
+  memset(out + 4, 0x5A, len);
+  return 4 + len;
+}
+
+static void test_sni_synthetic(void) {
+  unsigned char exts[256], ch[512];
+  __u32 e = sni_ext(exts, "Svc.NS.svc.cluster.local", 24);
+  __u32 len = build_ch(ch, exts, e);
+  assert_sni(ch, len, "svc.ns.svc.cluster.local");
+}
+
+static void test_sni_ech_wins(void) {
+  // ECH before or after a readable server_name: the outer SNI is not the
+  // real host, refuse either way.
+  unsigned char exts[256], ch[512];
+  char host[MAX_HOST_LEN];
+  __u32 n;
+  __u32 e = sni_ext(exts, "api.example.com", 15);
+  e += dummy_ext(exts + e, TLS_EXT_ECH, 32);
+  __u32 len = build_ch(ch, exts, e);
+  assert(parse_sni(ch, len, host, &n) == SNI_STATUS_ECH);
+
+  e = dummy_ext(exts, TLS_EXT_ECH, 32);
+  e += sni_ext(exts + e, "api.example.com", 15);
+  len = build_ch(ch, exts, e);
+  assert(parse_sni(ch, len, host, &n) == SNI_STATUS_ECH);
+}
+
+static void test_sni_rejects_bad_host_bytes(void) {
+  unsigned char exts[256], ch[512];
+  char host[MAX_HOST_LEN];
+  __u32 n;
+  // Embedded NUL would compare equal to a zero-padded "api.example.com".
+  __u32 len = build_ch(ch, exts, sni_ext(exts, "api.example.com\0evil", 20));
+  assert(parse_sni(ch, len, host, &n) == SNI_STATUS_MALFORMED);
+  len = build_ch(ch, exts, sni_ext(exts, "api example.com", 15));
+  assert(parse_sni(ch, len, host, &n) == SNI_STATUS_MALFORMED);
+  // A lone "." strips to an empty host.
+  len = build_ch(ch, exts, sni_ext(exts, ".", 1));
+  assert(parse_sni(ch, len, host, &n) == SNI_STATUS_MALFORMED);
+}
+
+static void test_sni_too_long(void) {
+  unsigned char exts[256], ch[512];
+  char host[MAX_HOST_LEN], name[MAX_HOST_LEN];
+  __u32 n;
+  memset(name, 'a', sizeof(name));
+  // MAX_HOST_LEN - 1 fits (sync rejects hosts >= MAX_HOST_LEN), MAX_HOST_LEN does not.
+  __u32 len = build_ch(ch, exts, sni_ext(exts, name, MAX_HOST_LEN - 1));
+  assert(parse_sni(ch, len, host, &n) == SNI_STATUS_SEEN && n == MAX_HOST_LEN - 1);
+  len = build_ch(ch, exts, sni_ext(exts, name, MAX_HOST_LEN));
+  assert(parse_sni(ch, len, host, &n) == SNI_STATUS_MALFORMED);
+}
+
+static void test_sni_duplicate_server_name(void) {
+  unsigned char exts[256], ch[512];
+  char host[MAX_HOST_LEN];
+  __u32 n;
+  __u32 e = sni_ext(exts, "api.example.com", 15);
+  e += sni_ext(exts + e, "evil.example", 12);
+  __u32 len = build_ch(ch, exts, e);
+  assert(parse_sni(ch, len, host, &n) == SNI_STATUS_MALFORMED);
+}
+
+static void test_sni_lying_lengths(void) {
+  unsigned char exts[256], ch[512];
+  char host[MAX_HOST_LEN];
+  __u32 n;
+  __u32 e = sni_ext(exts, "api.example.com", 15);
+  __u32 len = build_ch(ch, exts, e);
+
+  unsigned char bad[512];
+  // Extension length runs past the extensions block.
+  memcpy(bad, ch, len);
+  bad[len - e + 3] = 0xFF;
+  assert(parse_sni(bad, len, host, &n) == SNI_STATUS_MALFORMED);
+  // Host name length disagrees with the extension length.
+  memcpy(bad, ch, len);
+  bad[len - 15 - 1] = 14;
+  assert(parse_sni(bad, len, host, &n) == SNI_STATUS_MALFORMED);
+  // Handshake longer than its record.
+  memcpy(bad, ch, len);
+  bad[4] = (unsigned char)(bad[4] - 1);
+  assert(parse_sni(bad, len, host, &n) == SNI_STATUS_MALFORMED);
+  // Extensions block shorter than the handshake says.
+  memcpy(bad, ch, len);
+  bad[len - e - 1] = (unsigned char)(bad[len - e - 1] - 1);
+  assert(parse_sni(bad, len, host, &n) == SNI_STATUS_MALFORMED);
+}
+
+static void test_sni_too_many_extensions(void) {
+  unsigned char exts[512], ch[1024];
+  char host[MAX_HOST_LEN];
+  __u32 n;
+  __u32 e = 0;
+  for (int i = 0; i < TLS_SNI_MAX_EXTS; i++)
+    e += dummy_ext(exts + e, 0x1000 + (__u32)i, 0);
+  e += sni_ext(exts + e, "api.example.com", 15);
+  __u32 len = build_ch(ch, exts, e);
+  // server_name sits past the walk limit: not trusted.
+  assert(parse_sni(ch, len, host, &n) == SNI_STATUS_MALFORMED);
+}
+
+static void test_sni_past_copy_buffer(void) {
+  // server_name after TLS_SNI_BUF_LEN bytes of padding: TRUNCATED.
+  static unsigned char exts[TLS_SNI_BUF_LEN + 64], ch[TLS_SNI_BUF_LEN + 192];
+  char host[MAX_HOST_LEN];
+  __u32 n;
+  __u32 e = dummy_ext(exts, 0x0015, TLS_SNI_BUF_LEN); // padding extension
+  e += sni_ext(exts + e, "api.example.com", 15);
+  __u32 len = build_ch(ch, exts, e);
+  assert(len > TLS_SNI_BUF_LEN);
+  assert(parse_sni(ch, len, host, &n) == SNI_STATUS_TRUNCATED);
+}
+
 int main(void) {
   printf("parse_http_host:\n");
   RUN_TEST(test_parse_host_basic);
@@ -642,6 +864,23 @@ int main(void) {
   printf("gf128_halve_to_h (OpenSSL AVX-512 / Go H recovery):\n");
   RUN_TEST(test_gf128_halve_to_h_aes_keys);
   RUN_TEST(test_gf128_halve_to_h_edges);
+
+  printf("tls_parse_sni (SNI check):\n");
+  RUN_TEST(test_sni_go);
+  RUN_TEST(test_sni_node);
+  RUN_TEST(test_sni_bun);
+  RUN_TEST(test_sni_lowercase_trailing_dot);
+  RUN_TEST(test_sni_absent);
+  RUN_TEST(test_sni_truncated_real);
+  RUN_TEST(test_sni_not_client_hello);
+  RUN_TEST(test_sni_synthetic);
+  RUN_TEST(test_sni_ech_wins);
+  RUN_TEST(test_sni_rejects_bad_host_bytes);
+  RUN_TEST(test_sni_too_long);
+  RUN_TEST(test_sni_duplicate_server_name);
+  RUN_TEST(test_sni_lying_lengths);
+  RUN_TEST(test_sni_too_many_extensions);
+  RUN_TEST(test_sni_past_copy_buffer);
 
   printf("\n%d/%d tests passed.\n", tests_passed, tests_run);
   return 0;

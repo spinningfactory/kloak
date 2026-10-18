@@ -199,6 +199,8 @@ sequenceDiagram
 
 5. **TTL enforcement** -- DNS entries include a TTL. Expired entries are skipped on lookup, requiring re-verification through fresh DNS responses.
 
+6. **SNI check** -- A verified destination IP is not enough on its own: CDNs and cloud load balancers serve many customers on the same IPs and route each TLS connection by its SNI, so a compromised app could connect to an IP of `api.stripe.com` while naming another tenant's domain in its ClientHello. A kprobe on `tcp_sendmsg` records the SNI of each connection's first ClientHello, and a secret restricted to a hostname is only rewritten on a connection whose SNI is that host. The comparison is exact and case-insensitive: a client that connects to a short in-cluster name (`my-svc`) does not match an annotation with the full name (`my-svc.ns.svc.cluster.local`), so use the same name in both. Connections without SNI, with an encrypted ClientHello (ECH), or whose ClientHello could not be read are refused. Refusals are logged by the controller as an `SNI check violation`. Set `controller.ebpf.sniCheck: audit` to let them through while logging each one. Secrets restricted to an IP address, or to `*`, are not SNI-checked.
+
 ## How It Works
 
 ### 1. Label and Annotate Your Secrets
