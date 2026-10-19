@@ -11,7 +11,12 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: '1.26'
+  # Must match the golang image in the Dockerfile (enforced by the
+  # "Check Go version matches Dockerfile" step below). Unit coverage is
+  # produced by this toolchain and e2e coverage by the image's; different
+  # Go releases pick different coverage block boundaries, which breaks the
+  # unit + e2e merge and makes the reported percentage far too low.
+  GO_VERSION: '1.27'
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 
@@ -22,6 +27,26 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v7
+
+      - name: Check Go version matches Dockerfile
+        # The shipped (and e2e) binary is built by the Dockerfile's golang
+        # image; every workflow's GO_VERSION must name the same release so
+        # tests run on the toolchain we ship and unit + e2e coverage merge.
+        run: |
+          DOCKER_GO=$(sed -nE 's/^FROM .*golang:([0-9]+\.[0-9]+).*/\1/p' Dockerfile | head -1)
+          if [ -z "$DOCKER_GO" ]; then
+            echo "::error file=Dockerfile::could not find the golang base image version"
+            exit 1
+          fi
+          STATUS=0
+          for f in .github/workflows/*.yml; do
+            WF_GO=$(sed -nE "s/^  GO_VERSION: '?([0-9.]+)'?.*/\1/p" "$f")
+            if [ -n "$WF_GO" ] && [ "$WF_GO" != "$DOCKER_GO" ]; then
+              echo "::error file=$f::GO_VERSION is $WF_GO but the Dockerfile builds with golang:$DOCKER_GO; bump them together"
+              STATUS=1
+            fi
+          done
+          exit $STATUS
 
       - name: Set up Go
         uses: actions/setup-go@v7
@@ -38,7 +63,9 @@ jobs:
       - name: Run golangci-lint
         uses: golangci/golangci-lint-action@v9
         with:
-          version: v2.11.4
+          # Must be built with a Go release >= GO_VERSION, otherwise it
+          # panics with "file requires newer Go version".
+          version: v2.14.0
           args: --timeout=5m
 
       - name: Install Helm
@@ -103,11 +130,13 @@ jobs:
         # Include pkg/ebpf (Linux-tagged BPF tests self-skip via t.Skipf when
         # eBPF resources aren't available on the runner) and pkg/cgroups (its
         # utils.go is pure parsing + the cgroup_linux/cgroup_other split takes
-        # care of platform deps). Exclude:
-        #   - test/e2e — separate job
-        #   - cmd/      — entrypoint wiring; coverage merges via the e2e binary
-        #   - tools/    — CLI utilities, coverage isn't meaningful
-        run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/|/tools/')
+        # care of platform deps). cmd/kloak is included so its unit tests run;
+        # its shutdown paths are also covered via the e2e binary. Exclude:
+        #   - test/e2e      — separate job
+        #   - cmd/ebpftest  — verifier-debugging CLI with no tests; Go would
+        #                     still add it to the profile at 0%
+        #   - tools/        — CLI utilities, coverage isn't meaningful
+        run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/ebpftest|/tools/')
 
       - name: Upload unit coverage
         uses: actions/upload-artifact@v7
@@ -462,13 +491,13 @@ jobs:
           # 15-minute timer fired during a 4hop flake) teardown is skipped
           # and we'd be left with a running pod and no covcounters.
           helm uninstall kloak -n kloak-system --ignore-not-found 2>&1 || true
-          # Wait for the controller pod to fully terminate. The kloak
-          # binary's `flushCoverage` (cmd/kloak/coverage_flush_cover.go,
+          # Wait for the controller and webhook pods to fully terminate. The
+          # kloak binary's `flushCoverage` (cmd/kloak/coverage_flush_cover.go,
           # compiled in via -tags cover when COVER=1) writes covcounters
           # before main returns, so any clean exit produces a usable
-          # profile. 90s covers the 60s pod terminationGracePeriodSeconds
-          # plus uprobe detach / BPF close time.
-          kubectl wait --for=delete pod -l app.kubernetes.io/component=controller \
+          # profile. 90s covers the controller's 60s
+          # terminationGracePeriodSeconds plus uprobe detach / BPF close time.
+          kubectl wait --for=delete pod -l 'app.kubernetes.io/component in (controller,webhook)' \
             -n kloak-system --timeout=90s 2>/dev/null || true
           # k3s runs directly on the runner, so covdata lives at /tmp/kloak-coverage
           # on the host filesystem (values-e2e.yaml's coverage.hostPath).
@@ -515,6 +544,22 @@ jobs:
           strip_generated() { grep -v 'tlsuprobe_bpf'; }
 
           if [ -f "$UNIT" ] && [ -f "$E2E" ]; then
+            # `go tool cover` only merges records whose block ranges match
+            # exactly. Go releases differ in how they split the same source
+            # into blocks, so profiles from two toolchains don't line up and
+            # every statement gets counted once per profile, dragging the
+            # total far down. Files present in both profiles must therefore
+            # list exactly the same blocks.
+            MISMATCHED=$(awk '
+              FNR == 1 { next }
+              NR == FNR { split($1, a, ":"); files[a[1]] = 1; blocks[$1] = 1; next }
+              { split($1, a, ":"); if ((a[1] in files) && !($1 in blocks)) n++ }
+              END { print n + 0 }
+            ' <(strip_generated < "$UNIT") <(strip_generated < "$E2E"))
+            if [ "$MISMATCHED" -gt 0 ]; then
+              echo "::error::$MISMATCHED e2e coverage blocks don't match the unit profile's block boundaries. The kloak image and the unit tests were most likely built with different Go releases (Dockerfile golang image vs GO_VERSION); merging would double-count statements."
+              exit 1
+            fi
             head -1 "$UNIT" > "$OUT"
             tail -n +2 "$UNIT" | strip_generated >> "$OUT"
             tail -n +2 "$E2E"  | strip_generated >> "$OUT"

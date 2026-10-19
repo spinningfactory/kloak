@@ -91,6 +91,8 @@ certificates:
       name: kloak-selfsigned
       kind: Issuer
 
+# Go coverage collection for images built with COVER=1 (CI e2e only). The
+# controller and webhook both write covdata to this host directory.
 coverage:
   enabled: false
   hostPath: /tmp/kloak-coverage

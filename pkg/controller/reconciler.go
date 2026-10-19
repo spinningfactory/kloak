@@ -118,7 +118,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	if err != nil {
 		// This is expected during container startup - will retry on next reconcile
 		log.Debugw("cgroup IDs not available yet", "reason", err.Error())
-		return ctrl.Result{Requeue: true}, nil
+		return ctrl.Result{Requeue: true}, nil //nolint:staticcheck // SA1019: keep the rate-limited backoff; RequeueAfter is a fixed delay
 	}
 
 	// Compute cgroup diff under the lock, then attach uprobes outside it.

@@ -26,7 +26,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  GO_VERSION: '1.26'
+  GO_VERSION: '1.27'
   # How many recent release tags the nightly tracks/tests. BoringSSL builds are
   # slow, so keep this small; struct layout is stable across revisions anyway.
   RECENT_TAGS: '2'

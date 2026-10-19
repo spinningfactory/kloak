@@ -19,6 +19,21 @@ spec:
         app.kubernetes.io/component: webhook
     spec:
       serviceAccountName: kloak-controller
+      {{- if .Values.coverage.enabled }}
+      initContainers:
+        # The kubelet (or the root controller pod) creates the coverage
+        # hostPath as root with mode 0755, but the webhook runs as the image's
+        # non-root user. Open the directory up so it can write covcounters.
+        - name: coverage-dir
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["chmod", "1777", "/coverage"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: coverage
+              mountPath: /coverage
+      {{- end }}
       containers:
         - name: webhook
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -31,6 +46,10 @@ spec:
               value: {{ .Values.log.level | quote }}
             - name: KLOAK_LOG_DEV
               value: {{ .Values.log.dev | quote }}
+            {{- if .Values.coverage.enabled }}
+            - name: GOCOVERDIR
+              value: /coverage
+            {{- end }}
           ports:
             - name: webhook
               containerPort: 9443
@@ -40,6 +59,10 @@ spec:
             - name: webhook-certs
               mountPath: /certs
               readOnly: true
+            {{- if .Values.coverage.enabled }}
+            - name: coverage
+              mountPath: /coverage
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -65,3 +88,9 @@ spec:
               - key: {{ .Values.certificates.provided.keyKey }}
                 path: tls.key
             {{- end }}
+        {{- if .Values.coverage.enabled }}
+        - name: coverage
+          hostPath:
+            path: {{ .Values.coverage.hostPath }}
+            type: DirectoryOrCreate
+        {{- end }}

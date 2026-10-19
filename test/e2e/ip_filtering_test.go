@@ -71,7 +71,7 @@ func TestEBPFIPFiltering(t *testing.T) {
 	// The client pod connects to TARGET_HOST (set to "tls" service name by default)
 	// For IP-based filtering test, we need to change it to use the ClusterIP directly
 	// instead of the service name (which would cause DNS resolution).
-	
+
 	// Use kubectl to patch the deployment's TARGET_HOST environment variable
 	patchData := fmt.Sprintf(`{"spec":{"template":{"spec":{"containers":[{"name":"demo-app","env":[{"name":"TARGET_HOST","value":"%s"}]}]}}}}`, echoClusterIP)
 	_, err := kubectl("patch", "deployment", "demo-python-raw-tls", "-n", testNamespace, "-p", patchData)

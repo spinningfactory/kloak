@@ -1,6 +1,8 @@
 # eBPF + Go build stage.
 # Runs on the BUILD platform (host arch) regardless of target platform.
 # Cross-compiles both eBPF objects and Go binary for the target.
+# Bump GO_VERSION in .github/workflows/*.yml together with this image; CI
+# fails when they differ (see "Check Go version matches Dockerfile").
 FROM --platform=$BUILDPLATFORM golang:1.27 AS builder
 
 WORKDIR /app
