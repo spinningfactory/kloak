@@ -105,12 +105,12 @@ func TestDescribeBindingEvent(t *testing.T) {
 	keys := placeholderKeys(snapshot[0].Shadow)
 
 	for _, k := range keys { // raw and Huffman resolve to the same secret
-		pod, secret := describeBindingEvent(secretBindingEvent{CgroupID: 7, Key: k}, bindings, snapshot)
+		pod, secret := describeBindingEvent(&secretBindingEvent{CgroupID: 7, Key: k}, bindings, snapshot)
 		if pod != "ns/web" || secret != "ns/api[token]" {
 			t.Errorf("describeBindingEvent = (%q, %q), want (ns/web, ns/api[token])", pod, secret)
 		}
 	}
-	pod, secret := describeBindingEvent(secretBindingEvent{CgroupID: 9}, bindings, snapshot)
+	pod, secret := describeBindingEvent(&secretBindingEvent{CgroupID: 9}, bindings, snapshot)
 	if pod != "untracked cgroup 9" || secret != "unknown" {
 		t.Errorf("unknown event described as (%q, %q)", pod, secret)
 	}

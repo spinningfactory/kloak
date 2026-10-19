@@ -174,15 +174,47 @@ struct {
   __uint(max_entries, 64 * 1024);
 } secret_binding_events SEC(".maps");
 
-// A process redeemed a placeholder of a secret its pod does not reference.
-// Must match secretBindingEvent in pkg/ebpf/secret_binding.go.
+// Why a placeholder was not rewritten (secret_binding_event.reason).
+#define SECRET_EVT_BINDING 0 // its pod does not reference the secret (secret_acl)
+#define SECRET_EVT_SNI 1     // the connection's SNI is not the secret's host (sni_state)
+
+// A process redeemed a placeholder it may not redeem. Must match
+// secretBindingEvent in pkg/ebpf/secret_binding.go.
 struct secret_binding_event {
   __u64 cgroup_id;
   __u32 tgid;
-  __u8 audit; // 1 = audit mode, the rewrite went ahead; 0 = refused
-  __u8 _pad[3];
-  char key[8]; // placeholder BPF key (SECRET_KEY_LEN)
+  __u8 audit;      // 1 = audit mode, the rewrite went ahead; 0 = refused
+  __u8 reason;     // SECRET_EVT_*
+  __u8 sni_status; // SECRET_EVT_SNI: the connection's SNI_STATUS_*
+  __u8 memory_bio; // SECRET_EVT_SNI: 1 = memory-BIO writer, the socket may be another connection
+  char key[8];     // placeholder BPF key (SECRET_KEY_LEN)
+  char sni[MAX_HOST_LEN]; // SECRET_EVT_SNI: the connection's SNI, if any
 };
+
+// report_secret_event submits a refused (or, in audit mode, allowed)
+// redemption to secret_binding_events. sni may be NULL. Ring buffer memory
+// is not zeroed, so every field is written.
+static __always_inline void report_secret_event(const struct secret_key *key,
+                                                __u8 audit, __u8 reason,
+                                                __u8 sni_status, __u8 memory_bio,
+                                                const char *sni) {
+  struct secret_binding_event *evt =
+      bpf_ringbuf_reserve(&secret_binding_events, sizeof(*evt), 0);
+  if (!evt)
+    return;
+  evt->cgroup_id = bpf_get_current_cgroup_id();
+  evt->tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+  evt->audit = audit;
+  evt->reason = reason;
+  evt->sni_status = sni_status;
+  evt->memory_bio = memory_bio;
+  __builtin_memcpy(evt->key, key->prefix, sizeof(evt->key));
+  if (sni)
+    __builtin_memcpy(evt->sni, sni, MAX_HOST_LEN);
+  else
+    __builtin_memset(evt->sni, 0, MAX_HOST_LEN);
+  bpf_ringbuf_submit(evt, 0);
+}
 
 // Debug counters for diagnosing DNS interception issues.
 // Index: see DBG_* constants below.
@@ -244,6 +276,9 @@ enum {
   DBG_OSSL_H_FROM_HKEY1,     // OpenSSL: H recovered from the AVX-512 HashKey_1 slot (raw H field zero)
   DBG_SECRET_BINDING_DENY,   // placeholder redeemed outside its pod binding: refused
   DBG_SECRET_BINDING_AUDIT,  // same, but audit mode let the rewrite go ahead
+  DBG_SNI_CAPTURED,          // first handshake record on a connection parsed into sni_state
+  DBG_SNI_DENY,              // patch for a host-restricted secret refused: SNI missing / not the host
+  DBG_SNI_AUDIT,             // same, but audit mode let the rewrite go ahead
   DBG_MAX,
 };
 
@@ -278,18 +313,7 @@ static __always_inline int secret_binding_allows(const struct secret_key *key) {
   __u32 *mode = bpf_map_lookup_elem(&secret_binding_mode, &zero);
   int audit = mode && *mode == SECRET_BINDING_AUDIT;
   dbg_inc(audit ? DBG_SECRET_BINDING_AUDIT : DBG_SECRET_BINDING_DENY);
-
-  struct secret_binding_event *evt =
-      bpf_ringbuf_reserve(&secret_binding_events, sizeof(*evt), 0);
-  if (evt) {
-    evt->cgroup_id = ak.cgroup_id;
-    evt->tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-    evt->audit = (__u8)audit;
-    // Ring buffer memory is not zeroed; don't leak stale kernel bytes.
-    __builtin_memset(evt->_pad, 0, sizeof(evt->_pad));
-    __builtin_memcpy(evt->key, key->prefix, sizeof(evt->key));
-    bpf_ringbuf_submit(evt, 0);
-  }
+  report_secret_event(key, (__u8)audit, SECRET_EVT_BINDING, 0, 0, NULL);
   return audit;
 }
 
@@ -591,6 +615,7 @@ struct xor_patch {
   __u32 secret_offset;      // byte offset of secret in plaintext
   __u32 secret_len;         // length of secret (1..128)
   __u8  xor_delta[SECRET_MAX_LEN]; // shadow[i] ^ real[i]
+  struct secret_key key;    // placeholder key: tcp_sendmsg re-checks the secret's host against the SNI
 };
 
 // Per-thread pending XOR patches. Supports multiple secrets per SSL_write.
@@ -2271,6 +2296,8 @@ int bpf_xor_path(void *ctx) {
     w->staged_pending.patches[pi & (XOR_MAX_PATCHES - 1)].secret_len = val_len;
     __builtin_memcpy(w->staged_pending.patches[pi & (XOR_MAX_PATCHES - 1)].xor_delta,
                      w->ct_buf, SECRET_MAX_LEN);
+    __builtin_memcpy(&w->staged_pending.patches[pi & (XOR_MAX_PATCHES - 1)].key,
+                     &key, sizeof(key));
     w->staged_pending.patch_count = pi + 1;
   }
 
@@ -2500,6 +2527,269 @@ static int ghash_patch_iter(__u32 p, void *_unused) {
 
   bpf_loop(num_blocks, ghash_block_iter, NULL, 0);
   return 0;
+}
+
+// =============================================================================
+// SNI check (spinningfactory/kloak#328)
+//
+// A secret restricted to a hostname is only rewritten on a connection whose
+// first ClientHello named that host. The destination-IP check alone lets a
+// compromised pod open TLS to a verified IP of the host (a CDN or cloud load
+// balancer edge) with the SNI of another tenant on the same front end, which
+// then routes the real value to that tenant.
+//
+// bpf_kprobe_tcp_sendmsg_sni parses the first handshake record written on
+// each TCP connection into sni_state; tp_inet_sock_set_state clears the entry
+// when a socket starts a new connection or closes, so a reused struct sock
+// never inherits an old SNI. The bridge kprobe (bpf_kprobe_tcp_sendmsg) drops
+// patches whose secret host is not the SNI of the socket they would leave on.
+// =============================================================================
+
+struct sni_state_val {
+  __u32 status; // SNI_STATUS_* (helpers.h)
+  __u32 len;    // host length when status == SNI_STATUS_SEEN
+  char sni[MAX_HOST_LEN]; // lowercased, zero-padded (hosts_match-comparable)
+};
+
+// struct sock * -> SNI of the first ClientHello on that connection. A
+// missing (never seen, or evicted) entry refuses host-restricted patches.
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 65536);
+  __type(key, __u64);
+  __type(value, struct sni_state_val);
+} sni_state SEC(".maps");
+
+struct sni_scratch_buf {
+  __u8 buf[TLS_SNI_BUF_LEN]; // copy of the ClientHello prefix
+  struct sni_state_val st;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct sni_scratch_buf);
+} sni_scratch SEC(".maps");
+
+// SNI check mode, index 0. Enforce is the zero value, so an unconfigured map
+// still enforces.
+#define SNI_CHECK_ENFORCE 0
+#define SNI_CHECK_AUDIT 1
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __uint(map_flags, BPF_F_RDONLY_PROG);
+  __type(key, __u32);
+  __type(value, __u32);
+} sni_check_mode SEC(".maps");
+
+// iov_iter before Linux 6.4 named the iovec array `iov` (now `__iov`).
+struct iov_iter___pre_6_4 {
+  const struct iovec *iov;
+} __attribute__((preserve_access_index));
+
+// sendmsg_first_buf returns the user address and length of the first
+// contiguous chunk of a tcp_sendmsg payload: the whole buffer for write() /
+// send() (ITER_UBUF), the first iovec for writev() / sendmsg() (ITER_IOVEC).
+// A ClientHello is written in one piece by every TLS stack kloak supports.
+static __always_inline int sendmsg_first_buf(struct msghdr *msg, __u64 *base,
+                                             __u64 *len) {
+  if (!bpf_core_field_exists(msg->msg_iter.iter_type))
+    return -1; // < 5.14: no stable iter_type; the check fails closed
+  __u8 type = BPF_CORE_READ(msg, msg_iter.iter_type);
+  __u64 count = BPF_CORE_READ(msg, msg_iter.count);
+  __u64 skip = BPF_CORE_READ(msg, msg_iter.iov_offset);
+
+  if (bpf_core_enum_value_exists(enum iter_type, ITER_UBUF) &&
+      type == bpf_core_enum_value(enum iter_type, ITER_UBUF)) {
+    *base = (__u64)BPF_CORE_READ(msg, msg_iter.ubuf) + skip;
+    *len = count;
+    return 0;
+  }
+  if (type != bpf_core_enum_value(enum iter_type, ITER_IOVEC))
+    return -1;
+
+  const struct iovec *iov;
+  if (bpf_core_field_exists(msg->msg_iter.__iov)) {
+    iov = BPF_CORE_READ(msg, msg_iter.__iov);
+  } else {
+    struct iov_iter___pre_6_4 *it = (void *)&msg->msg_iter;
+    iov = BPF_CORE_READ(it, iov);
+  }
+  if (!iov)
+    return -1;
+  __u64 iov_base = (__u64)BPF_CORE_READ(iov, iov_base);
+  __u64 iov_len = BPF_CORE_READ(iov, iov_len);
+  if (skip >= iov_len)
+    return -1;
+  *base = iov_base + skip;
+  *len = iov_len - skip;
+  if (*len > count)
+    *len = count;
+  return 0;
+}
+
+// kprobe/tcp_sendmsg: record the SNI of the first handshake record each
+// connection writes. Runs before any SSL_write on that connection, so the
+// bridge kprobe below always finds it.
+//
+// The first TLS handshake record decides: anything that starts with
+// 0x16 0x03 and is not a parseable ClientHello leaves the connection
+// unusable for host-restricted secrets. Plaintext before it (STARTTLS-style
+// protocols) is ignored. A later valid ClientHello (after a
+// HelloRetryRequest) that names another host or carries ECH marks the
+// connection SNI_STATUS_MISMATCH.
+SEC("kprobe/tcp_sendmsg")
+int bpf_kprobe_tcp_sendmsg_sni(void *ctx) {
+  __u32 tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+  if (!bpf_map_lookup_elem(&tracked_tgids, &tgid))
+    return 0;
+
+  // tcp_sendmsg(struct sock *sk, struct msghdr *msg, size_t size)
+  struct sock *sk = NULL;
+  struct msghdr *msg = NULL;
+#if defined(bpf_target_x86)
+  bpf_probe_read_kernel(&sk, sizeof(sk), (char *)ctx + 112); // RDI
+  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 104); // RSI
+#elif defined(bpf_target_arm64)
+  bpf_probe_read_kernel(&sk, sizeof(sk), (char *)ctx + 0); // X0
+  bpf_probe_read_kernel(&msg, sizeof(msg), (char *)ctx + 8); // X1
+#else
+  return 0;
+#endif
+  if (!sk || !msg)
+    return 0;
+
+  __u64 base = 0, len = 0;
+  if (sendmsg_first_buf(msg, &base, &len) < 0 || len < 2)
+    return 0;
+  __u8 hdr[2] = {};
+  if (bpf_probe_read_user(hdr, sizeof(hdr), (void *)base) < 0)
+    return 0;
+  if (hdr[0] != TLS_CT_HANDSHAKE || hdr[1] != 0x03)
+    return 0;
+
+  __u64 sk_key = (__u64)sk;
+  struct sni_state_val *cur = bpf_map_lookup_elem(&sni_state, &sk_key);
+  __u32 cur_status = cur ? cur->status : SNI_STATUS_NONE;
+  if (cur_status != SNI_STATUS_NONE && cur_status != SNI_STATUS_SEEN)
+    return 0; // already decided, and not by a valid ClientHello
+
+  __u32 zero = 0;
+  struct sni_scratch_buf *s = bpf_map_lookup_elem(&sni_scratch, &zero);
+  if (!s)
+    return 0;
+  __u32 n = len > TLS_SNI_BUF_LEN ? TLS_SNI_BUF_LEN : (__u32)len;
+  if (bpf_probe_read_user(s->buf, n, (void *)base) < 0)
+    return 0;
+  __builtin_memset(&s->st, 0, sizeof(s->st));
+  __u32 host_len = 0;
+  __u32 status = tls_parse_sni(s->buf, n, s->st.sni, &host_len);
+
+  if (cur_status == SNI_STATUS_SEEN) {
+    // Only a fully valid ClientHello can change a decided connection: an
+    // encrypted TLS 1.2 handshake record (Finished) also starts with
+    // 0x16 0x03, and the server would reject a malformed second ClientHello.
+    int other = status == SNI_STATUS_ECH ||
+                (status == SNI_STATUS_SEEN && !hosts_match(cur->sni, s->st.sni));
+    if (other) {
+      cur = bpf_map_lookup_elem(&sni_state, &sk_key);
+      if (cur)
+        cur->status = SNI_STATUS_MISMATCH;
+    }
+    return 0;
+  }
+
+  if (status == SNI_NOT_CLIENT_HELLO)
+    status = SNI_STATUS_MALFORMED; // a handshake record, but not a ClientHello
+  s->st.status = status;
+  s->st.len = host_len;
+  bpf_map_update_elem(&sni_state, &sk_key, &s->st, BPF_ANY);
+  dbg_inc(DBG_SNI_CAPTURED);
+  return 0;
+}
+
+// tracepoint/sock/inet_sock_set_state: forget a socket's SNI when it starts
+// a new connection (SYN_SENT, before any data) or closes, so a reused
+// struct sock address never inherits another connection's SNI.
+SEC("tracepoint/sock/inet_sock_set_state")
+int tp_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx) {
+  if (ctx->protocol != IPPROTO_TCP)
+    return 0;
+  if (ctx->newstate != TCP_SYN_SENT && ctx->newstate != TCP_CLOSE)
+    return 0;
+  __u64 sk_key = (__u64)ctx->skaddr;
+  bpf_map_delete_elem(&sni_state, &sk_key);
+  return 0;
+}
+
+// sni_filter_patches drops, from ghash_scratch.staged_tc, the patches whose
+// secret is restricted to a hostname that is not the SNI of `sk`, the socket
+// the patched record will leave on. Refused patches are removed, not zeroed:
+// tc treats secret_len 0 as a full SECRET_MAX_LEN patch (clamp_write_len).
+// Returns the number of patches kept.
+//
+// Deliberately __noinline: its own stack frame, away from the bridge
+// kprobe's, which is close to the 512-byte limit.
+static __attribute__((noinline)) __u32 sni_filter_patches(__u64 sk_key,
+                                                         __u8 memory_bio) {
+  __u32 zero = 0;
+  __u32 *mode = bpf_map_lookup_elem(&sni_check_mode, &zero);
+  __u8 audit = mode && *mode == SNI_CHECK_AUDIT;
+
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0;
+  __u32 pc = w->staged_tc.patch_count;
+  if (pc > XOR_MAX_PATCHES)
+    pc = XOR_MAX_PATCHES;
+
+  __u32 kept = 0;
+  for (__u32 p = 0; p < XOR_MAX_PATCHES; p++) {
+    if (p >= pc)
+      break;
+    w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+    if (!w)
+      return 0;
+    struct secret_key key;
+    __builtin_memcpy(&key, &w->staged_tc.patches[p & (XOR_MAX_PATCHES - 1)].key,
+                     sizeof(key));
+
+    int keep = 1;
+    struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
+    if (!val) {
+      keep = 0; // secret removed since the uprobe staged it
+    } else if (val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
+      struct sni_state_val *st = bpf_map_lookup_elem(&sni_state, &sk_key);
+      __u32 status = st ? st->status : SNI_STATUS_NONE;
+      if (status == SNI_STATUS_SEEN && !hosts_match(st->sni, val->allowed_host))
+        status = SNI_STATUS_MISMATCH;
+      if (status != SNI_STATUS_SEEN) {
+        dbg_inc(audit ? DBG_SNI_AUDIT : DBG_SNI_DENY);
+        report_secret_event(&key, audit, SECRET_EVT_SNI, (__u8)status,
+                            memory_bio, st ? st->sni : NULL);
+        keep = audit;
+      }
+    }
+    if (!keep)
+      continue;
+
+    w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+    if (!w)
+      return 0;
+    if (kept != p)
+      w->staged_tc.patches[kept & (XOR_MAX_PATCHES - 1)] =
+          w->staged_tc.patches[p & (XOR_MAX_PATCHES - 1)];
+    kept++;
+  }
+
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 0;
+  w->staged_tc.patch_count = kept;
+  return kept;
 }
 
 // -----------------------------------------------------------------------------
@@ -2831,6 +3121,17 @@ h_ready:;
     w->staged_tc.patch_count = XOR_MAX_PATCHES;
   for (__u32 p = 0; p < XOR_MAX_PATCHES && p < w->staged_tc.patch_count; p++)
     w->staged_tc.patches[p] = pending->patches[p];
+
+  // SNI check: keep only patches whose secret may leave on this socket.
+  // xor_pending itself is untouched, so a memory-BIO write refused on another
+  // connection's tcp_sendmsg is still bridged on its own.
+  if (sni_filter_patches((__u64)sk, is_membio) == 0) {
+    if (!is_membio)
+      bpf_map_delete_elem(&xor_pending, &tgid);
+    return 0;
+  }
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w) return 0;
 
   // For memory BIO apps: write_seq from this tcp_sendmsg may not match the
   // segment that carries the TLS data (SSL_write and writev are decoupled).

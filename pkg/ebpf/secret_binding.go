@@ -87,13 +87,22 @@ type secretACLKey struct {
 	Key      placeholderKey
 }
 
+// Values of secret_binding_event.reason (SECRET_EVT_* in tls_uprobe.c).
+const (
+	secretEventBinding uint8 = 0 // the pod does not reference the secret
+	secretEventSNI     uint8 = 1 // the connection's SNI is not the secret's host
+)
+
 // secretBindingEvent must match struct secret_binding_event in tls_uprobe.c.
 type secretBindingEvent struct {
-	CgroupID uint64
-	Tgid     uint32
-	Audit    uint8
-	_        [3]byte
-	Key      placeholderKey
+	CgroupID  uint64
+	Tgid      uint32
+	Audit     uint8
+	Reason    uint8
+	SNIStatus uint8
+	MemoryBIO uint8
+	Key       placeholderKey
+	SNI       [maxHostLen]byte
 }
 
 // podBinding is what a pod is entitled to redeem: every container cgroup
@@ -149,7 +158,7 @@ func secretACL(snapshot []secrets.Secret, bindings map[string]podBinding) map[se
 // describeBindingEvent names the pod and secret behind a violation event,
 // for the controller log. bindings and snapshot are best-effort context:
 // a cgroup outside every binding belongs to a pod kloak doesn't track.
-func describeBindingEvent(ev secretBindingEvent, bindings map[string]podBinding, snapshot []secrets.Secret) (pod, secret string) {
+func describeBindingEvent(ev *secretBindingEvent, bindings map[string]podBinding, snapshot []secrets.Secret) (pod, secret string) {
 	pod = fmt.Sprintf("untracked cgroup %d", ev.CgroupID)
 	for _, b := range bindings {
 		for _, cg := range b.cgroupIDs {

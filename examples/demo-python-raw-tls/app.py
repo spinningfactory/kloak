@@ -35,8 +35,13 @@ def load_secret(env_var, default):
     return default
 
 
-def send_and_echo(host, secret_allowed, secret_blocked):
-    """Connect to echo server via DNS name, send secrets, return echo."""
+def send_and_echo(host, server_name, secret_allowed, secret_blocked):
+    """Connect to echo server via DNS name, send secrets, return echo.
+
+    server_name is the TLS SNI. It is normally the host itself; the e2e
+    suite overrides it to check that kloak refuses to rewrite a host-scoped
+    secret on a connection whose SNI names another host.
+    """
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
@@ -45,7 +50,7 @@ def send_and_echo(host, secret_allowed, secret_blocked):
     # This DNS lookup populates dns_ip_map, and the connect() to the
     # resolved IP sets last_verified_fd for host-based filtering.
     with socket.create_connection((host, LISTEN_PORT)) as sock:
-        with ctx.wrap_socket(sock, server_hostname=host) as tls:
+        with ctx.wrap_socket(sock, server_hostname=server_name) as tls:
             payload = f"ALLOWED={secret_allowed}\nBLOCKED={secret_blocked}\n"
             tls.sendall(payload.encode())
             return tls.recv(16384).decode()
@@ -55,6 +60,7 @@ def main():
     key_allowed = load_secret("SECRET_ALLOWED_FILE", "allowed-default-key")
     key_blocked = load_secret("SECRET_BLOCKED_FILE", "blocked-default-key")
     target_host = os.environ.get("TARGET_HOST", "tls")
+    server_name = os.environ.get("TLS_SERVER_NAME") or target_host
     interval = int(os.getenv("REQUEST_INTERVAL", "5"))
 
     print("=" * 60)
@@ -62,6 +68,7 @@ def main():
     print("=" * 60)
     print(f"OpenSSL: {ssl.OPENSSL_VERSION}")
     print(f"Target: {target_host}:{LISTEN_PORT}")
+    print(f"TLS SNI: {server_name}")
     print(f"Secret Allowed: {key_allowed[:30]}...")
     print(f"Secret Blocked: {key_blocked[:30]}...")
     print("=" * 60)
@@ -85,8 +92,8 @@ def main():
     while True:
         count += 1
         try:
-            echo = send_and_echo(target_host, key_allowed, key_blocked)
-            print(f"\n--- Request #{count} (target={target_host}) ---")
+            echo = send_and_echo(target_host, server_name, key_allowed, key_blocked)
+            print(f"\n--- Request #{count} (target={target_host}, sni={server_name}) ---")
             print(f"Echo: {echo.strip()}")
             sys.stdout.flush()
         except Exception as e:
