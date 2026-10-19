@@ -484,18 +484,18 @@ func TestHandle_NamespaceInheritance(t *testing.T) {
 // the controller-managed shadow. Used by the env-rewrite tests below.
 func enabledAndShadow(name, ns string) (*corev1.Secret, *corev1.Secret) {
 	return &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name,
-				Namespace: ns,
-				Labels:    map[string]string{LabelEnabled: "true"},
-			},
-		}, &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      name + "-kloak",
-				Namespace: ns,
-				Labels:    map[string]string{"getkloak.io/managed": "true"},
-			},
-		}
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: ns,
+			Labels:    map[string]string{LabelEnabled: "true"},
+		},
+	}, &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name + "-kloak",
+			Namespace: ns,
+			Labels:    map[string]string{"getkloak.io/managed": "true"},
+		},
+	}
 }
 
 // podWithEnvSecretKeyRef returns a Pod with one container that pulls a
