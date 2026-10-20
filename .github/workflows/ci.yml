@@ -623,6 +623,19 @@ jobs:
           sudo bpftool prog list 2>/dev/null || true
           echo "=== BPF Maps ==="
           sudo bpftool map list 2>/dev/null || true
+          # A controller that never finishes shutting down leaves its pod
+          # Terminating past the grace period: show where each of its
+          # threads is blocked in the kernel.
+          echo "=== Kloak controller threads (state, kernel stack) ==="
+          for p in $(pgrep -f '/kloak controller' || true); do
+            echo "--- pid $p: $(sudo grep -E '^(State|Threads):' /proc/$p/status 2>/dev/null | tr '\n' ' ')"
+            for t in /proc/$p/task/*; do
+              echo "tid ${t##*/} state=$(sudo cut -d' ' -f3 $t/stat 2>/dev/null) wchan=$(sudo cat $t/wchan 2>/dev/null)"
+              sudo cat $t/stack 2>/dev/null || true
+            done
+          done
+          echo "=== Tasks in uninterruptible sleep ==="
+          ps -eo pid,tid,stat,wchan:32,comm -L | awk 'NR == 1 || $3 ~ /^D/' || true
           echo "=== Kernel dmesg (last 50 lines) ==="
           sudo dmesg | tail -50 2>/dev/null || true
           # Captured trace_pipe output for the whole run. Filter to kloak's
