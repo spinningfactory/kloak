@@ -585,9 +585,9 @@ struct kloak_proc_event {
 // =============================================================================
 
 // Per-connection TLS state: GHASH key H and cipher suite.
-// Populated by the entry uprobe on first SSL_write (reads H from SSL struct at
-// a userspace-configured offset), then enriched by the controller with the
-// precomputed H power table.
+// Written by bpf_h_extract (libcrypto-hook path) and by the tcp_sendmsg
+// kprobe once it has H; read by bpf_xor_path and by tc, which derives the
+// H powers itself (copy_h_power_step).
 struct tls_conn_key {
   __u32 tgid;
   __u32 _pad;
@@ -596,11 +596,8 @@ struct tls_conn_key {
 
 struct tls_conn_state {
   __u8  ghash_h[16];         // GHASH key H = AES(K, 0^128)
-  __u8  h_powers[16][16];    // H^(2^i) for i=0..10 (padded to 16 for bitmask bounds)
   __u16 cipher_type;        // KLOAK_CIPHER_AES_GCM or KLOAK_CIPHER_UNKNOWN
-  __u8  h_powers_ready;      // 1 = userspace has pushed precomputed H powers
   __u8  nonce_len;           // 0 = TLS 1.3, 8 = TLS 1.2, 0xFF = unknown (use heuristic)
-  __u64 wrl_ptr;             // cached first pointer in chain — changes on session recycle
 };
 
 struct {
@@ -793,7 +790,8 @@ struct {
 // the last walk's pointers + the rounds value read at the configured offset,
 // plus a scan that reports the offset where a valid AES round count (10/12/14)
 // actually sits — so a wrong AEADToAESKey on a given build/arch is visible
-// without local reproduction.
+// without local reproduction. Only written in KLOAK_DEBUG builds; otherwise it
+// stays zero and the controller logs nothing for it.
 struct bssl_probe_val {
   __u64 ssl;
   __u64 s3;
@@ -861,6 +859,9 @@ static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_
   // Diagnostic: record the walk + scan for where a valid AES round count
   // actually sits (the SSLAEADContext is the heap object `aead` points to;
   // scan a window of offsets within it). Helps pin AEADToAESKey per build/arch.
+  // KLOAK_DEBUG builds only (the e2e and nightly images): the scan is dead
+  // weight in the stack-heavy tcp_sendmsg kprobe otherwise.
+#ifdef KLOAK_DEBUG
   {
     __u32 zero = 0;
     struct bssl_probe_val *pv = bpf_map_lookup_elem(&bssl_probe, &zero);
@@ -884,6 +885,7 @@ static __attribute__((noinline)) int bssl_recover_h(__u64 ssl_ptr, __u32 ssl_to_
       }
     }
   }
+#endif
 
   // aes_recover_h validates rounds ∈ {10,14} and writes H to h_out in place.
   if (!aes_recover_h(ab->rd_key, rounds, h_out)) {
@@ -988,7 +990,6 @@ struct tc_pending_val {
 // BPF stack limit, including staging areas for map updates and GF(2^128) state.
 struct ghash_work {
   // Staging for map updates (avoids large structs on BPF stack)
-  struct tls_conn_state staged_conn;     // for tls_conn_state map insert
   struct xor_pending_val staged_pending; // staging area for patch accumulation
   struct tc_pending_val staged_tc;       // for tc_pending map insert
   // Ciphertext patching buffers
@@ -1033,11 +1034,9 @@ struct {
 } ghash_scratch SEC(".maps");
 
 // Per-CPU scratch for the tls_conn_state that bpf_kprobe_tcp_sendmsg builds
-// before committing it to the tls_conn_state map. Kept off the stack: the
-// struct is ~284 bytes (h_powers[16][16]), and holding it on the kprobe's
-// frame pushed the combined stack across the bpf-to-bpf call into
-// bssl_recover_h over the verifier's 512-byte limit on some kernels
-// ("combined stack size of 2 calls is 768. Too large").
+// before committing it to the tls_conn_state map. Kept off the kprobe's
+// stack, which together with the bpf-to-bpf call into bssl_recover_h is the
+// deepest frame chain in this file (512-byte verifier limit).
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
   __uint(max_entries, 1);
@@ -1740,9 +1739,12 @@ static __always_inline __u32 ssl_read_fd(__u64 ssl_ptr) {
 // Resolve host and port for the current SSL/TLS connection using DNS chain.
 //
 // Chain: ssl_fd_map (cache) -> BIO fd read -> last_verified_fd -> conn_ip_map -> dns_ip_map
+//
+// bio_fd is ssl_read_fd(ssl_ptr), which the SSL_write uprobe has already read
+// for its server-mode check; 0 when there is no SSL* (Go) or the read failed.
 // =============================================================================
 static __always_inline void resolve_host(struct scratch_buf *scratch_data,
-                                         __u64 ssl_ptr) {
+                                         __u64 ssl_ptr, __u32 bio_fd) {
   scratch_data->host_offset = 0;
   scratch_data->host_value_len = 0;
   scratch_data->xor_fd = 0;
@@ -1775,7 +1777,6 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
   // This covers new connections where ssl_fd_map hasn't been populated yet
   // (e.g., raw TLS sockets, first SSL_write on a fresh connection).
   if (!found && ssl_ptr != 0) {
-    __u32 bio_fd = ssl_read_fd(ssl_ptr);
     if (bio_fd > 0) {
       fd = bio_fd;
       found = 1;
@@ -2880,7 +2881,6 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   struct tls_conn_state *new_conn = bpf_map_lookup_elem(&conn_state_scratch, &zero);
   if (!new_conn) return 0;
   __builtin_memset(new_conn, 0, sizeof(*new_conn));
-  __u64 wrl_val = 0;
 
   if (chain == CHAIN_GO_TLS) {
     // Go crypto/tls: H×2 stored at productTable offset 224 (entry 14).
@@ -3014,7 +3014,6 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
       }
       dbg_inc(DBG_BSSL_H_OK);
       new_conn->cipher_type = KLOAK_CIPHER_AES_GCM;
-      new_conn->wrl_ptr = 0;
       if (offsets->ssl_to_version != 0xFFFFFFFF) {
         __u32 ssl_ver = 0;
         bpf_probe_read_user(&ssl_ver, 4, (void *)(ssl_ptr + offsets->ssl_to_version));
@@ -3027,16 +3026,16 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 
     __u64 ptr = 0;
     if (offsets->wrl_to_enc_ctx > 0) {
-      if (bpf_probe_read_user(&ptr, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !ptr) {
+      __u64 wrl = 0;
+      if (bpf_probe_read_user(&wrl, 8, (void *)(ssl_ptr + offsets->ssl_to_wrl)) < 0 || !wrl) {
 #ifdef KLOAK_DEBUG
         bpf_printk("kloak [2-KPROBE] H-fail: 4hop wrl null ssl=%llx off=%u", ssl_ptr, offsets->ssl_to_wrl);
 #endif
         return 0;
       }
-      wrl_val = ptr;
-      if (bpf_probe_read_user(&ptr, 8, (void *)(ptr + offsets->wrl_to_enc_ctx)) < 0 || !ptr) {
+      if (bpf_probe_read_user(&ptr, 8, (void *)(wrl + offsets->wrl_to_enc_ctx)) < 0 || !ptr) {
 #ifdef KLOAK_DEBUG
-        bpf_printk("kloak [2-KPROBE] H-fail: 4hop enc_ctx null wrl=%llx off=%u", wrl_val, offsets->wrl_to_enc_ctx);
+        bpf_printk("kloak [2-KPROBE] H-fail: 4hop enc_ctx null wrl=%llx off=%u", wrl, offsets->wrl_to_enc_ctx);
 #endif
         return 0;
       }
@@ -3072,7 +3071,6 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
     }
 
     new_conn->cipher_type = KLOAK_CIPHER_AES_GCM;
-    new_conn->wrl_ptr = wrl_val;
 
     if (offsets->ssl_to_version != 0xFFFFFFFF) {
       __u32 ssl_ver = 0;
@@ -3222,7 +3220,7 @@ int bpf_uprobe_go_tls_write(void *ctx) {
   scratch_data->total_data_len = (__u32)data_len;
 
   // resolve_host uses last_verified_fd -> conn_ip_map -> dns_ip_map for Go.
-  resolve_host(scratch_data, 0);
+  resolve_host(scratch_data, 0, 0);
 
   // Pre-scan for kl:: prefix and tail-call to xor_path.
   // Same flow as SSL_write — the downstream pipeline is generic.
@@ -3289,16 +3287,15 @@ int bpf_uprobe_ssl_write(void *ctx) {
   // If ssl_read_fd fails (returns 0), we cannot determine client vs server mode,
   // so we fall through and let the existing logic handle it. We only bail when
   // we have a valid fd that is positively NOT in conn_ip_map (server-mode).
-  {
-    __u32 bio_fd = ssl_read_fd((__u64)ssl_ptr);
-    if (bio_fd != 0) {
-      __u32 cur_tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-      struct conn_ip_key cik = {};
-      cik.tgid = cur_tgid;
-      cik.fd = bio_fd;
-      if (!bpf_map_lookup_elem(&conn_ip_map, &cik))
-        return 0;  // server-mode: fd exists but not from connect()
-    }
+  // resolve_host reuses bio_fd instead of walking SSL → wbio again.
+  __u32 bio_fd = ssl_read_fd((__u64)ssl_ptr);
+  if (bio_fd != 0) {
+    __u32 cur_tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    struct conn_ip_key cik = {};
+    cik.tgid = cur_tgid;
+    cik.fd = bio_fd;
+    if (!bpf_map_lookup_elem(&conn_ip_map, &cik))
+      return 0;  // server-mode: fd exists but not from connect()
   }
 
 #ifdef KLOAK_DEBUG
@@ -3331,7 +3328,7 @@ int bpf_uprobe_ssl_write(void *ctx) {
   scratch_data->total_data_len = (__u32)num;
 
   // Look up hostname via DNS chain: ssl_fd_map -> conn_ip_map -> dns_ip_map
-  resolve_host(scratch_data, (__u64)ssl_ptr);
+  resolve_host(scratch_data, (__u64)ssl_ptr, bio_fd);
 
   // Pre-scan for kl:: prefix BEFORE conn_state check, so both
   // h_extract and xor_path have the match position in scratch_buf.
