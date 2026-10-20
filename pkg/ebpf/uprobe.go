@@ -2110,7 +2110,8 @@ func (m *TLSUprobeManager) DumpDebugCounters() {
 		}
 	}
 
-	// BoringSSL H-walk diagnostic capture (last walk + offset scan).
+	// BoringSSL H-walk diagnostic capture (last walk + offset scan). Only
+	// filled by KLOAK_DEBUG (BPF_DEBUG=1) builds; AEAD stays 0 otherwise.
 	if m.objs.BsslProbe != nil {
 		var pv struct {
 			SSL, S3, AEAD                       uint64

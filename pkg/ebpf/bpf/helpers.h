@@ -653,14 +653,16 @@ HELPER_INLINE void aes_mix_columns(__u8 s[16]) {
 }
 
 // aes_block_encrypt encrypts the 16-byte block in `state` IN PLACE under the
-// expanded key schedule `rk` ((nr+1)*16 bytes). nr in {10,12,14}. Operating in
+// expanded key schedule `rk` ((nr+1)*16 bytes). nr in {10,14}. Operating in
 // place keeps the BPF stack frame flat (no 16-byte temporaries).
 HELPER_INLINE void aes_block_encrypt(const __u8 *rk, __u32 nr, __u8 state[16]) {
   for (int i = 0; i < 16; i++) state[i] ^= rk[i]; // AddRoundKey 0
 
-  // Up to 13 mid rounds (AES-256 nr=14 → 13). Bounded by a constant so the
-  // eBPF verifier can unroll; `round < nr` gates the real per-key count.
-  for (__u32 round = 1; round < 14 && round < nr; round++) {
+  // Up to 13 mid rounds (AES-256 nr=14 → 13). Bounded by a constant so every
+  // round key sits at a constant offset; `round >= nr` ends AES-128 early.
+  for (__u32 round = 1; round < 14; round++) {
+    if (round >= nr)
+      break;
     for (int i = 0; i < 16; i++) state[i] = KLOAK_AES_SBOX[state[i]];
     aes_shift_rows(state);
     aes_mix_columns(state);
@@ -668,10 +670,12 @@ HELPER_INLINE void aes_block_encrypt(const __u8 *rk, __u32 nr, __u8 state[16]) {
     for (int i = 0; i < 16; i++) state[i] ^= k[i];
   }
 
-  // Final round (SubBytes + ShiftRows + AddRoundKey, no MixColumns).
+  // Final round (SubBytes + ShiftRows + AddRoundKey, no MixColumns). The last
+  // round key is picked from two constants rather than computed as rk + 16*nr:
+  // nr can be a runtime value, and the verifier rejects a variable offset here.
   for (int i = 0; i < 16; i++) state[i] = KLOAK_AES_SBOX[state[i]];
   aes_shift_rows(state);
-  const __u8 *k = rk + 16 * nr;
+  const __u8 *k = nr == 14 ? rk + 16 * 14 : rk + 16 * 10;
   for (int i = 0; i < 16; i++) state[i] ^= k[i];
 }
 
@@ -680,26 +684,29 @@ HELPER_INLINE void aes_block_encrypt(const __u8 *rk, __u32 nr, __u8 state[16]) {
 // `rounds` is not a TLS AES round count (a guard against a bogus offset read).
 // h_out doubles as the in-place AES state, so no scratch block is needed.
 //
-// Dispatch is on a COMPILE-TIME-CONSTANT round count so aes_block_encrypt
-// inlines with a constant `nr`: clang then fully unrolls its round loop into
-// constant-offset accesses into rd_key, which the eBPF verifier accepts
-// (a runtime `nr` would leave a variable-offset access the verifier rejects).
-// Only AES-128 (10) and AES-256 (14) are handled — TLS never negotiates
-// AES-192-GCM, so 12 is intentionally treated as unsupported.
+// Both key sizes share a single inlined aes_block_encrypt: inlining it once per
+// key size doubled the AES code in bssl_recover_h (~480 eBPF instructions and
+// ~100 bytes of stack). Only AES-128 (10) and AES-256 (14) are handled — TLS
+// never negotiates AES-192-GCM, so 12 is intentionally treated as unsupported.
 //
 // x86 AES-NI stores AES_KEY.rounds as nr-1 (9 for AES-128, 13 for AES-256),
 // so both the canonical and AES-NI values are accepted for each key size.
 HELPER_INLINE int aes_recover_h(const __u8 *rd_key, __u32 rounds, __u8 h_out[16]) {
   for (int i = 0; i < 16; i++) h_out[i] = 0; // plaintext block = 0
-  if (rounds == 10 || rounds == 9) {  // 9 = x86 AES-NI stores nr-1 for AES-128
-    aes_block_encrypt(rd_key, 10, h_out);
-    return 1;
-  }
-  if (rounds == 14 || rounds == 13) {  // 13 = x86 AES-NI stores nr-1 for AES-256
-    aes_block_encrypt(rd_key, 14, h_out);
-    return 1;
-  }
-  return 0;
+  __u32 nr;
+  if (rounds == 10 || rounds == 9)        // 9 = x86 AES-NI stores nr-1 for AES-128
+    nr = 10;
+  else if (rounds == 14 || rounds == 13)  // 13 = x86 AES-NI stores nr-1 for AES-256
+    nr = 14;
+  else
+    return 0;
+#ifdef __BPF__
+  // Hide nr from clang, which otherwise splits the call back into one copy
+  // per constant key size.
+  asm volatile("" : "+r"(nr));
+#endif
+  aes_block_encrypt(rd_key, nr, h_out);
+  return 1;
 }
 
 #endif // KLOAK_HELPERS_H
