@@ -3,7 +3,9 @@
 package ebpf
 
 import (
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"syscall"
 	"testing"
@@ -300,5 +302,63 @@ func TestWalkTLSLibrariesUnder_DeduplicatesByInode(t *testing.T) {
 	// must not be so aggressive that it drops everything.
 	if len(got) < 2 {
 		t.Errorf("expected at least 2 distinct TLS libs (UsrMove file + alias target), got %d: %v", len(got), got)
+	}
+}
+
+type fakeLink struct{ closed *int }
+
+func (l fakeLink) Close() error { *l.closed++; return nil }
+
+// TestAttachUprobesOncePerContainer checks that a container's uprobes on one
+// file and symbol are attached once however many of its processes AttachTLS
+// sees, and that untracking the container hands back exactly its links.
+func TestAttachUprobesOncePerContainer(t *testing.T) {
+	m := &TLSUprobeManager{}
+	closed, attaches := 0, 0
+	attach := func() ([]io.Closer, error) {
+		attaches++
+		return []io.Closer{fakeLink{&closed}, fakeLink{&closed}}, nil
+	}
+	lib := uprobeKey{cgroupID: 1, dev: 10, ino: 20, symbol: "SSL_write"}
+
+	for range 3 { // one call per process of the container
+		if _, err := m.attachUprobes(lib, attach); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if attaches != 1 {
+		t.Fatalf("library probe attached %d times, want 1", attaches)
+	}
+
+	// Another symbol, process (PID-scoped) or container is a new attach.
+	for _, k := range []uprobeKey{
+		{cgroupID: 1, dev: 10, ino: 20, symbol: "SSL_write_ex"},
+		{cgroupID: 1, pid: 7, dev: 10, ino: 20, symbol: "SSL_write"},
+		{cgroupID: 2, dev: 10, ino: 20, symbol: "SSL_write"},
+	} {
+		created, err := m.attachUprobes(k, attach)
+		if err != nil || !created {
+			t.Fatalf("%+v: created=%v err=%v", k, created, err)
+		}
+	}
+
+	// A failed attach is not recorded, so it is retried.
+	failed := uprobeKey{cgroupID: 1, dev: 10, ino: 30, symbol: "SSL_write"}
+	if _, err := m.attachUprobes(failed, func() ([]io.Closer, error) { return nil, errors.New("no such symbol") }); err == nil {
+		t.Fatal("attach error not returned")
+	}
+	if created, _ := m.attachUprobes(failed, attach); !created {
+		t.Fatal("failed attach was recorded")
+	}
+
+	links := m.takeCgroupLinks(1)
+	if len(links) != 8 { // 4 attaches for container 1, 2 links each
+		t.Fatalf("container 1 has %d links, want 8", len(links))
+	}
+	if created, _ := m.attachUprobes(lib, attach); !created {
+		t.Error("probe still recorded after its container was untracked")
+	}
+	if got := len(m.takeCgroupLinks(2)); got != 2 {
+		t.Errorf("container 2 has %d links, want 2", got)
 	}
 }
