@@ -69,6 +69,8 @@ The binary (`cmd/kloak/`) has these cobra subcommands:
 
 Supporting probes: a second `tcp_sendmsg` kprobe (`bpf_kprobe_tcp_sendmsg_sni`) that parses each connection's first handshake record into `sni_state` (keyed by `struct sock *`; parser `tls_parse_sni` in `helpers.h`), the `sock/inet_sock_set_state` tracepoint that clears it on SYN_SENT / CLOSE, kprobe/kretprobe on `udp_recvmsg` (DNS answers for watched hosts → `dns_ip_map`), `sys_enter/exit_connect` and `sys_enter_close` tracepoints (`conn_ip_map`, `last_verified_fd`), and `sched_process_exec/exit` (process lifecycle).
 
+Virtual IP host resolution (`--host-resolution=virtual-ip`, experimental, spinningfactory/kloak#327) is meant to replace the DNS snooping above step by step. So far the controller only gives every watched host a stable fake IP from `--virtual-ip-range` (default `198.18.0.0/15`; `planVirtualIPs` in `pkg/ebpf/virtual_ip.go`). The fake IPs live in `vip_host_ip` / `vip_ip_host`, which are pinned under `/sys/fs/bpf/kloak` so a restart keeps them. The controller refuses to start if the range overlaps a node address, pod or service CIDR, or node route (`cmd/kloak/virtual_ip.go`). No BPF program reads these maps yet, so the dns-snoop path still decides the host. Their layouts outlive the controller: if a `vip_*` struct changes, `prepareVirtualIPPins` drops the old pin and hosts are reallocated.
+
 Only AES-128/256-GCM records (TLS 1.2 and 1.3) are patched. GnuTLS and Go BoringCrypto are not supported (their e2e cases are skipped).
 
 ### Key Interfaces

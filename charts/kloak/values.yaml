@@ -57,6 +57,20 @@ controller:
     # refuses other rewrites: the placeholder goes out unchanged. "audit"
     # lets them through but logs each one in the controller.
     sniCheck: enforce
+    # How the data plane works out which host a connection goes to, for
+    # secrets restricted to a hostname. "dns-snoop" (default) reads DNS
+    # answers as pods receive them. "virtual-ip" is experimental
+    # (spinningfactory/kloak#327): every such host gets a stable fake IP
+    # from virtualIPRange, kept in BPF maps pinned under /sys/fs/bpf/kloak
+    # so restarts keep them. So far it only allocates the fake IPs; DNS
+    # answers are not rewritten yet and dns-snoop still decides the host.
+    # The pins stay on the node after an uninstall until it reboots.
+    hostResolution: dns-snoop
+    # IPv4 range (/19 or larger) the fake IPs come from in virtual-ip mode.
+    # The default is reserved for benchmarking (RFC 2544) and never routed.
+    # The controller refuses to start if the range overlaps a node address,
+    # a pod or service CIDR, or a route of the node.
+    virtualIPRange: 198.18.0.0/15
   cgroupPath: /host/sys/fs/cgroup
   dns:
     # Trusted DNS server IPs. Only DNS responses from these servers are used

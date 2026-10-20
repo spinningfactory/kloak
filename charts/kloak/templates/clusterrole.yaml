@@ -25,6 +25,16 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get"]
+  {{- if eq (.Values.controller.ebpf.hostResolution | default "dns-snoop") "virtual-ip" }}
+  # Address ranges the virtual IP range must not overlap: node pod CIDRs
+  # and addresses, and the service CIDRs
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["list"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["servicecidrs"]
+    verbs: ["list"]
+  {{- end }}
   # Events for debugging
   - apiGroups: [""]
     resources: ["events"]

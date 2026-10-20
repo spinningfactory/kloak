@@ -148,6 +148,31 @@ type TLSUprobeManager struct {
 	// bindingLogged rate-limits violation logs per (cgroup, placeholder,
 	// reason).
 	bindingLogged map[bindingLogKey]time.Time
+
+	// virtualIPs allocates the watched hosts' fake IPs in virtual-ip host
+	// resolution mode; nil otherwise.
+	virtualIPs *virtualIPAllocator
+
+	// uprobesMu guards uprobes and cgroupLinks.
+	uprobesMu sync.Mutex
+	// uprobes records the uprobes attached per container (attachUprobes).
+	uprobes map[uprobeKey]struct{}
+	// cgroupLinks holds each container's uprobe links, detached when the
+	// container is untracked or at Close.
+	cgroupLinks map[uint64][]io.Closer
+	// detachWG tracks the goroutines detaching untracked containers' links.
+	detachWG sync.WaitGroup
+}
+
+// uprobeKey identifies the uprobes kloak attached for a container on one
+// symbol (or file offset) of one file: for one of its processes, or for
+// every process that maps the file when pid is 0.
+type uprobeKey struct {
+	cgroupID uint64
+	pid      int
+	dev, ino uint64
+	symbol   string
+	offset   uint64
 }
 
 // bindingLogKey identifies a logged binding or SNI violation.
@@ -160,6 +185,59 @@ type bindingLogKey struct {
 // tcAttachEntry holds an open fd to a network namespace to prevent inode reuse.
 type tcAttachEntry struct {
 	netnsFd *os.File // kept open to pin the inode
+}
+
+// fileID returns the device and inode of the file at path.
+func fileID(path string) (dev, ino uint64, err error) {
+	var st syscall.Stat_t
+	if err := syscall.Stat(path, &st); err != nil {
+		return 0, 0, err
+	}
+	return uint64(st.Dev), st.Ino, nil //nolint:unconvert // Dev is uint32 on some arches
+}
+
+// attachUprobes calls attach to attach the uprobes for key, unless they are
+// attached already, and records the links with key's container so that
+// UntrackCgroup detaches them. It reports whether attach ran.
+//
+// AttachTLS runs for every process of a container on each exec in it, and a
+// uprobe without a PID filter already fires for every process that maps the
+// file. Attaching again would run the program once more per call and keep
+// the link until shutdown, where each uprobe detach waits for an RCU Tasks
+// Trace grace period, one at a time (the kernel holds event_mutex): with
+// hundreds of links the controller took minutes to exit.
+func (m *TLSUprobeManager) attachUprobes(key uprobeKey, attach func() ([]io.Closer, error)) (bool, error) {
+	m.uprobesMu.Lock()
+	defer m.uprobesMu.Unlock()
+	if _, ok := m.uprobes[key]; ok {
+		return false, nil
+	}
+	links, err := attach()
+	if err != nil {
+		return false, err
+	}
+	if m.uprobes == nil {
+		m.uprobes = make(map[uprobeKey]struct{})
+		m.cgroupLinks = make(map[uint64][]io.Closer)
+	}
+	m.uprobes[key] = struct{}{}
+	m.cgroupLinks[key.cgroupID] = append(m.cgroupLinks[key.cgroupID], links...)
+	return true, nil
+}
+
+// takeCgroupLinks forgets the uprobes attached for a container and returns
+// their links, for the caller to close.
+func (m *TLSUprobeManager) takeCgroupLinks(cgroupID uint64) []io.Closer {
+	m.uprobesMu.Lock()
+	defer m.uprobesMu.Unlock()
+	links := m.cgroupLinks[cgroupID]
+	delete(m.cgroupLinks, cgroupID)
+	for k := range m.uprobes {
+		if k.cgroupID == cgroupID {
+			delete(m.uprobes, k)
+		}
+	}
+	return links
 }
 
 // setupCgroupAncestor finds the kubepods cgroup directory and stores its fd
@@ -284,8 +362,26 @@ func parseBPFLogLevel(s string) ebpf.LogLevel {
 // the default route, an explicit name (e.g., "eth0", "wlp3s0") to pin, or
 // "none"/"lo-only" to attach only to loopback. See the field comment on
 // TLSUprobeManager.egressInterface for the full semantics.
-func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterface string, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
+//
+// hostRes selects the host resolution mode. In virtual-ip mode the virtual
+// IP maps are pinned under hostRes.PinPath, which must be on bpffs.
+func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterface string, hostRes HostResolutionConfig, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
 	log = log.Named("ebpf-uprobe")
+
+	if err := hostRes.validate(); err != nil {
+		return nil, err
+	}
+	spec, err := loadTlsuprobe()
+	if err != nil {
+		return nil, fmt.Errorf("loading eBPF collection spec: %w", err)
+	}
+	var mapOpts ebpf.MapOptions
+	if hostRes.virtualIP() {
+		if err := prepareVirtualIPPins(spec, hostRes.pinPath(), log); err != nil {
+			return nil, fmt.Errorf("preparing virtual IP map pins: %w", err)
+		}
+		mapOpts.PinPath = hostRes.pinPath()
+	}
 
 	objs := &tlsuprobeObjects{}
 	// Verifier-log level for BPF program loads. Defaults to disabled (0) so the
@@ -297,7 +393,8 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		LogSizeStart: 1 << 20, // 1 MB
 		LogLevel:     parseBPFLogLevel(os.Getenv("KLOAK_BPF_LOG_LEVEL")),
 	}
-	if err := loadTlsuprobeObjects(objs, &ebpf.CollectionOptions{
+	if err := spec.LoadAndAssign(objs, &ebpf.CollectionOptions{
+		Maps:     mapOpts,
 		Programs: progOpts,
 	}); err != nil {
 		var ve *ebpf.VerifierError
@@ -364,6 +461,12 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		tcMode:          newTCModeResolver(TCAttachAuto),
 		bindings:        make(map[string]podBinding),
 		bindingLogged:   make(map[bindingLogKey]time.Time),
+	}
+	if hostRes.virtualIP() {
+		mgr.virtualIPs = newVirtualIPAllocator(objs, hostRes.VirtualIPRange, log)
+		log.Infow("virtual IP host resolution enabled (experimental: fake IPs are allocated, DNS answers are not rewritten yet)",
+			"range", hostRes.VirtualIPRange.String(), "pinPath", hostRes.pinPath())
+		mgr.virtualIPs.logRestored()
 	}
 
 	// Attach tracepoints for DNS interception and connect tracking.
@@ -961,6 +1064,21 @@ func (m *TLSUprobeManager) RecordCgroupNetns(cgroupID uint64, pid int) {
 func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 	m.cgroupPaths.Delete(cgroupID)
 
+	// Detach the container's uprobes in the background: each detach can
+	// wait for an RCU grace period, which must not hold up reconciliation.
+	if links := m.takeCgroupLinks(cgroupID); len(links) > 0 {
+		m.detachWG.Add(1)
+		go func() {
+			defer m.detachWG.Done()
+			for _, l := range links {
+				if err := l.Close(); err != nil {
+					m.log.Debugw("failed to detach uprobe of untracked container", "cgroupID", cgroupID, "error", err)
+				}
+			}
+			logging.Tracew(m.log, "detached uprobes of untracked container", "cgroupID", cgroupID, "links", len(links))
+		}()
+	}
+
 	// Clean up tcAttached: close the pinned netns fd so the kernel can
 	// reclaim the inode. Check if any other cgroup still maps to the same
 	// netns before closing (multi-container pods share a netns).
@@ -1042,16 +1160,25 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 	if err != nil {
 		return fmt.Errorf("opening executable %s: %w", exePath, err)
 	}
+	exeDev, exeIno, err := fileID(exePath)
+	if err != nil {
+		return fmt.Errorf("stat executable %s: %w", exePath, err)
+	}
+	exeKey := func(symbol string, offset uint64) uprobeKey {
+		return uprobeKey{cgroupID: cgroupID, pid: pid, dev: exeDev, ino: exeIno, symbol: symbol, offset: offset}
+	}
 
 	// 1. Try Go crypto/tls (statically linked into the binary).
 	// Use PID-scoped attachment because Go binaries are unique per container
 	// and system-wide uprobes via overlay don't fire for the same binary.
 	goWriteSym := "crypto/tls.(*Conn).Write"
-	if up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, &link.UprobeOptions{PID: pid}); err == nil {
-		m.log.Debugw("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
-		m.linksMu.Lock()
-		m.links = append(m.links, up)
-		m.linksMu.Unlock()
+	if created, err := m.attachUprobes(exeKey(goWriteSym, 0), func() ([]io.Closer, error) {
+		up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, &link.UprobeOptions{PID: pid})
+		return []io.Closer{up}, err
+	}); err == nil {
+		if created {
+			m.log.Debugw("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
+		}
 
 		// Push Go-specific struct offsets for H extraction and attach tc egress
 		// for ciphertext patching. Both are required for the XOR-patch path.
@@ -1073,14 +1200,13 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 		m.log.Infow("Bun single-executable detected — attaching at SSL_write file offset",
 			"pid", pid, "version", bunVer,
 			"ssl_write_offset", fmt.Sprintf("0x%x", bunOff.SSLWriteOffset))
-		if up, err := ex.Uprobe("", m.objs.BpfUprobeSslWrite, &link.UprobeOptions{
-			Address: bunOff.SSLWriteOffset,
-			PID:     pid,
+		if _, err := m.attachUprobes(exeKey("", bunOff.SSLWriteOffset), func() ([]io.Closer, error) {
+			up, err := ex.Uprobe("", m.objs.BpfUprobeSslWrite, &link.UprobeOptions{
+				Address: bunOff.SSLWriteOffset,
+				PID:     pid,
+			})
+			return []io.Closer{up}, err
 		}); err == nil {
-			m.linksMu.Lock()
-			m.links = append(m.links, up)
-			m.linksMu.Unlock()
-
 			// Push BoringSSL chain offsets — Bun statically links BoringSSL and
 			// uses the same SSL→s3→aead_write_ctx→AES_KEY walk.
 			var st syscall.Stat_t
@@ -1119,14 +1245,16 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 	// Try main executable first (statically linked OpenSSL/BoringSSL/GnuTLS).
 	// Use PID-scoped because the main exe is unique per container.
 	for _, sym := range append(sslSymbols, gnutlsSymbols...) {
-		up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid})
+		created, err := m.attachUprobes(exeKey(sym, 0), func() ([]io.Closer, error) {
+			up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid})
+			return []io.Closer{up}, err
+		})
 		if err != nil {
 			continue
 		}
-		m.log.Debugw("Attached uprobe to main exe", "pid", pid, "symbol", sym)
-		m.linksMu.Lock()
-		m.links = append(m.links, up)
-		m.linksMu.Unlock()
+		if created {
+			m.log.Debugw("Attached uprobe to main exe", "pid", pid, "symbol", sym)
+		}
 		attached = true
 	}
 
@@ -1140,15 +1268,22 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 		if err != nil {
 			continue
 		}
+		libDev, libIno, err := fileID(hostPath)
+		if err != nil {
+			continue
+		}
 		for _, sym := range append(sslSymbols, gnutlsSymbols...) {
-			up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
+			key := uprobeKey{cgroupID: cgroupID, dev: libDev, ino: libIno, symbol: sym}
+			created, err := m.attachUprobes(key, func() ([]io.Closer, error) {
+				up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
+				return []io.Closer{up}, err
+			})
 			if err != nil {
 				continue
 			}
-			m.log.Debugw("Attached uprobe (system-wide)", "pid", pid, "symbol", sym, "lib", containerPath)
-			m.linksMu.Lock()
-			m.links = append(m.links, up)
-			m.linksMu.Unlock()
+			if created {
+				m.log.Debugw("Attached uprobe (system-wide)", "pid", pid, "symbol", sym, "lib", containerPath)
+			}
 			attached = true
 		}
 	}
@@ -1166,7 +1301,7 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 		// through h_extract → cache lookup. Otherwise (BoringSSL, statically
 		// linked) leave strategy at 0 (default) — process stays on the legacy
 		// kprobe-walks-chain path that's been on main since launch.
-		if m.attachLibcryptoCipherInit(pid, containerLibs) {
+		if m.attachLibcryptoCipherInit(pid, cgroupID, containerLibs) {
 			tgid := uint32(pid)
 			strategyVal := strategyLibcryptoHook
 			if err := m.objs.TlsStrategy.Update(&tgid, &strategyVal, 0); err != nil {
@@ -1246,7 +1381,7 @@ func (m *TLSUprobeManager) processUsesBoringSSL(pid int, containerLibs []string)
 // BoringSSL apps that don't expose EVP_CipherInit_ex anywhere (rare in
 // practice — Node.js publishes as OpenSSL despite the historical "uses
 // BoringSSL" reputation) stay on STRATEGY_KPROBE_WALK.
-func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []string) bool {
+func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, cgroupID uint64, containerLibs []string) bool {
 	// BoringSSL must stay on STRATEGY_KPROBE_WALK. Its libcrypto also exports
 	// EVP_CipherInit_ex, but BoringSSL's cipher init does NOT populate the
 	// OpenSSL evp_h_cache that h_extract reads, and the OpenSSL provider chain
@@ -1272,25 +1407,36 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []st
 
 	// 1. Main executable, PID-scoped — for statically-linked OpenSSL (Node.js).
 	exePath := fmt.Sprintf("/proc/%d/exe", pid)
-	if exeEx, err := link.OpenExecutable(exePath); err == nil {
+	exeEx, err := link.OpenExecutable(exePath)
+	var exeDev, exeIno uint64
+	if err == nil {
+		exeDev, exeIno, err = fileID(exePath)
+	}
+	if err == nil {
 		exeAttached := false
 		for _, sym := range cipherInitSymbols {
-			up, errEntry := exeEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit,
-				&link.UprobeOptions{PID: pid})
-			if errEntry != nil {
+			key := uprobeKey{cgroupID: cgroupID, pid: pid, dev: exeDev, ino: exeIno, symbol: sym}
+			created, err := m.attachUprobes(key, func() ([]io.Closer, error) {
+				up, errEntry := exeEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit,
+					&link.UprobeOptions{PID: pid})
+				if errEntry != nil {
+					return nil, errEntry
+				}
+				ret, errRet := exeEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit,
+					&link.UprobeOptions{PID: pid})
+				if errRet != nil {
+					_ = up.Close()
+					return nil, errRet
+				}
+				return []io.Closer{up, ret}, nil
+			})
+			if err != nil {
 				continue
 			}
-			ret, errRet := exeEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit,
-				&link.UprobeOptions{PID: pid})
-			if errRet != nil {
-				_ = up.Close()
-				continue
+			if created {
+				m.log.Debugw("Attached EVP_CipherInit hooks (main exe, PID-scoped)",
+					"pid", pid, "symbol", sym)
 			}
-			m.linksMu.Lock()
-			m.links = append(m.links, up, ret)
-			m.linksMu.Unlock()
-			m.log.Debugw("Attached EVP_CipherInit hooks (main exe, PID-scoped)",
-				"pid", pid, "symbol", sym)
 			attached = true
 			exeAttached = true
 		}
@@ -1313,6 +1459,10 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []st
 		libcryptoFound = true
 		hostPath := fmt.Sprintf("/proc/%d/root%s", pid, containerPath)
 		libEx, err := link.OpenExecutable(hostPath)
+		var libDev, libIno uint64
+		if err == nil {
+			libDev, libIno, err = fileID(hostPath)
+		}
 		if err != nil {
 			m.log.Debugw("Failed to open libcrypto for cipher_init attach",
 				"pid", pid, "lib", containerPath, "error", err)
@@ -1320,24 +1470,30 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, containerLibs []st
 		}
 		libAttached := false
 		for _, sym := range cipherInitSymbols {
-			up, errEntry := libEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit, nil)
-			if errEntry != nil {
-				m.log.Debugw("EVP_CipherInit entry uprobe attach failed",
-					"pid", pid, "symbol", sym, "lib", containerPath, "error", errEntry)
+			key := uprobeKey{cgroupID: cgroupID, dev: libDev, ino: libIno, symbol: sym}
+			created, err := m.attachUprobes(key, func() ([]io.Closer, error) {
+				up, errEntry := libEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit, nil)
+				if errEntry != nil {
+					m.log.Debugw("EVP_CipherInit entry uprobe attach failed",
+						"pid", pid, "symbol", sym, "lib", containerPath, "error", errEntry)
+					return nil, errEntry
+				}
+				ret, errRet := libEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit, nil)
+				if errRet != nil {
+					_ = up.Close()
+					m.log.Debugw("EVP_CipherInit uretprobe attach failed",
+						"pid", pid, "symbol", sym, "lib", containerPath, "error", errRet)
+					return nil, errRet
+				}
+				return []io.Closer{up, ret}, nil
+			})
+			if err != nil {
 				continue
 			}
-			ret, errRet := libEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit, nil)
-			if errRet != nil {
-				_ = up.Close()
-				m.log.Debugw("EVP_CipherInit uretprobe attach failed",
-					"pid", pid, "symbol", sym, "lib", containerPath, "error", errRet)
-				continue
+			if created {
+				m.log.Debugw("Attached EVP_CipherInit hooks (libcrypto.so, system-wide)",
+					"pid", pid, "symbol", sym, "lib", containerPath)
 			}
-			m.linksMu.Lock()
-			m.links = append(m.links, up, ret)
-			m.linksMu.Unlock()
-			m.log.Debugw("Attached EVP_CipherInit hooks (libcrypto.so, system-wide)",
-				"pid", pid, "symbol", sym, "lib", containerPath)
 			attached = true
 			libAttached = true
 		}
@@ -1660,6 +1816,18 @@ func (m *TLSUprobeManager) Close() error {
 	case <-time.After(5 * time.Second):
 		m.log.Warnw("timed out waiting for retry goroutines on shutdown; proceeding with teardown")
 	}
+	// Untracked containers' uprobes may still be detaching. Their links
+	// are no longer in cgroupLinks, so this is the only wait for them.
+	detached := make(chan struct{})
+	go func() {
+		m.detachWG.Wait()
+		close(detached)
+	}()
+	select {
+	case <-detached:
+	case <-time.After(10 * time.Second):
+		m.log.Warnw("timed out waiting for untracked containers' uprobes to detach; proceeding with teardown")
+	}
 
 	// Snapshot + nil out the slice under the lock, then release before doing
 	// the (slow, ~50-100ms each) kernel syscalls. Holding linksMu across the
@@ -1670,6 +1838,13 @@ func (m *TLSUprobeManager) Close() error {
 	links := m.links
 	m.links = nil
 	m.linksMu.Unlock()
+	m.uprobesMu.Lock()
+	for cg, cgLinks := range m.cgroupLinks {
+		links = append(links, cgLinks...)
+		delete(m.cgroupLinks, cg)
+	}
+	clear(m.uprobes)
+	m.uprobesMu.Unlock()
 
 	linkCount := len(links)
 	var errs []error
@@ -1922,7 +2097,10 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 		m.log.Errorw("failed to sync secrets to BPF map", "error", fmt.Errorf("snapshot secrets: %w", err))
 		return
 	}
-	applySecrets(m.objs.SecretMap, m.objs.WatchedHosts, snapshot, m.log)
+	hosts := applySecrets(m.objs.SecretMap, m.objs.WatchedHosts, snapshot, m.log)
+	if m.virtualIPs != nil {
+		m.virtualIPs.sync(hosts, time.Now())
+	}
 
 	m.bindMu.Lock()
 	defer m.bindMu.Unlock()

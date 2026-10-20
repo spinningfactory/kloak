@@ -296,9 +296,8 @@ func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, erro
 		return ctrl.Result{}, nil
 	}
 
-	// Uprobes will be automatically cleaned up by the uprobe component when
-	// the process dies, so we no longer have to detach them manually or remove cgroups from maps.
-	// Untrack cgroups from exec/exit tracepoint filtering.
+	// Untrack the cgroups: this stops exec/exit tracking for them and
+	// detaches the uprobes attached for their processes.
 	if r.UprobeManager != nil {
 		r.UprobeManager.UnbindPod(uid)
 		for cgroupID := range cgroupIDs {

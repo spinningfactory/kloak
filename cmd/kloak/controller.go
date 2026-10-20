@@ -54,6 +54,8 @@ var (
 	tcAttachMode        string
 	secretBinding       string
 	sniCheck            string
+	hostResolution      string
+	virtualIPRange      string
 )
 
 func init() {
@@ -75,12 +77,19 @@ func init() {
 	controllerCmd.Flags().StringVar(&sniCheck, "sni-check", "enforce",
 		`A secret restricted to a hostname (getkloak.io/hosts) is only rewritten on a connection whose TLS ClientHello names that host (SNI). `+
 			`"enforce" refuses other rewrites; "audit" allows them but logs each violation, to find clients whose SNI differs from the annotation before enforcing.`)
+	controllerCmd.Flags().StringVar(&hostResolution, "host-resolution", string(ebpf.HostResolutionDNSSnoop),
+		`How the data plane works out which host a connection goes to, for secrets restricted to a hostname (getkloak.io/hosts). `+
+			`"dns-snoop" reads DNS answers as pods receive them. "virtual-ip" (experimental, spinningfactory/kloak#327) gives every such host a stable fake IP from --virtual-ip-range, `+
+			`kept in maps pinned under `+ebpf.DefaultBPFPinPath+`; so far it only allocates the fake IPs, and dns-snoop still decides the host.`)
+	controllerCmd.Flags().StringVar(&virtualIPRange, "virtual-ip-range", ebpf.DefaultVirtualIPRange,
+		`IPv4 range (/19 or larger) fake IPs come from with --host-resolution=virtual-ip. `+
+			`The controller refuses to start if it overlaps a node address, pod CIDR, service CIDR or route of the node.`)
 }
 
 func runController(cmd *cobra.Command, args []string) {
 	setupLog := logging.Setup().Named("setup")
 
-	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface, "tcAttachMode", tcAttachMode, "secretBinding", secretBinding, "sniCheck", sniCheck)
+	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface, "tcAttachMode", tcAttachMode, "secretBinding", secretBinding, "sniCheck", sniCheck, "hostResolution", hostResolution)
 
 	tcMode, err := ebpf.ParseTCAttachMode(tcAttachMode)
 	if err != nil {
@@ -99,6 +108,21 @@ func runController(cmd *cobra.Command, args []string) {
 		setupLog.Errorw("invalid --sni-check", "error", err)
 		_ = setupLog.Sync()
 		os.Exit(1)
+	}
+	hostResMode, err := ebpf.ParseHostResolutionMode(hostResolution)
+	if err != nil {
+		setupLog.Errorw("invalid --host-resolution", "error", err)
+		_ = setupLog.Sync()
+		os.Exit(1)
+	}
+	hostRes := ebpf.HostResolutionConfig{Mode: hostResMode}
+	if hostResMode == ebpf.HostResolutionVirtualIP {
+		hostRes.VirtualIPRange, err = ebpf.ParseVirtualIPRange(virtualIPRange)
+		if err != nil {
+			setupLog.Errorw("invalid --virtual-ip-range", "error", err)
+			_ = setupLog.Sync()
+			os.Exit(1)
+		}
 	}
 
 	// 30 s is well under the daemonset's 60 s terminationGracePeriodSeconds,
@@ -122,7 +146,21 @@ func runController(cmd *cobra.Command, args []string) {
 	var uprobeMgr *ebpf.TLSUprobeManager
 
 	if enableEBPF {
-		uprobeMgr, err = ebpf.NewTLSUprobeManager(k8ssecrets.NewSource(mgr.GetClient()).WithLog(setupLog), cgroupPath, egressInterface, setupLog)
+		if hostResMode == ebpf.HostResolutionVirtualIP {
+			// The controller runs with hostPID: /proc/1 is in the host
+			// network namespace.
+			checkCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			err := checkVirtualIPRange(checkCtx, mgr.GetAPIReader(), hostRes.VirtualIPRange, "/proc/1", setupLog)
+			cancel()
+			if err != nil {
+				setupLog.Errorw("invalid --virtual-ip-range", "error", err)
+				_ = setupLog.Sync()
+				os.Exit(1)
+			}
+		} else {
+			ebpf.RemoveVirtualIPPins(hostRes.PinPath, setupLog)
+		}
+		uprobeMgr, err = ebpf.NewTLSUprobeManager(k8ssecrets.NewSource(mgr.GetClient()).WithLog(setupLog), cgroupPath, egressInterface, hostRes, setupLog)
 		if err != nil {
 			setupLog.Errorw("failed to initialize eBPF uprobe manager", "error", err)
 			_ = setupLog.Sync()

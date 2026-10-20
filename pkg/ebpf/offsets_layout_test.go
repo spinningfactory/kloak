@@ -46,3 +46,23 @@ func TestSecretACLKeyLayout(t *testing.T) {
 		t.Fatalf("secretACLKey is %d bytes, struct secret_acl_key is %d", got, want)
 	}
 }
+
+// TestVirtualIPLayout pins the virtual IP map mirrors to the generated
+// structs. These maps are pinned across restarts, so a change here is also a
+// change to what a new controller finds in bpffs (prepareVirtualIPPins).
+func TestVirtualIPLayout(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		got, want any
+	}{
+		{"vip_host_val", vipHostVal{}, tlsuprobeVipHostVal{}},
+		{"vip_ip_val", vipIPVal{}, tlsuprobeVipIpVal{}},
+	} {
+		if got, want := binary.Size(c.got), binary.Size(c.want); got != want {
+			t.Errorf("%T is %d bytes, struct %s is %d", c.got, got, c.name, want)
+		}
+		if got, want := fieldNames(c.got), fieldNames(c.want); !slices.Equal(got, want) {
+			t.Errorf("%T field order %v does not match struct %s %v", c.got, got, c.name, want)
+		}
+	}
+}
