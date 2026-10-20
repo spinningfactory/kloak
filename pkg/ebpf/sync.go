@@ -39,13 +39,15 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, sour
 }
 
 // applySecrets writes a snapshot to secret_map and watched_hosts (see
-// syncSecrets). Split out so the manager can reuse the same snapshot for
-// the secret_acl sync.
-func applySecrets(secretMap, watchedHostsMap *ebpf.Map, snapshot []secrets.Secret, log *zap.SugaredLogger) {
+// syncSecrets) and returns the hostnames it put in watched_hosts. Split out
+// so the manager can reuse the same snapshot for the secret_acl and virtual
+// IP syncs.
+func applySecrets(secretMap, watchedHostsMap *ebpf.Map, snapshot []secrets.Secret, log *zap.SugaredLogger) map[string]struct{} {
 	// newKeys tracks which keys we upsert so we can prune stale entries afterwards.
 	newKeys := make(map[secretKey]struct{})
 	// newHosts tracks unique hostnames to sync to the watched_hosts map.
 	newHosts := make(map[watchedHostKey]struct{})
+	hostNames := make(map[string]struct{})
 
 	for i := range snapshot {
 		s := &snapshot[i]
@@ -106,6 +108,7 @@ func applySecrets(secretMap, watchedHostsMap *ebpf.Map, snapshot []secrets.Secre
 			var whk watchedHostKey
 			copy(whk.Host[:], s.Host)
 			newHosts[whk] = struct{}{}
+			hostNames[s.Host] = struct{}{}
 		case s.IP != nil:
 			copy(val.AllowedIp[:], s.IP.To16())
 			val.IpLen = 16 // IP-based filtering with valid IP
@@ -220,6 +223,7 @@ func applySecrets(secretMap, watchedHostsMap *ebpf.Map, snapshot []secrets.Secre
 	log.Debugw("secret sync complete",
 		"snapshotEntries", len(snapshot), "bpfKeys", len(newKeys),
 		"pruned", len(staleKeys), "watchedHosts", len(newHosts))
+	return hostNames
 }
 
 // syncSecretACL makes secret_acl hold exactly the entries the bindings grant

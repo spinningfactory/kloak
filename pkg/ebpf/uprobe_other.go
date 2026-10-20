@@ -37,7 +37,7 @@ var ErrNotSupported = errors.New("kloak: eBPF uprobes are only supported on Linu
 // ErrNotSupported (or is a no-op for the void methods).
 type TLSUprobeManager struct{}
 
-func NewTLSUprobeManager(_ secrets.Source, _, _ string, _ *zap.SugaredLogger) (*TLSUprobeManager, error) {
+func NewTLSUprobeManager(_ secrets.Source, _, _ string, _ HostResolutionConfig, _ *zap.SugaredLogger) (*TLSUprobeManager, error) {
 	return nil, ErrNotSupported
 }
 
@@ -54,6 +54,9 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers([]net.IP) error { return Er
 func (m *TLSUprobeManager) DumpDebugCounters()                       {}
 func (m *TLSUprobeManager) SetTCAttachMode(TCAttachMode)             {}
 func (m *TLSUprobeManager) SetSecretBindingMode(SecretBindingMode)   {}
+func (m *TLSUprobeManager) SetSNICheckMode(SNICheckMode)             {}
 func (m *TLSUprobeManager) UnbindPod(string)                         {}
 
 func (m *TLSUprobeManager) BindPodSecrets(string, string, []uint64, []secrets.Ref) {}
+
+func RemoveVirtualIPPins(string, *zap.SugaredLogger) {}

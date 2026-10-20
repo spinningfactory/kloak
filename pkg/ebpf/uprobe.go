@@ -148,6 +148,10 @@ type TLSUprobeManager struct {
 	// bindingLogged rate-limits violation logs per (cgroup, placeholder,
 	// reason).
 	bindingLogged map[bindingLogKey]time.Time
+
+	// virtualIPs allocates the watched hosts' fake IPs in virtual-ip host
+	// resolution mode; nil otherwise.
+	virtualIPs *virtualIPAllocator
 }
 
 // bindingLogKey identifies a logged binding or SNI violation.
@@ -284,8 +288,26 @@ func parseBPFLogLevel(s string) ebpf.LogLevel {
 // the default route, an explicit name (e.g., "eth0", "wlp3s0") to pin, or
 // "none"/"lo-only" to attach only to loopback. See the field comment on
 // TLSUprobeManager.egressInterface for the full semantics.
-func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterface string, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
+//
+// hostRes selects the host resolution mode. In virtual-ip mode the virtual
+// IP maps are pinned under hostRes.PinPath, which must be on bpffs.
+func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterface string, hostRes HostResolutionConfig, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
 	log = log.Named("ebpf-uprobe")
+
+	if err := hostRes.validate(); err != nil {
+		return nil, err
+	}
+	spec, err := loadTlsuprobe()
+	if err != nil {
+		return nil, fmt.Errorf("loading eBPF collection spec: %w", err)
+	}
+	var mapOpts ebpf.MapOptions
+	if hostRes.virtualIP() {
+		if err := prepareVirtualIPPins(spec, hostRes.pinPath(), log); err != nil {
+			return nil, fmt.Errorf("preparing virtual IP map pins: %w", err)
+		}
+		mapOpts.PinPath = hostRes.pinPath()
+	}
 
 	objs := &tlsuprobeObjects{}
 	// Verifier-log level for BPF program loads. Defaults to disabled (0) so the
@@ -297,7 +319,8 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		LogSizeStart: 1 << 20, // 1 MB
 		LogLevel:     parseBPFLogLevel(os.Getenv("KLOAK_BPF_LOG_LEVEL")),
 	}
-	if err := loadTlsuprobeObjects(objs, &ebpf.CollectionOptions{
+	if err := spec.LoadAndAssign(objs, &ebpf.CollectionOptions{
+		Maps:     mapOpts,
 		Programs: progOpts,
 	}); err != nil {
 		var ve *ebpf.VerifierError
@@ -364,6 +387,12 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		tcMode:          newTCModeResolver(TCAttachAuto),
 		bindings:        make(map[string]podBinding),
 		bindingLogged:   make(map[bindingLogKey]time.Time),
+	}
+	if hostRes.virtualIP() {
+		mgr.virtualIPs = newVirtualIPAllocator(objs, hostRes.VirtualIPRange, log)
+		log.Infow("virtual IP host resolution enabled (experimental: fake IPs are allocated, DNS answers are not rewritten yet)",
+			"range", hostRes.VirtualIPRange.String(), "pinPath", hostRes.pinPath())
+		mgr.virtualIPs.logRestored()
 	}
 
 	// Attach tracepoints for DNS interception and connect tracking.
@@ -1922,7 +1951,10 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 		m.log.Errorw("failed to sync secrets to BPF map", "error", fmt.Errorf("snapshot secrets: %w", err))
 		return
 	}
-	applySecrets(m.objs.SecretMap, m.objs.WatchedHosts, snapshot, m.log)
+	hosts := applySecrets(m.objs.SecretMap, m.objs.WatchedHosts, snapshot, m.log)
+	if m.virtualIPs != nil {
+		m.virtualIPs.sync(hosts, time.Now())
+	}
 
 	m.bindMu.Lock()
 	defer m.bindMu.Unlock()

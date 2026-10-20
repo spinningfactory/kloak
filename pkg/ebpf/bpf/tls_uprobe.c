@@ -537,6 +537,51 @@ struct {
 } watched_hosts SEC(".maps");
 
 // =============================================================================
+// Virtual IP host resolution (--host-resolution=virtual-ip, spinningfactory/kloak#327)
+// =============================================================================
+
+// Every watched host gets a fake IP from a reserved range (virtual_ip.go).
+// Both maps are written only by userspace and, in virtual-ip mode, pinned in
+// bpffs so a controller restart keeps the fake IPs apps may have cached. No
+// program reads them yet: the tc DNS rewrite (host -> fake IP) and the
+// connect redirect (fake IP -> host) build on them.
+
+// Watched host -> its fake IPs.
+struct vip_host_val {
+  __u8 ip4[4];  // fake IPv4, network byte order
+  __u8 ip6[16]; // fake IPv6; all zero until an IPv6 range is supported
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 1024); // = watched_hosts
+  __uint(map_flags, BPF_F_RDONLY_PROG);
+  __type(key, struct watched_host_key);
+  __type(value, struct vip_host_val);
+} vip_host_ip SEC(".maps");
+
+// Set on a fake IP whose host is no longer watched. The IP stays reserved
+// for that host (and still resolves to it) for a retention period, so it is
+// not handed to another host while apps may still cache it.
+#define VIP_F_RETIRED 1
+
+// Fake IP -> host.
+struct vip_ip_val {
+  char host[MAX_HOST_LEN]; // lowercased, zero-padded (hosts_match-comparable)
+  __u32 host_len;
+  __u32 flags;      // VIP_F_*
+  __u64 retired_at; // unix seconds; userspace bookkeeping only
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 4096); // active hosts plus retired reservations
+  __uint(map_flags, BPF_F_RDONLY_PROG);
+  __type(key, struct dns_ip_key); // IPv4-mapped-IPv6 or native IPv6
+  __type(value, struct vip_ip_val);
+} vip_ip_host SEC(".maps");
+
+// =============================================================================
 // Container process lifecycle tracking
 // =============================================================================
 
