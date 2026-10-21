@@ -80,7 +80,7 @@ func init() {
 	controllerCmd.Flags().StringVar(&hostResolution, "host-resolution", string(ebpf.HostResolutionDNSSnoop),
 		`How the data plane works out which host a connection goes to, for secrets restricted to a hostname (getkloak.io/hosts). `+
 			`"dns-snoop" reads DNS answers as pods receive them. "virtual-ip" (experimental, spinningfactory/kloak#327) gives every such host a stable fake IP from --virtual-ip-range, `+
-			`kept in maps pinned under `+ebpf.DefaultBPFPinPath+`; so far it only allocates the fake IPs, and dns-snoop still decides the host.`)
+			`kept in maps pinned under `+ebpf.DefaultBPFPinPath+`. Kloak pods get the fake IP in DNS answers and their connects to it are redirected to the host's addresses; dns-snoop still decides the host.`)
 	controllerCmd.Flags().StringVar(&virtualIPRange, "virtual-ip-range", ebpf.DefaultVirtualIPRange,
 		`IPv4 range (/19 or larger) fake IPs come from with --host-resolution=virtual-ip. `+
 			`The controller refuses to start if it overlaps a node address, pod CIDR, service CIDR or route of the node.`)

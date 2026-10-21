@@ -279,12 +279,16 @@ enum {
   DBG_SNI_CAPTURED,          // first handshake record on a connection parsed into sni_state
   DBG_SNI_DENY,              // patch for a host-restricted secret refused: SNI missing / not the host
   DBG_SNI_AUDIT,             // same, but audit mode let the rewrite go ahead
+  DBG_VIP_DNS_REWRITTEN,     // tc_dns_rewrite replaced a watched host's A records with its fake IP
+  DBG_VIP_DNS_UNCHANGED,     // a watched host's answer left unchanged (not every record could be read)
+  DBG_VIP_CONNECT_REDIRECT,  // vip_connect4 sent a connect to a fake IP to a real address
+  DBG_VIP_CONNECT_REFUSED,   // connect to a fake IP refused: unallocated, or no address recorded yet
   DBG_MAX,
 };
 
 struct {
   __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 64); // must be >= DBG_MAX
+  __uint(max_entries, 128); // must be >= DBG_MAX
 
   __type(key, __u32);
   __type(value, __u64);
@@ -541,10 +545,12 @@ struct {
 // =============================================================================
 
 // Every watched host gets a fake IP from a reserved range (virtual_ip.go).
-// Both maps are written only by userspace and, in virtual-ip mode, pinned in
-// bpffs so a controller restart keeps the fake IPs apps may have cached. No
-// program reads them yet: the tc DNS rewrite (host -> fake IP) and the
-// connect redirect (fake IP -> host) build on them.
+// tc_dns_rewrite hands a pod that fake IP in place of the host's addresses,
+// and records the real ones in vip_upstream; vip_connect4 sends a connect to
+// the fake IP to one of them. vip_host_ip and vip_ip_host are written only by
+// userspace. The vip_* maps holding state (vip_host_ip, vip_ip_host,
+// vip_upstream) are pinned in bpffs in virtual-ip mode, so a controller
+// restart keeps the fake IPs apps may have cached and where they lead.
 
 // Watched host -> its fake IPs.
 struct vip_host_val {
@@ -580,6 +586,69 @@ struct {
   __type(key, struct dns_ip_key); // IPv4-mapped-IPv6 or native IPv6
   __type(value, struct vip_ip_val);
 } vip_ip_host SEC(".maps");
+
+// The virtual IP range, written by userspace at startup in virtual-ip mode.
+// mask4 == 0 (the default) disables tc_dns_rewrite and vip_connect4.
+struct vip_config_val {
+  __u32 net4;  // range address, network byte order
+  __u32 mask4; // range mask, network byte order
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct vip_config_val);
+} vip_config SEC(".maps");
+
+static __always_inline int vip_in_range(const struct vip_config_val *cfg,
+                                        __u32 ip4) {
+  return cfg->mask4 && (ip4 & cfg->mask4) == cfg->net4;
+}
+
+// Fake IP -> the real addresses of its host (struct vip_upstream_val in
+// helpers.h), as the trusted resolvers last returned them to a pod.
+// Written by tc_dns_rewrite; userspace deletes the entry of a fake IP that
+// is released or handed to another host.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 4096); // = vip_ip_host
+  __type(key, struct dns_ip_key); // fake IP, IPv4-mapped-IPv6
+  __type(value, struct vip_upstream_val);
+} vip_upstream SEC(".maps");
+
+// Per socket: the fake IP vip_connect4 redirected it from, so that
+// getpeername() reports the address the app connected to.
+struct vip_sock_val {
+  __u32 fake_ip4; // network byte order
+  __u32 real_ip4; // network byte order
+  __u32 port;     // bpf_sock_addr.user_port (network byte order)
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_SK_STORAGE);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+  __type(key, int);
+  __type(value, struct vip_sock_val);
+} vip_sock SEC(".maps");
+
+// Per-CPU state of tc_dns_rewrite: the DNS message and the walks over it
+// (too large for the stack). Not dns_scratch: tc runs in softirq context,
+// which can interrupt the udp_recvmsg kretprobe while it uses dns_scratch on
+// the same CPU.
+struct dns_rewrite_buf {
+  __u8 msg[MAX_DNS_PKT];
+  struct dns_question q;
+  struct dns_answers a;
+  struct vip_upstream_val up;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct dns_rewrite_buf);
+} dns_rewrite_scratch SEC(".maps");
 
 // =============================================================================
 // Container process lifecycle tracking
@@ -1163,6 +1232,19 @@ static __always_inline void ipv4_to_mapped(__u8 *out16, const __u8 *ipv4) {
   out16[15] = ipv4[3];
 }
 
+// dns_server_trusted reports whether DNS answers from ip (IPv4-mapped-IPv6
+// or IPv6) are believed: any server while no trusted_dns_servers whitelist
+// is configured, otherwise only the listed ones.
+static __always_inline int dns_server_trusted(const __u8 *ip) {
+  __u32 flag_key = 0;
+  __u8 *enabled = bpf_map_lookup_elem(&dns_whitelist_enabled, &flag_key);
+  if (!enabled || *enabled != 1)
+    return 1;
+  struct dns_ip_key key = {};
+  __builtin_memcpy(key.ip, ip, 16);
+  return bpf_map_lookup_elem(&trusted_dns_servers, &key) != NULL;
+}
+
 
 
 // barrier_var prevents the compiler from eliminating the AND mask below.
@@ -1568,18 +1650,8 @@ int kretprobe_udp_recvmsg(void *ctx) {
   }
 
   // Validate DNS server source IP against trusted_dns_servers whitelist.
-  // If dns_whitelist_enabled is 1 and the peer IP is not in the map, drop.
-  // If dns_whitelist_enabled is 0 (not configured), accept all DNS responses.
-  if (has_peer_ip) {
-    __u32 flag_key = 0;
-    __u8 *enabled = bpf_map_lookup_elem(&dns_whitelist_enabled, &flag_key);
-    if (enabled && *enabled == 1) {
-      struct dns_ip_key peer_key = {};
-      __builtin_memcpy(peer_key.ip, peer_ip, 16);
-      if (!bpf_map_lookup_elem(&trusted_dns_servers, &peer_key))
-        return 0;  // DNS server not in whitelist — drop
-    }
-  }
+  if (has_peer_ip && !dns_server_trusted(peer_ip))
+    return 0; // DNS server not in whitelist — drop
 
   // Read return value from pt_regs
   long ret = 0;
@@ -3879,6 +3951,315 @@ int tc_ghash_update(struct __sk_buff *skb) {
   }
 
   return 0 /* TC_ACT_OK */;
+}
+
+// =============================================================================
+// Virtual IP host resolution (--host-resolution=virtual-ip, spinningfactory/kloak#327)
+//
+// tc_dns_rewrite runs at tc ingress on the pod's own interface, inside the pod
+// netns: past the CNI (which may deliver with bpf_redirect_peer and skip the
+// host side of the veth), before the pod's sockets. It replaces every A
+// record of a trusted resolver's answer for a watched host with the host's
+// fake IP, and records the real addresses in vip_upstream. vip_connect4
+// (cgroup connect4 on the kubepods cgroup) sends a connect to a fake IP to
+// one of them, before any CNI socket load balancer sees it (vip_connect6 for
+// the v4-mapped form); vip_getpeername4/6 report the fake IP back to the app.
+//
+// Host attribution still uses the DNS snooping above: udp_recvmsg reads the
+// rewritten answer (fake IP -> host in dns_ip_map) and sys_enter_connect the
+// fake IP the app connects to, so the fake IP names the host exactly. The
+// socket and the packets carry the real address, which the tcp_sendmsg
+// kprobe and tc_egress_patch key on as before.
+// =============================================================================
+
+#ifndef TC_ACT_OK
+#define TC_ACT_OK 0
+#endif
+#ifndef TC_ACT_SHOT
+#define TC_ACT_SHOT 2
+#endif
+
+// vip_rewrite_a overwrites the A record address at skb offset `at` with
+// `to` (was `from`, both network byte order) and updates the UDP checksum at
+// csum_off. odd: `at` is an odd number of bytes past the UDP header.
+// has_csum: the datagram carries a checksum (UDP over IPv4 may send 0).
+static __always_inline long vip_rewrite_a(struct __sk_buff *skb, __u32 at,
+                                          __u32 csum_off, int odd,
+                                          int has_csum, __u32 from, __u32 to) {
+  if (!has_csum)
+    return bpf_skb_store_bytes(skb, at, &to, 4, BPF_F_RECOMPUTE_CSUM);
+  // No BPF_F_RECOMPUTE_CSUM: the checksum field moves by the opposite of the
+  // payload change, so a CHECKSUM_COMPLETE skb->csum stays right.
+  long err = bpf_skb_store_bytes(skb, at, &to, 4, 0);
+  if (err)
+    return err;
+  if (odd) {
+    from = csum_odd_bytes(from);
+    to = csum_odd_bytes(to);
+  }
+  return bpf_l4_csum_replace(skb, csum_off, from, to,
+                             BPF_F_MARK_MANGLED_0 | sizeof(__u32));
+}
+
+// bpf_loop callbacks driving the DNS walks of helpers.h over the message in
+// dns_rewrite_scratch (looked up again per callback for the verifier).
+static int dns_question_cb(__u32 idx, void *ctx) {
+  __u32 zero = 0;
+  struct dns_rewrite_buf *buf = bpf_map_lookup_elem(&dns_rewrite_scratch, &zero);
+  if (!buf)
+    return 1;
+  return dns_question_step(&buf->q, buf->msg);
+}
+
+static int dns_answers_cb(__u32 idx, void *ctx) {
+  __u32 zero = 0;
+  struct dns_rewrite_buf *buf = bpf_map_lookup_elem(&dns_rewrite_scratch, &zero);
+  if (!buf)
+    return 1;
+  return dns_answers_step(&buf->a, buf->msg);
+}
+
+SEC("tc")
+int tc_dns_rewrite(struct __sk_buff *skb) {
+  __u32 zero = 0;
+  struct vip_config_val *cfg = bpf_map_lookup_elem(&vip_config, &zero);
+  if (!cfg || !cfg->mask4)
+    return TC_ACT_OK;
+  if (skb->protocol != __bpf_htons(0x0800)) // ETH_P_IP
+    return TC_ACT_OK;
+
+  // Ethernet header if present (see tc_egress_patch).
+  __u32 l3_off = 0;
+  __u16 h_proto = 0;
+  if (bpf_skb_load_bytes(skb, 12, &h_proto, sizeof(h_proto)) == 0 &&
+      h_proto == __bpf_htons(0x0800))
+    l3_off = sizeof(struct ethhdr);
+
+  struct iphdr ip;
+  if (bpf_skb_load_bytes(skb, l3_off, &ip, sizeof(ip)))
+    return TC_ACT_OK;
+  if (ip.version != 4 || ip.protocol != IPPROTO_UDP)
+    return TC_ACT_OK;
+  // A fragment carries only part of the message (MF or a fragment offset).
+  if (ip.frag_off & __bpf_htons(0x3FFF))
+    return TC_ACT_OK;
+  __u32 ihl = ip.ihl * 4;
+  if (ihl < sizeof(struct iphdr))
+    return TC_ACT_OK;
+  __u32 l4_off = l3_off + ihl;
+
+  struct udphdr udp;
+  if (bpf_skb_load_bytes(skb, l4_off, &udp, sizeof(udp)))
+    return TC_ACT_OK;
+  if (udp.source != __bpf_htons(53))
+    return TC_ACT_OK;
+
+  __u8 src[16];
+  ipv4_to_mapped(src, (const __u8 *)&ip.saddr);
+  if (!dns_server_trusted(src))
+    return TC_ACT_OK;
+
+  // A message larger than the copy buffer could hold A records past it:
+  // left unchanged, like the DNS snooping that reads at most MAX_DNS_PKT.
+  // 64-bit with the two checks kept apart: as a __u32, or merged into one
+  // range check, the bounds end up on a copy and the verifier rejects the
+  // variable-length copy below.
+  __u64 udp_len = __bpf_ntohs(udp.len);
+  if (udp_len < sizeof(struct udphdr) + 12)
+    return TC_ACT_OK;
+  barrier_var(udp_len);
+  if (udp_len > sizeof(struct udphdr) + MAX_DNS_PKT)
+    return TC_ACT_OK;
+  __u32 msg_len = udp_len - sizeof(struct udphdr);
+
+  struct dns_rewrite_buf *buf = bpf_map_lookup_elem(&dns_rewrite_scratch, &zero);
+  if (!buf)
+    return TC_ACT_OK;
+  __u32 msg_off = l4_off + sizeof(struct udphdr);
+  if (bpf_skb_load_bytes(skb, msg_off, buf->msg, msg_len))
+    return TC_ACT_OK;
+
+  struct dns_question *q = &buf->q;
+  __builtin_memset(q, 0, sizeof(*q));
+  dns_question_begin(q, buf->msg, msg_len);
+  if (q->status == DNS_SCAN_RUNNING)
+    bpf_loop(DNS_QNAME_STEPS, dns_question_cb, NULL, 0);
+  if (dns_question_end(q) != DNS_SCAN_OK)
+    return TC_ACT_OK;
+  // q->qname is laid out as a watched_host_key.
+  struct vip_host_val *hv = bpf_map_lookup_elem(&vip_host_ip, q->qname);
+  if (!hv)
+    return TC_ACT_OK;
+  __u32 fake;
+  __builtin_memcpy(&fake, hv->ip4, 4);
+  if (!vip_in_range(cfg, fake))
+    return TC_ACT_OK;
+
+  struct dns_answers *a = &buf->a;
+  __builtin_memset(a, 0, sizeof(*a));
+  dns_answers_begin(a, msg_len, q->answers_off, q->ancount);
+  bpf_loop(DNS_SCAN_STEPS, dns_answers_cb, NULL, 0);
+  if (dns_answers_end(a) != DNS_SCAN_OK) {
+    // The app gets the real addresses: DNS snooping still names the host.
+    dbg_inc(DBG_VIP_DNS_UNCHANGED);
+    return TC_ACT_OK;
+  }
+  __u32 n = a->n_recs;
+  if (n == 0)
+    return TC_ACT_OK; // e.g. the answer to an AAAA query
+
+  // Record the real addresses before handing out the fake IP, so a connect
+  // that follows the answer finds them.
+  struct dns_ip_key fk = {};
+  ipv4_to_mapped(fk.ip, hv->ip4);
+  struct vip_upstream_val *up = &buf->up;
+  struct vip_upstream_val *cur = bpf_map_lookup_elem(&vip_upstream, &fk);
+  if (cur)
+    __builtin_memcpy(up, cur, sizeof(*up));
+  else
+    __builtin_memset(up, 0, sizeof(*up));
+  __u64 now = bpf_ktime_get_boot_ns();
+  int recorded = 0;
+  for (__u32 i = 0; i < DNS_MAX_A_RECORDS; i++) {
+    if (i >= n)
+      break;
+    __u32 real;
+    __builtin_memcpy(&real, a->recs[i].ip, 4);
+    // Already a fake IP (the program ran twice on this packet): not an
+    // upstream.
+    if (vip_in_range(cfg, real))
+      continue;
+    // RFC 2181: a TTL with the top bit set means 0.
+    __u64 ttl = a->recs[i].ttl > 0x7FFFFFFF ? 0 : a->recs[i].ttl;
+    vip_upstream_record(up, a->recs[i].ip, now + ttl * 1000000000ULL);
+    recorded = 1;
+  }
+  if (!recorded)
+    return TC_ACT_OK;
+  if (bpf_map_update_elem(&vip_upstream, &fk, up, BPF_ANY))
+    return TC_ACT_OK; // nowhere to redirect to: leave the real addresses
+
+  int has_csum = udp.check != 0;
+  __u32 csum_off = l4_off + offsetof(struct udphdr, check);
+  for (__u32 i = 0; i < DNS_MAX_A_RECORDS; i++) {
+    if (i >= n)
+      break;
+    __u32 real;
+    __builtin_memcpy(&real, a->recs[i].ip, 4);
+    if (vip_in_range(cfg, real))
+      continue;
+    // The message starts 8 bytes (even) past the UDP header.
+    if (vip_rewrite_a(skb, msg_off + a->recs[i].off, csum_off,
+                      a->recs[i].off & 1, has_csum, real, fake)) {
+      // Part of the answer may already hold the fake IP: drop it rather
+      // than deliver a mix; the resolver retries.
+      return TC_ACT_SHOT;
+    }
+  }
+  dbg_inc(DBG_VIP_DNS_REWRITTEN);
+#ifdef KLOAK_DEBUG
+  bpf_printk("kloak [vip] dns rewrite host=%s records=%u fake=%pI4", q->qname,
+             n, &fake);
+#endif
+  return TC_ACT_OK;
+}
+
+// vip_redirect decides where a connect to dst (IPv4, network byte order)
+// goes: -1 leaves it alone (not a fake IP), 0 refuses it, 1 sends it to
+// *real and records the socket's fake IP for getpeername.
+static __always_inline int vip_redirect(struct bpf_sock_addr *ctx, __u32 dst,
+                                        __u32 *real) {
+  __u32 zero = 0;
+  struct vip_config_val *cfg = bpf_map_lookup_elem(&vip_config, &zero);
+  if (!cfg || !vip_in_range(cfg, dst))
+    return -1;
+
+  // From here on the connect either goes to a real address or fails: the
+  // range is unrouted, a connect left on the fake IP would only time out.
+  struct dns_ip_key k = {};
+  ipv4_to_mapped(k.ip, (const __u8 *)&dst);
+  struct vip_upstream_val *up = NULL;
+  if (bpf_map_lookup_elem(&vip_ip_host, &k))
+    up = bpf_map_lookup_elem(&vip_upstream, &k);
+  *real = 0;
+  if (up)
+    *real = vip_upstream_pick(up, bpf_ktime_get_boot_ns(), bpf_get_prandom_u32());
+  if (!*real) {
+    dbg_inc(DBG_VIP_CONNECT_REFUSED);
+    return 0;
+  }
+
+  struct bpf_sock *sk = ctx->sk;
+  if (sk) {
+    struct vip_sock_val *sv =
+        bpf_sk_storage_get(&vip_sock, sk, 0, BPF_SK_STORAGE_GET_F_CREATE);
+    if (sv) {
+      sv->fake_ip4 = dst;
+      sv->real_ip4 = *real;
+      sv->port = ctx->user_port;
+    }
+  }
+  dbg_inc(DBG_VIP_CONNECT_REDIRECT);
+  return 1;
+}
+
+// vip_peer_fake returns the fake IP a socket connected to, if peer4 (its
+// peer, network byte order) is where vip_redirect sent it; 0 otherwise.
+static __always_inline __u32 vip_peer_fake(struct bpf_sock_addr *ctx,
+                                           __u32 peer4) {
+  struct bpf_sock *sk = ctx->sk;
+  if (!sk)
+    return 0;
+  struct vip_sock_val *sv = bpf_sk_storage_get(&vip_sock, sk, 0, 0);
+  if (sv && sv->real_ip4 == peer4 && sv->port == ctx->user_port)
+    return sv->fake_ip4;
+  return 0;
+}
+
+// An AF_INET6 socket reaches an IPv4 address through its v4-mapped form
+// (::ffff:a.b.c.d; Java does by default), and its connect goes through the
+// connect6 hook, not connect4.
+static __always_inline int vip_v4_mapped(const struct bpf_sock_addr *ctx) {
+  return ctx->user_ip6[0] == 0 && ctx->user_ip6[1] == 0 &&
+         ctx->user_ip6[2] == __bpf_htonl(0xffff);
+}
+
+SEC("cgroup/connect4")
+int vip_connect4(struct bpf_sock_addr *ctx) {
+  __u32 real;
+  int r = vip_redirect(ctx, ctx->user_ip4, &real);
+  if (r == 1)
+    ctx->user_ip4 = real;
+  return r != 0; // 0: EPERM
+}
+
+SEC("cgroup/connect6")
+int vip_connect6(struct bpf_sock_addr *ctx) {
+  if (!vip_v4_mapped(ctx))
+    return 1;
+  __u32 real;
+  int r = vip_redirect(ctx, ctx->user_ip6[3], &real);
+  if (r == 1)
+    ctx->user_ip6[3] = real;
+  return r != 0;
+}
+
+SEC("cgroup/getpeername4")
+int vip_getpeername4(struct bpf_sock_addr *ctx) {
+  __u32 fake = vip_peer_fake(ctx, ctx->user_ip4);
+  if (fake)
+    ctx->user_ip4 = fake;
+  return 1;
+}
+
+SEC("cgroup/getpeername6")
+int vip_getpeername6(struct bpf_sock_addr *ctx) {
+  if (!vip_v4_mapped(ctx))
+    return 1;
+  __u32 fake = vip_peer_fake(ctx, ctx->user_ip6[3]);
+  if (fake)
+    ctx->user_ip6[3] = fake;
+  return 1;
 }
 
 char LICENSE[] SEC("license") = "Dual BSD/GPL";
