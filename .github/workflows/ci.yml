@@ -148,8 +148,118 @@ jobs:
           # gets re-run after a data-plane flake, hours or days later.
           retention-days: 7
 
-  # Coverage Report runs on pull requests and comments a diff summary.
-  # Depends on e2e so it can work against the merged unit + e2e profile.
+  # Merge Coverage adds the controller and webhook coverage of every e2e leg
+  # to the unit profile and publishes it as combined-coverage. It also runs
+  # when an e2e leg fails, so main still publishes the baseline that PRs are
+  # compared against.
+  coverage-merge:
+    name: Merge Coverage
+    if: ${{ !cancelled() && needs.e2e.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    needs: [e2e]
+    steps:
+      # `go tool cover -func` below resolves package paths against go.mod.
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+
+      - name: Download unit coverage
+        # `continue-on-error` so a re-run after the artifact has been GC'd
+        # doesn't fail the whole workflow — we'll fall back to e2e-only
+        # coverage in the merge step below.
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          name: unit-coverage
+          path: /tmp/unit-coverage
+
+      - name: Download e2e coverage
+        # One subdirectory per leg: /tmp/e2e-covdata/e2e-covdata-<leg>/.
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: e2e-covdata-*
+          path: /tmp/e2e-covdata
+
+      - name: Merge unit and e2e coverage
+        run: |
+          # Convert the e2e covdata (binary) of every leg to Go text format.
+          # textfmt adds up the counters of all its input directories.
+          DIRS=$(find /tmp/e2e-covdata -name 'covcounters.*' -printf '%h\n' 2>/dev/null | sort -u | paste -sd, -)
+          if [ -n "$DIRS" ]; then
+            go tool covdata textfmt -i="$DIRS" -o=/tmp/e2e-coverage.out
+            echo "E2E coverage converted to text format from: $DIRS"
+          else
+            echo "No e2e coverage data found"
+          fi
+
+          # Build the combined profile. Each profile starts with a `mode:` line
+          # plus per-line records. We pick whichever inputs exist.
+          # Drop the generated eBPF bindings (tlsuprobe_bpfel.go /
+          # tlsuprobe_bpfeb.go) from BOTH halves — they're only on disk on
+          # nodes that ran `go generate`, and downstream jobs that read the
+          # profile (Coverage Badge runs `go tool cover -func` against the
+          # whole file) will fail otherwise. Apply the filter to the unit
+          # half too, since pkg/ebpf is now in unit coverage.
+          UNIT=/tmp/unit-coverage/coverage.out
+          E2E=/tmp/e2e-coverage.out
+          OUT=/tmp/combined-coverage.out
+
+          # head -1 keeps the `mode:` line; the filter trims subsequent lines.
+          strip_generated() { grep -v 'tlsuprobe_bpf'; }
+
+          if [ -f "$UNIT" ] && [ -f "$E2E" ]; then
+            # `go tool cover` only merges records whose block ranges match
+            # exactly. Go releases differ in how they split the same source
+            # into blocks, so profiles from two toolchains don't line up and
+            # every statement gets counted once per profile, dragging the
+            # total far down. Files present in both profiles must therefore
+            # list exactly the same blocks.
+            MISMATCHED=$(awk '
+              FNR == 1 { next }
+              NR == FNR { split($1, a, ":"); files[a[1]] = 1; blocks[$1] = 1; next }
+              { split($1, a, ":"); if ((a[1] in files) && !($1 in blocks)) n++ }
+              END { print n + 0 }
+            ' <(strip_generated < "$UNIT") <(strip_generated < "$E2E"))
+            if [ "$MISMATCHED" -gt 0 ]; then
+              echo "::error::$MISMATCHED e2e coverage blocks don't match the unit profile's block boundaries. The kloak image and the unit tests were most likely built with different Go releases (Dockerfile golang image vs GO_VERSION); merging would double-count statements."
+              exit 1
+            fi
+            head -1 "$UNIT" > "$OUT"
+            tail -n +2 "$UNIT" | strip_generated >> "$OUT"
+            tail -n +2 "$E2E"  | strip_generated >> "$OUT"
+            echo "Combined unit + e2e coverage"
+          elif [ -f "$UNIT" ]; then
+            head -1 "$UNIT" > "$OUT"
+            tail -n +2 "$UNIT" | strip_generated >> "$OUT"
+            echo "Unit coverage only (no e2e data)"
+          elif [ -f "$E2E" ]; then
+            head -1 "$E2E" > "$OUT"
+            tail -n +2 "$E2E" | strip_generated >> "$OUT"
+            echo "E2E coverage only (no unit artifact — likely a single-job re-run after retention)"
+          else
+            echo "No coverage data available; producing empty profile"
+            echo "mode: atomic" > "$OUT"
+          fi
+
+          echo "=== Combined coverage summary ==="
+          go tool cover -func="$OUT" | tail -1
+
+      - name: Upload combined coverage
+        uses: actions/upload-artifact@v7
+        with:
+          name: combined-coverage
+          path: /tmp/combined-coverage.out
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Coverage Report runs on pull requests and comments a diff summary of the
+  # merged unit + e2e profile, and only when every e2e leg passed.
   #
   # Skipped for pull requests originating from forks: GitHub strips
   # `pull-requests: write` from the GITHUB_TOKEN of fork PRs as a security
@@ -162,7 +272,7 @@ jobs:
     name: Coverage Report
     if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
     runs-on: ubuntu-latest
-    needs: [e2e]
+    needs: [e2e, coverage-merge]
     permissions:
       contents: read
       actions: read
@@ -187,7 +297,7 @@ jobs:
     name: Coverage Badge
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
-    needs: [e2e]
+    needs: [e2e, coverage-merge]
     steps:
       # `go tool cover -func` resolves the package paths in the coverage
       # profile (e.g. github.com/spinningfactory/kloak/cmd/kloak/main.go:9)
@@ -486,115 +596,6 @@ jobs:
           echo "BPF trace size:"
           ls -la /tmp/bpf-trace.log 2>/dev/null || true
 
-      - name: Collect e2e coverage
-        if: always() && matrix.tc-attach-mode == 'auto' && matrix.host-resolution == 'dns-snoop'
-        env:
-          KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
-        run: |
-          mkdir -p /tmp/e2e-covdata
-          # Run helm uninstall here unconditionally — the e2e teardown does
-          # it too, but if the test process panicked (e.g. the suite's
-          # 15-minute timer fired during a 4hop flake) teardown is skipped
-          # and we'd be left with a running pod and no covcounters.
-          helm uninstall kloak -n kloak-system --ignore-not-found 2>&1 || true
-          # Wait for the controller and webhook pods to fully terminate. The
-          # kloak binary's `flushCoverage` (cmd/kloak/coverage_flush_cover.go,
-          # compiled in via -tags cover when COVER=1) writes covcounters
-          # before main returns, so any clean exit produces a usable
-          # profile. 90s covers the controller's 60s
-          # terminationGracePeriodSeconds plus uprobe detach / BPF close time.
-          kubectl wait --for=delete pod -l 'app.kubernetes.io/component in (controller,webhook)' \
-            -n kloak-system --timeout=90s 2>/dev/null || true
-          # k3s runs directly on the runner, so covdata lives at /tmp/kloak-coverage
-          # on the host filesystem (values-e2e.yaml's coverage.hostPath).
-          sudo cp -r /tmp/kloak-coverage/. /tmp/e2e-covdata/ 2>/dev/null || true
-          sudo chown -R "$(id -u):$(id -g)" /tmp/e2e-covdata || true
-          echo "E2E coverage files:"
-          ls -la /tmp/e2e-covdata/ 2>/dev/null || echo "No coverage files collected"
-
-      - name: Download unit coverage
-        # `continue-on-error` so a re-run of just this job after the artifact
-        # has been GC'd doesn't fail the whole workflow — we'll fall back to
-        # e2e-only coverage in the merge step below.
-        if: always() && matrix.tc-attach-mode == 'auto' && matrix.host-resolution == 'dns-snoop'
-        continue-on-error: true
-        uses: actions/download-artifact@v8
-        with:
-          name: unit-coverage
-          path: /tmp/unit-coverage
-
-      - name: Merge unit and e2e coverage
-        if: always() && matrix.tc-attach-mode == 'auto' && matrix.host-resolution == 'dns-snoop'
-        run: |
-          # Convert e2e covdata (binary) to Go text format.
-          if ls /tmp/e2e-covdata/covcounters.* 1>/dev/null 2>&1; then
-            go tool covdata textfmt -i=/tmp/e2e-covdata -o=/tmp/e2e-coverage.out
-            echo "E2E coverage converted to text format"
-          else
-            echo "No e2e coverage data found"
-          fi
-
-          # Build the combined profile. Each profile starts with a `mode:` line
-          # plus per-line records. We pick whichever inputs exist.
-          # Drop the generated eBPF bindings (tlsuprobe_bpfel.go /
-          # tlsuprobe_bpfeb.go) from BOTH halves — they're only on disk on
-          # nodes that ran `go generate`, and downstream jobs that read the
-          # profile (Coverage Badge runs `go tool cover -func` against the
-          # whole file) will fail otherwise. Apply the filter to the unit
-          # half too, since pkg/ebpf is now in unit coverage.
-          UNIT=/tmp/unit-coverage/coverage.out
-          E2E=/tmp/e2e-coverage.out
-          OUT=/tmp/combined-coverage.out
-
-          # head -1 keeps the `mode:` line; the filter trims subsequent lines.
-          strip_generated() { grep -v 'tlsuprobe_bpf'; }
-
-          if [ -f "$UNIT" ] && [ -f "$E2E" ]; then
-            # `go tool cover` only merges records whose block ranges match
-            # exactly. Go releases differ in how they split the same source
-            # into blocks, so profiles from two toolchains don't line up and
-            # every statement gets counted once per profile, dragging the
-            # total far down. Files present in both profiles must therefore
-            # list exactly the same blocks.
-            MISMATCHED=$(awk '
-              FNR == 1 { next }
-              NR == FNR { split($1, a, ":"); files[a[1]] = 1; blocks[$1] = 1; next }
-              { split($1, a, ":"); if ((a[1] in files) && !($1 in blocks)) n++ }
-              END { print n + 0 }
-            ' <(strip_generated < "$UNIT") <(strip_generated < "$E2E"))
-            if [ "$MISMATCHED" -gt 0 ]; then
-              echo "::error::$MISMATCHED e2e coverage blocks don't match the unit profile's block boundaries. The kloak image and the unit tests were most likely built with different Go releases (Dockerfile golang image vs GO_VERSION); merging would double-count statements."
-              exit 1
-            fi
-            head -1 "$UNIT" > "$OUT"
-            tail -n +2 "$UNIT" | strip_generated >> "$OUT"
-            tail -n +2 "$E2E"  | strip_generated >> "$OUT"
-            echo "Combined unit + e2e coverage"
-          elif [ -f "$UNIT" ]; then
-            head -1 "$UNIT" > "$OUT"
-            tail -n +2 "$UNIT" | strip_generated >> "$OUT"
-            echo "Unit coverage only (no e2e data)"
-          elif [ -f "$E2E" ]; then
-            head -1 "$E2E" > "$OUT"
-            tail -n +2 "$E2E" | strip_generated >> "$OUT"
-            echo "E2E coverage only (no unit artifact — likely a single-job re-run after retention)"
-          else
-            echo "No coverage data available; producing empty profile"
-            echo "mode: atomic" > "$OUT"
-          fi
-
-          echo "=== Combined coverage summary ==="
-          go tool cover -func="$OUT" | tail -1
-
-      - name: Upload combined coverage
-        if: always() && matrix.tc-attach-mode == 'auto' && matrix.host-resolution == 'dns-snoop'
-        uses: actions/upload-artifact@v7
-        with:
-          name: combined-coverage
-          path: /tmp/combined-coverage.out
-          retention-days: 7
-          if-no-files-found: ignore
-
       - name: Collect logs and BPF debug info on failure
         if: failure()
         env:
@@ -651,6 +652,45 @@ jobs:
         with:
           name: bpf-trace-${{ matrix.tc-attach-mode }}-${{ matrix.host-resolution }}
           path: /tmp/bpf-trace.log
+          retention-days: 7
+          if-no-files-found: ignore
+
+      # Every leg collects coverage: the clsact and virtual-ip legs run code
+      # the default leg never reaches (the clsact fallback, the virtual IP
+      # DNS rewrite and connect redirect). Merge Coverage adds them up. This
+      # runs after the failure dump because it uninstalls kloak.
+      - name: Collect e2e coverage
+        if: always()
+        env:
+          KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
+        run: |
+          mkdir -p /tmp/e2e-covdata
+          # Run helm uninstall here unconditionally — the e2e teardown does
+          # it too, but if the test process panicked (e.g. the suite's
+          # 15-minute timer fired during a 4hop flake) teardown is skipped
+          # and we'd be left with a running pod and no covcounters.
+          helm uninstall kloak -n kloak-system --ignore-not-found 2>&1 || true
+          # Wait for the controller and webhook pods to fully terminate. The
+          # kloak binary's `flushCoverage` (cmd/kloak/coverage_flush_cover.go,
+          # compiled in via -tags cover when COVER=1) writes covcounters
+          # before main returns, so any clean exit produces a usable
+          # profile. 90s covers the controller's 60s
+          # terminationGracePeriodSeconds plus uprobe detach / BPF close time.
+          kubectl wait --for=delete pod -l 'app.kubernetes.io/component in (controller,webhook)' \
+            -n kloak-system --timeout=90s 2>/dev/null || true
+          # k3s runs directly on the runner, so covdata lives at /tmp/kloak-coverage
+          # on the host filesystem (values-e2e.yaml's coverage.hostPath).
+          sudo cp -r /tmp/kloak-coverage/. /tmp/e2e-covdata/ 2>/dev/null || true
+          sudo chown -R "$(id -u):$(id -g)" /tmp/e2e-covdata || true
+          echo "E2E coverage files:"
+          ls -la /tmp/e2e-covdata/ 2>/dev/null || echo "No coverage files collected"
+
+      - name: Upload e2e coverage
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-covdata-${{ matrix.tc-attach-mode }}-${{ matrix.host-resolution }}
+          path: /tmp/e2e-covdata
           retention-days: 7
           if-no-files-found: ignore
 
