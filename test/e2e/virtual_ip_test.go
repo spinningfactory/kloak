@@ -5,6 +5,7 @@ package e2e
 import (
 	"context"
 	"net/netip"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -58,6 +59,87 @@ func TestVirtualIPAllocation(t *testing.T) {
 	}
 	if retired := waitForVirtualIPLog(t, newPod, host, "retired virtual IP"); retired != ip {
 		t.Fatalf("retired %s for %s, want %s", retired, host, ip)
+	}
+}
+
+// TestVirtualIPRedirect checks the virtual IP data plane on the raw TLS demo:
+// the pod resolves the echo server's host to its fake IP, its connects to
+// the fake IP reach the server (the secret is rewritten end to end, still
+// attributed by DNS snooping) and getpeername() reports the fake IP, while a
+// connect to a fake IP no host has is refused.
+func TestVirtualIPRedirect(t *testing.T) {
+	vipRange := controllerVirtualIPRange(t)
+	echoHostFQDN := "tls." + testNamespace + ".svc.cluster.local"
+
+	gcCtx, gcCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer gcCancel()
+	for _, name := range []string{"secret-allowed", "secret-blocked", "secret-allowed-kloak", "secret-blocked-kloak"} {
+		_ = waitForSecretAbsent(gcCtx, testNamespace, name)
+	}
+
+	allowedData := map[string][]byte{"api-key": []byte("REAL-VIP-ALLOWED-KEY-12345")}
+	blockedData := map[string][]byte{"api-key": []byte("REAL-VIP-BLOCKED-KEY-67890")}
+	createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{"getkloak.io/hosts": echoHostFQDN})
+	createEnabledSecret(t, "secret-blocked", blockedData, nil, map[string]string{"getkloak.io/hosts": "example.com"})
+	assertShadowSecret(t, "secret-allowed", allowedData)
+	assertShadowSecret(t, "secret-blocked", blockedData)
+
+	demoManifest := filepath.Join(repoRoot, "examples", "demo-python-raw-tls", "deployment.yaml")
+	if err := applyManifest(t, demoManifest); err != nil {
+		t.Fatalf("failed to deploy demo-python-raw-tls: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := waitForDeploymentReady(ctx, testNamespace, "demo-python-raw-tls"); err != nil {
+		t.Fatalf("demo-python-raw-tls not ready: %v", err)
+	}
+
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer pollCancel()
+	out := pollDemoLogs(t, pollCtx, "app=demo-python-raw-tls", "demo-python-raw-tls",
+		"timed out waiting for the allowed secret through the virtual IP",
+		func(s string) bool { return strings.Contains(s, "REAL-VIP-ALLOWED-KEY-12345") })
+	if strings.Contains(out, "REAL-VIP-BLOCKED-KEY-67890") {
+		t.Errorf("blocked secret rewritten (host mismatch)")
+	}
+
+	// The range's first address is never allocated (planVirtualIPs).
+	unallocated := vipRange.Masked().Addr()
+	const probe = `import socket, sys
+host, unallocated = sys.argv[1], sys.argv[2]
+s = socket.create_connection((host, 8443), timeout=5)
+print("resolved", socket.gethostbyname(host), "peer", s.getpeername()[0])
+s.close()
+try:
+    socket.create_connection((unallocated, 8443), timeout=5)
+    print("unallocated connected")
+except OSError as e:
+    print("unallocated errno", e.errno)
+`
+	res, err := kubectl("exec", "-n", testNamespace, "deploy/demo-python-raw-tls", "-c", "demo-app", "--",
+		"python", "-c", probe, echoHostFQDN, unallocated.String())
+	if err != nil {
+		t.Fatalf("probe in the demo pod: %v", err)
+	}
+	t.Logf("probe: %s", strings.TrimSpace(res))
+	var resolved, peer string
+	for _, line := range strings.Split(res, "\n") {
+		if f := strings.Fields(line); len(f) == 4 && f[0] == "resolved" && f[2] == "peer" {
+			resolved, peer = f[1], f[3]
+		}
+	}
+	ip, err := netip.ParseAddr(resolved)
+	if err != nil || !vipRange.Contains(ip) {
+		t.Errorf("%s resolved to %q in the pod, want an address in %s", echoHostFQDN, resolved, vipRange)
+	}
+	if peer != resolved {
+		t.Errorf("getpeername() = %q, want the fake IP %q", peer, resolved)
+	}
+	if !strings.Contains(res, "unallocated errno 1\n") { // EPERM
+		t.Errorf("connect to the unallocated fake IP %s was not refused with EPERM", unallocated)
 	}
 }
 

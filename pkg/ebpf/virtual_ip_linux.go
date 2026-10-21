@@ -5,14 +5,20 @@ package ebpf
 import (
 	"errors"
 	"fmt"
+	"io"
 	"maps"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"runtime"
 	"slices"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"go.uber.org/zap"
 	"golang.org/x/sys/unix"
 )
@@ -34,8 +40,222 @@ type vipIPVal struct {
 // vipFlagRetired is VIP_F_RETIRED in tls_uprobe.c.
 const vipFlagRetired uint32 = 1
 
+// vipConfigVal matches C struct vip_config_val.
+type vipConfigVal struct {
+	Net4  [4]byte // network byte order
+	Mask4 [4]byte
+}
+
+// vipUpstreamSlots is VIP_UPSTREAM_SLOTS in helpers.h.
+const vipUpstreamSlots = 4
+
+// vipUpstreamVal matches C struct vip_upstream_val: the real addresses
+// tc_dns_rewrite recorded for a fake IP.
+type vipUpstreamVal struct {
+	Slot [vipUpstreamSlots]vipUpstreamSlot
+}
+
+// vipUpstreamSlot matches C struct vip_upstream_slot.
+type vipUpstreamSlot struct {
+	IP4       [4]byte // all zero: empty slot
+	_         uint32
+	ExpiresAt uint64 // CLOCK_BOOTTIME nanoseconds
+}
+
 // virtualIPMaps are the maps pinned in virtual-ip mode.
-var virtualIPMaps = []string{"vip_host_ip", "vip_ip_host"}
+var virtualIPMaps = []string{"vip_host_ip", "vip_ip_host", "vip_upstream"}
+
+// vipConfig returns the vip_config value for the range r (IPv4).
+func vipConfig(r netip.Prefix) vipConfigVal {
+	var v vipConfigVal
+	v.Net4 = r.Masked().Addr().As4()
+	copy(v.Mask4[:], net.CIDRMask(r.Bits(), 32))
+	return v
+}
+
+// attachVirtualIPRedirect enables the virtual IP data plane for range r:
+// vip_config turns on tc_dns_rewrite, and the connect and getpeername
+// hooks go on the kubepods cgroup at cgroupPath, which every pod's sockets
+// are under. Attached there, they run before programs on the root cgroup (a
+// CNI's socket load balancer), which then sees the real address.
+func (m *TLSUprobeManager) attachVirtualIPRedirect(r netip.Prefix, cgroupPath string) error {
+	if cgroupPath == "" {
+		return errors.New("kubepods cgroup not found")
+	}
+	cfg := vipConfig(r)
+	if err := m.objs.VipConfig.Update(uint32(0), &cfg, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("writing vip_config: %w", err)
+	}
+	for _, p := range []struct {
+		prog   *ebpf.Program
+		attach ebpf.AttachType
+	}{
+		{m.objs.VipConnect4, ebpf.AttachCGroupInet4Connect},
+		{m.objs.VipConnect6, ebpf.AttachCGroupInet6Connect},
+		{m.objs.VipGetpeername4, ebpf.AttachCgroupInet4GetPeername},
+		{m.objs.VipGetpeername6, ebpf.AttachCgroupInet6GetPeername},
+	} {
+		l, err := link.AttachCgroup(link.CgroupOptions{Path: cgroupPath, Attach: p.attach, Program: p.prog})
+		if err != nil {
+			return fmt.Errorf("attaching %s to %s: %w", p.attach, cgroupPath, err)
+		}
+		m.linksMu.Lock()
+		m.links = append(m.links, l)
+		m.linksMu.Unlock()
+	}
+	return nil
+}
+
+// attachDNSRewrite attaches tc_dns_rewrite, in virtual-ip mode, at tc
+// ingress on the egress interface of the network namespace of pid, a
+// process of the container cgroupID, so that the pod is handed fake IPs for
+// watched hosts. AttachTLS calls it first, so it runs as soon as the
+// reconciler finds the pod's processes, TLS or not, and again on each exec
+// until it succeeds: an answer the pod receives before carries the real
+// addresses (which the DNS snooping still attributes). Once per netns;
+// nothing in dns-snoop mode, nor for a pod in the host network namespace,
+// where the rewrite would hand fake IPs to node processes the connect
+// redirect does not cover.
+func (m *TLSUprobeManager) attachDNSRewrite(pid int, cgroupID uint64) error {
+	if m.virtualIPs == nil {
+		return nil
+	}
+	nsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
+	ino, err := netnsInode(nsPath)
+	if err != nil {
+		return err
+	}
+	rootIno, err := netnsInode("/proc/1/ns/net")
+	if err != nil {
+		return err
+	}
+	if ino == rootIno {
+		return nil
+	}
+	// Lets UntrackCgroup release the netns once the pod is gone.
+	m.RecordCgroupNetns(cgroupID, pid)
+
+	m.dnsRewriteMu.Lock()
+	defer m.dnsRewriteMu.Unlock()
+	if _, ok := m.dnsRewriteNetns[ino]; ok {
+		return nil
+	}
+	// Kept open while attached, so the inode can't be reused by another
+	// pod's netns and wrongly look attached (see tcAttached).
+	podNS, err := os.Open(nsPath)
+	if err != nil {
+		return fmt.Errorf("opening pod netns %s: %w", nsPath, err)
+	}
+	links, err := runInNetns(podNS, m.log, func() ([]io.Closer, error) {
+		var links []io.Closer
+		for _, name := range m.resolveEgressInterfaces(pid) {
+			if name == "lo" {
+				continue
+			}
+			iface, err := net.InterfaceByName(name)
+			if err == nil {
+				var l io.Closer
+				if l, err = m.attachTCProgram(m.objs.TcDnsRewrite, iface.Index, true, podNS); err == nil {
+					links = append(links, l)
+					continue
+				}
+			}
+			for _, l := range links {
+				_ = l.Close()
+			}
+			return nil, fmt.Errorf("attaching the DNS rewrite to %s in pid %d netns: %w", name, pid, err)
+		}
+		return links, nil
+	})
+	if err == nil && len(links) == 0 &&
+		!strings.EqualFold(m.egressInterface, "none") && !strings.EqualFold(m.egressInterface, "lo-only") {
+		// No default route yet (CNI still setting up): retried with the
+		// next container or reconcile.
+		err = fmt.Errorf("no interface resolved in pid %d netns", pid)
+	}
+	if err != nil {
+		_ = podNS.Close()
+		if !m.dnsRewriteFailed[ino] {
+			m.dnsRewriteFailed[ino] = true
+			m.log.Warnw("failed to attach the DNS rewrite: the pod gets real addresses for watched hosts until it succeeds",
+				"pid", pid, "cgroupID", cgroupID, "error", err)
+		}
+		return err
+	}
+	delete(m.dnsRewriteFailed, ino)
+	m.dnsRewriteNetns[ino] = podNS
+	m.linksMu.Lock()
+	m.links = append(m.links, links...)
+	m.linksMu.Unlock()
+	m.log.Infow("attached DNS rewrite to pod netns", "pid", pid, "cgroupID", cgroupID, "netns", ino, "interfaces", len(links))
+	return nil
+}
+
+// releaseDNSRewriteNetns forgets the DNS rewrite of a netns whose pod is
+// gone. Its tc links go with the pod's interfaces.
+func (m *TLSUprobeManager) releaseDNSRewriteNetns(ino uint64) {
+	m.dnsRewriteMu.Lock()
+	defer m.dnsRewriteMu.Unlock()
+	if f, ok := m.dnsRewriteNetns[ino]; ok {
+		_ = f.Close()
+		delete(m.dnsRewriteNetns, ino)
+	}
+	delete(m.dnsRewriteFailed, ino)
+}
+
+func netnsInode(path string) (uint64, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return 0, err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, fmt.Errorf("stat %s: no inode", path)
+	}
+	return st.Ino, nil
+}
+
+// runInNetns runs fn on an OS thread switched into the network namespace
+// ns, in a worker goroutine. If the thread can't be switched back, the
+// worker exits with it still locked, so the Go runtime retires the thread
+// instead of handing it to other goroutines (see attachTCEgress).
+func runInNetns(ns *os.File, log *zap.SugaredLogger, fn func() ([]io.Closer, error)) ([]io.Closer, error) {
+	self, err := os.Open("/proc/self/ns/net")
+	if err != nil {
+		return nil, fmt.Errorf("opening self netns: %w", err)
+	}
+	defer func() { _ = self.Close() }()
+
+	type result struct {
+		links []io.Closer
+		err   error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		runtime.LockOSThread()
+		usable := true
+		defer func() {
+			if usable {
+				runtime.UnlockOSThread()
+			}
+		}()
+		if err := unix.Setns(int(ns.Fd()), unix.CLONE_NEWNET); err != nil {
+			ch <- result{err: fmt.Errorf("setns: %w", err)}
+			return
+		}
+		// Registered after the unlock: runs first.
+		defer func() {
+			if err := unix.Setns(int(self.Fd()), unix.CLONE_NEWNET); err != nil {
+				log.Errorw("CRITICAL: failed to restore netns; retiring this worker goroutine's OS thread", "error", err)
+				usable = false
+			}
+		}()
+		links, err := fn()
+		ch <- result{links: links, err: err}
+	}()
+	r := <-ch
+	return r.links, r.err
+}
 
 // prepareVirtualIPPins marks the virtual IP maps of spec for pinning under
 // pinPath, so loading spec reuses the maps a previous controller pinned
@@ -127,19 +347,21 @@ func RemoveVirtualIPPins(pinPath string, log *zap.SugaredLogger) {
 }
 
 // virtualIPAllocator keeps vip_ip_host and vip_host_ip in line with the
-// watched hosts (planVirtualIPs).
+// watched hosts (planVirtualIPs), and clears vip_upstream of fake IPs that
+// no longer lead to their host.
 type virtualIPAllocator struct {
-	hostIP *ebpf.Map // vip_host_ip
-	ipHost *ebpf.Map // vip_ip_host
-	prefix netip.Prefix
-	log    *zap.SugaredLogger
+	hostIP   *ebpf.Map // vip_host_ip
+	ipHost   *ebpf.Map // vip_ip_host
+	upstream *ebpf.Map // vip_upstream; nil skips its cleanup
+	prefix   netip.Prefix
+	log      *zap.SugaredLogger
 	// unallocated holds the hosts last reported as left without a fake IP,
 	// so the error is logged when the set changes rather than every sync.
 	unallocated []string
 }
 
 func newVirtualIPAllocator(objs *tlsuprobeObjects, prefix netip.Prefix, log *zap.SugaredLogger) *virtualIPAllocator {
-	return &virtualIPAllocator{hostIP: objs.VipHostIp, ipHost: objs.VipIpHost, prefix: prefix, log: log}
+	return &virtualIPAllocator{hostIP: objs.VipHostIp, ipHost: objs.VipIpHost, upstream: objs.VipUpstream, prefix: prefix, log: log}
 }
 
 // logRestored logs the reservations found in the pinned vip_ip_host, which
@@ -177,7 +399,9 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 	// Write order keeps every IP in vip_host_ip resolvable in vip_ip_host:
 	// drop host -> IP entries that go away or change, then release
 	// reservations (making room before new ones), then write reservations,
-	// then the host -> IP side.
+	// then the host -> IP side. vip_upstream is cleared of IPs released or
+	// handed to another host before the new host -> IP entries let
+	// tc_dns_rewrite record that host's addresses under them.
 	for host, ip := range currentHosts {
 		if want, ok := plan.Hosts[host]; ok && want == ip {
 			continue
@@ -196,6 +420,7 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 			a.log.Errorw("failed to release virtual IP", "ip", ip.String(), "error", err)
 		}
 	}
+	a.pruneUpstreams(existing, plan.Entries)
 	for ip, e := range plan.Entries {
 		val := vipIPValue(e)
 		if old, ok := existing[ip]; ok && vipIPValue(old) == val {
@@ -237,6 +462,36 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 		if len(plan.Unallocated) > 0 {
 			a.log.Errorw("virtual IP map is full, hosts left without a fake IP",
 				"hosts", plan.Unallocated, "capacity", a.ipHost.MaxEntries())
+		}
+	}
+}
+
+// pruneUpstreams deletes the vip_upstream entries of fake IPs that are not
+// reserved in plan, or reserved for another host than in existing: their
+// addresses belong to a host the IP no longer leads to.
+func (a *virtualIPAllocator) pruneUpstreams(existing, plan map[netip.Addr]vipEntry) {
+	if a.upstream == nil {
+		return
+	}
+	var stale []dnsIPKey
+	var k dnsIPKey
+	var v vipUpstreamVal
+	iter := a.upstream.Iterate()
+	for iter.Next(&k, &v) {
+		ip := netip.AddrFrom16(k.IP).Unmap()
+		if e, ok := plan[ip]; ok {
+			if old, ok := existing[ip]; ok && old.Host == e.Host {
+				continue
+			}
+		}
+		stale = append(stale, k)
+	}
+	if err := iter.Err(); err != nil {
+		a.log.Errorw("failed to read vip_upstream", "error", err)
+	}
+	for i := range stale {
+		if err := a.upstream.Delete(&stale[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			a.log.Errorw("failed to delete vip_upstream entry", "ip", netip.AddrFrom16(stale[i].IP).Unmap().String(), "error", err)
 		}
 	}
 }

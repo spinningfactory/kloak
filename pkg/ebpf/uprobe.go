@@ -152,6 +152,14 @@ type TLSUprobeManager struct {
 	// virtualIPs allocates the watched hosts' fake IPs in virtual-ip host
 	// resolution mode; nil otherwise.
 	virtualIPs *virtualIPAllocator
+	// dnsRewriteMu guards dnsRewriteNetns and dnsRewriteFailed, and
+	// serializes attachDNSRewrite.
+	dnsRewriteMu sync.Mutex
+	// dnsRewriteNetns holds an open fd to each pod netns tc_dns_rewrite is
+	// attached in, keyed by inode (pinning it, like tcAttached).
+	dnsRewriteNetns map[uint64]*os.File
+	// dnsRewriteFailed records the netns whose attach failure was logged.
+	dnsRewriteFailed map[uint64]bool
 
 	// uprobesMu guards uprobes and cgroupLinks.
 	uprobesMu sync.Mutex
@@ -240,11 +248,11 @@ func (m *TLSUprobeManager) takeCgroupLinks(cgroupID uint64) []io.Closer {
 	return links
 }
 
-// setupCgroupAncestor finds the kubepods cgroup directory and stores its fd
-// in the BPF cgroup_ancestor map. This enables bpf_current_task_under_cgroup()
-// in the exec tracepoint to catch all container execs without per-container
-// cgroup tracking.
-func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log *zap.SugaredLogger) error {
+// setupCgroupAncestor finds the kubepods cgroup directory, stores its fd in
+// the BPF cgroup_ancestor map and returns its path. This enables
+// bpf_current_task_under_cgroup() in the exec tracepoint to catch all
+// container execs without per-container cgroup tracking.
+func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log *zap.SugaredLogger) (string, error) {
 	// Find the kubepods cgroup directory. Strategy:
 	// 1. Derive from the controller's own cgroup path (/proc/self/cgroup)
 	//    since the controller runs under kubepods — most reliable because
@@ -311,10 +319,10 @@ func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log *zap.Sug
 		err = objs.CgroupAncestor.Update(key, val, 0)
 		_ = f.Close()
 		if err != nil {
-			return fmt.Errorf("updating cgroup_ancestor map: %w", err)
+			return "", fmt.Errorf("updating cgroup_ancestor map: %w", err)
 		}
 		log.Infow("Configured cgroup ancestor for exec tracepoint", "path", path)
-		return nil
+		return path, nil
 	}
 
 	// List top-level entries to help diagnose cgroup layout
@@ -326,7 +334,7 @@ func setupCgroupAncestor(objs *tlsuprobeObjects, cgroupRoot string, log *zap.Sug
 	}
 	log.Errorw("kubepods cgroup not found — exec tracepoint will not detect container processes",
 		"cgroupRoot", cgroupRoot, "candidates", candidates, "topLevelDirs", topLevel)
-	return fmt.Errorf("kubepods cgroup not found in %s", cgroupRoot)
+	return "", fmt.Errorf("kubepods cgroup not found in %s", cgroupRoot)
 }
 
 // parseBPFLogLevel maps a string from the KLOAK_BPF_LOG_LEVEL env var (or the
@@ -432,7 +440,8 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 
 	// Populate the cgroup ancestor map so the exec tracepoint can catch
 	// ALL container execs. Find the kubepods cgroup and store its fd.
-	if err := setupCgroupAncestor(objs, cgroupRoot, log); err != nil {
+	kubepods, err := setupCgroupAncestor(objs, cgroupRoot, log)
+	if err != nil {
 		log.Errorw("failed to setup cgroup ancestor — exec tracepoint will not catch initial container processes", "error", err)
 		// Non-fatal: exec tracepoint falls back to tracked_cgroups
 	}
@@ -451,22 +460,29 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 	}
 
 	mgr := &TLSUprobeManager{
-		objs:            objs,
-		reader:          reader,
-		procReader:      procReader,
-		log:             log,
-		secretSource:    secretSource,
-		cgroupRoot:      cgroupRoot,
-		egressInterface: egressInterface,
-		tcMode:          newTCModeResolver(TCAttachAuto),
-		bindings:        make(map[string]podBinding),
-		bindingLogged:   make(map[bindingLogKey]time.Time),
+		objs:             objs,
+		reader:           reader,
+		procReader:       procReader,
+		log:              log,
+		secretSource:     secretSource,
+		cgroupRoot:       cgroupRoot,
+		egressInterface:  egressInterface,
+		tcMode:           newTCModeResolver(TCAttachAuto),
+		bindings:         make(map[string]podBinding),
+		bindingLogged:    make(map[bindingLogKey]time.Time),
+		dnsRewriteNetns:  make(map[uint64]*os.File),
+		dnsRewriteFailed: make(map[uint64]bool),
 	}
 	if hostRes.virtualIP() {
 		mgr.virtualIPs = newVirtualIPAllocator(objs, hostRes.VirtualIPRange, log)
-		log.Infow("virtual IP host resolution enabled (experimental: fake IPs are allocated, DNS answers are not rewritten yet)",
-			"range", hostRes.VirtualIPRange.String(), "pinPath", hostRes.pinPath())
 		mgr.virtualIPs.logRestored()
+		// Without the redirect, a pod handed a fake IP could not connect.
+		if err := mgr.attachVirtualIPRedirect(hostRes.VirtualIPRange, kubepods); err != nil {
+			_ = mgr.Close()
+			return nil, fmt.Errorf("attaching the virtual IP connect redirect: %w", err)
+		}
+		log.Infow("virtual IP host resolution enabled (experimental): kloak pods get fake IPs for watched hosts, connects to them are redirected",
+			"range", hostRes.VirtualIPRange.String(), "pinPath", hostRes.pinPath(), "cgroup", kubepods)
 	}
 
 	// Attach tracepoints for DNS interception and connect tracking.
@@ -1099,6 +1115,7 @@ func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 					_ = e.netnsFd.Close()
 				}
 			}
+			m.releaseDNSRewriteNetns(ino)
 		}
 	}
 
@@ -1144,6 +1161,10 @@ func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 // containers only.
 func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+
+	// Virtual-ip mode: from now on the pod gets fake IPs for watched hosts.
+	// A failure is logged once and retried with the next attach.
+	_ = m.attachDNSRewrite(pid, cgroupID)
 
 	// Register the process for DNS/connect tracking.
 	if err := m.TrackTGID(uint32(pid)); err != nil {
@@ -2266,6 +2287,7 @@ var debugCounterNames = []string{
 	"openssl_gcm_gate_fail", "openssl_h_from_hkey1",
 	"secret_binding_deny", "secret_binding_audit",
 	"sni_captured", "sni_deny", "sni_audit",
+	"vip_dns_rewritten", "vip_dns_unchanged", "vip_connect_redirect", "vip_connect_refused",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

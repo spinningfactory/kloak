@@ -803,6 +803,377 @@ static void test_sni_past_copy_buffer(void) {
   assert(parse_sni(ch, len, host, &n) == SNI_STATUS_TRUNCATED);
 }
 
+// ============================================================================
+// DNS answer walks (dns_parse_question, dns_scan_a_records)
+// ============================================================================
+
+struct dns_msg {
+  __u8 b[MAX_DNS_PKT];
+  __u32 len;
+};
+
+static void dm_u8(struct dns_msg *m, __u8 v) {
+  assert(m->len < MAX_DNS_PKT);
+  m->b[m->len++] = v;
+}
+
+static void dm_u16(struct dns_msg *m, __u16 v) {
+  dm_u8(m, (__u8)(v >> 8));
+  dm_u8(m, (__u8)v);
+}
+
+static void dm_u32(struct dns_msg *m, __u32 v) {
+  dm_u16(m, (__u16)(v >> 16));
+  dm_u16(m, (__u16)v);
+}
+
+// dm_name writes a dotted name as uncompressed labels.
+static void dm_name(struct dns_msg *m, const char *name) {
+  while (*name) {
+    const char *dot = strchr(name, '.');
+    __u32 n = dot ? (__u32)(dot - name) : (__u32)strlen(name);
+    dm_u8(m, (__u8)n);
+    for (__u32 i = 0; i < n; i++)
+      dm_u8(m, (__u8)name[i]);
+    name += n;
+    if (*name == '.')
+      name++;
+  }
+  dm_u8(m, 0);
+}
+
+static void dm_ptr(struct dns_msg *m, __u16 off) { dm_u16(m, 0xC000 | off); }
+
+// dm_response starts a NOERROR response (QR, RD, RA) with one question.
+static void dm_response(struct dns_msg *m, const char *qname, __u16 qtype,
+                        __u16 ancount) {
+  memset(m, 0, sizeof(*m));
+  dm_u16(m, 0x1234); // ID
+  dm_u16(m, 0x8180); // flags
+  dm_u16(m, 1);      // QDCOUNT
+  dm_u16(m, ancount);
+  dm_u16(m, 0); // NSCOUNT
+  dm_u16(m, 0); // ARCOUNT
+  dm_name(m, qname);
+  dm_u16(m, qtype);
+  dm_u16(m, DNS_CLASS_IN);
+}
+
+// dm_rr writes a record's fixed part and rdata; the owner name comes first.
+static void dm_rr(struct dns_msg *m, __u16 type, __u32 ttl, const __u8 *rdata,
+                  __u16 rdlen) {
+  dm_u16(m, type);
+  dm_u16(m, DNS_CLASS_IN);
+  dm_u32(m, ttl);
+  dm_u16(m, rdlen);
+  for (__u16 i = 0; i < rdlen; i++)
+    dm_u8(m, rdata[i]);
+}
+
+static void dm_a(struct dns_msg *m, __u32 ttl, __u8 a, __u8 b, __u8 c, __u8 d) {
+  __u8 ip[4] = {a, b, c, d};
+  dm_rr(m, DNS_TYPE_A, ttl, ip, 4);
+}
+
+static __u32 dns_question(const struct dns_msg *m, struct dns_question *q) {
+  memset(q, 0, sizeof(*q));
+  return dns_parse_question(m->b, m->len, q);
+}
+
+static __u32 dns_answers(const struct dns_msg *m, struct dns_answers *a) {
+  struct dns_question q;
+  assert(dns_question(m, &q) == DNS_SCAN_OK);
+  memset(a, 0, sizeof(*a));
+  return dns_scan_a_records(m->b, m->len, q.answers_off, q.ancount, a);
+}
+
+static void test_dns_question_basic(void) {
+  struct dns_msg m;
+  dm_response(&m, "API.Example.COM", DNS_TYPE_A, 1);
+  __u32 answers = m.len;
+  dm_ptr(&m, 12);
+  dm_a(&m, 30, 10, 0, 0, 1);
+
+  struct dns_question q;
+  assert(dns_question(&m, &q) == DNS_SCAN_OK);
+  assert(q.qname_len == 15);
+  assert(memcmp(q.qname, "api.example.com", 16) == 0); // zero-padded
+  assert(q.ancount == 1);
+  assert(q.answers_off == answers);
+}
+
+static void test_dns_question_not_an_answer(void) {
+  struct dns_msg m;
+  struct dns_question q;
+  struct {
+    __u8 byte, value;
+  } cases[] = {
+      {2, 0x01}, // a query (QR = 0)
+      {2, 0x83}, // truncated (TC = 1)
+      {2, 0x89}, // opcode 1 (IQUERY)
+      {3, 0x83}, // NXDOMAIN
+      {5, 2},    // two questions
+      {7, 0},    // no answers
+  };
+  for (__u32 i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+    dm_response(&m, "api.example.com", DNS_TYPE_A, 1);
+    dm_ptr(&m, 12);
+    dm_a(&m, 30, 10, 0, 0, 1);
+    m.b[cases[i].byte] = cases[i].value;
+    assert(dns_question(&m, &q) == DNS_SCAN_NOT_ANSWER);
+  }
+  // Shorter than a header, cut inside the name, cut before QTYPE/QCLASS.
+  dm_response(&m, "api.example.com", DNS_TYPE_A, 1);
+  assert(dns_parse_question(m.b, 11, &q) == DNS_SCAN_NOT_ANSWER);
+  memset(&q, 0, sizeof(q));
+  assert(dns_parse_question(m.b, 20, &q) == DNS_SCAN_NOT_ANSWER);
+  memset(&q, 0, sizeof(q));
+  assert(dns_parse_question(m.b, m.len - 1, &q) == DNS_SCAN_NOT_ANSWER);
+}
+
+static void test_dns_question_bad_names(void) {
+  struct dns_msg m;
+  struct dns_question q;
+  const char *bad[] = {
+      "a b.example.com",  // space
+      "ex\x01mple.com",   // control byte
+      "",                 // root
+  };
+  for (__u32 i = 0; i < sizeof(bad) / sizeof(bad[0]); i++) {
+    dm_response(&m, bad[i], DNS_TYPE_A, 1);
+    assert(dns_question(&m, &q) == DNS_SCAN_BAD_NAME);
+  }
+
+  // A '.' inside a label (escaped dot) must not read as a label boundary.
+  dm_response(&m, "x", DNS_TYPE_A, 1);
+  m.len = 12;
+  dm_u8(&m, 3);
+  dm_u8(&m, 'a');
+  dm_u8(&m, '.');
+  dm_u8(&m, 'b');
+  dm_u8(&m, 0);
+  dm_u16(&m, DNS_TYPE_A);
+  dm_u16(&m, DNS_CLASS_IN);
+  assert(dns_question(&m, &q) == DNS_SCAN_BAD_NAME);
+
+  // A compression pointer in the question.
+  dm_response(&m, "x", DNS_TYPE_A, 1);
+  m.len = 12;
+  dm_ptr(&m, 12);
+  dm_u16(&m, DNS_TYPE_A);
+  dm_u16(&m, DNS_CLASS_IN);
+  assert(dns_question(&m, &q) == DNS_SCAN_BAD_NAME);
+}
+
+static void test_dns_question_name_length(void) {
+  // 63 bytes, the longest host kloak watches: accepted.
+  char name[80];
+  memset(name, 'a', sizeof(name));
+  memcpy(name + 59, ".com", 5); // 59 + 4 = 63 bytes, NUL included above
+  assert(strlen(name) == 63);
+  struct dns_msg m;
+  struct dns_question q;
+  dm_response(&m, name, DNS_TYPE_A, 1);
+  assert(dns_question(&m, &q) == DNS_SCAN_OK);
+  assert(q.qname_len == 63 && q.qname[63] == 0);
+  assert(memcmp(q.qname, name, 63) == 0);
+
+  // 64 bytes: refused, it could never match.
+  memset(name, 'a', sizeof(name));
+  memcpy(name + 60, ".com", 5);
+  dm_response(&m, name, DNS_TYPE_A, 1);
+  assert(dns_question(&m, &q) == DNS_SCAN_BAD_NAME);
+}
+
+static void test_dns_answers_cname_chain(void) {
+  struct dns_msg m;
+  dm_response(&m, "api.example.com", DNS_TYPE_A, 3);
+  // api.example.com CNAME edge.example.net
+  __u32 cname_owner = m.len;
+  dm_ptr(&m, 12);
+  struct dns_msg target = {0};
+  dm_name(&target, "edge.example.net");
+  dm_rr(&m, 5, 300, target.b, (__u16)target.len);
+  __u32 cname_target = cname_owner + 2 + 10;
+  // edge.example.net A 192.0.2.10 / 192.0.2.11 (owner: pointer to the target)
+  dm_ptr(&m, (__u16)cname_target);
+  dm_a(&m, 60, 192, 0, 2, 10);
+  __u32 second = m.len;
+  dm_ptr(&m, (__u16)cname_target);
+  dm_a(&m, 61, 192, 0, 2, 11);
+
+  struct dns_answers a;
+  assert(dns_answers(&m, &a) == DNS_SCAN_OK);
+  assert(a.n_recs == 2);
+  assert(a.recs[0].ttl == 60 && a.recs[1].ttl == 61);
+  assert(a.recs[1].off == second + 2 + 10);
+  assert(memcmp(a.recs[1].ip, "\xc0\x00\x02\x0b", 4) == 0);
+  assert(memcmp(m.b + a.recs[0].off, "\xc0\x00\x02\x0a", 4) == 0);
+}
+
+static void test_dns_answers_uncompressed_and_aaaa(void) {
+  struct dns_msg m;
+  dm_response(&m, "api.example.com", DNS_TYPE_A, 3);
+  dm_name(&m, "api.example.com"); // uncompressed owner
+  dm_a(&m, 5, 198, 51, 100, 7);
+  dm_ptr(&m, 12);
+  __u8 v6[16] = {0x20, 0x01, 0x0d, 0xb8};
+  dm_rr(&m, 28, 5, v6, 16); // AAAA: not listed
+  dm_ptr(&m, 12);
+  dm_a(&m, 5, 198, 51, 100, 8);
+
+  struct dns_answers a;
+  assert(dns_answers(&m, &a) == DNS_SCAN_OK);
+  assert(a.n_recs == 2);
+  assert(a.recs[0].ip[3] == 7 && a.recs[1].ip[3] == 8);
+}
+
+static void test_dns_answers_limits(void) {
+  struct dns_msg m;
+  struct dns_answers a;
+  // DNS_MAX_A_RECORDS records fit, one more leaves the answer unchanged.
+  for (__u32 count = DNS_MAX_A_RECORDS; count <= DNS_MAX_A_RECORDS + 1; count++) {
+    dm_response(&m, "api.example.com", DNS_TYPE_A, (__u16)count);
+    for (__u32 i = 0; i < count; i++) {
+      dm_ptr(&m, 12);
+      dm_a(&m, 5, 10, 0, 0, (__u8)i);
+    }
+    __u32 want = count == DNS_MAX_A_RECORDS ? DNS_SCAN_OK : DNS_SCAN_INCOMPLETE;
+    assert(dns_answers(&m, &a) == want);
+  }
+
+  // Fewer records than ancount, or the last one cut short.
+  dm_response(&m, "api.example.com", DNS_TYPE_A, 3);
+  dm_ptr(&m, 12);
+  dm_a(&m, 5, 10, 0, 0, 1);
+  dm_ptr(&m, 12);
+  dm_a(&m, 5, 10, 0, 0, 2);
+  assert(dns_answers(&m, &a) == DNS_SCAN_INCOMPLETE);
+  m.b[7] = 2;
+  m.len -= 1;
+  assert(dns_answers(&m, &a) == DNS_SCAN_INCOMPLETE);
+
+  // An A record that is not 4 bytes long.
+  dm_response(&m, "api.example.com", DNS_TYPE_A, 1);
+  dm_ptr(&m, 12);
+  __u8 five[5] = {1, 2, 3, 4, 5};
+  dm_rr(&m, DNS_TYPE_A, 5, five, 5);
+  assert(dns_answers(&m, &a) == DNS_SCAN_MALFORMED);
+
+  // A reserved label type in an owner name.
+  dm_response(&m, "api.example.com", DNS_TYPE_A, 1);
+  dm_u8(&m, 0x80);
+  dm_a(&m, 5, 10, 0, 0, 1);
+  assert(dns_answers(&m, &a) == DNS_SCAN_MALFORMED);
+}
+
+// Ones' complement helpers mirroring the kernel's csum_replace4.
+static __u16 oc_add(__u16 a, __u16 b) {
+  __u32 s = (__u32)a + b;
+  return (__u16)((s & 0xFFFF) + (s >> 16));
+}
+
+static __u16 oc_sum(const __u8 *b, __u32 len) {
+  __u16 s = 0;
+  for (__u32 i = 0; i + 1 < len; i += 2)
+    s = oc_add(s, (__u16)((b[i] << 8) | b[i + 1]));
+  if (len & 1)
+    s = oc_add(s, (__u16)(b[len - 1] << 8));
+  return s;
+}
+
+static __u16 csum_replace4(__u16 check, __u32 from, __u32 to) {
+  __u8 f[4], t[4];
+  memcpy(f, &from, 4);
+  memcpy(t, &to, 4);
+  __u16 fs = oc_add((__u16)((f[0] << 8) | f[1]), (__u16)((f[2] << 8) | f[3]));
+  __u16 ts = oc_add((__u16)((t[0] << 8) | t[1]), (__u16)((t[2] << 8) | t[3]));
+  return (__u16)~oc_add(oc_add((__u16)~check, (__u16)~fs), ts);
+}
+
+static void test_csum_odd_bytes(void) {
+  __u32 v;
+  memcpy(&v, "\x01\x02\x03\x04", 4);
+  __u32 w = csum_odd_bytes(v);
+  assert(memcmp(&w, "\x02\x01\x04\x03", 4) == 0);
+
+  // Updating the checksum for a 4-byte change at every offset of a buffer
+  // matches recomputing it, with csum_odd_bytes at odd offsets.
+  __u8 buf[40];
+  for (__u32 i = 0; i < sizeof(buf); i++)
+    buf[i] = (__u8)(i * 37 + 11);
+  for (__u32 off = 0; off + 4 <= sizeof(buf); off++) {
+    __u8 b[40];
+    memcpy(b, buf, sizeof(b));
+    __u16 check = (__u16)~oc_sum(b, sizeof(b));
+    __u32 from, to;
+    memcpy(&from, b + off, 4);
+    memcpy(&to, "\xc6\x12\x00\x05", 4); // 198.18.0.5
+    memcpy(b + off, &to, 4);
+    if (off & 1) {
+      from = csum_odd_bytes(from);
+      to = csum_odd_bytes(to);
+    }
+    __u16 updated = csum_replace4(check, from, to);
+    __u16 want = (__u16)~oc_sum(b, sizeof(b));
+    // 0x0000 and 0xFFFF are the same ones' complement value.
+    assert((updated == 0xFFFF ? 0 : updated) == (want == 0xFFFF ? 0 : want));
+  }
+}
+
+static void test_vip_upstream_record(void) {
+  struct vip_upstream_val v;
+  memset(&v, 0, sizeof(v));
+  const __u8 a[4] = {10, 0, 0, 1}, b[4] = {10, 0, 0, 2}, c[4] = {10, 0, 0, 3},
+             d[4] = {10, 0, 0, 4}, e[4] = {10, 0, 0, 5}, zero[4] = {0};
+
+  vip_upstream_record(&v, a, 100);
+  assert(memcmp(v.slot[0].ip4, a, 4) == 0 && v.slot[0].expires_at == 100);
+  // Same address: the later expiry wins, an earlier one doesn't shorten it.
+  vip_upstream_record(&v, a, 200);
+  vip_upstream_record(&v, a, 150);
+  assert(v.slot[0].expires_at == 200 && v.slot[1].expires_at == 0);
+  vip_upstream_record(&v, zero, 999);
+  assert(v.slot[1].ip4[3] == 0 && v.slot[1].expires_at == 0);
+
+  vip_upstream_record(&v, b, 300);
+  vip_upstream_record(&v, c, 50);
+  vip_upstream_record(&v, d, 400);
+  // Full: e replaces c, the slot that expires first.
+  vip_upstream_record(&v, e, 500);
+  assert(memcmp(v.slot[2].ip4, e, 4) == 0 && v.slot[2].expires_at == 500);
+  assert(memcmp(v.slot[0].ip4, a, 4) == 0 && memcmp(v.slot[1].ip4, b, 4) == 0 &&
+         memcmp(v.slot[3].ip4, d, 4) == 0);
+}
+
+static __u32 ip4(__u8 a, __u8 b, __u8 c, __u8 d) {
+  __u8 ip[4] = {a, b, c, d};
+  __u32 v;
+  memcpy(&v, ip, 4);
+  return v;
+}
+
+static void test_vip_upstream_pick(void) {
+  struct vip_upstream_val v;
+  memset(&v, 0, sizeof(v));
+  assert(vip_upstream_pick(&v, 0, 0) == 0);
+
+  const __u8 a[4] = {10, 0, 0, 1}, b[4] = {10, 0, 0, 2}, c[4] = {10, 0, 0, 3};
+  vip_upstream_record(&v, a, 100);
+  vip_upstream_record(&v, b, 300);
+  vip_upstream_record(&v, c, 200);
+  // All unexpired: rnd picks among them, in slot order.
+  assert(vip_upstream_pick(&v, 50, 0) == ip4(10, 0, 0, 1));
+  assert(vip_upstream_pick(&v, 50, 1) == ip4(10, 0, 0, 2));
+  assert(vip_upstream_pick(&v, 50, 2) == ip4(10, 0, 0, 3));
+  assert(vip_upstream_pick(&v, 50, 3) == ip4(10, 0, 0, 1));
+  // a expired: only b and c.
+  assert(vip_upstream_pick(&v, 150, 0) == ip4(10, 0, 0, 2));
+  assert(vip_upstream_pick(&v, 150, 1) == ip4(10, 0, 0, 3));
+  // All expired: the one that expired last.
+  assert(vip_upstream_pick(&v, 1000, 7) == ip4(10, 0, 0, 2));
+}
+
 int main(void) {
   printf("parse_http_host:\n");
   RUN_TEST(test_parse_host_basic);
@@ -881,6 +1252,20 @@ int main(void) {
   RUN_TEST(test_sni_lying_lengths);
   RUN_TEST(test_sni_too_many_extensions);
   RUN_TEST(test_sni_past_copy_buffer);
+
+  printf("dns rewrite walks:\n");
+  RUN_TEST(test_dns_question_basic);
+  RUN_TEST(test_dns_question_not_an_answer);
+  RUN_TEST(test_dns_question_bad_names);
+  RUN_TEST(test_dns_question_name_length);
+  RUN_TEST(test_dns_answers_cname_chain);
+  RUN_TEST(test_dns_answers_uncompressed_and_aaaa);
+  RUN_TEST(test_dns_answers_limits);
+  RUN_TEST(test_csum_odd_bytes);
+
+  printf("vip_upstream:\n");
+  RUN_TEST(test_vip_upstream_record);
+  RUN_TEST(test_vip_upstream_pick);
 
   printf("\n%d/%d tests passed.\n", tests_passed, tests_run);
   return 0;

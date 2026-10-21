@@ -110,6 +110,63 @@ func TestVirtualIPAllocatorSync(t *testing.T) {
 	check("release", want)
 }
 
+func TestVirtualIPAllocatorPrunesUpstreams(t *testing.T) {
+	spec := loadSpec(t)
+	hostIP, ipHost := newVirtualIPMaps(t, spec, ciliumebpf.MapOptions{})
+	t.Cleanup(func() { _ = hostIP.Close(); _ = ipHost.Close() })
+	upstream, err := ciliumebpf.NewMap(spec.Maps["vip_upstream"])
+	if err != nil {
+		t.Skipf("eBPF maps not available: %v", err)
+	}
+	t.Cleanup(func() { _ = upstream.Close() })
+	a := &virtualIPAllocator{hostIP: hostIP, ipHost: ipHost, upstream: upstream, prefix: testVIPRange, log: testLog()}
+
+	put := func(ip netip.Addr) {
+		t.Helper()
+		key := dnsIPKey{IP: ip.As16()}
+		var v vipUpstreamVal
+		v.Slot[0].IP4 = [4]byte{192, 0, 2, 1}
+		if err := upstream.Update(&key, &v, ciliumebpf.UpdateAny); err != nil {
+			t.Fatal(err)
+		}
+	}
+	has := func(ip netip.Addr) bool {
+		t.Helper()
+		key := dnsIPKey{IP: ip.As16()}
+		var v vipUpstreamVal
+		err := upstream.Lookup(&key, &v)
+		if err != nil && !errors.Is(err, ciliumebpf.ErrKeyNotExist) {
+			t.Fatal(err)
+		}
+		return err == nil
+	}
+
+	a.sync(hostSet("api.example.com", "b.example.com"), testVIPNow)
+	hosts, err := readVirtualIPHosts(hostIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+	apiIP, bIP := hosts["api.example.com"], hosts["b.example.com"]
+	orphan := netip.MustParseAddr("198.18.200.1")
+	for _, ip := range []netip.Addr{apiIP, bIP, orphan} {
+		put(ip)
+	}
+
+	// b retired: its fake IP still leads to it, and keeps its addresses.
+	// An IP reserved for no host loses them.
+	later := testVIPNow.Add(time.Minute)
+	a.sync(hostSet("api.example.com"), later)
+	if !has(apiIP) || !has(bIP) || has(orphan) {
+		t.Errorf("after retiring b: api %v, b %v, orphan %v; want true, true, false", has(apiIP), has(bIP), has(orphan))
+	}
+
+	// b released: its IP may go to another host, without b's addresses.
+	a.sync(hostSet("api.example.com"), later.Add(virtualIPRetention))
+	if !has(apiIP) || has(bIP) {
+		t.Errorf("after releasing b: api %v, b %v; want true, false", has(apiIP), has(bIP))
+	}
+}
+
 func TestVirtualIPPinsSurviveReload(t *testing.T) {
 	if err := requireBPFFS("/sys/fs/bpf"); err != nil {
 		t.Skipf("no bpffs: %v", err)

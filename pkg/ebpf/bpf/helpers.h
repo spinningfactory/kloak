@@ -582,6 +582,383 @@ HELPER_INLINE __u32 tls_parse_sni(const __u8 *buf, __u32 len, char *host_out,
 }
 
 // ============================================================================
+// DNS answers for the virtual IP rewrite (tc_dns_rewrite,
+// --host-resolution=virtual-ip). dns_parse_question reads the question of a
+// response and dns_scan_a_records lists the A records of its answer section,
+// so the tc program can replace each address with the host's fake IP. Both
+// read the first MAX_DNS_PKT bytes of the message, copied into a buffer of
+// that size.
+// ============================================================================
+
+#ifndef MAX_DNS_PKT
+#define MAX_DNS_PKT 512
+#endif
+#define DNS_MSG_MASK (MAX_DNS_PKT - 1)
+_Static_assert((MAX_DNS_PKT & DNS_MSG_MASK) == 0,
+               "MAX_DNS_PKT must be a power of two: offsets are masked with it");
+
+// A records rewritten per answer. An answer with more is left unchanged.
+#define DNS_MAX_A_RECORDS 8
+// Answer section walk budget: one step per owner name label and one per
+// record. Covers DNS_MAX_A_RECORDS records under compressed names with room
+// for a CNAME chain or uncompressed names.
+#define DNS_SCAN_STEPS 64
+
+#define DNS_TYPE_A 1
+#define DNS_CLASS_IN 1
+
+// dns_parse_question / dns_scan_a_records results.
+#define DNS_SCAN_OK 0
+#define DNS_SCAN_NOT_ANSWER 1 // not an untruncated NOERROR answer to one question
+#define DNS_SCAN_BAD_NAME 2   // the question is not a name a watched host can have
+#define DNS_SCAN_INCOMPLETE 3 // the answer section is cut short or past the walk budget
+#define DNS_SCAN_MALFORMED 4  // lengths or label types are invalid
+
+// An IN A record of an answer section.
+struct dns_a_record {
+  __u32 off; // offset of the 4-byte address (RDATA) in the message
+  __u32 ttl;
+  __u8 ip[4];
+};
+
+// dns_idx masks a message offset, hidden from the compiler like sni_idx.
+HELPER_INLINE __u32 dns_idx(__u32 off) {
+#ifdef __BPF__
+  asm volatile("" : "+r"(off));
+#endif
+  return off & DNS_MSG_MASK;
+}
+
+HELPER_INLINE __u32 dns_rd16(const __u8 *b, __u32 off) {
+  return ((__u32)b[dns_idx(off)] << 8) | (__u32)b[dns_idx(off + 1)];
+}
+
+// The walks below take one bounded step per name byte, label or record, so
+// that BPF can drive them with bpf_loop: unrolled, their branches multiply
+// the paths the verifier explores past its instruction budget. Each has a
+// begin / step / end triple (step returns 1 once the walk is over) and a
+// plain-loop driver used by the userspace tests.
+#define DNS_SCAN_RUNNING 0xFF
+
+// Question walk: one step per byte of the question name. A name of
+// MAX_HOST_LEN - 1 bytes takes MAX_HOST_LEN + 1 bytes on the wire.
+#define DNS_QNAME_STEPS (MAX_HOST_LEN + 1)
+
+struct dns_question {
+  char qname[MAX_HOST_LEN]; // lowercased, without the root label, zero-padded
+  __u32 qname_len;
+  __u32 ancount;
+  __u32 answers_off; // where the answer section starts
+  __u32 status;      // DNS_SCAN_*
+  __u32 len;         // message length (at most MAX_DNS_PKT)
+  __u32 off;         // next byte of the name
+  __u32 label_rem;   // bytes left in the current label
+};
+
+// dns_question_begin checks that msg[0..len) is an untruncated NOERROR
+// response to a single standard query, with at least one answer, and starts
+// the walk of its question name. q must be zeroed by the caller.
+HELPER_INLINE void dns_question_begin(struct dns_question *q, const __u8 *msg,
+                                      __u32 len) {
+  q->status = DNS_SCAN_NOT_ANSWER;
+  if (len > MAX_DNS_PKT)
+    len = MAX_DNS_PKT;
+  q->len = len;
+  if (len < 12)
+    return;
+  // QR = 1, opcode QUERY, TC = 0; RCODE NOERROR.
+  if ((msg[2] & 0xFA) != 0x80 || (msg[3] & 0x0F) != 0)
+    return;
+  if (dns_rd16(msg, 4) != 1)
+    return;
+  q->ancount = dns_rd16(msg, 6);
+  if (q->ancount == 0)
+    return;
+  q->off = 12;
+  q->status = DNS_SCAN_RUNNING;
+}
+
+// dns_question_step reads one byte of the question name into q->qname. A
+// name longer than MAX_HOST_LEN - 1 bytes, compressed, or with a byte a
+// hostname cannot hold (sni_host_char_ok, and no '.' inside a label) is
+// refused with DNS_SCAN_BAD_NAME: no watched host can match it.
+HELPER_INLINE int dns_question_step(struct dns_question *q, const __u8 *msg) {
+  if (q->status != DNS_SCAN_RUNNING)
+    return 1;
+  __u32 off = q->off, len = q->len, n = q->qname_len;
+  if (off >= len || off >= MAX_DNS_PKT) {
+    q->status = DNS_SCAN_NOT_ANSWER;
+    return 1;
+  }
+  __u8 c = msg[dns_idx(off)];
+  q->off = off + 1;
+  if (q->label_rem == 0) {
+    if (c == 0) { // root label: the name is complete
+      // QTYPE, QCLASS
+      if (n == 0) {
+        q->status = DNS_SCAN_BAD_NAME;
+      } else if (off + 1 + 4 > len) {
+        q->status = DNS_SCAN_NOT_ANSWER;
+      } else {
+        q->answers_off = off + 1 + 4;
+        q->status = DNS_SCAN_OK;
+      }
+      return 1;
+    }
+    if (c > 63) { // compression pointer or reserved label type
+      q->status = DNS_SCAN_BAD_NAME;
+      return 1;
+    }
+    if (n > 0) {
+      if (n >= MAX_HOST_LEN - 1) {
+        q->status = DNS_SCAN_BAD_NAME;
+        return 1;
+      }
+      q->qname[n & (MAX_HOST_LEN - 1)] = '.';
+      q->qname_len = n + 1;
+    }
+    q->label_rem = c;
+    return 0;
+  }
+  if (c >= 'A' && c <= 'Z')
+    c = c - 'A' + 'a';
+  if (c == '.' || !sni_host_char_ok(c) || n >= MAX_HOST_LEN - 1) {
+    q->status = DNS_SCAN_BAD_NAME;
+    return 1;
+  }
+  q->qname[n & (MAX_HOST_LEN - 1)] = (char)c;
+  q->qname_len = n + 1;
+  q->label_rem--;
+  return 0;
+}
+
+// dns_question_end returns the walk's DNS_SCAN_* result. On DNS_SCAN_OK
+// q->qname, q->qname_len, q->ancount and q->answers_off are set.
+HELPER_INLINE __u32 dns_question_end(struct dns_question *q) {
+  if (q->status == DNS_SCAN_RUNNING) // name longer than the step budget
+    q->status = DNS_SCAN_BAD_NAME;
+  return q->status;
+}
+
+HELPER_INLINE __u32 dns_parse_question(const __u8 *msg, __u32 len,
+                                       struct dns_question *q) {
+  dns_question_begin(q, msg, len);
+  for (__u32 i = 0; i < DNS_QNAME_STEPS; i++)
+    if (dns_question_step(q, msg))
+      break;
+  return dns_question_end(q);
+}
+
+// Answer walk: one step per owner name label or per record.
+struct dns_answers {
+  struct dns_a_record recs[DNS_MAX_A_RECORDS];
+  __u32 n_recs;
+  __u32 status;  // DNS_SCAN_*
+  __u32 len;     // message length (at most MAX_DNS_PKT)
+  __u32 off;     // next label or record
+  __u32 ancount; // records in the answer section
+  __u32 done;    // records walked
+  __u32 in_name; // 1 while walking an owner name
+};
+
+// dns_answers_begin starts the walk of the ancount records of the answer
+// section at msg[off] (dns_question.answers_off). a must be zeroed by the
+// caller.
+HELPER_INLINE void dns_answers_begin(struct dns_answers *a, __u32 len,
+                                     __u32 off, __u32 ancount) {
+  if (len > MAX_DNS_PKT)
+    len = MAX_DNS_PKT;
+  a->len = len;
+  a->off = off;
+  a->ancount = ancount;
+  a->in_name = 1;
+  a->status = DNS_SCAN_RUNNING;
+}
+
+// dns_answers_step walks one owner name label or one record, listing IN A
+// records in a->recs. Other records, such as the CNAME chain leading to the
+// addresses, are skipped.
+HELPER_INLINE int dns_answers_step(struct dns_answers *a, const __u8 *msg) {
+  if (a->status != DNS_SCAN_RUNNING)
+    return 1;
+  if (a->done >= a->ancount) {
+    a->status = DNS_SCAN_OK;
+    return 1;
+  }
+  __u32 off = a->off, len = a->len;
+  if (a->in_name) {
+    if (off >= len || off >= MAX_DNS_PKT) {
+      a->status = DNS_SCAN_INCOMPLETE;
+      return 1;
+    }
+    __u8 b = msg[dns_idx(off)];
+    if (b == 0) {
+      a->off = off + 1;
+      a->in_name = 0;
+    } else if ((b & 0xC0) == 0xC0) { // a compression pointer ends the name
+      a->off = off + 2;
+      a->in_name = 0;
+    } else if (b & 0xC0) {
+      a->status = DNS_SCAN_MALFORMED;
+      return 1;
+    } else {
+      a->off = off + 1 + (__u32)b;
+    }
+    return 0;
+  }
+  // TYPE (2), CLASS (2), TTL (4), RDLENGTH (2)
+  if (off + 10 > len || off >= MAX_DNS_PKT) {
+    a->status = DNS_SCAN_INCOMPLETE;
+    return 1;
+  }
+  __u32 type = dns_rd16(msg, off);
+  __u32 cls = dns_rd16(msg, off + 2);
+  __u32 ttl = (dns_rd16(msg, off + 4) << 16) | dns_rd16(msg, off + 6);
+  __u32 rdlen = dns_rd16(msg, off + 8);
+  off += 10;
+  if (off + rdlen > len) {
+    a->status = DNS_SCAN_INCOMPLETE;
+    return 1;
+  }
+  if (type == DNS_TYPE_A && cls == DNS_CLASS_IN) {
+    __u32 n = a->n_recs;
+    if (rdlen != 4) {
+      a->status = DNS_SCAN_MALFORMED;
+      return 1;
+    }
+    if (n >= DNS_MAX_A_RECORDS) {
+      a->status = DNS_SCAN_INCOMPLETE;
+      return 1;
+    }
+    struct dns_a_record *r = &a->recs[n & (DNS_MAX_A_RECORDS - 1)];
+    r->off = off;
+    r->ttl = ttl;
+    for (__u32 k = 0; k < 4; k++)
+      r->ip[k] = msg[dns_idx(off + k)];
+    a->n_recs = n + 1;
+  }
+  a->off = off + rdlen;
+  a->done++;
+  a->in_name = 1;
+  return 0;
+}
+
+// dns_answers_end returns DNS_SCAN_OK only when every record was walked:
+// rewriting part of an answer would hand the app a mix of fake and real
+// addresses.
+HELPER_INLINE __u32 dns_answers_end(struct dns_answers *a) {
+  if (a->status == DNS_SCAN_RUNNING)
+    a->status = a->done >= a->ancount ? DNS_SCAN_OK : DNS_SCAN_INCOMPLETE;
+  return a->status;
+}
+
+HELPER_INLINE __u32 dns_scan_a_records(const __u8 *msg, __u32 len, __u32 off,
+                                       __u32 ancount, struct dns_answers *a) {
+  dns_answers_begin(a, len, off, ancount);
+  for (__u32 i = 0; i < DNS_SCAN_STEPS; i++)
+    if (dns_answers_step(a, msg))
+      break;
+  return dns_answers_end(a);
+}
+
+// csum_odd_bytes prepares a 4-byte value that starts at an odd offset from
+// the start of a checksummed area for the ones' complement update helpers
+// (bpf_l4_csum_replace), which sum it as two aligned 16-bit words. At an odd
+// offset each byte lands in the other half of its word, which is the same as
+// swapping the bytes of each 16-bit half (RFC 1071 byte order independence).
+// The result holds the bytes b1 b0 b3 b2 in memory order, on either
+// endianness.
+HELPER_INLINE __u32 csum_odd_bytes(__u32 v) {
+  return ((v & 0x00FF00FFu) << 8) | ((v >> 8) & 0x00FF00FFu);
+}
+
+// ============================================================================
+// Virtual IP upstreams (vip_upstream): the real IPv4 addresses the trusted
+// resolvers returned for a fake IP's host. tc_dns_rewrite records them, the
+// connect4 redirect picks one.
+// ============================================================================
+
+#define VIP_UPSTREAM_SLOTS 4
+
+struct vip_upstream_slot {
+  __u8 ip4[4];      // network byte order; all zero = empty slot
+  __u32 _pad;
+  __u64 expires_at; // bpf_ktime_get_boot_ns() at which the record's TTL ran out
+};
+
+struct vip_upstream_val {
+  struct vip_upstream_slot slot[VIP_UPSTREAM_SLOTS];
+};
+
+// vip_upstream_record adds ip, valid until expires_at, to v. A slot already
+// holding ip keeps the later expiry; otherwise ip takes the slot that
+// expires first (an empty one if any). 0.0.0.0 is not recorded.
+HELPER_INLINE void vip_upstream_record(struct vip_upstream_val *v,
+                                       const __u8 ip[4], __u64 expires_at) {
+  __u32 want;
+  __builtin_memcpy(&want, ip, 4);
+  if (want == 0)
+    return;
+  __u32 victim = 0;
+  __u64 victim_exp = ~0ULL;
+  for (__u32 i = 0; i < VIP_UPSTREAM_SLOTS; i++) {
+    __u32 cur;
+    __builtin_memcpy(&cur, v->slot[i].ip4, 4);
+    if (cur == want) {
+      if (expires_at > v->slot[i].expires_at)
+        v->slot[i].expires_at = expires_at;
+      return;
+    }
+    __u64 exp = cur ? v->slot[i].expires_at : 0;
+    if (exp < victim_exp) {
+      victim_exp = exp;
+      victim = i;
+    }
+  }
+  struct vip_upstream_slot *s = &v->slot[victim & (VIP_UPSTREAM_SLOTS - 1)];
+  __builtin_memcpy(s->ip4, ip, 4);
+  s->expires_at = expires_at;
+}
+
+// vip_upstream_pick returns the address (network byte order) a connect to
+// v's fake IP goes to at time now: one of the unexpired addresses, chosen by
+// rnd, or else the one that expired last, as a resolver serving a stale
+// answer would. 0 when v holds none.
+HELPER_INLINE __u32 vip_upstream_pick(const struct vip_upstream_val *v,
+                                      __u64 now, __u32 rnd) {
+  __u32 n_live = 0, newest = 0;
+  __u64 newest_exp = 0;
+  for (__u32 i = 0; i < VIP_UPSTREAM_SLOTS; i++) {
+    __u32 cur;
+    __builtin_memcpy(&cur, v->slot[i].ip4, 4);
+    if (cur == 0)
+      continue;
+    __u64 exp = v->slot[i].expires_at;
+    if (exp > now)
+      n_live++;
+    if (newest == 0 || exp > newest_exp) {
+      newest = cur;
+      newest_exp = exp;
+    }
+  }
+  if (n_live == 0)
+    return newest;
+  // The k-th unexpired slot (no variable index into a stack array: the
+  // verifier rejects it).
+  __u32 k = rnd % n_live;
+  for (__u32 i = 0; i < VIP_UPSTREAM_SLOTS; i++) {
+    __u32 cur;
+    __builtin_memcpy(&cur, v->slot[i].ip4, 4);
+    if (cur == 0 || v->slot[i].expires_at <= now)
+      continue;
+    if (k == 0)
+      return cur;
+    k--;
+  }
+  return newest;
+}
+
+// ============================================================================
 // AES single-block encryption — used to recover the GHASH subkey H for
 // BoringSSL.
 //
