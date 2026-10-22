@@ -45,6 +45,8 @@ var bunOffsetTable = map[string]BunOffsets{
 	"1.4.2/arm64":  {SSLWriteOffset: 40058880, BoringSSL: BoringSSLOffsets{SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32}}, // discovered from bun-v1.4.2 profile build
 	"1.4.3/amd64":  {SSLWriteOffset: 38792064, BoringSSL: BoringSSLOffsets{SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32}}, // discovered from bun-v1.4.3 profile build
 	"1.4.3/arm64":  {SSLWriteOffset: 36898944, BoringSSL: BoringSSLOffsets{SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32}}, // discovered from bun-v1.4.3 profile build
+	"1.4.4/amd64":  {SSLWriteOffset: 40879552, BoringSSL: BoringSSLOffsets{SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32}}, // discovered from bun-v1.4.4 profile build
+	"1.4.4/arm64":  {SSLWriteOffset: 38568576, BoringSSL: BoringSSLOffsets{SSLToS3: 48, S3ToAEAD: 272, AEADToAESKey: 288, SSLToWBIO: 32}}, // discovered from bun-v1.4.4 profile build
 }
 
 var bunVersionRe = regexp.MustCompile(`bun/(\d+\.\d+\.\d+)`)
