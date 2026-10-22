@@ -473,28 +473,69 @@ func TestVirtualIPConnectRedirect(t *testing.T) {
 	for _, c := range []struct {
 		addr netip.Addr
 		want string
+		host string // recorded for the socket in vip_sock_host
 	}{
-		{vipTestFake, fmt.Sprintf("connected %s:%d", vipTestFake, port)},
-		{vipTestFake2, "operation not permitted"},
-		{netip.MustParseAddr("198.18.0.7"), "operation not permitted"},
+		{vipTestFake, fmt.Sprintf("connected %s:%d", vipTestFake, port), "api.example.com"},
+		{vipTestFake2, "operation not permitted", ""},
+		{netip.MustParseAddr("198.18.0.7"), "operation not permitted", ""},
 		// Outside the range: left alone.
-		{netip.MustParseAddr("127.0.0.1"), fmt.Sprintf("connected 127.0.0.1:%d", port)},
+		{netip.MustParseAddr("127.0.0.1"), fmt.Sprintf("connected 127.0.0.1:%d", port), ""},
 	} {
 		// From an AF_INET socket, and from an AF_INET6 one through the
 		// v4-mapped address (connect6 / getpeername6).
 		for _, family := range []string{"4", "6"} {
-			out := connectFromCgroup(t, path, family, netip.AddrPortFrom(c.addr, uint16(port)))
+			out := connectFromCgroup(t, path, family, netip.AddrPortFrom(c.addr, uint16(port)), netip.AddrPort{})
 			if !strings.Contains(out, c.want) {
 				t.Errorf("AF_INET%s connect to %s: %q, want %q", family, c.addr, out, c.want)
 			}
+			if got := sockHost(t, objs, out); got != c.host {
+				t.Errorf("AF_INET%s connect to %s: socket host %q, want %q", family, c.addr, got, c.host)
+			}
+		}
+	}
+
+	// A socket whose connect to a fake IP failed and that then connects
+	// elsewhere loses the host (nothing listens on the fake IP's port 1).
+	direct := netip.AddrPortFrom(netip.MustParseAddr("127.0.0.1"), uint16(port))
+	for _, family := range []string{"4", "6"} {
+		out := connectFromCgroup(t, path, family, netip.AddrPortFrom(vipTestFake, 1), direct)
+		if !strings.Contains(out, "failed: connection refused") || !strings.Contains(out, "then connected 127.0.0.1") {
+			t.Fatalf("AF_INET%s connect to %s:1, then %s: %q", family, vipTestFake, direct, out)
+		}
+		if got := sockHost(t, objs, out); got != "" {
+			t.Errorf("AF_INET%s reconnected socket kept socket host %q", family, got)
 		}
 	}
 }
 
+// sockHost returns the host vip_sock_host holds for the socket whose cookie
+// the connect helper reported in out, "" when none.
+func sockHost(t *testing.T, objs *tlsuprobeObjects, out string) string {
+	t.Helper()
+	var cookie uint64
+	for _, line := range strings.Split(out, "\n") {
+		if _, err := fmt.Sscanf(line, "cookie %d", &cookie); err == nil {
+			break
+		}
+	}
+	if cookie == 0 {
+		t.Fatalf("no socket cookie in %q", out)
+	}
+	var host [maxHostLen]byte
+	if err := objs.VipSockHost.Lookup(&cookie, &host); err != nil {
+		if errors.Is(err, ciliumebpf.ErrKeyNotExist) {
+			return ""
+		}
+		t.Fatal(err)
+	}
+	return vipHostString(host, maxHostLen)
+}
+
 // connectFromCgroup connects to addr from a child process started in the
-// cgroup at path, with an AF_INET or (family "6") AF_INET6 socket, and
-// returns what it reports.
-func connectFromCgroup(t *testing.T, path, family string, addr netip.AddrPort) string {
+// cgroup at path, with an AF_INET or (family "6") AF_INET6 socket, then, if
+// then is valid, connects the same socket to it, and returns what it
+// reports.
+func connectFromCgroup(t *testing.T, path, family string, addr, then netip.AddrPort) string {
 	t.Helper()
 	cg, err := os.Open(path)
 	if err != nil {
@@ -503,6 +544,9 @@ func connectFromCgroup(t *testing.T, path, family string, addr netip.AddrPort) s
 	defer func() { _ = cg.Close() }()
 	cmd := exec.Command(os.Args[0], "-test.run=^TestVirtualIPConnectHelper$")
 	cmd.Env = append(os.Environ(), "KLOAK_VIP_CONNECT="+addr.String(), "KLOAK_VIP_CONNECT_FAMILY="+family)
+	if then.IsValid() {
+		cmd.Env = append(cmd.Env, "KLOAK_VIP_CONNECT_THEN="+then.String())
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{UseCgroupFD: true, CgroupFD: int(cg.Fd())}
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -512,31 +556,50 @@ func connectFromCgroup(t *testing.T, path, family string, addr netip.AddrPort) s
 }
 
 // TestVirtualIPConnectHelper is the child process of connectFromCgroup. It
-// reports the peer getpeername() returns.
+// reports its socket's cookie and the peer getpeername() returns.
 func TestVirtualIPConnectHelper(t *testing.T) {
 	addr := os.Getenv("KLOAK_VIP_CONNECT")
 	if addr == "" {
 		t.Skip("helper process for TestVirtualIPConnectRedirect")
 	}
-	ap := netip.MustParseAddrPort(addr)
+	six := os.Getenv("KLOAK_VIP_CONNECT_FAMILY") == "6"
+	sockaddr := func(ap netip.AddrPort) unix.Sockaddr {
+		if six {
+			return &unix.SockaddrInet6{Addr: netip.AddrFrom16(ap.Addr().As16()).As16(), Port: int(ap.Port())}
+		}
+		return &unix.SockaddrInet4{Addr: ap.Addr().As4(), Port: int(ap.Port())}
+	}
 	domain := unix.AF_INET
-	var sa unix.Sockaddr = &unix.SockaddrInet4{Addr: ap.Addr().As4(), Port: int(ap.Port())}
-	if os.Getenv("KLOAK_VIP_CONNECT_FAMILY") == "6" {
+	if six {
 		// Go's net package dials IPv4 addresses with AF_INET sockets only.
 		domain = unix.AF_INET6
-		sa = &unix.SockaddrInet6{Addr: netip.AddrFrom16(ap.Addr().As16()).As16(), Port: int(ap.Port())}
 	}
 	fd, err := unix.Socket(domain, unix.SOCK_STREAM, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer func() { _ = unix.Close(fd) }()
+	cookie, err := unix.GetsockoptUint64(fd, unix.SOL_SOCKET, unix.SO_COOKIE)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println("cookie", cookie)
 	// A connect left on a fake IP would hang on the unrouted range.
 	tv := unix.NsecToTimeval((5 * time.Second).Nanoseconds())
 	if err := unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_SNDTIMEO, &tv); err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Connect(fd, sa); err != nil {
+	err = unix.Connect(fd, sockaddr(netip.MustParseAddrPort(addr)))
+	if then := os.Getenv("KLOAK_VIP_CONNECT_THEN"); then != "" {
+		if err != nil {
+			fmt.Println("failed:", err)
+		}
+		if err = unix.Connect(fd, sockaddr(netip.MustParseAddrPort(then))); err != nil {
+			fmt.Println("then failed:", err)
+			return
+		}
+		fmt.Print("then ")
+	} else if err != nil {
 		fmt.Println("failed:", err)
 		return
 	}

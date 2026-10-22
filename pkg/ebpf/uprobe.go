@@ -2323,7 +2323,7 @@ var debugCounterNames = []string{
 	"secret_binding_deny", "secret_binding_audit",
 	"sni_captured", "sni_deny", "sni_audit",
 	"vip_dns_rewritten", "vip_dns_unchanged", "vip_connect_redirect", "vip_connect_refused",
-	"vip_dns_unbound",
+	"vip_dns_unbound", "vip_sock_host_deny", "vip_sock_addr_deny",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

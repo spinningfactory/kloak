@@ -958,6 +958,34 @@ HELPER_INLINE __u32 vip_upstream_pick(const struct vip_upstream_val *v,
   return newest;
 }
 
+// Results of vip_socket_check.
+#define VIP_SOCK_OK 0
+#define VIP_SOCK_DENY_HOST 1 // the socket did not connect to the host's fake IP
+#define VIP_SOCK_DENY_ADDR 2 // the socket's real address or port is not the allowed one
+
+// vip_socket_check applies a secret's host, IP and port restrictions to the
+// socket a record leaves on (virtual IP mode, at tcp_sendmsg), with the same
+// meaning as the uprobe's check against resolve_host: a host length of 0 or
+// MAX_HOST_LEN and more, an IP length other than 16 and a port of 0 restrict
+// nothing.
+//   sock_host: the host of the fake IP the socket connected to (zero-padded,
+//              as vip_ip_val.host), NULL when it connected to none;
+//   daddr16:   the socket's real destination, IPv4-mapped;
+//   dport:     the socket's destination port, host byte order.
+HELPER_INLINE int vip_socket_check(const char *sock_host, __u32 host_len,
+                                   const char *allowed_host, __u32 ip_len,
+                                   const __u8 *allowed_ip, const __u8 *daddr16,
+                                   __u16 port, __u16 dport) {
+  if (host_len > 0 && host_len < MAX_HOST_LEN &&
+      (!sock_host || !hosts_match(sock_host, allowed_host)))
+    return VIP_SOCK_DENY_HOST;
+  if (ip_len == 16 && __builtin_memcmp(daddr16, allowed_ip, 16) != 0)
+    return VIP_SOCK_DENY_ADDR;
+  if (port != 0 && dport != port)
+    return VIP_SOCK_DENY_ADDR;
+  return VIP_SOCK_OK;
+}
+
 // ============================================================================
 // AES single-block encryption — used to recover the GHASH subkey H for
 // BoringSSL.

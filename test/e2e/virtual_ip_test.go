@@ -189,7 +189,7 @@ while True:
 		Command:         []string{"python", "-c", waitForFakeIP, host, vipRange.String()},
 	}}
 	createVIPProbePod(t, bound)
-	createVIPProbePod(t, vipProbePod("vip-scope-unbound", ""))
+	createVIPProbePod(t, vipProbePod("vip-scope-unbound"))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
 	defer cancel()
@@ -225,9 +225,137 @@ while True:
 	}
 }
 
+// TestVirtualIPSocketHost checks that, in virtual-ip mode, a secret's host
+// is the socket's: the host of the fake IP it connected to. The echo server
+// has two names leading to the same IP, its Service and an ExternalName
+// alias of it, which DNS snooping can't tell apart; here each gets its own
+// fake IP. A secret restricted to one name is rewritten on a connection to
+// that name, and not on a connection to the other name even with the right
+// SNI. A secret restricted to the server's IP is rewritten on a connection
+// made through a fake IP, which reaches that IP.
+func TestVirtualIPSocketHost(t *testing.T) {
+	vipRange := controllerVirtualIPRange(t)
+	hostA := "tls." + testNamespace + ".svc.cluster.local"
+	hostB := "tls-alias." + testNamespace + ".svc.cluster.local"
+
+	gcCtx, gcCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer gcCancel()
+	for _, name := range []string{"secret-allowed", "secret-blocked", "secret-allowed-kloak", "secret-blocked-kloak"} {
+		_ = waitForSecretAbsent(gcCtx, testNamespace, name)
+	}
+	// The demo's two secrets, restricted to each name.
+	dataA := map[string][]byte{"api-key": []byte("REAL-SOCKHOST-A-KEY-12345")}
+	dataB := map[string][]byte{"api-key": []byte("REAL-SOCKHOST-B-KEY-67890")}
+	createEnabledSecret(t, "secret-allowed", dataA, nil, map[string]string{"getkloak.io/hosts": hostA})
+	createEnabledSecret(t, "secret-blocked", dataB, nil, map[string]string{"getkloak.io/hosts": hostB})
+	assertShadowSecret(t, "secret-allowed", dataA)
+	assertShadowSecret(t, "secret-blocked", dataB)
+
+	demoManifest := filepath.Join(repoRoot, "examples", "demo-python-raw-tls", "deployment.yaml")
+	if err := applyManifest(t, demoManifest); err != nil {
+		t.Fatalf("failed to deploy demo-python-raw-tls: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
+	})
+	alias := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "tls-alias", Namespace: testNamespace},
+		Spec:       corev1.ServiceSpec{Type: corev1.ServiceTypeExternalName, ExternalName: hostA},
+	}
+	if _, err := clientset.CoreV1().Services(testNamespace).Create(context.Background(), alias, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating the ExternalName alias: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = clientset.CoreV1().Services(testNamespace).Delete(context.Background(), "tls-alias", metav1.DeleteOptions{})
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := waitForDeploymentReady(ctx, testNamespace, "demo-python-raw-tls"); err != nil {
+		t.Fatalf("demo-python-raw-tls not ready: %v", err)
+	}
+	svc, err := clientset.CoreV1().Services(testNamespace).Get(context.Background(), "tls", metav1.GetOptions{})
+	if err != nil {
+		t.Fatalf("getting the echo Service: %v", err)
+	}
+	dataIP := map[string][]byte{"api-key": []byte("REAL-SOCKHOST-IP-KEY-24680")}
+	createEnabledSecret(t, "secret-sockhost-ip", dataIP, nil, map[string]string{"getkloak.io/hosts": svc.Spec.ClusterIP})
+	assertShadowSecret(t, "secret-sockhost-ip", dataIP)
+
+	controller := controllerPod(t)
+	for _, host := range []string{hostA, hostB} {
+		if ip := waitForVirtualIPLog(t, controller, host, "allocated virtual IP", "reactivated virtual IP"); !vipRange.Contains(ip) {
+			t.Fatalf("%s got %s, outside %s", host, ip, vipRange)
+		}
+	}
+	createVIPProbePod(t, vipProbePod("vip-sockhost-probe", "secret-allowed", "secret-blocked", "secret-sockhost-ip"))
+	if err := waitForPodReady(ctx, testNamespace, "vip-sockhost-probe"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Each line: <case> <first line of the echo>. The process is only
+	// traced once kloak has seen its exec, so it first waits for a rewrite
+	// that must happen.
+	const probe = `import socket, ssl, sys, time
+a, b, ip = sys.argv[1:4]
+def send(host, sni, secret):
+    value = open("/etc/secrets/%s/api-key" % secret).read().strip()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with socket.create_connection((host, 8443), timeout=5) as sock:
+        with ctx.wrap_socket(sock, server_hostname=sni) as tls:
+            tls.sendall(("S=%s\n" % value).encode())
+            return tls.recv(16384).decode(errors="replace").strip().splitlines()[0]
+deadline = time.monotonic() + 60
+while True:
+    out = send(a, a, "secret-allowed")
+    if "REAL-" in out or time.monotonic() > deadline:
+        break
+    time.sleep(0.5)
+print("a-via-a", out)
+print("a-via-b", send(b, a, "secret-allowed"))
+print("b-via-b", send(b, b, "secret-blocked"))
+print("ip-via-a", send(a, a, "secret-sockhost-ip"))
+`
+	res, err := kubectl("exec", "-n", testNamespace, "vip-sockhost-probe", "-c", "app", "--",
+		"python", "-c", probe, hostA, hostB, svc.Spec.ClusterIP)
+	if err != nil {
+		t.Fatalf("probe: %v\n%s", err, res)
+	}
+	t.Logf("probe:\n%s", strings.TrimSpace(res))
+	got := make(map[string]string)
+	for _, line := range strings.Split(res, "\n") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(line), " "); ok {
+			got[k] = v
+		}
+	}
+	for _, c := range []struct {
+		name, real string
+		rewritten  bool
+	}{
+		{"a-via-a", "REAL-SOCKHOST-A-KEY-12345", true},
+		// The socket's host is the alias: refused, though the SNI names A
+		// and the connection reaches A's server.
+		{"a-via-b", "REAL-SOCKHOST-A-KEY-12345", false},
+		{"b-via-b", "REAL-SOCKHOST-B-KEY-67890", true},
+		// The socket's real address is the ClusterIP; the app connected to
+		// A's fake IP.
+		{"ip-via-a", "REAL-SOCKHOST-IP-KEY-24680", true},
+	} {
+		echo, ok := got[c.name]
+		if !ok {
+			t.Errorf("%s: no result", c.name)
+			continue
+		}
+		if strings.Contains(echo, c.real) != c.rewritten {
+			t.Errorf("%s: echo %q, rewritten %v, want %v", c.name, echo, !c.rewritten, c.rewritten)
+		}
+	}
+}
+
 // vipProbePod returns a kloak pod running the raw TLS demo's image (for its
-// Python), mounting secret unless it is empty.
-func vipProbePod(name, secret string) *corev1.Pod {
+// Python), mounting each of secrets at /etc/secrets/<secret>.
+func vipProbePod(name string, secrets ...string) *corev1.Pod {
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -244,12 +372,13 @@ func vipProbePod(name, secret string) *corev1.Pod {
 			}},
 		},
 	}
-	if secret != "" {
-		pod.Spec.Volumes = []corev1.Volume{{
-			Name:         "secret",
+	for _, secret := range secrets {
+		pod.Spec.Volumes = append(pod.Spec.Volumes, corev1.Volume{
+			Name:         secret,
 			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secret}},
-		}}
-		pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "secret", MountPath: "/etc/secret", ReadOnly: true}}
+		})
+		pod.Spec.Containers[0].VolumeMounts = append(pod.Spec.Containers[0].VolumeMounts,
+			corev1.VolumeMount{Name: secret, MountPath: "/etc/secrets/" + secret, ReadOnly: true})
 	}
 	return pod
 }

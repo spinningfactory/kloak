@@ -1174,6 +1174,39 @@ static void test_vip_upstream_pick(void) {
   assert(vip_upstream_pick(&v, 1000, 7) == ip4(10, 0, 0, 2));
 }
 
+static void test_vip_socket_check(void) {
+  char api[MAX_HOST_LEN] = "api.example.com";
+  char other[MAX_HOST_LEN] = "api.example.co";
+  const __u8 real[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 10};
+  const __u8 elsewhere[16] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 192, 0, 2, 11};
+  __u32 api_len = (__u32)strlen(api);
+
+  // No restriction: any socket, even one that connected to no fake IP.
+  assert(vip_socket_check(NULL, 0, api, 0, real, elsewhere, 0, 1) == VIP_SOCK_OK);
+  // A host length of MAX_HOST_LEN or more restricts nothing (as in the uprobe).
+  assert(vip_socket_check(NULL, MAX_HOST_LEN, api, 0, real, elsewhere, 0, 1) == VIP_SOCK_OK);
+
+  // Host: only a socket that connected to that host's fake IP.
+  assert(vip_socket_check(api, api_len, api, 0, real, real, 0, 443) == VIP_SOCK_OK);
+  assert(vip_socket_check(NULL, api_len, api, 0, real, real, 0, 443) == VIP_SOCK_DENY_HOST);
+  assert(vip_socket_check(other, api_len, api, 0, real, real, 0, 443) == VIP_SOCK_DENY_HOST);
+
+  // IP: the socket's real destination, whatever the app connected to.
+  assert(vip_socket_check(api, 0, other, 16, real, real, 0, 443) == VIP_SOCK_OK);
+  assert(vip_socket_check(api, 0, other, 16, real, elsewhere, 0, 443) == VIP_SOCK_DENY_ADDR);
+  // Any other IP length restricts nothing.
+  assert(vip_socket_check(NULL, 0, other, 4, real, elsewhere, 0, 443) == VIP_SOCK_OK);
+
+  // Port.
+  assert(vip_socket_check(api, api_len, api, 0, real, real, 443, 443) == VIP_SOCK_OK);
+  assert(vip_socket_check(api, api_len, api, 0, real, real, 443, 8443) == VIP_SOCK_DENY_ADDR);
+
+  // Every restriction applies; the host is reported first.
+  assert(vip_socket_check(api, api_len, api, 16, real, real, 443, 443) == VIP_SOCK_OK);
+  assert(vip_socket_check(other, api_len, api, 16, real, elsewhere, 443, 80) == VIP_SOCK_DENY_HOST);
+  assert(vip_socket_check(api, api_len, api, 16, real, elsewhere, 443, 443) == VIP_SOCK_DENY_ADDR);
+}
+
 int main(void) {
   printf("parse_http_host:\n");
   RUN_TEST(test_parse_host_basic);
@@ -1266,6 +1299,7 @@ int main(void) {
   printf("vip_upstream:\n");
   RUN_TEST(test_vip_upstream_record);
   RUN_TEST(test_vip_upstream_pick);
+  RUN_TEST(test_vip_socket_check);
 
   printf("\n%d/%d tests passed.\n", tests_passed, tests_run);
   return 0;
