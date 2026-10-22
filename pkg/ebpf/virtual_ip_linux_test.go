@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"maps"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -60,9 +61,10 @@ func entryValues(entries map[netip.Addr]vipEntry) map[netip.Addr]vipIPVal {
 func TestVirtualIPAllocatorSync(t *testing.T) {
 	hostIP, ipHost := newVirtualIPMaps(t, loadSpec(t), ciliumebpf.MapOptions{})
 	t.Cleanup(func() { _ = hostIP.Close(); _ = ipHost.Close() })
-	a := &virtualIPAllocator{hostIP: hostIP, ipHost: ipHost, prefix: testVIPRange, log: testLog()}
+	a := &virtualIPAllocator{hostIP: hostIP, ipHost: ipHost, ranges: testVIPRanges, log: testLog()}
 
-	check := func(step string, want vipPlan) {
+	// want4 / want6: the plans of each family the maps should hold.
+	check := func(step string, want4, want6 vipPlan) {
 		t.Helper()
 		gotHosts, err := readVirtualIPHosts(hostIP)
 		if err != nil {
@@ -72,46 +74,69 @@ func TestVirtualIPAllocatorSync(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if !reflect.DeepEqual(gotHosts, want.Hosts) {
-			t.Errorf("%s: vip_host_ip = %v, want %v", step, gotHosts, want.Hosts)
+		if wantHosts := vipHostVals(want4.Hosts, want6.Hosts); !reflect.DeepEqual(gotHosts, wantHosts) {
+			t.Errorf("%s: vip_host_ip = %v, want %v", step, gotHosts, wantHosts)
 		}
-		if !reflect.DeepEqual(entryValues(gotEntries), entryValues(want.Entries)) {
-			t.Errorf("%s: vip_ip_host = %v, want %v", step, gotEntries, want.Entries)
+		wantEntries := maps.Clone(want4.Entries)
+		maps.Copy(wantEntries, want6.Entries)
+		if !reflect.DeepEqual(entryValues(gotEntries), entryValues(wantEntries)) {
+			t.Errorf("%s: vip_ip_host = %v, want %v", step, gotEntries, wantEntries)
 		}
 	}
 
+	// Every host gets a fake IP of each family.
 	hosts := hostSet("api.example.com", "b.example.com")
 	a.sync(hosts, testVIPNow)
-	want := planVirtualIPs(testVIPRange, hosts, nil, testVIPNow, 4096)
-	check("allocate", want)
-
-	// The IPv6 half stays zero until an IPv6 range is supported.
+	want4, want6 := planVirtualIPRanges(testVIPRanges, hosts, nil, testVIPNow, 4096)
+	check("allocate", want4, want6)
 	key := vipHostKey("api.example.com")
 	var raw vipHostVal
 	if err := hostIP.Lookup(&key, &raw); err != nil {
 		t.Fatal(err)
 	}
-	if raw.IP6 != [16]byte{} || netip.AddrFrom4(raw.IP4) != want.Hosts["api.example.com"] {
+	if netip.AddrFrom4(raw.IP4) != want4.Hosts["api.example.com"] || netip.AddrFrom16(raw.IP6) != want6.Hosts["api.example.com"] ||
+		!testVIPRange.Contains(netip.AddrFrom4(raw.IP4)) || !testVIPRange6.Contains(netip.AddrFrom16(raw.IP6)) {
 		t.Errorf("vip_host_ip value %+v", raw)
 	}
 
-	// b is no longer watched: dropped from vip_host_ip, retired in vip_ip_host.
+	// b is no longer watched: dropped from vip_host_ip, both IPs retired in
+	// vip_ip_host.
 	later := testVIPNow.Add(time.Minute)
 	hosts = hostSet("api.example.com")
 	a.sync(hosts, later)
-	bIP := want.Hosts["b.example.com"]
-	want.Hosts = map[string]netip.Addr{"api.example.com": want.Hosts["api.example.com"]}
-	want.Entries[bIP] = vipEntry{Host: "b.example.com", Retired: true, RetiredAt: later}
-	check("retire", want)
+	bIP4, bIP6 := want4.Hosts["b.example.com"], want6.Hosts["b.example.com"]
+	delete(want4.Hosts, "b.example.com")
+	delete(want6.Hosts, "b.example.com")
+	want4.Entries[bIP4] = vipEntry{Host: "b.example.com", Retired: true, RetiredAt: later}
+	want6.Entries[bIP6] = vipEntry{Host: "b.example.com", Retired: true, RetiredAt: later}
+	check("retire", want4, want6)
 
 	// A second sync with nothing new changes nothing.
 	a.sync(hosts, later.Add(time.Minute))
-	check("steady", want)
+	check("steady", want4, want6)
 
-	// Past the retention period the reservation is released.
+	// Past the retention period the reservations are released.
 	a.sync(hosts, later.Add(virtualIPRetention))
-	delete(want.Entries, bIP)
-	check("release", want)
+	delete(want4.Entries, bIP4)
+	delete(want6.Entries, bIP6)
+	check("release", want4, want6)
+
+	// The IPv6 range removed: the hosts keep their fake IPv4, their IPv6
+	// reservations go.
+	apiIP6 := want6.Hosts["api.example.com"]
+	a.ranges = VirtualIPRanges{V4: testVIPRange}
+	a.sync(hosts, later.Add(virtualIPRetention))
+	check("no IPv6 range", want4, vipPlan{})
+
+	// Back again: the same fake IPv6, derived from the host.
+	a.ranges = testVIPRanges
+	a.sync(hosts, later.Add(virtualIPRetention))
+	if err := hostIP.Lookup(&key, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if got := netip.AddrFrom16(raw.IP6); got != apiIP6 || netip.AddrFrom4(raw.IP4) != want4.Hosts["api.example.com"] {
+		t.Errorf("IPv6 range back: vip_host_ip value %+v, want IPv6 %s", raw, apiIP6)
+	}
 }
 
 func TestVirtualIPAllocatorPrunesUpstreams(t *testing.T) {
@@ -123,13 +148,13 @@ func TestVirtualIPAllocatorPrunesUpstreams(t *testing.T) {
 		t.Skipf("eBPF maps not available: %v", err)
 	}
 	t.Cleanup(func() { _ = upstream.Close() })
-	a := &virtualIPAllocator{hostIP: hostIP, ipHost: ipHost, upstream: upstream, prefix: testVIPRange, log: testLog()}
+	a := &virtualIPAllocator{hostIP: hostIP, ipHost: ipHost, upstream: upstream, ranges: VirtualIPRanges{V4: testVIPRange}, log: testLog()}
 
 	put := func(ip netip.Addr) {
 		t.Helper()
 		key := dnsIPKey{IP: ip.As16()}
 		var v vipUpstreamVal
-		v.Slot[0].IP4 = [4]byte{192, 0, 2, 1}
+		v.Slot[0].IP = netip.MustParseAddr("192.0.2.1").As16()
 		if err := upstream.Update(&key, &v, ciliumebpf.UpdateAny); err != nil {
 			t.Fatal(err)
 		}
@@ -150,7 +175,7 @@ func TestVirtualIPAllocatorPrunesUpstreams(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	apiIP, bIP := hosts["api.example.com"], hosts["b.example.com"]
+	apiIP, bIP := netip.AddrFrom4(hosts["api.example.com"].IP4), netip.AddrFrom4(hosts["b.example.com"].IP4)
 	orphan := netip.MustParseAddr("198.18.200.1")
 	for _, ip := range []netip.Addr{apiIP, bIP, orphan} {
 		put(ip)
@@ -191,10 +216,10 @@ func TestVirtualIPPinsSurviveReload(t *testing.T) {
 	}
 
 	hostIP, ipHost := open()
-	a := &virtualIPAllocator{hostIP: hostIP, ipHost: ipHost, prefix: testVIPRange, log: testLog()}
+	a := &virtualIPAllocator{hostIP: hostIP, ipHost: ipHost, ranges: testVIPRanges, log: testLog()}
 	a.sync(hostSet("api.example.com", "b.example.com"), testVIPNow)
 	want, err := readVirtualIPs(ipHost)
-	if err != nil || len(want) != 2 {
+	if err != nil || len(want) != 4 {
 		t.Fatalf("after sync: %v, %v", want, err)
 	}
 	_ = hostIP.Close()
@@ -320,20 +345,21 @@ func TestVipPodHostBindings(t *testing.T) {
 		}
 	}
 
-	// The address went to a new pod before the old pod's deletion was seen.
-	addr := []netip.Addr{netip.MustParseAddr("10.42.0.7")}
+	// The addresses (a dual-stack pod's) went to a new pod before the old
+	// pod's deletion was seen.
+	addr := []netip.Addr{netip.MustParseAddr("10.42.0.7"), netip.MustParseAddr("fd42::7")}
 	m.BindPodSecrets("uid-old", "ns/old", addr, nil, []secrets.Ref{{OwnerID: "ns/api"}})
 	m.BindPodSecrets("uid-new", "ns/new", addr, nil, []secrets.Ref{{OwnerID: "ns/db"}})
-	check("bound", "10.42.0.7 api.example.com", "10.42.0.7 db.example.com")
+	check("bound", "10.42.0.7 api.example.com", "10.42.0.7 db.example.com", "fd42::7 api.example.com", "fd42::7 db.example.com")
 	m.UnbindPod("uid-old")
-	check("old pod unbound", "10.42.0.7 db.example.com")
+	check("old pod unbound", "10.42.0.7 db.example.com", "fd42::7 db.example.com")
 
 	putPodHost(t, objs, netip.MustParseAddr("10.42.0.99"), "api.example.com")
 	syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), m.log)
-	check("synced", "10.42.0.7 db.example.com")
+	check("synced", "10.42.0.7 db.example.com", "fd42::7 db.example.com")
 
 	m.SetSecretBindingMode(SecretBindingAudit)
 	m.BindPodSecrets("uid-new", "ns/new", addr, nil, []secrets.Ref{{OwnerID: "ns/db"}})
 	syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, true), m.log)
-	check("audit", "10.42.0.7 ")
+	check("audit", "10.42.0.7 ", "fd42::7 ")
 }

@@ -45,6 +45,28 @@ func TestDiscoverTrustedDNSServers_KubeDNSOnly(t *testing.T) {
 	}
 }
 
+func TestDiscoverTrustedDNSServers_DualStackKubeDNS(t *testing.T) {
+	svc := kubeDNSSvc("10.43.0.10")
+	svc.Spec.ClusterIPs = []string{"10.43.0.10", "fd43::a"}
+	reader := newFakeReader(svc)
+	trustedDNSServers = ""
+
+	ips := discoverTrustedDNSServers(reader, zap.NewNop().Sugar())
+
+	if len(ips) != 2 || ips[0].String() != "10.43.0.10" || ips[1].String() != "fd43::a" {
+		t.Fatalf("expected both kube-dns ClusterIPs, got %v", ips)
+	}
+}
+
+func TestDiscoverTrustedDNSServers_HeadlessKubeDNS(t *testing.T) {
+	reader := newFakeReader(kubeDNSSvc("None"))
+	trustedDNSServers = ""
+
+	if ips := discoverTrustedDNSServers(reader, zap.NewNop().Sugar()); len(ips) != 0 {
+		t.Fatalf("expected no IP for a headless kube-dns, got %v", ips)
+	}
+}
+
 func TestDiscoverTrustedDNSServers_UserProvidedOnly(t *testing.T) {
 	// No kube-dns service
 	reader := newFakeReader()

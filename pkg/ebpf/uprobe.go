@@ -373,9 +373,13 @@ func parseBPFLogLevel(s string) ebpf.LogLevel {
 // "none"/"lo-only" to attach only to loopback. See the field comment on
 // TLSUprobeManager.egressInterface for the full semantics.
 //
-// hostRes selects the host resolution mode. In virtual-ip mode the virtual
-// IP maps are pinned under hostRes.PinPath, which must be on bpffs.
-func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterface string, hostRes HostResolutionConfig, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
+// hostRes selects the host resolution mode (nil: dns-snoop). In virtual-ip
+// mode the virtual IP maps are pinned under hostRes.PinPath, which must be on
+// bpffs.
+func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterface string, hostRes *HostResolutionConfig, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
+	if hostRes == nil {
+		hostRes = &HostResolutionConfig{}
+	}
 	log = log.Named("ebpf-uprobe")
 
 	if err := hostRes.validate(); err != nil {
@@ -476,15 +480,15 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		dnsRewriteFailed: make(map[string]bool),
 	}
 	if hostRes.virtualIP() {
-		mgr.virtualIPs = newVirtualIPAllocator(objs, hostRes.VirtualIPRange, log)
+		mgr.virtualIPs = newVirtualIPAllocator(objs, hostRes.VirtualIPRanges, log)
 		mgr.virtualIPs.logRestored()
 		// Without the redirect, a pod handed a fake IP could not connect.
-		if err := mgr.attachVirtualIPRedirect(hostRes.VirtualIPRange, kubepods); err != nil {
+		if err := mgr.attachVirtualIPRedirect(hostRes.VirtualIPRanges, kubepods); err != nil {
 			_ = mgr.Close()
 			return nil, fmt.Errorf("attaching the virtual IP connect redirect: %w", err)
 		}
 		log.Infow("virtual IP host resolution enabled (experimental): kloak pods get fake IPs for watched hosts, connects to them are redirected",
-			"range", hostRes.VirtualIPRange.String(), "pinPath", hostRes.pinPath(), "cgroup", kubepods)
+			"range", hostRes.VirtualIPRanges.String(), "pinPath", hostRes.pinPath(), "cgroup", kubepods)
 	}
 
 	// Attach tracepoints for DNS interception and connect tracking.
@@ -2323,7 +2327,7 @@ var debugCounterNames = []string{
 	"secret_binding_deny", "secret_binding_audit",
 	"sni_captured", "sni_deny", "sni_audit",
 	"vip_dns_rewritten", "vip_dns_unchanged", "vip_connect_redirect", "vip_connect_refused",
-	"vip_dns_unbound", "vip_sock_host_deny", "vip_sock_addr_deny",
+	"vip_dns_unbound", "vip_sock_host_deny", "vip_sock_addr_deny", "sock_ipv6_deny",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

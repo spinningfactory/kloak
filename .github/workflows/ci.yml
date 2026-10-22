@@ -402,7 +402,8 @@ jobs:
     # so required status checks still match. "clsact" reruns the suite with
     # the pre-6.6-kernel tc fallback forced on, since CI kernels support TCX
     # and would never exercise it. "virtual-ip" reruns it with the
-    # experimental virtual IP host resolution (spinningfactory/kloak#327).
+    # experimental virtual IP host resolution (spinningfactory/kloak#327), on
+    # a dual-stack cluster for its IPv6 tests.
     name: ${{ (matrix.tc-attach-mode == 'auto' && matrix.host-resolution == 'dns-snoop') && 'E2E Tests' || (matrix.host-resolution != 'dns-snoop' && format('E2E Tests ({0})', matrix.host-resolution)) || format('E2E Tests (tc {0})', matrix.tc-attach-mode) }}
     runs-on: ubuntu-latest
     needs: [build, test]
@@ -458,7 +459,18 @@ jobs:
 
       - name: Install k3s
         run: |
-          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="--write-kubeconfig-mode 644 --disable=traefik" sh -
+          K3S_EXEC="--write-kubeconfig-mode 644 --disable=traefik"
+          if [ "${{ matrix.host-resolution }}" = "virtual-ip" ]; then
+            # Dual-stack, for TestVirtualIPv6. The runner has no IPv6
+            # address: the node gets a ULA one; pods on this single node
+            # reach each other and the IPv6 Services through it.
+            IFACE=$(ip -4 route show default | awk '{print $5; exit}')
+            V4=$(ip -4 -o addr show dev "$IFACE" | awk '{split($4, a, "/"); print a[1]; exit}')
+            sudo ip -6 addr add fd00:6b6c::1/64 dev "$IFACE" nodad
+            sudo sysctl -w net.ipv6.conf.all.forwarding=1
+            K3S_EXEC="$K3S_EXEC --node-ip=$V4,fd00:6b6c::1 --cluster-cidr=10.42.0.0/16,fd42::/56 --service-cidr=10.43.0.0/16,fd43::/112 --flannel-ipv6-masq"
+          fi
+          curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="$K3S_EXEC" sh -
           # Wait for node to register before running kubectl wait
           for i in $(seq 1 30); do
             sudo k3s kubectl get nodes -o name 2>/dev/null | grep -q . && break

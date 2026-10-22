@@ -15,7 +15,7 @@ import (
 
 func main() {
 	fmt.Println("Attempting to load eBPF objects...")
-	mgr, err := ebpfpkg.NewTLSUprobeManager(nil, "", "auto", ebpfpkg.HostResolutionConfig{}, zap.NewNop().Sugar())
+	mgr, err := ebpfpkg.NewTLSUprobeManager(nil, "", "auto", nil, zap.NewNop().Sugar())
 	if err != nil {
 		var ve *ebpf.VerifierError
 		if errors.As(err, &ve) {

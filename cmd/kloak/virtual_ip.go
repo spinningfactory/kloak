@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/netip"
 
@@ -16,17 +17,23 @@ import (
 	"github.com/spinningfactory/kloak/pkg/ebpf"
 )
 
-// checkVirtualIPRange refuses a virtual IP range that overlaps an address
+// checkVirtualIPRanges refuses virtual IP ranges that overlap an address
 // range in use on the cluster or the node (see discoverReservedRanges).
-func checkVirtualIPRange(ctx context.Context, reader client.Reader, r netip.Prefix, procDir string, log *zap.SugaredLogger) error {
+func checkVirtualIPRanges(ctx context.Context, reader client.Reader, r ebpf.VirtualIPRanges, procDir string, log *zap.SugaredLogger) error {
 	reserved, err := discoverReservedRanges(ctx, reader, procDir, log)
 	if err != nil {
 		return fmt.Errorf("listing the address ranges in use: %w", err)
 	}
-	if err := ebpf.CheckVirtualIPRange(r, reserved); err != nil {
+	var errs []error
+	for _, p := range r.Prefixes() {
+		if err := ebpf.CheckVirtualIPRange(p, reserved); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if err := errors.Join(errs...); err != nil {
 		return err
 	}
-	log.Infow("virtual IP range does not overlap any address range in use",
+	log.Infow("virtual IP ranges do not overlap any address range in use",
 		"range", r.String(), "checkedRanges", len(reserved))
 	return nil
 }

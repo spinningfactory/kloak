@@ -44,6 +44,8 @@ const vipFlagRetired uint32 = 1
 type vipConfigVal struct {
 	Net4  [4]byte // network byte order
 	Mask4 [4]byte
+	Net6  [16]byte // all zero (with Mask6): no IPv6 range
+	Mask6 [16]byte
 }
 
 // vipUpstreamSlots is VIP_UPSTREAM_SLOTS in helpers.h.
@@ -57,28 +59,31 @@ type vipUpstreamVal struct {
 
 // vipUpstreamSlot matches C struct vip_upstream_slot.
 type vipUpstreamSlot struct {
-	IP4       [4]byte // all zero: empty slot
-	_         uint32
-	ExpiresAt uint64 // CLOCK_BOOTTIME nanoseconds
+	IP        [16]byte // IPv4-mapped or IPv6, the fake IP's family
+	ExpiresAt uint64   // CLOCK_BOOTTIME nanoseconds; 0: empty slot
 }
 
 // virtualIPMaps are the maps pinned in virtual-ip mode.
 var virtualIPMaps = []string{"vip_host_ip", "vip_ip_host", "vip_upstream"}
 
-// vipConfig returns the vip_config value for the range r (IPv4).
-func vipConfig(r netip.Prefix) vipConfigVal {
+// vipConfig returns the vip_config value for ranges.
+func vipConfig(r VirtualIPRanges) vipConfigVal {
 	var v vipConfigVal
-	v.Net4 = r.Masked().Addr().As4()
-	copy(v.Mask4[:], net.CIDRMask(r.Bits(), 32))
+	v.Net4 = r.V4.Masked().Addr().As4()
+	copy(v.Mask4[:], net.CIDRMask(r.V4.Bits(), 32))
+	if r.V6.IsValid() {
+		v.Net6 = r.V6.Masked().Addr().As16()
+		copy(v.Mask6[:], net.CIDRMask(r.V6.Bits(), 128))
+	}
 	return v
 }
 
-// attachVirtualIPRedirect enables the virtual IP data plane for range r:
+// attachVirtualIPRedirect enables the virtual IP data plane for ranges r:
 // vip_config turns on tc_dns_rewrite, and the connect and getpeername
 // hooks go on the kubepods cgroup at cgroupPath, which every pod's sockets
 // are under. Attached there, they run before programs on the root cgroup (a
 // CNI's socket load balancer), which then sees the real address.
-func (m *TLSUprobeManager) attachVirtualIPRedirect(r netip.Prefix, cgroupPath string) error {
+func (m *TLSUprobeManager) attachVirtualIPRedirect(r VirtualIPRanges, cgroupPath string) error {
 	if cgroupPath == "" {
 		return errors.New("kubepods cgroup not found")
 	}
@@ -119,7 +124,7 @@ type dnsRewriteAttach struct {
 	// another netns and wrongly look attached (see tcAttached).
 	netns *os.File
 	links []io.Closer
-	addrs []netip.Addr // IPv4 addresses of the interfaces attached to
+	addrs []netip.Addr // addresses of the interfaces attached to
 }
 
 func (a *dnsRewriteAttach) close() {
@@ -132,7 +137,7 @@ func (a *dnsRewriteAttach) close() {
 // AttachPodDNSRewrite attaches tc_dns_rewrite, in virtual-ip mode, at tc
 // ingress on the egress interfaces of a pod's network namespace, so that the
 // pod is handed the fake IPs of the hosts it has secrets for
-// (BindPodSecrets), and returns the IPv4 addresses of those interfaces: the
+// (BindPodSecrets), and returns the addresses of those interfaces: the
 // pod's, before its status reports them. pids are processes of the pod; the
 // first one still running names the netns. The reconciler calls it as soon
 // as the pod's sandbox runs, before its containers start, so that they find
@@ -195,7 +200,7 @@ func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) (
 				var l io.Closer
 				if l, err = m.attachTCProgram(m.objs.TcDnsRewrite, iface.Index, true, podNS); err == nil {
 					links = append(links, l)
-					addrs = append(addrs, interfaceIPv4s(iface)...)
+					addrs = append(addrs, interfaceAddrs(iface)...)
 					continue
 				}
 			}
@@ -228,9 +233,9 @@ func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) (
 	return addrs, nil
 }
 
-// interfaceIPv4s returns the IPv4 addresses of iface, in the calling
-// thread's netns.
-func interfaceIPv4s(iface *net.Interface) []netip.Addr {
+// interfaceAddrs returns the IPv4 and IPv6 addresses of iface, link-local
+// ones aside (no DNS answer is sent to them), in the calling thread's netns.
+func interfaceAddrs(iface *net.Interface) []netip.Addr {
 	list, err := iface.Addrs()
 	if err != nil {
 		return nil
@@ -238,7 +243,7 @@ func interfaceIPv4s(iface *net.Interface) []netip.Addr {
 	var out []netip.Addr
 	for _, a := range list {
 		if n, ok := a.(*net.IPNet); ok {
-			if ip, ok := netip.AddrFromSlice(n.IP); ok && ip.Unmap().Is4() {
+			if ip, ok := netip.AddrFromSlice(n.IP); ok && !ip.IsLinkLocalUnicast() {
 				out = append(out, ip.Unmap())
 			}
 		}
@@ -359,8 +364,11 @@ func runInNetns(ns *os.File, log *zap.SugaredLogger, fn func() ([]io.Closer, err
 // pinPath, so loading spec reuses the maps a previous controller pinned
 // there (and pins new ones otherwise). A pin whose layout no longer matches
 // spec, left by another kloak version, is removed so the load recreates it
-// instead of failing. Its hosts then get fresh fake IPs, mostly the same
-// ones since allocation is derived from a hash of the host.
+// instead of failing. For vip_host_ip or vip_ip_host, its hosts then get
+// fresh fake IPs, mostly the same ones since allocation is derived from a
+// hash of the host; for vip_upstream, the real addresses are recorded again
+// from the next DNS answers, and until then a connect to a fake IP is
+// refused.
 func prepareVirtualIPPins(spec *ebpf.CollectionSpec, pinPath string, log *zap.SugaredLogger) error {
 	if err := requireBPFFS(pinPath); err != nil {
 		return err
@@ -388,7 +396,11 @@ func prepareVirtualIPPins(spec *ebpf.CollectionSpec, pinPath string, log *zap.Su
 		if err == nil {
 			continue
 		}
-		log.Warnw("pinned virtual IP map does not match this version's layout, recreating it (its hosts get new fake IPs)",
+		lost := "its hosts get new fake IPs"
+		if name == "vip_upstream" {
+			lost = "connects to a fake IP are refused until a DNS answer for its host records the real addresses again"
+		}
+		log.Warnw("pinned virtual IP map does not match this version's layout, recreating it ("+lost+")",
 			"path", path, "error", err)
 		if err := os.Remove(path); err != nil {
 			return fmt.Errorf("removing incompatible pinned map %s: %w", path, err)
@@ -445,21 +457,21 @@ func RemoveVirtualIPPins(pinPath string, log *zap.SugaredLogger) {
 }
 
 // virtualIPAllocator keeps vip_ip_host and vip_host_ip in line with the
-// watched hosts (planVirtualIPs), and clears vip_upstream of fake IPs that
-// no longer lead to their host.
+// watched hosts (planVirtualIPRanges), and clears vip_upstream of fake IPs
+// that no longer lead to their host.
 type virtualIPAllocator struct {
 	hostIP   *ebpf.Map // vip_host_ip
 	ipHost   *ebpf.Map // vip_ip_host
 	upstream *ebpf.Map // vip_upstream; nil skips its cleanup
-	prefix   netip.Prefix
+	ranges   VirtualIPRanges
 	log      *zap.SugaredLogger
 	// unallocated holds the hosts last reported as left without a fake IP,
 	// so the error is logged when the set changes rather than every sync.
 	unallocated []string
 }
 
-func newVirtualIPAllocator(objs *tlsuprobeObjects, prefix netip.Prefix, log *zap.SugaredLogger) *virtualIPAllocator {
-	return &virtualIPAllocator{hostIP: objs.VipHostIp, ipHost: objs.VipIpHost, upstream: objs.VipUpstream, prefix: prefix, log: log}
+func newVirtualIPAllocator(objs *tlsuprobeObjects, ranges VirtualIPRanges, log *zap.SugaredLogger) *virtualIPAllocator {
+	return &virtualIPAllocator{hostIP: objs.VipHostIp, ipHost: objs.VipIpHost, upstream: objs.VipUpstream, ranges: ranges, log: log}
 }
 
 // logRestored logs the reservations found in the pinned vip_ip_host, which
@@ -492,25 +504,31 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 		a.log.Errorw("failed to read vip_host_ip, skipping virtual IP sync", "error", err)
 		return
 	}
-	plan := planVirtualIPs(a.prefix, hosts, existing, now, int(a.ipHost.MaxEntries()))
+	p4, p6 := planVirtualIPRanges(a.ranges, hosts, existing, now, int(a.ipHost.MaxEntries()))
+	entries := make(map[netip.Addr]vipEntry, len(p4.Entries)+len(p6.Entries))
+	maps.Copy(entries, p4.Entries)
+	maps.Copy(entries, p6.Entries)
 
 	// Write order keeps every IP in vip_host_ip resolvable in vip_ip_host:
-	// drop host -> IP entries that go away or change, then release
-	// reservations (making room before new ones), then write reservations,
-	// then the host -> IP side. vip_upstream is cleared of IPs released or
-	// handed to another host before the new host -> IP entries let
-	// tc_dns_rewrite record that host's addresses under them.
-	for host, ip := range currentHosts {
-		if want, ok := plan.Hosts[host]; ok && want == ip {
+	// drop host -> IP entries holding an IP that goes away or changes, then
+	// release reservations (making room before new ones), then write
+	// reservations, then the host -> IP side. vip_upstream is cleared of IPs
+	// released or handed to another host before the new host -> IP entries
+	// let tc_dns_rewrite record that host's addresses under them.
+	want := vipHostVals(p4.Hosts, p6.Hosts)
+	dropped := make(map[string]bool)
+	for host, cur := range currentHosts {
+		if w, ok := want[host]; ok && !dropsVirtualIP(cur, w) {
 			continue
 		}
 		key := vipHostKey(host)
 		if err := a.hostIP.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			a.log.Errorw("failed to delete vip_host_ip entry", "host", host, "error", err)
 		}
+		dropped[host] = true
 	}
 	for ip := range existing {
-		if _, ok := plan.Entries[ip]; ok {
+		if _, ok := entries[ip]; ok {
 			continue
 		}
 		key := dnsIPKey{IP: ip.As16()}
@@ -518,8 +536,8 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 			a.log.Errorw("failed to release virtual IP", "ip", ip.String(), "error", err)
 		}
 	}
-	a.pruneUpstreams(existing, plan.Entries)
-	for ip, e := range plan.Entries {
+	a.pruneUpstreams(existing, entries)
+	for ip, e := range entries {
 		val := vipIPValue(e)
 		if old, ok := existing[ip]; ok && vipIPValue(old) == val {
 			continue
@@ -528,40 +546,83 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 		if err := a.ipHost.Update(&key, &val, ebpf.UpdateAny); err != nil {
 			a.log.Errorw("failed to write vip_ip_host entry", "ip", ip.String(), "host", e.Host, "error", err)
 			// Without its reservation the IP must not be handed out.
-			delete(plan.Hosts, e.Host)
+			if ip.Is4() {
+				delete(p4.Hosts, e.Host)
+			} else {
+				delete(p6.Hosts, e.Host)
+			}
 		}
 	}
-	for host, ip := range plan.Hosts {
-		if cur, ok := currentHosts[host]; ok && cur == ip {
+	want = vipHostVals(p4.Hosts, p6.Hosts)
+	for host, val := range want {
+		if cur, ok := currentHosts[host]; ok && !dropped[host] && cur == val {
 			continue
 		}
 		key := vipHostKey(host)
-		val := vipHostVal{IP4: ip.As4()}
 		if err := a.hostIP.Update(&key, &val, ebpf.UpdateAny); err != nil {
-			a.log.Errorw("failed to write vip_host_ip entry", "host", host, "ip", ip.String(), "error", err)
+			a.log.Errorw("failed to write vip_host_ip entry", "host", host, "error", err)
+		}
+	}
+	for host := range currentHosts {
+		// Kept above, but its reservations could not be written.
+		if _, ok := want[host]; !ok && !dropped[host] {
+			key := vipHostKey(host)
+			if err := a.hostIP.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+				a.log.Errorw("failed to delete vip_host_ip entry", "host", host, "error", err)
+			}
 		}
 	}
 
-	for _, c := range plan.Allocated {
-		a.log.Infow("allocated virtual IP", "host", c.Host, "ip", c.IP.String())
+	var unallocated []string
+	for _, plan := range []*vipPlan{&p4, &p6} {
+		for _, c := range plan.Allocated {
+			a.log.Infow("allocated virtual IP", "host", c.Host, "ip", c.IP.String())
+		}
+		for _, c := range plan.Reactivated {
+			a.log.Infow("reactivated virtual IP", "host", c.Host, "ip", c.IP.String())
+		}
+		for _, c := range plan.Retired {
+			a.log.Infow("retired virtual IP (host no longer watched)", "host", c.Host, "ip", c.IP.String(),
+				"reservedUntil", now.Add(virtualIPRetention).UTC().Format(time.RFC3339))
+		}
+		for _, c := range plan.Released {
+			a.log.Infow("released virtual IP", "host", c.Host, "ip", c.IP.String(), "reason", c.Reason)
+		}
+		unallocated = append(unallocated, plan.Unallocated...)
 	}
-	for _, c := range plan.Reactivated {
-		a.log.Infow("reactivated virtual IP", "host", c.Host, "ip", c.IP.String())
-	}
-	for _, c := range plan.Retired {
-		a.log.Infow("retired virtual IP (host no longer watched)", "host", c.Host, "ip", c.IP.String(),
-			"reservedUntil", now.Add(virtualIPRetention).UTC().Format(time.RFC3339))
-	}
-	for _, c := range plan.Released {
-		a.log.Infow("released virtual IP", "host", c.Host, "ip", c.IP.String(), "reason", c.Reason)
-	}
-	if !slices.Equal(plan.Unallocated, a.unallocated) {
-		a.unallocated = plan.Unallocated
-		if len(plan.Unallocated) > 0 {
+	slices.Sort(unallocated)
+	unallocated = slices.Compact(unallocated)
+	if !slices.Equal(unallocated, a.unallocated) {
+		a.unallocated = unallocated
+		if len(unallocated) > 0 {
 			a.log.Errorw("virtual IP map is full, hosts left without a fake IP",
-				"hosts", plan.Unallocated, "capacity", a.ipHost.MaxEntries())
+				"hosts", unallocated, "capacity", a.ipHost.MaxEntries())
 		}
 	}
+}
+
+// vipHostVals returns the vip_host_ip values for the hosts' fake IPv4s and
+// fake IPv6s.
+func vipHostVals(ip4, ip6 map[string]netip.Addr) map[string]vipHostVal {
+	out := make(map[string]vipHostVal, len(ip4))
+	for host, ip := range ip4 {
+		v := out[host]
+		v.IP4 = ip.As4()
+		out[host] = v
+	}
+	for host, ip := range ip6 {
+		v := out[host]
+		v.IP6 = ip.As16()
+		out[host] = v
+	}
+	return out
+}
+
+// dropsVirtualIP reports whether going from the vip_host_ip value cur to
+// want takes away a fake IP cur holds.
+func dropsVirtualIP(cur, want vipHostVal) bool {
+	return (cur.IP4 != [4]byte{} && cur.IP4 != want.IP4) ||
+		(cur.IP6 != [16]byte{} && cur.IP6 != want.IP6)
 }
 
 // pruneUpstreams deletes the vip_upstream entries of fake IPs that are not
@@ -614,14 +675,14 @@ func readVirtualIPs(m *ebpf.Map) (map[netip.Addr]vipEntry, error) {
 	return out, nil
 }
 
-// readVirtualIPHosts reads the IPv4 side of vip_host_ip.
-func readVirtualIPHosts(m *ebpf.Map) (map[string]netip.Addr, error) {
-	out := make(map[string]netip.Addr)
+// readVirtualIPHosts reads vip_host_ip.
+func readVirtualIPHosts(m *ebpf.Map) (map[string]vipHostVal, error) {
+	out := make(map[string]vipHostVal)
 	var k watchedHostKey
 	var v vipHostVal
 	iter := m.Iterate()
 	for iter.Next(&k, &v) {
-		out[vipHostString(k.Host, maxHostLen)] = netip.AddrFrom4(v.IP4)
+		out[vipHostString(k.Host, maxHostLen)] = v
 	}
 	if err := iter.Err(); err != nil {
 		return nil, err

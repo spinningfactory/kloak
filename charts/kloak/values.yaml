@@ -61,9 +61,10 @@ controller:
     # secrets restricted to a hostname. "dns-snoop" (default) reads DNS
     # answers as pods receive them. "virtual-ip" is experimental
     # (spinningfactory/kloak#327): every such host gets a stable fake IP
-    # from virtualIPRange. A kloak pod with a secret restricted to the host
-    # gets it in place of the host's IPv4 addresses in DNS answers, and its
-    # connects to it are redirected to one of those addresses. A secret
+    # from virtualIPRange, and a fake IPv6. A kloak pod with a secret
+    # restricted to the host gets them in place of the host's addresses in
+    # DNS answers (A and AAAA records), and its connects to them are
+    # redirected to one of those addresses. A secret
     # restricted to the host is only rewritten on a connection made to its
     # fake IP (an app that connects to a hardcoded address, or resolves
     # outside the pod's DNS, gets none). While the controller is not running,
@@ -71,11 +72,15 @@ controller:
     # pinned under /sys/fs/bpf/kloak so restarts keep them; the pins stay on
     # the node after an uninstall until it reboots.
     hostResolution: dns-snoop
-    # IPv4 range (/19 or larger) the fake IPs come from in virtual-ip mode.
-    # The default is reserved for benchmarking (RFC 2544) and never routed.
-    # The controller refuses to start if the range overlaps a node address,
-    # a pod or service CIDR, or a route of the node.
-    virtualIPRange: 198.18.0.0/15
+    # Ranges the fake IPs come from in virtual-ip mode: an IPv4 range (/19
+    # or larger) and optionally an IPv6 one (/115 or larger),
+    # comma-separated (escape the comma as "\," with helm --set). Without
+    # an IPv6 range, AAAA answers are left unchanged, and an app that
+    # connects over IPv6 gets no host-restricted secret. The defaults are
+    # reserved for benchmarking (RFC 2544, RFC 5180) and never routed. The
+    # controller refuses to start if a range overlaps a node address, a pod
+    # or service CIDR, or a route of the node.
+    virtualIPRange: 198.18.0.0/15,2001:2::/48
   cgroupPath: /host/sys/fs/cgroup
   dns:
     # Trusted DNS server IPs. Only DNS responses from these servers are used

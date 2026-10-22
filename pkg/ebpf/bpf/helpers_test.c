@@ -804,7 +804,7 @@ static void test_sni_past_copy_buffer(void) {
 }
 
 // ============================================================================
-// DNS answer walks (dns_parse_question, dns_scan_a_records)
+// DNS answer walks (dns_parse_question, dns_scan_addr_records)
 // ============================================================================
 
 struct dns_msg {
@@ -875,6 +875,13 @@ static void dm_a(struct dns_msg *m, __u32 ttl, __u8 a, __u8 b, __u8 c, __u8 d) {
   dm_rr(m, DNS_TYPE_A, ttl, ip, 4);
 }
 
+// dm_aaaa writes an AAAA record for 2001:db8::<last>.
+static void dm_aaaa(struct dns_msg *m, __u32 ttl, __u8 last) {
+  __u8 ip[16] = {0x20, 0x01, 0x0d, 0xb8};
+  ip[15] = last;
+  dm_rr(m, DNS_TYPE_AAAA, ttl, ip, 16);
+}
+
 static __u32 dns_question(const struct dns_msg *m, struct dns_question *q) {
   memset(q, 0, sizeof(*q));
   return dns_parse_question(m->b, m->len, q);
@@ -884,7 +891,7 @@ static __u32 dns_answers(const struct dns_msg *m, struct dns_answers *a) {
   struct dns_question q;
   assert(dns_question(m, &q) == DNS_SCAN_OK);
   memset(a, 0, sizeof(*a));
-  return dns_scan_a_records(m->b, m->len, q.answers_off, q.ancount, a);
+  return dns_scan_addr_records(m->b, m->len, q.answers_off, q.ancount, q.qtype, a);
 }
 
 static void test_dns_question_basic(void) {
@@ -898,8 +905,13 @@ static void test_dns_question_basic(void) {
   assert(dns_question(&m, &q) == DNS_SCAN_OK);
   assert(q.qname_len == 15);
   assert(memcmp(q.qname, "api.example.com", 16) == 0); // zero-padded
+  assert(q.qtype == DNS_TYPE_A);
   assert(q.ancount == 1);
   assert(q.answers_off == answers);
+
+  dm_response(&m, "api.example.com", DNS_TYPE_AAAA, 1);
+  assert(dns_question(&m, &q) == DNS_SCAN_OK);
+  assert(q.qtype == DNS_TYPE_AAAA);
 }
 
 static void test_dns_question_not_an_answer(void) {
@@ -1017,8 +1029,7 @@ static void test_dns_answers_uncompressed_and_aaaa(void) {
   dm_name(&m, "api.example.com"); // uncompressed owner
   dm_a(&m, 5, 198, 51, 100, 7);
   dm_ptr(&m, 12);
-  __u8 v6[16] = {0x20, 0x01, 0x0d, 0xb8};
-  dm_rr(&m, 28, 5, v6, 16); // AAAA: not listed
+  dm_aaaa(&m, 5, 1); // AAAA in the answer to an A question: not listed
   dm_ptr(&m, 12);
   dm_a(&m, 5, 198, 51, 100, 8);
 
@@ -1026,19 +1037,65 @@ static void test_dns_answers_uncompressed_and_aaaa(void) {
   assert(dns_answers(&m, &a) == DNS_SCAN_OK);
   assert(a.n_recs == 2);
   assert(a.recs[0].ip[3] == 7 && a.recs[1].ip[3] == 8);
+  // Only the 4 bytes of an A record's address are set.
+  for (__u32 i = 4; i < 16; i++)
+    assert(a.recs[0].ip[i] == 0);
+}
+
+static void test_dns_answers_aaaa(void) {
+  // The answer to an AAAA question lists its AAAA records, behind a CNAME,
+  // and skips any A record.
+  struct dns_msg m;
+  dm_response(&m, "api.example.com", DNS_TYPE_AAAA, 4);
+  __u32 cname_owner = m.len;
+  dm_ptr(&m, 12);
+  struct dns_msg target = {0};
+  dm_name(&target, "edge.example.net");
+  dm_rr(&m, 5, 300, target.b, (__u16)target.len);
+  __u32 cname_target = cname_owner + 2 + 10;
+  dm_ptr(&m, (__u16)cname_target);
+  dm_aaaa(&m, 60, 0x10);
+  dm_ptr(&m, (__u16)cname_target);
+  dm_a(&m, 60, 192, 0, 2, 10);
+  __u32 second = m.len;
+  dm_ptr(&m, (__u16)cname_target);
+  dm_aaaa(&m, 61, 0x11);
+
+  struct dns_answers a;
+  assert(dns_answers(&m, &a) == DNS_SCAN_OK);
+  assert(a.n_recs == 2);
+  assert(a.recs[0].ttl == 60 && a.recs[1].ttl == 61);
+  assert(a.recs[1].off == second + 2 + 10);
+  const __u8 want[16] = {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x11};
+  assert(memcmp(a.recs[1].ip, want, 16) == 0);
+  assert(memcmp(m.b + a.recs[1].off, want, 16) == 0);
+
+  // An AAAA record that is not 16 bytes long.
+  dm_response(&m, "api.example.com", DNS_TYPE_AAAA, 1);
+  dm_ptr(&m, 12);
+  __u8 four[4] = {1, 2, 3, 4};
+  dm_rr(&m, DNS_TYPE_AAAA, 5, four, 4);
+  assert(dns_answers(&m, &a) == DNS_SCAN_MALFORMED);
+
+  // Another question type: nothing is listed.
+  dm_response(&m, "api.example.com", 16 /* TXT */, 1);
+  dm_ptr(&m, 12);
+  dm_a(&m, 5, 192, 0, 2, 10);
+  assert(dns_answers(&m, &a) == DNS_SCAN_OK);
+  assert(a.n_recs == 0 && a.rr_len == 0);
 }
 
 static void test_dns_answers_limits(void) {
   struct dns_msg m;
   struct dns_answers a;
-  // DNS_MAX_A_RECORDS records fit, one more leaves the answer unchanged.
-  for (__u32 count = DNS_MAX_A_RECORDS; count <= DNS_MAX_A_RECORDS + 1; count++) {
+  // DNS_MAX_ADDR_RECORDS records fit, one more leaves the answer unchanged.
+  for (__u32 count = DNS_MAX_ADDR_RECORDS; count <= DNS_MAX_ADDR_RECORDS + 1; count++) {
     dm_response(&m, "api.example.com", DNS_TYPE_A, (__u16)count);
     for (__u32 i = 0; i < count; i++) {
       dm_ptr(&m, 12);
       dm_a(&m, 5, 10, 0, 0, (__u8)i);
     }
-    __u32 want = count == DNS_MAX_A_RECORDS ? DNS_SCAN_OK : DNS_SCAN_INCOMPLETE;
+    __u32 want = count == DNS_MAX_ADDR_RECORDS ? DNS_SCAN_OK : DNS_SCAN_INCOMPLETE;
     assert(dns_answers(&m, &a) == want);
   }
 
@@ -1121,57 +1178,139 @@ static void test_csum_odd_bytes(void) {
   }
 }
 
+// v4 returns a.b.c.d IPv4-mapped; v6 returns 2001:db8::<last>.
+static const __u8 *v4(__u8 *out, __u8 a, __u8 b, __u8 c, __u8 d) {
+  memset(out, 0, 16);
+  out[10] = out[11] = 0xff;
+  out[12] = a;
+  out[13] = b;
+  out[14] = c;
+  out[15] = d;
+  return out;
+}
+
+static const __u8 *v6(__u8 *out, __u8 last) {
+  memset(out, 0, 16);
+  out[0] = 0x20;
+  out[1] = 0x01;
+  out[2] = 0x0d;
+  out[3] = 0xb8;
+  out[15] = last;
+  return out;
+}
+
+static void test_vip_addr(void) {
+  __u8 b[16], c[16];
+  assert(vip_addr_eq(v6(b, 1), v6(c, 1)));
+  assert(!vip_addr_eq(v6(b, 1), v6(c, 2)));
+  v6(c, 1);
+  c[0] ^= 0x80; // first byte differs
+  assert(!vip_addr_eq(v6(b, 1), c));
+  assert(!vip_addr_eq(v4(b, 0, 0, 0, 1), v6(c, 1)));
+  assert(vip_addr_v4mapped(v4(b, 10, 0, 0, 1)));
+  assert(!vip_addr_v4mapped(v6(b, 1)));
+  memset(b, 0, 16);
+  assert(!vip_addr_v4mapped(b) && vip_addr_unspecified(b)); // ::
+  assert(vip_addr_unspecified(v4(b, 0, 0, 0, 0)));         // 0.0.0.0
+  assert(!vip_addr_unspecified(v4(b, 0, 0, 0, 1)));
+  assert(!vip_addr_unspecified(v6(b, 0)));                 // 2001:db8::
+  memset(b, 0, 16);
+  b[15] = 1;
+  assert(!vip_addr_unspecified(b)); // ::1
+  memset(b, 0, 16);
+  b[10] = 0xff;
+  assert(!vip_addr_unspecified(b) && !vip_addr_v4mapped(b)); // ::ff00:0:0
+
+  // 2001:2::/48.
+  const __u8 net[16] = {0x20, 0x01, 0x00, 0x02};
+  const __u8 mask[16] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+  __u8 in[16] = {0x20, 0x01, 0x00, 0x02, 0, 0, 0xab, 0xcd};
+  in[15] = 9;
+  assert(vip_in_prefix6(net, mask, in));
+  in[5] = 1; // 2001:2:1::/48
+  assert(!vip_in_prefix6(net, mask, in));
+  assert(!vip_in_prefix6(net, mask, v4(b, 198, 18, 0, 5)));
+  // No IPv6 range: nothing is in it, not even ::.
+  const __u8 zero[16] = {0};
+  assert(!vip_in_prefix6(zero, zero, zero));
+  // A /52: the mask's partial byte counts.
+  const __u8 mask52[16] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xf0};
+  in[5] = 0;
+  in[6] = 0x0f;
+  assert(vip_in_prefix6(net, mask52, in));
+  in[6] = 0x10;
+  assert(!vip_in_prefix6(net, mask52, in));
+}
+
 static void test_vip_upstream_record(void) {
   struct vip_upstream_val v;
   memset(&v, 0, sizeof(v));
-  const __u8 a[4] = {10, 0, 0, 1}, b[4] = {10, 0, 0, 2}, c[4] = {10, 0, 0, 3},
-             d[4] = {10, 0, 0, 4}, e[4] = {10, 0, 0, 5}, zero[4] = {0};
+  __u8 a[16], b[16], c[16], d[16], e[16], zero[16];
+  v4(a, 10, 0, 0, 1);
+  v4(b, 10, 0, 0, 2);
+  v4(c, 10, 0, 0, 3);
+  v4(d, 10, 0, 0, 4);
+  v4(e, 10, 0, 0, 5);
+  v4(zero, 0, 0, 0, 0);
 
   vip_upstream_record(&v, a, 100);
-  assert(memcmp(v.slot[0].ip4, a, 4) == 0 && v.slot[0].expires_at == 100);
+  assert(memcmp(v.slot[0].ip, a, 16) == 0 && v.slot[0].expires_at == 100);
   // Same address: the later expiry wins, an earlier one doesn't shorten it.
   vip_upstream_record(&v, a, 200);
   vip_upstream_record(&v, a, 150);
   assert(v.slot[0].expires_at == 200 && v.slot[1].expires_at == 0);
+  // Unspecified addresses are not recorded.
   vip_upstream_record(&v, zero, 999);
-  assert(v.slot[1].ip4[3] == 0 && v.slot[1].expires_at == 0);
+  memset(zero, 0, 16);
+  vip_upstream_record(&v, zero, 999);
+  // Nor is an address without an expiry (expires_at 0 marks empty slots).
+  vip_upstream_record(&v, b, 0);
+  assert(vip_addr_unspecified(v.slot[1].ip) && v.slot[1].expires_at == 0);
 
   vip_upstream_record(&v, b, 300);
   vip_upstream_record(&v, c, 50);
   vip_upstream_record(&v, d, 400);
   // Full: e replaces c, the slot that expires first.
   vip_upstream_record(&v, e, 500);
-  assert(memcmp(v.slot[2].ip4, e, 4) == 0 && v.slot[2].expires_at == 500);
-  assert(memcmp(v.slot[0].ip4, a, 4) == 0 && memcmp(v.slot[1].ip4, b, 4) == 0 &&
-         memcmp(v.slot[3].ip4, d, 4) == 0);
-}
+  assert(memcmp(v.slot[2].ip, e, 16) == 0 && v.slot[2].expires_at == 500);
+  assert(memcmp(v.slot[0].ip, a, 16) == 0 && memcmp(v.slot[1].ip, b, 16) == 0 &&
+         memcmp(v.slot[3].ip, d, 16) == 0);
 
-static __u32 ip4(__u8 a, __u8 b, __u8 c, __u8 d) {
-  __u8 ip[4] = {a, b, c, d};
-  __u32 v;
-  memcpy(&v, ip, 4);
-  return v;
+  // IPv6 addresses (a fake IPv6's upstreams) are compared whole.
+  memset(&v, 0, sizeof(v));
+  vip_upstream_record(&v, v6(a, 1), 100);
+  vip_upstream_record(&v, v6(b, 2), 100);
+  vip_upstream_record(&v, v6(c, 1), 300);
+  assert(memcmp(v.slot[0].ip, a, 16) == 0 && v.slot[0].expires_at == 300);
+  assert(memcmp(v.slot[1].ip, b, 16) == 0 && vip_addr_unspecified(v.slot[2].ip));
 }
 
 static void test_vip_upstream_pick(void) {
   struct vip_upstream_val v;
   memset(&v, 0, sizeof(v));
-  assert(vip_upstream_pick(&v, 0, 0) == 0);
+  __u8 out[16], want[16];
+  memset(out, 0xaa, 16);
+  assert(!vip_upstream_pick(&v, 0, 0, out));
+  assert(out[0] == 0xaa); // untouched
 
-  const __u8 a[4] = {10, 0, 0, 1}, b[4] = {10, 0, 0, 2}, c[4] = {10, 0, 0, 3};
-  vip_upstream_record(&v, a, 100);
-  vip_upstream_record(&v, b, 300);
-  vip_upstream_record(&v, c, 200);
+  __u8 a[16], b[16], c[16];
+  vip_upstream_record(&v, v4(a, 10, 0, 0, 1), 100);
+  vip_upstream_record(&v, v4(b, 10, 0, 0, 2), 300);
+  vip_upstream_record(&v, v4(c, 10, 0, 0, 3), 200);
   // All unexpired: rnd picks among them, in slot order.
-  assert(vip_upstream_pick(&v, 50, 0) == ip4(10, 0, 0, 1));
-  assert(vip_upstream_pick(&v, 50, 1) == ip4(10, 0, 0, 2));
-  assert(vip_upstream_pick(&v, 50, 2) == ip4(10, 0, 0, 3));
-  assert(vip_upstream_pick(&v, 50, 3) == ip4(10, 0, 0, 1));
+  assert(vip_upstream_pick(&v, 50, 0, out) && memcmp(out, a, 16) == 0);
+  assert(vip_upstream_pick(&v, 50, 1, out) && memcmp(out, b, 16) == 0);
+  assert(vip_upstream_pick(&v, 50, 2, out) && memcmp(out, c, 16) == 0);
+  assert(vip_upstream_pick(&v, 50, 3, out) && memcmp(out, a, 16) == 0);
   // a expired: only b and c.
-  assert(vip_upstream_pick(&v, 150, 0) == ip4(10, 0, 0, 2));
-  assert(vip_upstream_pick(&v, 150, 1) == ip4(10, 0, 0, 3));
+  assert(vip_upstream_pick(&v, 150, 0, out) && memcmp(out, b, 16) == 0);
+  assert(vip_upstream_pick(&v, 150, 1, out) && memcmp(out, c, 16) == 0);
   // All expired: the one that expired last.
-  assert(vip_upstream_pick(&v, 1000, 7) == ip4(10, 0, 0, 2));
+  assert(vip_upstream_pick(&v, 1000, 7, out) && memcmp(out, b, 16) == 0);
+
+  memset(&v, 0, sizeof(v));
+  vip_upstream_record(&v, v6(a, 7), 100);
+  assert(vip_upstream_pick(&v, 50, 5, out) && memcmp(out, v6(want, 7), 16) == 0);
 }
 
 static void test_vip_socket_check(void) {
@@ -1205,6 +1344,17 @@ static void test_vip_socket_check(void) {
   assert(vip_socket_check(api, api_len, api, 16, real, real, 443, 443) == VIP_SOCK_OK);
   assert(vip_socket_check(other, api_len, api, 16, real, elsewhere, 443, 80) == VIP_SOCK_DENY_HOST);
   assert(vip_socket_check(api, api_len, api, 16, real, elsewhere, 443, 443) == VIP_SOCK_DENY_ADDR);
+
+  // An IPv6 secret IP against an IPv6 socket, and never against the IPv4
+  // socket whose address ends in the same bytes.
+  __u8 real6[16], other6[16];
+  v6(real6, 10);
+  v6(other6, 11);
+  __u8 tail[16];
+  v4(tail, 0, 0, 0, 10);
+  assert(vip_socket_check(api, api_len, api, 16, real6, real6, 443, 443) == VIP_SOCK_OK);
+  assert(vip_socket_check(api, api_len, api, 16, real6, other6, 443, 443) == VIP_SOCK_DENY_ADDR);
+  assert(vip_socket_check(api, api_len, api, 16, real6, tail, 443, 443) == VIP_SOCK_DENY_ADDR);
 }
 
 int main(void) {
@@ -1293,10 +1443,12 @@ int main(void) {
   RUN_TEST(test_dns_question_name_length);
   RUN_TEST(test_dns_answers_cname_chain);
   RUN_TEST(test_dns_answers_uncompressed_and_aaaa);
+  RUN_TEST(test_dns_answers_aaaa);
   RUN_TEST(test_dns_answers_limits);
   RUN_TEST(test_csum_odd_bytes);
 
   printf("vip_upstream:\n");
+  RUN_TEST(test_vip_addr);
   RUN_TEST(test_vip_upstream_record);
   RUN_TEST(test_vip_upstream_pick);
   RUN_TEST(test_vip_socket_check);
