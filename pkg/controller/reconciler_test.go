@@ -2,6 +2,8 @@ package controller
 
 import (
 	"context"
+	"net/netip"
+	"slices"
 	"testing"
 
 	"go.uber.org/zap"
@@ -357,5 +359,35 @@ func TestReconcile_DeleteTrackedPod(t *testing.T) {
 	}
 	if _, exists := r.podKeyToUID["default/deleted-pod"]; exists {
 		t.Error("podKeyToUID should be cleaned up")
+	}
+}
+
+func TestPodIPs(t *testing.T) {
+	ip := netip.MustParseAddr
+	for _, c := range []struct {
+		name string
+		pod  corev1.Pod
+		want []netip.Addr
+	}{
+		{"no address yet", corev1.Pod{}, nil},
+		{"dual stack", corev1.Pod{Status: corev1.PodStatus{
+			PodIP:  "10.42.0.7",
+			PodIPs: []corev1.PodIP{{IP: "10.42.0.7"}, {IP: "fd00::7"}},
+		}}, []netip.Addr{ip("10.42.0.7"), ip("fd00::7")}},
+		{"PodIP only", corev1.Pod{Status: corev1.PodStatus{PodIP: "10.42.0.8"}}, []netip.Addr{ip("10.42.0.8")}},
+		{"unparsable skipped", corev1.Pod{Status: corev1.PodStatus{
+			PodIPs: []corev1.PodIP{{IP: "bogus"}, {IP: "::ffff:10.42.0.9"}},
+		}}, []netip.Addr{ip("10.42.0.9")}},
+		// The node's address: the pod has no network of its own.
+		{"host network", corev1.Pod{
+			Spec:   corev1.PodSpec{HostNetwork: true},
+			Status: corev1.PodStatus{PodIP: "192.168.1.10"},
+		}, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := podIPs(&c.pod); !slices.Equal(got, c.want) {
+				t.Errorf("podIPs = %v, want %v", got, c.want)
+			}
+		})
 	}
 }

@@ -61,13 +61,13 @@ controller:
     # secrets restricted to a hostname. "dns-snoop" (default) reads DNS
     # answers as pods receive them. "virtual-ip" is experimental
     # (spinningfactory/kloak#327): every such host gets a stable fake IP
-    # from virtualIPRange. Kloak pods get it in place of the host's IPv4
-    # addresses in DNS answers, and their connects to it are redirected to
-    # one of those addresses; dns-snoop still decides the host. While the
-    # controller is not running, connects to fake IPs fail. The fake IPs and
-    # their addresses are kept in BPF maps pinned under /sys/fs/bpf/kloak so
-    # restarts keep them; the pins stay on the node after an uninstall until
-    # it reboots.
+    # from virtualIPRange. A kloak pod with a secret restricted to the host
+    # gets it in place of the host's IPv4 addresses in DNS answers, and its
+    # connects to it are redirected to one of those addresses; dns-snoop
+    # still decides the host. While the controller is not running, connects
+    # to fake IPs fail. The fake IPs and their addresses are kept in BPF maps
+    # pinned under /sys/fs/bpf/kloak so restarts keep them; the pins stay on
+    # the node after an uninstall until it reboots.
     hostResolution: dns-snoop
     # IPv4 range (/19 or larger) the fake IPs come from in virtual-ip mode.
     # The default is reserved for benchmarking (RFC 2544) and never routed.

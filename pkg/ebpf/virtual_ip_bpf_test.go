@@ -35,7 +35,7 @@ var (
 )
 
 // loadVirtualIPObjects loads the BPF objects with the virtual IP range of
-// the tests configured and vipTestHosts watched.
+// the tests configured, vipTestHosts watched, and vipTestPod granted them.
 func loadVirtualIPObjects(t *testing.T) *tlsuprobeObjects {
 	t.Helper()
 	objs := loadTestObjects(t)
@@ -49,8 +49,21 @@ func loadVirtualIPObjects(t *testing.T) *tlsuprobeObjects {
 		if err := objs.VipHostIp.Update(&key, &val, ciliumebpf.UpdateAny); err != nil {
 			t.Fatal(err)
 		}
+		putPodHost(t, objs, vipTestPod, host)
 	}
 	return objs
+}
+
+// putPodHost lets the pod at addr get the fake IP of host (vip_pod_host);
+// "" stands for every host.
+func putPodHost(t *testing.T, objs *tlsuprobeObjects, addr netip.Addr, host string) {
+	t.Helper()
+	k := vipPodHostKey{PodIP: addr.As16()}
+	copy(k.Host[:], host)
+	v := uint8(1)
+	if err := objs.VipPodHost.Update(&k, &v, ciliumebpf.UpdateAny); err != nil {
+		t.Fatal(err)
+	}
 }
 
 // dnsResponse builds a compressed NOERROR response to a query for qname.
@@ -290,6 +303,44 @@ func TestDNSRewrite(t *testing.T) {
 		}
 		if _, ok := readUpstream(t, objs, vipTestFake); ok {
 			t.Error("fake IP recorded as its own upstream")
+		}
+	})
+
+	t.Run("pod scope", func(t *testing.T) {
+		scoped := netip.MustParseAddr("10.42.0.8")
+		audit := netip.MustParseAddr("10.42.0.9")
+		putPodHost(t, objs, scoped, "apis.example.com")
+		putPodHost(t, objs, audit, "")
+		for _, c := range []struct {
+			name      string
+			pod       netip.Addr
+			host      string
+			rewritten bool
+		}{
+			{"granted the host", scoped, "apis.example.com", true},
+			{"granted another host", scoped, "api.example.com", false},
+			{"granted every host", audit, "api.example.com", true},
+			{"granted nothing", netip.MustParseAddr("10.42.0.10"), "api.example.com", false},
+		} {
+			t.Run(c.name, func(t *testing.T) {
+				clearUpstreams(t, objs)
+				msg := dnsResponse(t, c.host, dnsmessage.TypeA, dnsmessage.RCodeSuccess, aRecords(t, c.host, vipTestReal[0]))
+				in := udpFrame(vipTestDNS, c.pod, 53, 40000, msg, true)
+				out := runTC(t, prog, in)
+				fake := vipTestHosts[c.host]
+				if !c.rewritten {
+					if !bytes.Equal(out, in) {
+						t.Error("answer changed")
+					}
+					if _, ok := readUpstream(t, objs, fake); ok {
+						t.Error("vip_upstream written")
+					}
+					return
+				}
+				if got := answerAddrs(t, out); len(got) != 1 || got[0] != fake {
+					t.Errorf("A records after rewrite: %v, want %s", got, fake)
+				}
+			})
 		}
 	})
 

@@ -59,6 +59,7 @@ func TestVirtualIPLayout(t *testing.T) {
 		{"vip_ip_val", vipIPVal{}, tlsuprobeVipIpVal{}},
 		{"vip_config_val", vipConfigVal{}, tlsuprobeVipConfigVal{}},
 		{"vip_upstream_val", vipUpstreamVal{}, tlsuprobeVipUpstreamVal{}},
+		{"vip_pod_host_key", vipPodHostKey{}, tlsuprobeVipPodHostKey{}},
 	} {
 		if got, want := binary.Size(c.got), binary.Size(c.want); got != want {
 			t.Errorf("%T is %d bytes, struct %s is %d", c.got, got, c.name, want)

@@ -2,6 +2,7 @@ package ebpf
 
 import (
 	"fmt"
+	"net/netip"
 	"strings"
 
 	"golang.org/x/net/http2/hpack"
@@ -109,50 +110,104 @@ type secretBindingEvent struct {
 // of the pod may redeem the secrets the pod references.
 type podBinding struct {
 	pod       string // namespace/name, for logs
+	podIPs    []netip.Addr
 	cgroupIDs []uint64
 	refs      []secrets.Ref
 }
 
-// secretACL returns the secret_acl entries the bindings grant over the
-// snapshot. A Ref whose owner or key is not in the snapshot grants nothing.
-func secretACL(snapshot []secrets.Secret, bindings map[string]podBinding) map[secretACLKey]struct{} {
-	// owner → data key → placeholder keys
-	byOwner := make(map[string]map[string][]placeholderKey)
+// secretsByRef indexes a snapshot by owner and data key, to resolve
+// secrets.Ref.
+type secretsByRef map[string]map[string]*secrets.Secret
+
+func indexSecrets(snapshot []secrets.Secret) secretsByRef {
+	ix := make(secretsByRef)
 	for i := range snapshot {
 		s := &snapshot[i]
-		keys := placeholderKeys(s.Shadow)
-		if len(keys) == 0 {
-			continue
+		if ix[s.OwnerID] == nil {
+			ix[s.OwnerID] = make(map[string]*secrets.Secret)
 		}
-		if byOwner[s.OwnerID] == nil {
-			byOwner[s.OwnerID] = make(map[string][]placeholderKey)
-		}
-		byOwner[s.OwnerID][s.Key] = keys
+		ix[s.OwnerID][s.Key] = s
 	}
+	return ix
+}
 
-	acl := make(map[secretACLKey]struct{})
-	grant := func(cgroupIDs []uint64, keys []placeholderKey) {
-		for _, cg := range cgroupIDs {
-			for _, k := range keys {
-				acl[secretACLKey{CgroupID: cg, Key: k}] = struct{}{}
-			}
+// each calls fn for every secret ref grants: all of its owner's keys, or
+// the ones ref.Keys names. A Ref whose owner or key is not in the snapshot
+// grants nothing.
+func (ix secretsByRef) each(ref secrets.Ref, fn func(*secrets.Secret)) {
+	owned := ix[ref.OwnerID]
+	if ref.Keys == nil {
+		for _, s := range owned {
+			fn(s)
+		}
+		return
+	}
+	for _, k := range ref.Keys {
+		if s, ok := owned[k]; ok {
+			fn(s)
 		}
 	}
+}
+
+// secretACL returns the secret_acl entries the bindings grant over the
+// snapshot.
+func secretACL(snapshot []secrets.Secret, bindings map[string]podBinding) map[secretACLKey]struct{} {
+	ix := indexSecrets(snapshot)
+	acl := make(map[secretACLKey]struct{})
 	for _, b := range bindings {
 		for _, ref := range b.refs {
-			owned := byOwner[ref.OwnerID]
-			if ref.Keys == nil {
-				for _, keys := range owned {
-					grant(b.cgroupIDs, keys)
+			ix.each(ref, func(s *secrets.Secret) {
+				for _, k := range placeholderKeys(s.Shadow) {
+					for _, cg := range b.cgroupIDs {
+						acl[secretACLKey{CgroupID: cg, Key: k}] = struct{}{}
+					}
 				}
-				continue
-			}
-			for _, k := range ref.Keys {
-				grant(b.cgroupIDs, owned[k])
-			}
+			})
 		}
 	}
 	return acl
+}
+
+// vipPodHostKey must match struct vip_pod_host_key in tls_uprobe.c.
+type vipPodHostKey struct {
+	PodIP [16]byte         // IPv4-mapped-IPv6
+	Host  [maxHostLen]byte // all zero: every watched host
+}
+
+// vipPodHosts returns the vip_pod_host entries for the bindings over the
+// snapshot: each IPv4 address of a pod, paired with the host of every
+// secret the pod references that is restricted to a hostname, so that
+// tc_dns_rewrite hands the pod those hosts' fake IPs. anyHost
+// (--secret-binding=audit, where a pod may redeem every secret) pairs each
+// address with every watched host instead.
+func vipPodHosts(snapshot []secrets.Secret, bindings map[string]podBinding, anyHost bool) map[vipPodHostKey]struct{} {
+	ix := indexSecrets(snapshot)
+	out := make(map[vipPodHostKey]struct{})
+	for _, b := range bindings {
+		for _, ip := range b.podIPs {
+			// tc_dns_rewrite rewrites IPv4 answers only.
+			if ip = ip.Unmap(); !ip.Is4() {
+				continue
+			}
+			addr := vipPodHostKey{PodIP: ip.As16()}
+			if anyHost {
+				out[addr] = struct{}{}
+				continue
+			}
+			for _, ref := range b.refs {
+				ix.each(ref, func(s *secrets.Secret) {
+					// The hosts applySecrets puts in watched_hosts.
+					if s.Host == "" || len(s.Host) >= maxHostLen {
+						return
+					}
+					k := addr
+					copy(k.Host[:], s.Host)
+					out[k] = struct{}{}
+				})
+			}
+		}
+	}
+	return out
 }
 
 // describeBindingEvent names the pod and secret behind a violation event,

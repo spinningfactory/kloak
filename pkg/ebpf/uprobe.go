@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"net"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -136,12 +137,14 @@ type TLSUprobeManager struct {
 	// objects, so a sleeping retry can't fire AttachTLS against a freed map fd.
 	retryWG sync.WaitGroup
 
-	// bindMu guards bindings and lastSnapshot, and serializes every
-	// secret_acl write, so a periodic sync can't prune entries a concurrent
-	// BindPodSecrets just granted.
+	// bindMu guards bindings, bindingMode and lastSnapshot, and serializes
+	// every secret_acl and vip_pod_host write, so a periodic sync can't
+	// prune entries a concurrent BindPodSecrets just granted.
 	bindMu sync.Mutex
 	// bindings maps pod UID → the secrets that pod may redeem (secret_binding.go).
 	bindings map[string]podBinding
+	// bindingMode is the --secret-binding mode (SetSecretBindingMode).
+	bindingMode SecretBindingMode
 	// lastSnapshot is the most recent secrets snapshot, used to grant a new
 	// pod's bindings immediately instead of at the next periodic sync.
 	lastSnapshot []secrets.Secret
@@ -152,14 +155,13 @@ type TLSUprobeManager struct {
 	// virtualIPs allocates the watched hosts' fake IPs in virtual-ip host
 	// resolution mode; nil otherwise.
 	virtualIPs *virtualIPAllocator
-	// dnsRewriteMu guards dnsRewriteNetns and dnsRewriteFailed, and
-	// serializes attachDNSRewrite.
+	// dnsRewriteMu guards dnsRewrite and dnsRewriteFailed, and serializes
+	// AttachPodDNSRewrite.
 	dnsRewriteMu sync.Mutex
-	// dnsRewriteNetns holds an open fd to each pod netns tc_dns_rewrite is
-	// attached in, keyed by inode (pinning it, like tcAttached).
-	dnsRewriteNetns map[uint64]*os.File
-	// dnsRewriteFailed records the netns whose attach failure was logged.
-	dnsRewriteFailed map[uint64]bool
+	// dnsRewrite maps pod UID → tc_dns_rewrite attached in the pod's netns.
+	dnsRewrite map[string]*dnsRewriteAttach
+	// dnsRewriteFailed records the pods whose attach failure was logged.
+	dnsRewriteFailed map[string]bool
 
 	// uprobesMu guards uprobes and cgroupLinks.
 	uprobesMu sync.Mutex
@@ -470,8 +472,8 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		tcMode:           newTCModeResolver(TCAttachAuto),
 		bindings:         make(map[string]podBinding),
 		bindingLogged:    make(map[bindingLogKey]time.Time),
-		dnsRewriteNetns:  make(map[uint64]*os.File),
-		dnsRewriteFailed: make(map[uint64]bool),
+		dnsRewrite:       make(map[string]*dnsRewriteAttach),
+		dnsRewriteFailed: make(map[string]bool),
 	}
 	if hostRes.virtualIP() {
 		mgr.virtualIPs = newVirtualIPAllocator(objs, hostRes.VirtualIPRange, log)
@@ -1115,7 +1117,6 @@ func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 					_ = e.netnsFd.Close()
 				}
 			}
-			m.releaseDNSRewriteNetns(ino)
 		}
 	}
 
@@ -1161,10 +1162,6 @@ func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 // containers only.
 func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 	exePath := fmt.Sprintf("/proc/%d/exe", pid)
-
-	// Virtual-ip mode: from now on the pod gets fake IPs for watched hosts.
-	// A failure is logged once and retried with the next attach.
-	_ = m.attachDNSRewrite(pid, cgroupID)
 
 	// Register the process for DNS/connect tracking.
 	if err := m.TrackTGID(uint32(pid)); err != nil {
@@ -1866,6 +1863,13 @@ func (m *TLSUprobeManager) Close() error {
 	}
 	clear(m.uprobes)
 	m.uprobesMu.Unlock()
+	m.dnsRewriteMu.Lock()
+	for uid, a := range m.dnsRewrite {
+		links = append(links, a.links...)
+		links = append(links, a.netns)
+		delete(m.dnsRewrite, uid)
+	}
+	m.dnsRewriteMu.Unlock()
 
 	linkCount := len(links)
 	var errs []error
@@ -2127,12 +2131,18 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 	defer m.bindMu.Unlock()
 	m.lastSnapshot = snapshot
 	syncSecretACL(m.objs.SecretAcl, snapshot, m.bindings, m.log)
+	if m.virtualIPs != nil {
+		syncVipPodHost(m.objs.VipPodHost, vipPodHosts(snapshot, m.bindings, m.bindingMode == SecretBindingAudit), m.log)
+	}
 }
 
 // SetSecretBindingMode configures what the data plane does when a process
 // redeems a placeholder of a secret its pod does not reference. The BPF
 // default (an unwritten map) is enforce, so a failed write fails closed.
 func (m *TLSUprobeManager) SetSecretBindingMode(mode SecretBindingMode) {
+	m.bindMu.Lock()
+	m.bindingMode = mode
+	m.bindMu.Unlock()
 	key, val := uint32(0), mode.bpfValue()
 	if err := m.objs.SecretBindingMode.Update(&key, &val, ebpf.UpdateAny); err != nil {
 		m.log.Errorw("failed to set secret binding mode; enforcing", "mode", mode, "error", err)
@@ -2152,20 +2162,30 @@ func (m *TLSUprobeManager) SetSNICheckMode(mode SNICheckMode) {
 
 // BindPodSecrets records which secrets a pod may redeem and grants them to
 // its container cgroups at once, so the pod's first TLS writes are rewritten.
-// It replaces any previous binding for the pod: cgroups or references that
-// went away are revoked at the next sync. podUID keys the binding; pod
-// (namespace/name) is only used in logs.
-func (m *TLSUprobeManager) BindPodSecrets(podUID, pod string, cgroupIDs []uint64, refs []secrets.Ref) {
-	b := podBinding{pod: pod, cgroupIDs: cgroupIDs, refs: refs}
+// In virtual-ip mode it also lets the pod at podIPs (its network, which
+// exists before its containers do) get the fake IPs of those secrets'
+// hosts. It replaces any previous binding for the pod: addresses, cgroups
+// or references that went away are revoked at the next sync. podUID keys
+// the binding; pod (namespace/name) is only used in logs.
+func (m *TLSUprobeManager) BindPodSecrets(podUID, pod string, podIPs []netip.Addr, cgroupIDs []uint64, refs []secrets.Ref) {
+	b := podBinding{pod: pod, podIPs: podIPs, cgroupIDs: cgroupIDs, refs: refs}
 
 	m.bindMu.Lock()
 	defer m.bindMu.Unlock()
 	m.bindings[podUID] = b
 
 	allowed := uint8(1)
-	for key := range secretACL(m.lastSnapshot, map[string]podBinding{podUID: b}) {
+	single := map[string]podBinding{podUID: b}
+	for key := range secretACL(m.lastSnapshot, single) {
 		if err := m.objs.SecretAcl.Update(&key, &allowed, ebpf.UpdateAny); err != nil {
 			m.log.Errorw("failed to grant secret binding", "error", err, "pod", pod, "cgroupID", key.CgroupID)
+		}
+	}
+	if m.virtualIPs != nil {
+		for key := range vipPodHosts(m.lastSnapshot, single, m.bindingMode == SecretBindingAudit) {
+			if err := m.objs.VipPodHost.Update(&key, &allowed, ebpf.UpdateAny); err != nil {
+				m.log.Errorw("failed to grant the pod its hosts' virtual IPs", "error", err, "pod", pod)
+			}
 		}
 	}
 }
@@ -2200,6 +2220,11 @@ func (m *TLSUprobeManager) UnbindPod(podUID string) {
 		if err := m.objs.SecretAcl.Delete(&stale[i]); err != nil {
 			m.log.Errorw("failed to revoke secret binding", "error", err, "pod", b.pod)
 		}
+	}
+	// The pod's address may already belong to a new pod: keep what the
+	// remaining bindings grant.
+	if m.virtualIPs != nil && len(b.podIPs) > 0 {
+		syncVipPodHost(m.objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, m.bindingMode == SecretBindingAudit), m.log)
 	}
 }
 
@@ -2288,6 +2313,7 @@ var debugCounterNames = []string{
 	"secret_binding_deny", "secret_binding_audit",
 	"sni_captured", "sni_deny", "sni_audit",
 	"vip_dns_rewritten", "vip_dns_unchanged", "vip_connect_redirect", "vip_connect_refused",
+	"vip_dns_unbound",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.
