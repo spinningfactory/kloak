@@ -1,6 +1,11 @@
 package ebpf
 
 import (
+	"maps"
+	"net"
+	"net/netip"
+	"slices"
+	"strings"
 	"testing"
 
 	"golang.org/x/net/http2/hpack"
@@ -97,6 +102,65 @@ func TestSecretACL(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestVipPodHosts(t *testing.T) {
+	snapshot := []secrets.Secret{
+		{OwnerID: "ns/api", Key: "token", Shadow: "kl::token-placeholder-0001", Host: "api.example.com"},
+		{OwnerID: "ns/api", Key: "id", Shadow: "kl::id-placeholder-000002"}, // any host
+		{OwnerID: "ns/db", Key: "password", Shadow: "kl::db-placeholder-000003", Host: "db.example.com"},
+		{OwnerID: "ns/db", Key: "user", Shadow: "kl::db-placeholder-000004", Host: "users.example.com"},
+		{OwnerID: "ns/ip", Key: "key", Shadow: "kl::ip-placeholder-000005", IP: net.ParseIP("192.0.2.1")},
+		{OwnerID: "ns/long", Key: "key", Shadow: "kl::long-placeholder-0006", Host: strings.Repeat("a", maxHostLen)},
+	}
+	ip := netip.MustParseAddr
+	bindings := map[string]podBinding{
+		// The IPv6 address gets nothing: only A records are rewritten.
+		"uid-api":     {podIPs: []netip.Addr{ip("10.42.0.7"), ip("fd00::7")}, refs: []secrets.Ref{{OwnerID: "ns/api"}}},
+		"uid-db-key":  {podIPs: []netip.Addr{ip("::ffff:10.42.0.8")}, refs: []secrets.Ref{{OwnerID: "ns/db", Keys: []string{"password"}}}},
+		"uid-pending": {refs: []secrets.Ref{{OwnerID: "ns/api"}}}, // no address yet
+		"uid-ip":      {podIPs: []netip.Addr{ip("10.42.0.9")}, refs: []secrets.Ref{{OwnerID: "ns/ip"}, {OwnerID: "ns/long"}}},
+		"uid-unknown": {podIPs: []netip.Addr{ip("10.42.0.10")}, refs: []secrets.Ref{{OwnerID: "ns/gone"}, {OwnerID: "ns/db", Keys: []string{"nope"}}}},
+	}
+	key := func(addr, host string) vipPodHostKey {
+		k := vipPodHostKey{PodIP: ip(addr).As16()}
+		copy(k.Host[:], host)
+		return k
+	}
+
+	for _, c := range []struct {
+		name    string
+		anyHost bool
+		want    []vipPodHostKey
+	}{
+		{"enforce", false, []vipPodHostKey{
+			key("10.42.0.7", "api.example.com"),
+			key("10.42.0.8", "db.example.com"),
+		}},
+		{"audit", true, []vipPodHostKey{
+			key("10.42.0.7", ""), key("10.42.0.8", ""), key("10.42.0.9", ""), key("10.42.0.10", ""),
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := vipPodHosts(snapshot, bindings, c.anyHost)
+			want := make(map[vipPodHostKey]struct{}, len(c.want))
+			for _, k := range c.want {
+				want[k] = struct{}{}
+			}
+			if !maps.Equal(got, want) {
+				t.Errorf("got %v, want %v", vipPodHostStrings(got), vipPodHostStrings(want))
+			}
+		})
+	}
+}
+
+func vipPodHostStrings(m map[vipPodHostKey]struct{}) []string {
+	var out []string
+	for k := range m {
+		out = append(out, netip.AddrFrom16(k.PodIP).Unmap().String()+" "+strings.TrimRight(string(k.Host[:]), "\x00"))
+	}
+	slices.Sort(out)
+	return out
 }
 
 func TestDescribeBindingEvent(t *testing.T) {

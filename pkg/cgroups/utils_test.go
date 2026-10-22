@@ -193,3 +193,69 @@ func TestReadCgroupProcs_MissingFile(t *testing.T) {
 		t.Errorf("error should mention the file, got: %v", err)
 	}
 }
+
+func TestFindPodCgroupPath(t *testing.T) {
+	const podUID = "abcd1234-5678-9abc-def0-fedcba987654"
+	podUnderscored := strings.ReplaceAll(podUID, "-", "_")
+
+	for _, c := range []struct {
+		name string
+		rel  string
+	}{
+		{"systemd burstable", filepath.Join("kubepods.slice", "kubepods-burstable.slice", "kubepods-burstable-pod"+podUnderscored+".slice")},
+		{"systemd besteffort", filepath.Join("kubepods.slice", "kubepods-besteffort.slice", "kubepods-besteffort-pod"+podUnderscored+".slice")},
+		{"systemd guaranteed", filepath.Join("kubepods.slice", "kubepods-pod"+podUnderscored+".slice")},
+		{"cgroupfs burstable", filepath.Join("kubepods", "burstable", "pod"+podUID)},
+		{"cgroupfs guaranteed", filepath.Join("kubepods", "pod"+podUID)},
+		{"nested (tree walk)", filepath.Join("docker", "abc", "kubepods", "besteffort", "pod"+podUID)},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			root := t.TempDir()
+			want := filepath.Join(root, c.rel)
+			// Another pod and the pod's own containers must not match.
+			mkdirAll(t, filepath.Join(want, "cri-containerd-0123.scope"),
+				filepath.Join(root, "kubepods", "besteffort", "pod00000000-0000-0000-0000-000000000000"))
+			got, err := FindPodCgroupPath(root, podUID)
+			if err != nil {
+				t.Fatalf("FindPodCgroupPath: %v", err)
+			}
+			if got != want {
+				t.Errorf("got  %q\nwant %q", got, want)
+			}
+		})
+	}
+
+	if got, err := FindPodCgroupPath(t.TempDir(), podUID); err == nil {
+		t.Errorf("found %q for a pod with no cgroup", got)
+	}
+}
+
+func TestReadCgroupTreeProcs(t *testing.T) {
+	pod := t.TempDir()
+	sandbox := filepath.Join(pod, "cri-containerd-sandbox.scope")
+	app := filepath.Join(pod, "cri-containerd-app.scope")
+	empty := filepath.Join(pod, "cri-containerd-exited.scope")
+	mkdirAll(t, sandbox, app, empty)
+	for path, procs := range map[string]string{
+		filepath.Join(pod, "cgroup.procs"):     "", // no internal processes
+		filepath.Join(sandbox, "cgroup.procs"): "100\n",
+		filepath.Join(app, "cgroup.procs"):     "200\n201\n",
+	} {
+		if err := os.WriteFile(path, []byte(procs), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got, err := ReadCgroupTreeProcs(pod)
+	if err != nil {
+		t.Fatalf("ReadCgroupTreeProcs: %v", err)
+	}
+	sort.Ints(got)
+	if want := []int{100, 200, 201}; !reflect.DeepEqual(got, want) {
+		t.Errorf("got %v, want %v", got, want)
+	}
+
+	if _, err := ReadCgroupTreeProcs(filepath.Join(pod, "gone")); err == nil {
+		t.Error("expected an error for a missing cgroup")
+	}
+}

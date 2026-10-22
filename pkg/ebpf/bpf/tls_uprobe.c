@@ -283,6 +283,7 @@ enum {
   DBG_VIP_DNS_UNCHANGED,     // a watched host's answer left unchanged (not every record could be read)
   DBG_VIP_CONNECT_REDIRECT,  // vip_connect4 sent a connect to a fake IP to a real address
   DBG_VIP_CONNECT_REFUSED,   // connect to a fake IP refused: unallocated, or no address recorded yet
+  DBG_VIP_DNS_UNBOUND,       // a watched host's answer left unchanged: the pod has no secret for the host
   DBG_MAX,
 };
 
@@ -632,6 +633,24 @@ struct {
   __type(value, struct vip_sock_val);
 } vip_sock SEC(".maps");
 
+// The (pod IP, host) pairs tc_dns_rewrite rewrites answers for: a pod gets
+// the fake IP of a host only if it references a secret restricted to that
+// host (its secret_acl bindings). An all-zero host stands for every watched
+// host (--secret-binding=audit, where a pod may redeem any secret). Written
+// only by userspace, from the pod bindings; not pinned (rebuilt at startup).
+struct vip_pod_host_key {
+  __u8 pod_ip[16];         // IPv4-mapped-IPv6, as dns_ip_key
+  char host[MAX_HOST_LEN]; // as watched_host_key
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 16384);
+  __uint(map_flags, BPF_F_RDONLY_PROG);
+  __type(key, struct vip_pod_host_key);
+  __type(value, __u8);
+} vip_pod_host SEC(".maps");
+
 // Per-CPU state of tc_dns_rewrite: the DNS message and the walks over it
 // (too large for the stack). Not dns_scratch: tc runs in softirq context,
 // which can interrupt the udp_recvmsg kretprobe while it uses dns_scratch on
@@ -641,6 +660,7 @@ struct dns_rewrite_buf {
   struct dns_question q;
   struct dns_answers a;
   struct vip_upstream_val up;
+  struct vip_pod_host_key pod;
 };
 
 struct {
@@ -3960,7 +3980,8 @@ int tc_ghash_update(struct __sk_buff *skb) {
 // netns: past the CNI (which may deliver with bpf_redirect_peer and skip the
 // host side of the veth), before the pod's sockets. It replaces every A
 // record of a trusted resolver's answer for a watched host with the host's
-// fake IP, and records the real addresses in vip_upstream. vip_connect4
+// fake IP, if the pod has a secret for the host (vip_pod_host), and records
+// the real addresses in vip_upstream. vip_connect4
 // (cgroup connect4 on the kubepods cgroup) sends a connect to a fake IP to
 // one of them, before any CNI socket load balancer sees it (vip_connect6 for
 // the v4-mapped form); vip_getpeername4/6 report the fake IP back to the app.
@@ -4094,6 +4115,20 @@ int tc_dns_rewrite(struct __sk_buff *skb) {
   __builtin_memcpy(&fake, hv->ip4, 4);
   if (!vip_in_range(cfg, fake))
     return TC_ACT_OK;
+
+  // Only for a pod with a secret for the host (the answer's destination is
+  // the pod's address): any other pod keeps the real addresses, and DNS
+  // snooping names the host as in dns-snoop mode.
+  struct vip_pod_host_key *pk = &buf->pod;
+  ipv4_to_mapped(pk->pod_ip, (const __u8 *)&ip.daddr);
+  __builtin_memcpy(pk->host, q->qname, MAX_HOST_LEN);
+  if (!bpf_map_lookup_elem(&vip_pod_host, pk)) {
+    __builtin_memset(pk->host, 0, MAX_HOST_LEN);
+    if (!bpf_map_lookup_elem(&vip_pod_host, pk)) {
+      dbg_inc(DBG_VIP_DNS_UNBOUND);
+      return TC_ACT_OK;
+    }
+  }
 
   struct dns_answers *a = &buf->a;
   __builtin_memset(a, 0, sizeof(*a));

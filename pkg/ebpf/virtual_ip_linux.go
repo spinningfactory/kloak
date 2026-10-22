@@ -106,46 +106,84 @@ func (m *TLSUprobeManager) attachVirtualIPRedirect(r netip.Prefix, cgroupPath st
 	return nil
 }
 
-// attachDNSRewrite attaches tc_dns_rewrite, in virtual-ip mode, at tc
-// ingress on the egress interface of the network namespace of pid, a
-// process of the container cgroupID, so that the pod is handed fake IPs for
-// watched hosts. AttachTLS calls it first, so it runs as soon as the
-// reconciler finds the pod's processes, TLS or not, and again on each exec
-// until it succeeds: an answer the pod receives before carries the real
-// addresses (which the DNS snooping still attributes). Once per netns;
-// nothing in dns-snoop mode, nor for a pod in the host network namespace,
-// where the rewrite would hand fake IPs to node processes the connect
-// redirect does not cover.
-func (m *TLSUprobeManager) attachDNSRewrite(pid int, cgroupID uint64) error {
-	if m.virtualIPs == nil {
-		return nil
+// VirtualIPEnabled reports whether the manager runs in virtual-ip host
+// resolution mode.
+func (m *TLSUprobeManager) VirtualIPEnabled() bool {
+	return m.virtualIPs != nil
+}
+
+// dnsRewriteAttach is tc_dns_rewrite attached in a pod's netns.
+type dnsRewriteAttach struct {
+	ino uint64
+	// netns is kept open while attached, so its inode can't be reused by
+	// another netns and wrongly look attached (see tcAttached).
+	netns *os.File
+	links []io.Closer
+	addrs []netip.Addr // IPv4 addresses of the interfaces attached to
+}
+
+func (a *dnsRewriteAttach) close() {
+	for _, l := range a.links {
+		_ = l.Close()
 	}
-	nsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
-	ino, err := netnsInode(nsPath)
-	if err != nil {
-		return err
+	_ = a.netns.Close()
+}
+
+// AttachPodDNSRewrite attaches tc_dns_rewrite, in virtual-ip mode, at tc
+// ingress on the egress interfaces of a pod's network namespace, so that the
+// pod is handed the fake IPs of the hosts it has secrets for
+// (BindPodSecrets), and returns the IPv4 addresses of those interfaces: the
+// pod's, before its status reports them. pids are processes of the pod; the
+// first one still running names the netns. The reconciler calls it as soon
+// as the pod's sandbox runs, before its containers start, so that they find
+// the rewrite in place; an answer received before carries the real
+// addresses (which the DNS snooping still attributes). It does nothing when
+// already attached in the pod's current netns, in dns-snoop mode, or for a
+// pod in the host network namespace, where the rewrite would hand fake IPs
+// to node processes the connect redirect does not cover. A pod whose
+// sandbox was recreated gets it again in its new netns.
+func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) ([]netip.Addr, error) {
+	if m.virtualIPs == nil {
+		return nil, nil
 	}
 	rootIno, err := netnsInode("/proc/1/ns/net")
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if ino == rootIno {
-		return nil
+	var podNS *os.File
+	var pid int
+	for _, p := range pids {
+		if f, err := os.Open(fmt.Sprintf("/proc/%d/ns/net", p)); err == nil {
+			podNS, pid = f, p
+			break
+		}
 	}
-	// Lets UntrackCgroup release the netns once the pod is gone.
-	m.RecordCgroupNetns(cgroupID, pid)
+	if podNS == nil {
+		return nil, fmt.Errorf("none of the %d processes of pod %s is running", len(pids), pod)
+	}
+	fi, err := podNS.Stat()
+	if err != nil {
+		_ = podNS.Close()
+		return nil, err
+	}
+	ino, err := statInode(fi)
+	if err != nil || ino == rootIno {
+		_ = podNS.Close()
+		return nil, err
+	}
 
 	m.dnsRewriteMu.Lock()
 	defer m.dnsRewriteMu.Unlock()
-	if _, ok := m.dnsRewriteNetns[ino]; ok {
-		return nil
+	if cur := m.dnsRewrite[podUID]; cur != nil {
+		if cur.ino == ino {
+			_ = podNS.Close()
+			return cur.addrs, nil
+		}
+		// A new sandbox: the old netns is gone with its interfaces.
+		delete(m.dnsRewrite, podUID)
+		cur.close()
 	}
-	// Kept open while attached, so the inode can't be reused by another
-	// pod's netns and wrongly look attached (see tcAttached).
-	podNS, err := os.Open(nsPath)
-	if err != nil {
-		return fmt.Errorf("opening pod netns %s: %w", nsPath, err)
-	}
+	var addrs []netip.Addr
 	links, err := runInNetns(podNS, m.log, func() ([]io.Closer, error) {
 		var links []io.Closer
 		for _, name := range m.resolveEgressInterfaces(pid) {
@@ -157,6 +195,7 @@ func (m *TLSUprobeManager) attachDNSRewrite(pid int, cgroupID uint64) error {
 				var l io.Closer
 				if l, err = m.attachTCProgram(m.objs.TcDnsRewrite, iface.Index, true, podNS); err == nil {
 					links = append(links, l)
+					addrs = append(addrs, interfaceIPv4s(iface)...)
 					continue
 				}
 			}
@@ -169,38 +208,93 @@ func (m *TLSUprobeManager) attachDNSRewrite(pid int, cgroupID uint64) error {
 	})
 	if err == nil && len(links) == 0 &&
 		!strings.EqualFold(m.egressInterface, "none") && !strings.EqualFold(m.egressInterface, "lo-only") {
-		// No default route yet (CNI still setting up): retried with the
-		// next container or reconcile.
+		// No default route yet (CNI still setting up): the reconciler
+		// retries.
 		err = fmt.Errorf("no interface resolved in pid %d netns", pid)
 	}
 	if err != nil {
 		_ = podNS.Close()
-		if !m.dnsRewriteFailed[ino] {
-			m.dnsRewriteFailed[ino] = true
+		if !m.dnsRewriteFailed[podUID] {
+			m.dnsRewriteFailed[podUID] = true
 			m.log.Warnw("failed to attach the DNS rewrite: the pod gets real addresses for watched hosts until it succeeds",
-				"pid", pid, "cgroupID", cgroupID, "error", err)
+				"pod", pod, "pid", pid, "error", err)
 		}
-		return err
+		return nil, err
 	}
-	delete(m.dnsRewriteFailed, ino)
-	m.dnsRewriteNetns[ino] = podNS
-	m.linksMu.Lock()
-	m.links = append(m.links, links...)
-	m.linksMu.Unlock()
-	m.log.Infow("attached DNS rewrite to pod netns", "pid", pid, "cgroupID", cgroupID, "netns", ino, "interfaces", len(links))
-	return nil
+	delete(m.dnsRewriteFailed, podUID)
+	m.dnsRewrite[podUID] = &dnsRewriteAttach{ino: ino, netns: podNS, links: links, addrs: addrs}
+	m.log.Infow("attached DNS rewrite to pod netns", "pod", pod, "pid", pid, "netns", ino,
+		"interfaces", len(links), "addrs", addrs)
+	return addrs, nil
 }
 
-// releaseDNSRewriteNetns forgets the DNS rewrite of a netns whose pod is
-// gone. Its tc links go with the pod's interfaces.
-func (m *TLSUprobeManager) releaseDNSRewriteNetns(ino uint64) {
-	m.dnsRewriteMu.Lock()
-	defer m.dnsRewriteMu.Unlock()
-	if f, ok := m.dnsRewriteNetns[ino]; ok {
-		_ = f.Close()
-		delete(m.dnsRewriteNetns, ino)
+// interfaceIPv4s returns the IPv4 addresses of iface, in the calling
+// thread's netns.
+func interfaceIPv4s(iface *net.Interface) []netip.Addr {
+	list, err := iface.Addrs()
+	if err != nil {
+		return nil
 	}
-	delete(m.dnsRewriteFailed, ino)
+	var out []netip.Addr
+	for _, a := range list {
+		if n, ok := a.(*net.IPNet); ok {
+			if ip, ok := netip.AddrFromSlice(n.IP); ok && ip.Unmap().Is4() {
+				out = append(out, ip.Unmap())
+			}
+		}
+	}
+	return out
+}
+
+// DetachPodDNSRewrite removes the DNS rewrite of a pod that is gone, and
+// releases its netns.
+func (m *TLSUprobeManager) DetachPodDNSRewrite(podUID string) {
+	m.dnsRewriteMu.Lock()
+	a := m.dnsRewrite[podUID]
+	delete(m.dnsRewrite, podUID)
+	delete(m.dnsRewriteFailed, podUID)
+	m.dnsRewriteMu.Unlock()
+	if a != nil {
+		a.close()
+	}
+}
+
+// syncVipPodHost makes vip_pod_host hold exactly desired (vipPodHosts):
+// pruning is what stops the rewrite for a pod that went away, or whose
+// secrets no longer name a host. Stale entries go first, making room.
+func syncVipPodHost(m *ebpf.Map, desired map[vipPodHostKey]struct{}, log *zap.SugaredLogger) {
+	var stale []vipPodHostKey
+	present := make(map[vipPodHostKey]struct{}, len(desired))
+	var k vipPodHostKey
+	var v uint8
+	iter := m.Iterate()
+	for iter.Next(&k, &v) {
+		if _, ok := desired[k]; ok {
+			present[k] = struct{}{}
+		} else {
+			stale = append(stale, k)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		log.Errorw("error iterating BPF vip_pod_host", "error", err)
+	}
+	for i := range stale {
+		if err := m.Delete(&stale[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			log.Errorw("failed to remove a pod's virtual IP host", "error", err,
+				"podIP", netip.AddrFrom16(stale[i].PodIP).Unmap().String())
+		}
+	}
+	allowed := uint8(1)
+	for key := range desired {
+		if _, ok := present[key]; ok {
+			continue
+		}
+		if err := m.Update(&key, &allowed, ebpf.UpdateAny); err != nil {
+			// A missing entry leaves the pod the real addresses.
+			log.Errorw("failed to grant the pod its hosts' virtual IPs", "error", err,
+				"podIP", netip.AddrFrom16(key.PodIP).Unmap().String())
+		}
+	}
 }
 
 func netnsInode(path string) (uint64, error) {
@@ -208,9 +302,13 @@ func netnsInode(path string) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
+	return statInode(fi)
+}
+
+func statInode(fi os.FileInfo) (uint64, error) {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	if !ok {
-		return 0, fmt.Errorf("stat %s: no inode", path)
+		return 0, fmt.Errorf("stat %s: no inode", fi.Name())
 	}
 	return st.Ino, nil
 }
@@ -220,12 +318,6 @@ func netnsInode(path string) (uint64, error) {
 // worker exits with it still locked, so the Go runtime retires the thread
 // instead of handing it to other goroutines (see attachTCEgress).
 func runInNetns(ns *os.File, log *zap.SugaredLogger, fn func() ([]io.Closer, error)) ([]io.Closer, error) {
-	self, err := os.Open("/proc/self/ns/net")
-	if err != nil {
-		return nil, fmt.Errorf("opening self netns: %w", err)
-	}
-	defer func() { _ = self.Close() }()
-
 	type result struct {
 		links []io.Closer
 		err   error
@@ -239,6 +331,12 @@ func runInNetns(ns *os.File, log *zap.SugaredLogger, fn func() ([]io.Closer, err
 				runtime.UnlockOSThread()
 			}
 		}()
+		self, err := os.Open(threadNetnsPath)
+		if err != nil {
+			ch <- result{err: fmt.Errorf("opening self netns: %w", err)}
+			return
+		}
+		defer func() { _ = self.Close() }()
 		if err := unix.Setns(int(ns.Fd()), unix.CLONE_NEWNET); err != nil {
 			ch <- result{err: fmt.Errorf("setns: %w", err)}
 			return

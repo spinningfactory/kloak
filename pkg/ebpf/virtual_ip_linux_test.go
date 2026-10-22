@@ -10,11 +10,15 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	ciliumebpf "github.com/cilium/ebpf"
+	"go.uber.org/zap"
+
+	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
 // newVirtualIPMaps creates vip_host_ip and vip_ip_host from spec, pinned
@@ -278,4 +282,58 @@ func TestRemoveVirtualIPPins(t *testing.T) {
 
 	// Nothing pinned: nothing to do.
 	RemoveVirtualIPPins(filepath.Join(t.TempDir(), "missing"), testLog())
+}
+
+// TestVipPodHostBindings checks that vip_pod_host follows the pod bindings:
+// granted at bind time, kept for an address that a new pod already holds
+// when the old pod is unbound, and pruned to exactly the bindings by a sync.
+func TestVipPodHostBindings(t *testing.T) {
+	objs := loadTestObjects(t)
+	m := &TLSUprobeManager{
+		objs:       objs,
+		log:        zap.NewNop().Sugar(),
+		bindings:   make(map[string]podBinding),
+		virtualIPs: &virtualIPAllocator{},
+		lastSnapshot: []secrets.Secret{
+			{OwnerID: "ns/api", Key: "token", Shadow: "kl::token-placeholder-0001", Host: "api.example.com"},
+			{OwnerID: "ns/db", Key: "password", Shadow: "kl::db-placeholder-000003", Host: "db.example.com"},
+		},
+	}
+	read := func() []string {
+		t.Helper()
+		got := make(map[vipPodHostKey]struct{})
+		var k vipPodHostKey
+		var v uint8
+		iter := objs.VipPodHost.Iterate()
+		for iter.Next(&k, &v) {
+			got[k] = struct{}{}
+		}
+		if err := iter.Err(); err != nil {
+			t.Fatal(err)
+		}
+		return vipPodHostStrings(got)
+	}
+	check := func(step string, want ...string) {
+		t.Helper()
+		if got := read(); !slices.Equal(got, want) {
+			t.Errorf("%s: vip_pod_host = %q, want %q", step, got, want)
+		}
+	}
+
+	// The address went to a new pod before the old pod's deletion was seen.
+	addr := []netip.Addr{netip.MustParseAddr("10.42.0.7")}
+	m.BindPodSecrets("uid-old", "ns/old", addr, nil, []secrets.Ref{{OwnerID: "ns/api"}})
+	m.BindPodSecrets("uid-new", "ns/new", addr, nil, []secrets.Ref{{OwnerID: "ns/db"}})
+	check("bound", "10.42.0.7 api.example.com", "10.42.0.7 db.example.com")
+	m.UnbindPod("uid-old")
+	check("old pod unbound", "10.42.0.7 db.example.com")
+
+	putPodHost(t, objs, netip.MustParseAddr("10.42.0.99"), "api.example.com")
+	syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), m.log)
+	check("synced", "10.42.0.7 db.example.com")
+
+	m.SetSecretBindingMode(SecretBindingAudit)
+	m.BindPodSecrets("uid-new", "ns/new", addr, nil, []secrets.Ref{{OwnerID: "ns/db"}})
+	syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, true), m.log)
+	check("audit", "10.42.0.7 ")
 }

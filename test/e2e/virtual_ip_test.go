@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -141,6 +142,126 @@ except OSError as e:
 	if !strings.Contains(res, "unallocated errno 1\n") { // EPERM
 		t.Errorf("connect to the unallocated fake IP %s was not refused with EPERM", unallocated)
 	}
+}
+
+// TestVirtualIPPodScope checks which pods get a host's fake IP: a pod that
+// references a secret restricted to the host does, already in its init
+// container (the controller attaches the DNS rewrite while the pod is
+// Pending), and a kloak pod without such a secret gets the real address.
+func TestVirtualIPPodScope(t *testing.T) {
+	vipRange := controllerVirtualIPRange(t)
+	// Resolvable in every cluster.
+	const host = "kubernetes.default.svc.cluster.local"
+	data := map[string][]byte{"api-key": []byte("REAL-VIP-SCOPE-KEY-12345")}
+	createEnabledSecret(t, "secret-vip-scope", data, nil, map[string]string{"getkloak.io/hosts": host})
+	assertShadowSecret(t, "secret-vip-scope", data)
+	// The secret is synced and the host has its fake IP, so the pods' first
+	// lookups only wait for the DNS rewrite to attach. Not "restored": a
+	// host retired by an earlier run is restored at startup but only
+	// reactivated by the sync.
+	waitForVirtualIPLog(t, controllerPod(t), host, "allocated virtual IP", "reactivated virtual IP")
+
+	// The init container exits once the host resolves to a fake IP, so the
+	// pod only starts if the rewrite was attached before it ran.
+	const waitForFakeIP = `import ipaddress, socket, sys, time
+host, net = sys.argv[1], ipaddress.ip_network(sys.argv[2])
+deadline = time.monotonic() + 90
+while True:
+    try:
+        ip = socket.gethostbyname(host)
+    except OSError as e:
+        ip = "error-%d" % e.errno
+    print("lookup", ip, flush=True)
+    try:
+        if ipaddress.ip_address(ip) in net:
+            sys.exit(0)
+    except ValueError:
+        pass
+    if time.monotonic() > deadline:
+        sys.exit(1)
+    time.sleep(0.2)
+`
+	bound := vipProbePod("vip-scope-bound", "secret-vip-scope")
+	bound.Spec.InitContainers = []corev1.Container{{
+		Name:            "wait-for-fake-ip",
+		Image:           bound.Spec.Containers[0].Image,
+		ImagePullPolicy: corev1.PullNever,
+		Command:         []string{"python", "-c", waitForFakeIP, host, vipRange.String()},
+	}}
+	createVIPProbePod(t, bound)
+	createVIPProbePod(t, vipProbePod("vip-scope-unbound", ""))
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
+	defer cancel()
+	for _, name := range []string{"vip-scope-bound", "vip-scope-unbound"} {
+		if err := waitForPodReady(ctx, testNamespace, name); err != nil {
+			logs, _ := kubectl("logs", "-n", testNamespace, name, "--all-containers", "--tail=20")
+			t.Fatalf("%v\n%s", err, logs)
+		}
+	}
+	initLogs, _ := kubectl("logs", "-n", testNamespace, "vip-scope-bound", "-c", "wait-for-fake-ip")
+	t.Logf("init container lookups before the fake IP: %d", strings.Count(initLogs, "lookup ")-1)
+
+	resolve := func(pod string) netip.Addr {
+		t.Helper()
+		out, err := kubectl("exec", "-n", testNamespace, pod, "-c", "app", "--",
+			"python", "-c", "import socket, sys; print(socket.gethostbyname(sys.argv[1]))", host)
+		if err != nil {
+			t.Fatalf("resolving %s in %s: %v\n%s", host, pod, err, out)
+		}
+		// The last line: kubectl may print warnings before it.
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		ip, err := netip.ParseAddr(strings.TrimSpace(lines[len(lines)-1]))
+		if err != nil {
+			t.Fatalf("%s resolved %s to %q", pod, host, out)
+		}
+		return ip
+	}
+	if ip := resolve("vip-scope-bound"); !vipRange.Contains(ip) {
+		t.Errorf("pod with a secret for %s resolved it to %s, want an address in %s", host, ip, vipRange)
+	}
+	if ip := resolve("vip-scope-unbound"); vipRange.Contains(ip) {
+		t.Errorf("pod without a secret for %s got its fake IP %s", host, ip)
+	}
+}
+
+// vipProbePod returns a kloak pod running the raw TLS demo's image (for its
+// Python), mounting secret unless it is empty.
+func vipProbePod(name, secret string) *corev1.Pod {
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: testNamespace,
+			Labels:    map[string]string{"getkloak.io/enabled": "true"},
+		},
+		Spec: corev1.PodSpec{
+			RestartPolicy: corev1.RestartPolicyNever,
+			Containers: []corev1.Container{{
+				Name:            "app",
+				Image:           "kloak-demo-python-raw-tls:latest",
+				ImagePullPolicy: corev1.PullNever,
+				Command:         []string{"python", "-c", "import time; time.sleep(3600)"},
+			}},
+		},
+	}
+	if secret != "" {
+		pod.Spec.Volumes = []corev1.Volume{{
+			Name:         "secret",
+			VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{SecretName: secret}},
+		}}
+		pod.Spec.Containers[0].VolumeMounts = []corev1.VolumeMount{{Name: "secret", MountPath: "/etc/secret", ReadOnly: true}}
+	}
+	return pod
+}
+
+func createVIPProbePod(t *testing.T, pod *corev1.Pod) {
+	t.Helper()
+	if _, err := clientset.CoreV1().Pods(testNamespace).Create(context.Background(), pod, metav1.CreateOptions{}); err != nil {
+		t.Fatalf("creating pod %s: %v", pod.Name, err)
+	}
+	t.Cleanup(func() {
+		_ = clientset.CoreV1().Pods(testNamespace).Delete(context.Background(), pod.Name, metav1.DeleteOptions{})
+	})
 }
 
 // controllerVirtualIPRange returns the virtual IP range the controller is

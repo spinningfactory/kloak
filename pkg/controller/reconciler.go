@@ -5,6 +5,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 	"sync"
 	"time"
@@ -27,6 +28,14 @@ const (
 
 	// CgroupBasePath is the base path for cgroups v2.
 	CgroupBasePath = "/sys/fs/cgroup"
+
+	// In virtual-ip mode a Pending pod is checked every sandboxPoll for its
+	// sandbox, to attach the DNS rewrite before its containers start; once
+	// pending for sandboxPollFor (a long image pull, a CNI failure), every
+	// sandboxPollSlow.
+	sandboxPoll     = 100 * time.Millisecond
+	sandboxPollFor  = 30 * time.Second
+	sandboxPollSlow = 5 * time.Second
 )
 
 // Reconciler watches pods and manages eBPF cgroup tracking.
@@ -107,9 +116,37 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
+	addrs := podIPs(pod)
+
 	// Pod is running and enabled
 	if pod.Status.Phase != corev1.PodRunning {
-		log.Debugw("pod not running yet", "phase", pod.Status.Phase)
+		// Virtual-ip mode: attach the DNS rewrite as soon as the pod's
+		// sandbox runs, so that its containers, init containers first, find
+		// it in place, and bind the pod at the sandbox's address (its
+		// status reports it only later). A lookup made before gets the
+		// real addresses.
+		if pod.Status.Phase != corev1.PodPending || pod.Spec.HostNetwork || !r.virtualIP() {
+			log.Debugw("pod not running yet", "phase", pod.Status.Phase)
+			return ctrl.Result{}, nil
+		}
+		r.mu.Lock()
+		if r.trackedPods[string(pod.UID)] == nil {
+			r.trackedPods[string(pod.UID)] = make(map[uint64]bool)
+		}
+		r.podKeyToUID[req.String()] = string(pod.UID)
+		r.mu.Unlock()
+		netnsAddrs, attached := r.attachDNSRewrite(pod, req.String())
+		if !attached {
+			poll := sandboxPoll
+			if time.Since(pod.CreationTimestamp.Time) > sandboxPollFor {
+				poll = sandboxPollSlow
+			}
+			return ctrl.Result{RequeueAfter: poll}, nil
+		}
+		if len(addrs) == 0 {
+			addrs = netnsAddrs
+		}
+		r.UprobeManager.BindPodSecrets(string(pod.UID), req.String(), addrs, nil, k8ssecrets.PodSecretRefs(pod))
 		return ctrl.Result{}, nil
 	}
 
@@ -167,8 +204,11 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		for id := range cgroupIDs {
 			ids = append(ids, id)
 		}
-		r.UprobeManager.BindPodSecrets(string(pod.UID), req.String(), ids, k8ssecrets.PodSecretRefs(pod))
+		r.UprobeManager.BindPodSecrets(string(pod.UID), req.String(), addrs, ids, k8ssecrets.PodSecretRefs(pod))
 	}
+	// Also for pods running before the controller started, and for a pod
+	// whose sandbox was recreated (a new netns).
+	_, dnsAttached := r.attachDNSRewrite(pod, req.String())
 
 	// Attach uprobes outside the lock — this involves filesystem I/O.
 	for _, cgroupID := range needsAttach {
@@ -198,7 +238,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// If any cgroups still need attachment, requeue to retry later.
 	// This handles runtimes like Python where libssl loads lazily.
 	r.mu.RLock()
-	needsRetry := false
+	needsRetry := !dnsAttached
 	if tracked := r.trackedPods[string(pod.UID)]; tracked != nil {
 		for _, attached := range tracked {
 			if !attached {
@@ -286,6 +326,57 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (cg
 	return "", 0
 }
 
+// virtualIP reports whether the data plane runs in virtual-ip host
+// resolution mode.
+func (r *Reconciler) virtualIP() bool {
+	return r.UprobeManager != nil && r.UprobeManager.VirtualIPEnabled()
+}
+
+// attachDNSRewrite attaches the virtual IP DNS rewrite in the pod's network
+// namespace, found through any process in the pod's cgroup: its sandbox's
+// runs before any container. It returns the pod's IPv4 addresses as found
+// in the netns, and false when it should be retried.
+func (r *Reconciler) attachDNSRewrite(pod *corev1.Pod, name string) ([]netip.Addr, bool) {
+	if !r.virtualIP() || pod.Spec.HostNetwork {
+		return nil, true
+	}
+	podCgroup, err := cgroups.FindPodCgroupPath(r.CgroupRoot, string(pod.UID))
+	if err != nil {
+		logging.Tracew(r.Log, "pod cgroup not found yet", "pod", name, "err", err)
+		return nil, false
+	}
+	pids, err := cgroups.ReadCgroupTreeProcs(podCgroup)
+	if err != nil || len(pids) == 0 {
+		logging.Tracew(r.Log, "no process in the pod cgroup yet", "pod", name, "path", podCgroup, "err", err)
+		return nil, false
+	}
+	addrs, err := r.UprobeManager.AttachPodDNSRewrite(string(pod.UID), name, pids)
+	if err != nil {
+		logging.Tracew(r.Log, "could not attach the DNS rewrite yet", "pod", name, "err", err)
+		return nil, false
+	}
+	return addrs, true
+}
+
+// podIPs returns the pod's addresses, or none for a pod in the host network
+// namespace (its address is the node's).
+func podIPs(pod *corev1.Pod) []netip.Addr {
+	if pod.Spec.HostNetwork {
+		return nil
+	}
+	ips := pod.Status.PodIPs
+	if len(ips) == 0 && pod.Status.PodIP != "" {
+		ips = []corev1.PodIP{{IP: pod.Status.PodIP}}
+	}
+	var out []netip.Addr
+	for _, ip := range ips {
+		if a, err := netip.ParseAddr(ip.IP); err == nil {
+			out = append(out, a.Unmap())
+		}
+	}
+	return out
+}
+
 // handleDelete removes a pod from tracking. uid is the pod UID (trackedPods key),
 // namespacedName is the "namespace/name" string (podKeyToUID key).
 func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, error) {
@@ -300,6 +391,7 @@ func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, erro
 	// detaches the uprobes attached for their processes.
 	if r.UprobeManager != nil {
 		r.UprobeManager.UnbindPod(uid)
+		r.UprobeManager.DetachPodDNSRewrite(uid)
 		for cgroupID := range cgroupIDs {
 			if err := r.UprobeManager.UntrackCgroup(cgroupID); err != nil {
 				r.Log.Debugw("failed to untrack cgroup", "cgroupID", cgroupID, "err", err)
