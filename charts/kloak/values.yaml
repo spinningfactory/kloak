@@ -82,6 +82,19 @@ controller:
     # or service CIDR, or a route of the node.
     virtualIPRange: 198.18.0.0/15,2001:2::/48
   cgroupPath: /host/sys/fs/cgroup
+  # NRI (Node Resource Interface) hook into the container runtime, used in
+  # virtual-ip mode: containerd 2.0+ and CRI-O 1.30+ serve it by default.
+  # The runtime then waits for kloak to attach the DNS rewrite while it
+  # creates each pod sandbox, so no container of a kloak pod resolves a
+  # name before it. Without NRI (disabled here or in the runtime), the
+  # controller attaches the rewrite by polling pending pods, which leaves a
+  # short window at pod start: a lookup made in it gets the real addresses,
+  # and a connection made with them gets no host-restricted secret until the
+  # app resolves the name again. The controller logs which way each node
+  # runs. The socket's directory is mounted from the host.
+  nri:
+    enabled: true
+    socketPath: /var/run/nri/nri.sock
   dns:
     # Trusted DNS server IPs. Only DNS responses from these servers are used
     # for host-based secret filtering. If empty, auto-discovers kube-dns ClusterIP.

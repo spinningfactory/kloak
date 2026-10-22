@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -17,6 +18,8 @@ import (
 	"time"
 
 	ciliumebpf "github.com/cilium/ebpf"
+	"github.com/vishvananda/netlink"
+	"github.com/vishvananda/netns"
 	"go.uber.org/zap"
 
 	"github.com/spinningfactory/kloak/pkg/secrets"
@@ -362,4 +365,129 @@ func TestVipPodHostBindings(t *testing.T) {
 	m.BindPodSecrets("uid-new", "ns/new", addr, nil, []secrets.Ref{{OwnerID: "ns/db"}})
 	syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, true), m.log)
 	check("audit", "10.42.0.7 ", "fd42::7 ")
+}
+
+// TestBindPodNetworkKeepsCgroups checks that binding a pod's network (its
+// sandbox being created, NRI) keeps the container cgroups of its current
+// binding, which a sync would otherwise revoke.
+func TestBindPodNetworkKeepsCgroups(t *testing.T) {
+	objs := loadTestObjects(t)
+	m := &TLSUprobeManager{
+		objs:       objs,
+		log:        zap.NewNop().Sugar(),
+		bindings:   make(map[string]podBinding),
+		virtualIPs: &virtualIPAllocator{},
+		lastSnapshot: []secrets.Secret{
+			{OwnerID: "ns/api", Key: "token", Shadow: "kl::token-placeholder-0001", Host: "api.example.com"},
+		},
+	}
+	refs := []secrets.Ref{{OwnerID: "ns/api"}}
+	aclCgroups := func() []uint64 {
+		t.Helper()
+		var out []uint64
+		var k secretACLKey
+		var v uint8
+		iter := objs.SecretAcl.Iterate()
+		for iter.Next(&k, &v) {
+			out = append(out, k.CgroupID)
+		}
+		if err := iter.Err(); err != nil {
+			t.Fatal(err)
+		}
+		slices.Sort(out)
+		return slices.Compact(out)
+	}
+
+	// A new pod: its network only, no cgroup yet.
+	m.BindPodNetwork("uid", "ns/app", []netip.Addr{netip.MustParseAddr("10.42.0.7")}, refs)
+	if b := m.bindings["uid"]; len(b.cgroupIDs) != 0 || len(b.podIPs) != 1 {
+		t.Fatalf("binding %+v", b)
+	}
+
+	// Running: the reconciler binds its containers; a container created
+	// later (a restart) rebinds the network at a new address.
+	m.BindPodSecrets("uid", "ns/app", []netip.Addr{netip.MustParseAddr("10.42.0.7")}, []uint64{41, 42}, refs)
+	m.BindPodNetwork("uid", "ns/app", []netip.Addr{netip.MustParseAddr("10.42.0.8")}, refs)
+	if b := m.bindings["uid"]; !slices.Equal(b.cgroupIDs, []uint64{41, 42}) || b.podIPs[0] != netip.MustParseAddr("10.42.0.8") {
+		t.Fatalf("binding after BindPodNetwork: %+v", b)
+	}
+	syncSecretACL(objs.SecretAcl, m.lastSnapshot, m.bindings, m.log)
+	if got := aclCgroups(); !slices.Equal(got, []uint64{41, 42}) {
+		t.Errorf("secret_acl cgroups after a sync: %v, want [41 42]", got)
+	}
+	syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), m.log)
+	var k vipPodHostKey
+	var v uint8
+	var hosts []string
+	iter := objs.VipPodHost.Iterate()
+	for iter.Next(&k, &v) {
+		hosts = append(hosts, netip.AddrFrom16(k.PodIP).Unmap().String())
+	}
+	if !slices.Equal(hosts, []string{"10.42.0.8"}) {
+		t.Errorf("vip_pod_host addresses %v, want the new address only", hosts)
+	}
+}
+
+// TestAttachPodDNSRewriteNetns attaches tc_dns_rewrite in a network
+// namespace given by path, as the container runtime reports it while it
+// creates a pod sandbox (NRI), before the pod has any process.
+func TestAttachPodDNSRewriteNetns(t *testing.T) {
+	objs := loadTestObjects(t)
+	podNS := newNetns(t)
+	h, err := netlink.NewHandleAt(netns.NsHandle(podNS.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	// The pod's interface, with its address and the default route through
+	// it, as a CNI leaves it.
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "eth0"}}
+	if err := h.LinkAdd(link); err != nil {
+		t.Skipf("cannot create a dummy interface: %v", err)
+	}
+	if err := h.LinkSetUp(link); err != nil {
+		t.Fatal(err)
+	}
+	addr, _ := netlink.ParseAddr("10.42.0.7/24")
+	if err := h.AddrAdd(link, addr); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Gw: net.ParseIP("10.42.0.1")}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &TLSUprobeManager{
+		objs:             objs,
+		log:              zap.NewNop().Sugar(),
+		virtualIPs:       &virtualIPAllocator{},
+		tcMode:           newTCModeResolver(TCAttachAuto),
+		dnsRewrite:       make(map[string]*dnsRewriteAttach),
+		dnsRewriteFailed: make(map[string]bool),
+	}
+	t.Cleanup(func() { m.DetachPodDNSRewrite("uid") })
+	path := fmt.Sprintf("/proc/self/fd/%d", podNS.Fd())
+	want := []netip.Addr{netip.MustParseAddr("10.42.0.7")}
+	got, err := m.AttachPodDNSRewriteNetns("uid", "ns/app", path)
+	if err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("addresses %v, want %v", got, want)
+	}
+	a := m.dnsRewrite["uid"]
+	if a == nil || len(a.links) != 1 {
+		t.Fatalf("attachment %+v", a)
+	}
+	// Again (another container of the pod, or the reconciler polling): the
+	// same attachment.
+	if got, err := m.AttachPodDNSRewriteNetns("uid", "ns/app", path); err != nil || !slices.Equal(got, want) || m.dnsRewrite["uid"] != a {
+		t.Errorf("second attach: %v, %v, same attachment %v", got, err, m.dnsRewrite["uid"] == a)
+	}
+	// The host's network namespace (a host-network pod): nothing.
+	if got, err := m.AttachPodDNSRewriteNetns("uid-host", "ns/host", "/proc/1/ns/net"); err != nil || got != nil || m.dnsRewrite["uid-host"] != nil {
+		t.Errorf("host netns: %v, %v", got, err)
+	}
+	if _, err := m.AttachPodDNSRewriteNetns("uid-gone", "ns/gone", "/proc/self/fd/9999"); err == nil {
+		t.Error("attached through a path that does not exist")
+	}
 }

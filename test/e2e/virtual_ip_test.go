@@ -146,8 +146,12 @@ except OSError as e:
 
 // TestVirtualIPPodScope checks which pods get a host's fake IP: a pod that
 // references a secret restricted to the host does, already in its init
-// container (the controller attaches the DNS rewrite while the pod is
-// Pending), and a kloak pod without such a secret gets the real address.
+// container, and a kloak pod without such a secret gets the real address.
+// With NRI the container runtime waits for the controller to attach the DNS
+// rewrite while it creates the sandbox, so the init container's first
+// lookup gets the fake IP; without it (the polling CI leg) the controller
+// polls the Pending pod, and an early lookup may still get the real
+// address.
 func TestVirtualIPPodScope(t *testing.T) {
 	vipRange := controllerVirtualIPRange(t)
 	// Resolvable in every cluster.
@@ -200,7 +204,24 @@ while True:
 		}
 	}
 	initLogs, _ := kubectl("logs", "-n", testNamespace, "vip-scope-bound", "-c", "wait-for-fake-ip")
-	t.Logf("init container lookups before the fake IP: %d", strings.Count(initLogs, "lookup ")-1)
+	early := strings.Count(initLogs, "lookup ") - 1
+	controller := controllerPod(t)
+	nri := controllerUsesNRI(t, controller)
+	t.Logf("init container lookups before the fake IP: %d (NRI: %v)", early, nri)
+	if nri {
+		if early != 0 {
+			t.Errorf("with NRI, the init container's first %d lookups got the real address:\n%s", early, initLogs)
+		}
+		// Attached by the runtime's call, not by the reconciler's polling,
+		// which would hide a broken NRI path.
+		logs, _ := kubectl("logs", "-n", kloakNamespace, controller, "-c", "controller", "--tail=-1")
+		if !slices.ContainsFunc(strings.Split(logs, "\n"), func(l string) bool {
+			return strings.Contains(l, "DNS rewrite in place at sandbox creation (NRI)") &&
+				strings.Contains(l, testNamespace+"/vip-scope-bound")
+		}) {
+			t.Errorf("the DNS rewrite of vip-scope-bound was not attached at sandbox creation (NRI)")
+		}
+	}
 
 	resolve := func(pod string) netip.Addr {
 		t.Helper()
@@ -618,6 +639,17 @@ func controllerPod(t *testing.T) string {
 	}
 	t.Fatalf("no running controller pod among %d", len(pods.Items))
 	return ""
+}
+
+// controllerUsesNRI reports whether the controller pod connected to the
+// container runtime through NRI.
+func controllerUsesNRI(t *testing.T, pod string) bool {
+	t.Helper()
+	logs, err := kubectl("logs", "-n", kloakNamespace, pod, "-c", "controller", "--tail=-1")
+	if err != nil {
+		t.Fatalf("controller logs: %v", err)
+	}
+	return strings.Contains(logs, "connected to the container runtime through NRI")
 }
 
 var virtualIPLogIP = regexp.MustCompile(`"ip":\s*"([0-9a-fA-F.:]+)"`)

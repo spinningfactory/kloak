@@ -13,6 +13,7 @@ import (
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -36,6 +37,10 @@ const (
 	sandboxPoll     = 100 * time.Millisecond
 	sandboxPollFor  = 30 * time.Second
 	sandboxPollSlow = 5 * time.Second
+
+	// sandboxPodLookupTimeout bounds PrepareSandbox's read of a pod the
+	// cache does not have yet: the container runtime waits for it.
+	sandboxPodLookupTimeout = time.Second
 )
 
 // Reconciler watches pods and manages eBPF cgroup tracking.
@@ -47,6 +52,9 @@ type Reconciler struct {
 	CgroupRoot    string
 	// NodeName filters pods to only those on this node (empty = all nodes)
 	NodeName string
+	// APIReader reads a pod from the API server when the cache does not have
+	// it yet (PrepareSandbox); nil: cache only.
+	APIReader client.Reader
 
 	mu sync.RWMutex
 	// trackedPods maps pod UID -> set of cgroup IDs (one per container).
@@ -123,7 +131,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		// Virtual-ip mode: attach the DNS rewrite as soon as the pod's
 		// sandbox runs, so that its containers, init containers first, find
 		// it in place, and bind the pod at the sandbox's address (its
-		// status reports it only later). A lookup made before gets the
+		// status reports it only later). With NRI the runtime already had
+		// it attached while creating the sandbox (PrepareSandbox), and this
+		// finds it in place; without NRI, a lookup made before gets the
 		// real addresses.
 		if pod.Status.Phase != corev1.PodPending || pod.Spec.HostNetwork || !r.virtualIP() {
 			log.Debugw("pod not running yet", "phase", pod.Status.Phase)
@@ -330,6 +340,91 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (cg
 // resolution mode.
 func (r *Reconciler) virtualIP() bool {
 	return r.UprobeManager != nil && r.UprobeManager.VirtualIPEnabled()
+}
+
+// Sandbox is a pod sandbox the container runtime is creating, as it reports
+// it over NRI.
+type Sandbox struct {
+	ID        string
+	UID       string
+	Namespace string
+	Name      string
+	// Annotations are the pod's (the kubelet passes them to the sandbox).
+	Annotations map[string]string
+	// NetnsPath is the sandbox's network namespace as a path this process
+	// can open; "" when the runtime does not report one (host network).
+	NetnsPath string
+	// IPs are the pod's addresses, when the runtime reports them.
+	IPs []netip.Addr
+}
+
+// PrepareSandbox attaches the virtual IP DNS rewrite in a kloak pod's
+// network namespace and binds the pod at its addresses, while the container
+// runtime creates the pod's sandbox or one of its containers (NRI): the
+// runtime waits for it, so the rewrite is in place before any container of
+// the pod resolves a name. It reports whether the pod is prepared; when it
+// is not (no NRI, or a failure), the reconciler attaches the rewrite by
+// polling the Pending pod, which leaves a short window at pod start.
+func (r *Reconciler) PrepareSandbox(ctx context.Context, sb *Sandbox) bool {
+	// Most sandboxes are not kloak pods: no API read for them.
+	if !r.virtualIP() || sb.Annotations[AnnotationEnabled] != "true" || sb.NetnsPath == "" {
+		return false
+	}
+	name := sb.Namespace + "/" + sb.Name
+	pod, err := r.sandboxPod(ctx, sb)
+	if err != nil {
+		r.Log.Debugw("pod of a sandbox being created not found; the reconciler attaches the DNS rewrite when it sees the pod",
+			"pod", name, "sandbox", sb.ID, "error", err)
+		return false
+	}
+	// The sandbox is on this node: the runtime creating it is this node's,
+	// whatever the cache's copy of the pod says yet.
+	if !r.isEnabled(pod) || pod.Spec.HostNetwork {
+		return false
+	}
+
+	r.mu.Lock()
+	if r.trackedPods[string(pod.UID)] == nil {
+		r.trackedPods[string(pod.UID)] = make(map[uint64]bool)
+	}
+	r.podKeyToUID[name] = string(pod.UID)
+	r.mu.Unlock()
+
+	netnsAddrs, err := r.UprobeManager.AttachPodDNSRewriteNetns(string(pod.UID), name, sb.NetnsPath)
+	if err != nil {
+		logging.Tracew(r.Log, "could not attach the DNS rewrite at sandbox creation", "pod", name, "sandbox", sb.ID, "err", err)
+		return false
+	}
+	addrs := sb.IPs
+	if len(addrs) == 0 {
+		addrs = netnsAddrs
+	}
+	r.UprobeManager.BindPodNetwork(string(pod.UID), name, addrs, k8ssecrets.PodSecretRefs(pod))
+	r.Log.Infow("DNS rewrite in place at sandbox creation (NRI)", "pod", name, "sandbox", sb.ID, "addrs", addrs)
+	return true
+}
+
+// sandboxPod returns the pod a sandbox is created for: from the cache, or,
+// when the cache does not have it yet, from the API server.
+func (r *Reconciler) sandboxPod(ctx context.Context, sb *Sandbox) (*corev1.Pod, error) {
+	nn := types.NamespacedName{Namespace: sb.Namespace, Name: sb.Name}
+	pod := &corev1.Pod{}
+	if err := r.Get(ctx, nn, pod); err == nil && string(pod.UID) == sb.UID {
+		return pod, nil
+	}
+	if r.APIReader == nil {
+		return nil, fmt.Errorf("pod %s (uid %s) not in the cache", nn, sb.UID)
+	}
+	ctx, cancel := context.WithTimeout(ctx, sandboxPodLookupTimeout)
+	defer cancel()
+	pod = &corev1.Pod{}
+	if err := r.APIReader.Get(ctx, nn, pod); err != nil {
+		return nil, err
+	}
+	if string(pod.UID) != sb.UID {
+		return nil, fmt.Errorf("pod %s has uid %s, the sandbox is for %s", nn, pod.UID, sb.UID)
+	}
+	return pod, nil
 }
 
 // attachDNSRewrite attaches the virtual IP DNS rewrite in the pod's network

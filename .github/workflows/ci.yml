@@ -403,8 +403,10 @@ jobs:
     # the pre-6.6-kernel tc fallback forced on, since CI kernels support TCX
     # and would never exercise it. "virtual-ip" reruns it with the
     # experimental virtual IP host resolution (spinningfactory/kloak#327), on
-    # a dual-stack cluster for its IPv6 tests.
-    name: ${{ (matrix.tc-attach-mode == 'auto' && matrix.host-resolution == 'dns-snoop') && 'E2E Tests' || (matrix.host-resolution != 'dns-snoop' && format('E2E Tests ({0})', matrix.host-resolution)) || format('E2E Tests (tc {0})', matrix.tc-attach-mode) }}
+    # a dual-stack cluster for its IPv6 tests, with the DNS rewrite attached
+    # through NRI (k3s's containerd serves it); "virtual-ip, polling" with NRI
+    # off, as on a runtime without it.
+    name: ${{ (matrix.tc-attach-mode == 'auto' && matrix.host-resolution == 'dns-snoop') && 'E2E Tests' || (matrix.host-resolution != 'dns-snoop' && format('E2E Tests ({0}{1})', matrix.host-resolution, matrix.nri == false && ', polling' || '')) || format('E2E Tests (tc {0})', matrix.tc-attach-mode) }}
     runs-on: ubuntu-latest
     needs: [build, test]
     strategy:
@@ -412,9 +414,14 @@ jobs:
       matrix:
         tc-attach-mode: [auto, clsact]
         host-resolution: [dns-snoop]
+        nri: [true]
         include:
           - tc-attach-mode: auto
             host-resolution: virtual-ip
+            nri: true
+          - tc-attach-mode: auto
+            host-resolution: virtual-ip
+            nri: false
     permissions:
       contents: read
       packages: write
@@ -591,7 +598,7 @@ jobs:
         run: go test -v -timeout 1500s -tags=e2e_ebpf -count=1 ./test/e2e/
         env:
           KUBECONFIG: /home/runner/.kube/k3s-e2e.yaml
-          E2E_HELM_SET: controller.ebpf.tcAttachMode=${{ matrix.tc-attach-mode }},controller.ebpf.hostResolution=${{ matrix.host-resolution }}
+          E2E_HELM_SET: controller.ebpf.tcAttachMode=${{ matrix.tc-attach-mode }},controller.ebpf.hostResolution=${{ matrix.host-resolution }},controller.nri.enabled=${{ matrix.nri }}
 
       - name: Stop BPF trace capture
         if: always()
@@ -662,7 +669,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bpf-trace-${{ matrix.tc-attach-mode }}-${{ matrix.host-resolution }}
+          name: bpf-trace-${{ matrix.tc-attach-mode }}-${{ matrix.host-resolution }}${{ matrix.nri == false && '-polling' || '' }}
           path: /tmp/bpf-trace.log
           retention-days: 7
           if-no-files-found: ignore
@@ -701,7 +708,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-covdata-${{ matrix.tc-attach-mode }}-${{ matrix.host-resolution }}
+          name: e2e-covdata-${{ matrix.tc-attach-mode }}-${{ matrix.host-resolution }}${{ matrix.nri == false && '-polling' || '' }}
           path: /tmp/e2e-covdata
           retention-days: 7
           if-no-files-found: ignore

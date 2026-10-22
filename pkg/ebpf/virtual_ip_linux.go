@@ -140,31 +140,51 @@ func (a *dnsRewriteAttach) close() {
 // (BindPodSecrets), and returns the addresses of those interfaces: the
 // pod's, before its status reports them. pids are processes of the pod; the
 // first one still running names the netns. The reconciler calls it as soon
-// as the pod's sandbox runs, before its containers start, so that they find
-// the rewrite in place; an answer received before carries the real
-// addresses (which the DNS snooping still attributes). It does nothing when
-// already attached in the pod's current netns, in dns-snoop mode, or for a
-// pod in the host network namespace, where the rewrite would hand fake IPs
-// to node processes the connect redirect does not cover. A pod whose
-// sandbox was recreated gets it again in its new netns.
+// as the pod's sandbox runs, unless the container runtime already had it
+// attached while creating the sandbox (AttachPodDNSRewriteNetns, NRI); an
+// answer received before carries the real addresses, and a connection made
+// to them gets no host-restricted secret. It does nothing when already
+// attached in the pod's current netns, in dns-snoop mode, or for a pod in
+// the host network namespace, where the rewrite would hand fake IPs to node
+// processes the connect redirect does not cover. A pod whose sandbox was
+// recreated gets it again in its new netns.
 func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) ([]netip.Addr, error) {
 	if m.virtualIPs == nil {
 		return nil, nil
 	}
-	rootIno, err := netnsInode("/proc/1/ns/net")
+	for _, p := range pids {
+		if f, err := os.Open(fmt.Sprintf("/proc/%d/ns/net", p)); err == nil {
+			return m.attachPodDNSRewrite(podUID, pod, f, fmt.Sprintf("pid %d", p))
+		}
+	}
+	return nil, fmt.Errorf("none of the %d processes of pod %s is running", len(pids), pod)
+}
+
+// AttachPodDNSRewriteNetns is AttachPodDNSRewrite for the network namespace
+// at path, a file of it this process can open (such as the sandbox's netns
+// bind mount reached through /proc/1/root). The container runtime reports
+// it while it creates the pod's sandbox (NRI), before any container of the
+// pod exists, so attached then, the rewrite precedes the pod's first
+// lookup.
+func (m *TLSUprobeManager) AttachPodDNSRewriteNetns(podUID, pod, path string) ([]netip.Addr, error) {
+	if m.virtualIPs == nil {
+		return nil, nil
+	}
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
 	}
-	var podNS *os.File
-	var pid int
-	for _, p := range pids {
-		if f, err := os.Open(fmt.Sprintf("/proc/%d/ns/net", p)); err == nil {
-			podNS, pid = f, p
-			break
-		}
-	}
-	if podNS == nil {
-		return nil, fmt.Errorf("none of the %d processes of pod %s is running", len(pids), pod)
+	return m.attachPodDNSRewrite(podUID, pod, f, path)
+}
+
+// attachPodDNSRewrite attaches tc_dns_rewrite in podNS, which it owns from
+// then on (kept open while attached, closed otherwise); where names the
+// netns in logs.
+func (m *TLSUprobeManager) attachPodDNSRewrite(podUID, pod string, podNS *os.File, where string) ([]netip.Addr, error) {
+	rootIno, err := netnsInode("/proc/1/ns/net")
+	if err != nil {
+		_ = podNS.Close()
+		return nil, err
 	}
 	fi, err := podNS.Stat()
 	if err != nil {
@@ -191,7 +211,7 @@ func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) (
 	var addrs []netip.Addr
 	links, err := runInNetns(podNS, m.log, func() ([]io.Closer, error) {
 		var links []io.Closer
-		for _, name := range m.resolveEgressInterfaces(pid) {
+		for _, name := range m.resolveEgressInterfaces(where) {
 			if name == "lo" {
 				continue
 			}
@@ -207,7 +227,7 @@ func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) (
 			for _, l := range links {
 				_ = l.Close()
 			}
-			return nil, fmt.Errorf("attaching the DNS rewrite to %s in pid %d netns: %w", name, pid, err)
+			return nil, fmt.Errorf("attaching the DNS rewrite to %s in the netns of %s: %w", name, where, err)
 		}
 		return links, nil
 	})
@@ -215,20 +235,20 @@ func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) (
 		!strings.EqualFold(m.egressInterface, "none") && !strings.EqualFold(m.egressInterface, "lo-only") {
 		// No default route yet (CNI still setting up): the reconciler
 		// retries.
-		err = fmt.Errorf("no interface resolved in pid %d netns", pid)
+		err = fmt.Errorf("no interface resolved in the netns of %s", where)
 	}
 	if err != nil {
 		_ = podNS.Close()
 		if !m.dnsRewriteFailed[podUID] {
 			m.dnsRewriteFailed[podUID] = true
 			m.log.Warnw("failed to attach the DNS rewrite: the pod gets real addresses for watched hosts until it succeeds",
-				"pod", pod, "pid", pid, "error", err)
+				"pod", pod, "netnsOf", where, "error", err)
 		}
 		return nil, err
 	}
 	delete(m.dnsRewriteFailed, podUID)
 	m.dnsRewrite[podUID] = &dnsRewriteAttach{ino: ino, netns: podNS, links: links, addrs: addrs}
-	m.log.Infow("attached DNS rewrite to pod netns", "pod", pod, "pid", pid, "netns", ino,
+	m.log.Infow("attached DNS rewrite to pod netns", "pod", pod, "netnsOf", where, "netns", ino,
 		"interfaces", len(links), "addrs", addrs)
 	return addrs, nil
 }
