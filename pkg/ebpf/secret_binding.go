@@ -170,12 +170,12 @@ func secretACL(snapshot []secrets.Secret, bindings map[string]podBinding) map[se
 
 // vipPodHostKey must match struct vip_pod_host_key in tls_uprobe.c.
 type vipPodHostKey struct {
-	PodIP [16]byte         // IPv4-mapped-IPv6
+	PodIP [16]byte         // IPv4-mapped-IPv6 or IPv6
 	Host  [maxHostLen]byte // all zero: every watched host
 }
 
 // vipPodHosts returns the vip_pod_host entries for the bindings over the
-// snapshot: each IPv4 address of a pod, paired with the host of every
+// snapshot: each address of a pod, paired with the host of every
 // secret the pod references that is restricted to a hostname, so that
 // tc_dns_rewrite hands the pod those hosts' fake IPs. anyHost
 // (--secret-binding=audit, where a pod may redeem every secret) pairs each
@@ -185,11 +185,7 @@ func vipPodHosts(snapshot []secrets.Secret, bindings map[string]podBinding, anyH
 	out := make(map[vipPodHostKey]struct{})
 	for _, b := range bindings {
 		for _, ip := range b.podIPs {
-			// tc_dns_rewrite rewrites IPv4 answers only.
-			if ip = ip.Unmap(); !ip.Is4() {
-				continue
-			}
-			addr := vipPodHostKey{PodIP: ip.As16()}
+			addr := vipPodHostKey{PodIP: ip.Unmap().As16()}
 			if anyHost {
 				out[addr] = struct{}{}
 				continue

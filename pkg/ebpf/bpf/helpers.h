@@ -584,10 +584,10 @@ HELPER_INLINE __u32 tls_parse_sni(const __u8 *buf, __u32 len, char *host_out,
 // ============================================================================
 // DNS answers for the virtual IP rewrite (tc_dns_rewrite,
 // --host-resolution=virtual-ip). dns_parse_question reads the question of a
-// response and dns_scan_a_records lists the A records of its answer section,
-// so the tc program can replace each address with the host's fake IP. Both
-// read the first MAX_DNS_PKT bytes of the message, copied into a buffer of
-// that size.
+// response and dns_scan_addr_records lists the address records of its answer
+// section (A for an A question, AAAA for an AAAA one), so the tc program can
+// replace each address with the host's fake IP of that family. Both read the
+// first MAX_DNS_PKT bytes of the message, copied into a buffer of that size.
 // ============================================================================
 
 #ifndef MAX_DNS_PKT
@@ -597,29 +597,41 @@ HELPER_INLINE __u32 tls_parse_sni(const __u8 *buf, __u32 len, char *host_out,
 _Static_assert((MAX_DNS_PKT & DNS_MSG_MASK) == 0,
                "MAX_DNS_PKT must be a power of two: offsets are masked with it");
 
-// A records rewritten per answer. An answer with more is left unchanged.
-#define DNS_MAX_A_RECORDS 8
+// Address records rewritten per answer. An answer with more is left
+// unchanged.
+#define DNS_MAX_ADDR_RECORDS 8
 // Answer section walk budget: one step per owner name label and one per
-// record. Covers DNS_MAX_A_RECORDS records under compressed names with room
+// record. Covers DNS_MAX_ADDR_RECORDS records under compressed names with room
 // for a CNAME chain or uncompressed names.
 #define DNS_SCAN_STEPS 64
 
 #define DNS_TYPE_A 1
+#define DNS_TYPE_AAAA 28
 #define DNS_CLASS_IN 1
 
-// dns_parse_question / dns_scan_a_records results.
+// dns_parse_question / dns_scan_addr_records results.
 #define DNS_SCAN_OK 0
 #define DNS_SCAN_NOT_ANSWER 1 // not an untruncated NOERROR answer to one question
 #define DNS_SCAN_BAD_NAME 2   // the question is not a name a watched host can have
 #define DNS_SCAN_INCOMPLETE 3 // the answer section is cut short or past the walk budget
 #define DNS_SCAN_MALFORMED 4  // lengths or label types are invalid
 
-// An IN A record of an answer section.
-struct dns_a_record {
-  __u32 off; // offset of the 4-byte address (RDATA) in the message
+// An IN A or AAAA record of an answer section.
+struct dns_addr_record {
+  __u32 off; // offset of the address (RDATA) in the message
   __u32 ttl;
-  __u8 ip[4];
+  __u8 ip[16]; // an A record's address in the first 4 bytes
 };
+
+// dns_addr_len returns the address length of the records answering a
+// question of type qtype: 4 for A, 16 for AAAA, 0 for any other type.
+HELPER_INLINE __u32 dns_addr_len(__u32 qtype) {
+  if (qtype == DNS_TYPE_A)
+    return 4;
+  if (qtype == DNS_TYPE_AAAA)
+    return 16;
+  return 0;
+}
 
 // dns_idx masks a message offset, hidden from the compiler like sni_idx.
 HELPER_INLINE __u32 dns_idx(__u32 off) {
@@ -647,6 +659,7 @@ HELPER_INLINE __u32 dns_rd16(const __u8 *b, __u32 off) {
 struct dns_question {
   char qname[MAX_HOST_LEN]; // lowercased, without the root label, zero-padded
   __u32 qname_len;
+  __u32 qtype;
   __u32 ancount;
   __u32 answers_off; // where the answer section starts
   __u32 status;      // DNS_SCAN_*
@@ -700,6 +713,7 @@ HELPER_INLINE int dns_question_step(struct dns_question *q, const __u8 *msg) {
       } else if (off + 1 + 4 > len) {
         q->status = DNS_SCAN_NOT_ANSWER;
       } else {
+        q->qtype = dns_rd16(msg, off + 1);
         q->answers_off = off + 1 + 4;
         q->status = DNS_SCAN_OK;
       }
@@ -733,7 +747,7 @@ HELPER_INLINE int dns_question_step(struct dns_question *q, const __u8 *msg) {
 }
 
 // dns_question_end returns the walk's DNS_SCAN_* result. On DNS_SCAN_OK
-// q->qname, q->qname_len, q->ancount and q->answers_off are set.
+// q->qname, q->qname_len, q->qtype, q->ancount and q->answers_off are set.
 HELPER_INLINE __u32 dns_question_end(struct dns_question *q) {
   if (q->status == DNS_SCAN_RUNNING) // name longer than the step budget
     q->status = DNS_SCAN_BAD_NAME;
@@ -751,8 +765,10 @@ HELPER_INLINE __u32 dns_parse_question(const __u8 *msg, __u32 len,
 
 // Answer walk: one step per owner name label or per record.
 struct dns_answers {
-  struct dns_a_record recs[DNS_MAX_A_RECORDS];
+  struct dns_addr_record recs[DNS_MAX_ADDR_RECORDS];
   __u32 n_recs;
+  __u32 rr_type; // the record type listed (the question's)
+  __u32 rr_len;  // its address length (dns_addr_len), 0: none listed
   __u32 status;  // DNS_SCAN_*
   __u32 len;     // message length (at most MAX_DNS_PKT)
   __u32 off;     // next label or record
@@ -762,12 +778,14 @@ struct dns_answers {
 };
 
 // dns_answers_begin starts the walk of the ancount records of the answer
-// section at msg[off] (dns_question.answers_off). a must be zeroed by the
-// caller.
+// section at msg[off] (dns_question.answers_off), listing the IN records of
+// type qtype if it is A or AAAA. a must be zeroed by the caller.
 HELPER_INLINE void dns_answers_begin(struct dns_answers *a, __u32 len,
-                                     __u32 off, __u32 ancount) {
+                                     __u32 off, __u32 ancount, __u32 qtype) {
   if (len > MAX_DNS_PKT)
     len = MAX_DNS_PKT;
+  a->rr_type = qtype;
+  a->rr_len = dns_addr_len(qtype);
   a->len = len;
   a->off = off;
   a->ancount = ancount;
@@ -775,9 +793,9 @@ HELPER_INLINE void dns_answers_begin(struct dns_answers *a, __u32 len,
   a->status = DNS_SCAN_RUNNING;
 }
 
-// dns_answers_step walks one owner name label or one record, listing IN A
-// records in a->recs. Other records, such as the CNAME chain leading to the
-// addresses, are skipped.
+// dns_answers_step walks one owner name label or one record, listing the IN
+// records of type a->rr_type in a->recs. Other records, such as the CNAME
+// chain leading to the addresses, are skipped.
 HELPER_INLINE int dns_answers_step(struct dns_answers *a, const __u8 *msg) {
   if (a->status != DNS_SCAN_RUNNING)
     return 1;
@@ -820,21 +838,22 @@ HELPER_INLINE int dns_answers_step(struct dns_answers *a, const __u8 *msg) {
     a->status = DNS_SCAN_INCOMPLETE;
     return 1;
   }
-  if (type == DNS_TYPE_A && cls == DNS_CLASS_IN) {
+  __u32 alen = a->rr_len;
+  if (alen && type == a->rr_type && cls == DNS_CLASS_IN) {
     __u32 n = a->n_recs;
-    if (rdlen != 4) {
+    if (rdlen != alen) {
       a->status = DNS_SCAN_MALFORMED;
       return 1;
     }
-    if (n >= DNS_MAX_A_RECORDS) {
+    if (n >= DNS_MAX_ADDR_RECORDS) {
       a->status = DNS_SCAN_INCOMPLETE;
       return 1;
     }
-    struct dns_a_record *r = &a->recs[n & (DNS_MAX_A_RECORDS - 1)];
+    struct dns_addr_record *r = &a->recs[n & (DNS_MAX_ADDR_RECORDS - 1)];
     r->off = off;
     r->ttl = ttl;
-    for (__u32 k = 0; k < 4; k++)
-      r->ip[k] = msg[dns_idx(off + k)];
+    for (__u32 k = 0; k < 16; k++)
+      r->ip[k] = k < alen ? msg[dns_idx(off + k)] : 0;
     a->n_recs = n + 1;
   }
   a->off = off + rdlen;
@@ -852,9 +871,10 @@ HELPER_INLINE __u32 dns_answers_end(struct dns_answers *a) {
   return a->status;
 }
 
-HELPER_INLINE __u32 dns_scan_a_records(const __u8 *msg, __u32 len, __u32 off,
-                                       __u32 ancount, struct dns_answers *a) {
-  dns_answers_begin(a, len, off, ancount);
+HELPER_INLINE __u32 dns_scan_addr_records(const __u8 *msg, __u32 len,
+                                          __u32 off, __u32 ancount,
+                                          __u32 qtype, struct dns_answers *a) {
+  dns_answers_begin(a, len, off, ancount, qtype);
   for (__u32 i = 0; i < DNS_SCAN_STEPS; i++)
     if (dns_answers_step(a, msg))
       break;
@@ -873,89 +893,133 @@ HELPER_INLINE __u32 csum_odd_bytes(__u32 v) {
 }
 
 // ============================================================================
-// Virtual IP upstreams (vip_upstream): the real IPv4 addresses the trusted
-// resolvers returned for a fake IP's host. tc_dns_rewrite records them, the
-// connect4 redirect picks one.
+// Virtual IP addresses. Every address is 16 bytes, network byte order: IPv6,
+// or IPv4-mapped (::ffff:a.b.c.d) for IPv4. The tests below OR the bytes
+// together rather than stop at the first one that decides: one branch per
+// test, where an early exit per byte multiplies the paths the verifier walks
+// (with clang 19, past its budget in vip_connect6).
 // ============================================================================
+
+// vip_addr_eq reports whether the addresses a and b are equal.
+HELPER_INLINE int vip_addr_eq(const __u8 *a, const __u8 *b) {
+  __u8 diff = 0;
+  for (__u32 i = 0; i < 16; i++)
+    diff |= a[i] ^ b[i];
+  return diff == 0;
+}
+
+// vip_addr_v4mapped reports whether ip is an IPv4-mapped address.
+HELPER_INLINE int vip_addr_v4mapped(const __u8 *ip) {
+  __u8 diff = (__u8)(ip[10] ^ 0xff) | (__u8)(ip[11] ^ 0xff);
+  for (__u32 i = 0; i < 10; i++)
+    diff |= ip[i];
+  return diff == 0;
+}
+
+// vip_addr_unspecified reports whether ip is :: or 0.0.0.0 (IPv4-mapped).
+HELPER_INLINE int vip_addr_unspecified(const __u8 *ip) {
+  __u8 rest = ip[12] | ip[13] | ip[14] | ip[15];
+  for (__u32 i = 0; i < 10; i++)
+    rest |= ip[i];
+  if (rest)
+    return 0;
+  return (ip[10] | ip[11]) == 0 || (ip[10] & ip[11]) == 0xff;
+}
+
+// vip_in_prefix6 reports whether the IPv6 address ip is in the range
+// net/mask; never when mask is all zero (no IPv6 range).
+HELPER_INLINE int vip_in_prefix6(const __u8 *net, const __u8 *mask,
+                                 const __u8 *ip) {
+  __u8 diff = 0, any = 0;
+  for (__u32 i = 0; i < 16; i++) {
+    diff |= (ip[i] & mask[i]) ^ net[i];
+    any |= mask[i];
+  }
+  return diff == 0 && any != 0;
+}
+
+// Virtual IP upstreams (vip_upstream): the real addresses the trusted
+// resolvers returned for a fake IP's host, in the fake IP's family (from the
+// A records for a fake IPv4, the AAAA records for a fake IPv6).
+// tc_dns_rewrite records them, the connect redirect picks one.
 
 #define VIP_UPSTREAM_SLOTS 4
 
 struct vip_upstream_slot {
-  __u8 ip4[4];      // network byte order; all zero = empty slot
-  __u32 _pad;
-  __u64 expires_at; // bpf_ktime_get_boot_ns() at which the record's TTL ran out
+  __u8 ip[16];
+  __u64 expires_at; // bpf_ktime_get_boot_ns() at which the record's TTL ran
+                    // out; 0 = empty slot
 };
 
 struct vip_upstream_val {
   struct vip_upstream_slot slot[VIP_UPSTREAM_SLOTS];
 };
 
-// vip_upstream_record adds ip, valid until expires_at, to v. A slot already
-// holding ip keeps the later expiry; otherwise ip takes the slot that
-// expires first (an empty one if any). 0.0.0.0 is not recorded.
+// vip_upstream_record adds ip, valid until expires_at (not 0), to v. A slot
+// already holding ip keeps the later expiry; otherwise ip takes the slot
+// that expires first (an empty one if any). An unspecified address (:: or
+// 0.0.0.0) is not recorded.
 HELPER_INLINE void vip_upstream_record(struct vip_upstream_val *v,
-                                       const __u8 ip[4], __u64 expires_at) {
-  __u32 want;
-  __builtin_memcpy(&want, ip, 4);
-  if (want == 0)
+                                       const __u8 *ip, __u64 expires_at) {
+  if (expires_at == 0 || vip_addr_unspecified(ip))
     return;
   __u32 victim = 0;
   __u64 victim_exp = ~0ULL;
   for (__u32 i = 0; i < VIP_UPSTREAM_SLOTS; i++) {
-    __u32 cur;
-    __builtin_memcpy(&cur, v->slot[i].ip4, 4);
-    if (cur == want) {
-      if (expires_at > v->slot[i].expires_at)
+    __u64 exp = v->slot[i].expires_at;
+    if (exp && vip_addr_eq(v->slot[i].ip, ip)) {
+      if (expires_at > exp)
         v->slot[i].expires_at = expires_at;
       return;
     }
-    __u64 exp = cur ? v->slot[i].expires_at : 0;
     if (exp < victim_exp) {
       victim_exp = exp;
       victim = i;
     }
   }
   struct vip_upstream_slot *s = &v->slot[victim & (VIP_UPSTREAM_SLOTS - 1)];
-  __builtin_memcpy(s->ip4, ip, 4);
+  __builtin_memcpy(s->ip, ip, 16);
   s->expires_at = expires_at;
 }
 
-// vip_upstream_pick returns the address (network byte order) a connect to
-// v's fake IP goes to at time now: one of the unexpired addresses, chosen by
-// rnd, or else the one that expired last, as a resolver serving a stale
-// answer would. 0 when v holds none.
-HELPER_INLINE __u32 vip_upstream_pick(const struct vip_upstream_val *v,
-                                      __u64 now, __u32 rnd) {
-  __u32 n_live = 0, newest = 0;
+// vip_upstream_pick copies to out the address a connect to v's fake IP goes
+// to at time now: one of the unexpired addresses, chosen by rnd, or else the
+// one that expired last, as a resolver serving a stale answer would.
+// Returns 0 (out untouched) when v holds none.
+HELPER_INLINE int vip_upstream_pick(const struct vip_upstream_val *v,
+                                    __u64 now, __u32 rnd, __u8 *out) {
+  __u32 n_live = 0, newest = VIP_UPSTREAM_SLOTS;
   __u64 newest_exp = 0;
   for (__u32 i = 0; i < VIP_UPSTREAM_SLOTS; i++) {
-    __u32 cur;
-    __builtin_memcpy(&cur, v->slot[i].ip4, 4);
-    if (cur == 0)
-      continue;
     __u64 exp = v->slot[i].expires_at;
+    if (exp == 0)
+      continue;
     if (exp > now)
       n_live++;
-    if (newest == 0 || exp > newest_exp) {
-      newest = cur;
+    if (exp > newest_exp) {
+      newest = i;
       newest_exp = exp;
     }
   }
-  if (n_live == 0)
-    return newest;
-  // The k-th unexpired slot (no variable index into a stack array: the
-  // verifier rejects it).
-  __u32 k = rnd % n_live;
-  for (__u32 i = 0; i < VIP_UPSTREAM_SLOTS; i++) {
-    __u32 cur;
-    __builtin_memcpy(&cur, v->slot[i].ip4, 4);
-    if (cur == 0 || v->slot[i].expires_at <= now)
-      continue;
-    if (k == 0)
-      return cur;
-    k--;
+  if (newest == VIP_UPSTREAM_SLOTS)
+    return 0;
+  __u32 pick = newest;
+  if (n_live > 0) {
+    // The k-th unexpired slot (no variable index into a stack array: the
+    // verifier rejects it).
+    __u32 k = rnd % n_live;
+    for (__u32 i = 0; i < VIP_UPSTREAM_SLOTS; i++) {
+      if (v->slot[i].expires_at <= now)
+        continue;
+      if (k == 0) {
+        pick = i;
+        break;
+      }
+      k--;
+    }
   }
-  return newest;
+  __builtin_memcpy(out, v->slot[pick & (VIP_UPSTREAM_SLOTS - 1)].ip, 16);
+  return 1;
 }
 
 // Results of vip_socket_check.
@@ -970,7 +1034,7 @@ HELPER_INLINE __u32 vip_upstream_pick(const struct vip_upstream_val *v,
 // nothing.
 //   sock_host: the host of the fake IP the socket connected to (zero-padded,
 //              as vip_ip_val.host), NULL when it connected to none;
-//   daddr16:   the socket's real destination, IPv4-mapped;
+//   daddr16:   the socket's real destination, IPv6 or IPv4-mapped;
 //   dport:     the socket's destination port, host byte order.
 HELPER_INLINE int vip_socket_check(const char *sock_host, __u32 host_len,
                                    const char *allowed_host, __u32 ip_len,

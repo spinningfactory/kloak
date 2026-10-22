@@ -48,6 +48,21 @@ func procDirWithRoutes(t *testing.T, routes ...[2]string) string {
 	return dir
 }
 
+// addRoutes6 writes a net/ipv6_route with the given destinations to the
+// <pid> directory dir.
+func addRoutes6(t *testing.T, dir string, dsts ...string) {
+	t.Helper()
+	var b strings.Builder
+	for _, d := range dsts {
+		p := netip.MustParsePrefix(d)
+		a := p.Addr().As16()
+		fmt.Fprintf(&b, "%x %02x 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0\n", a[:], p.Bits())
+	}
+	if err := os.WriteFile(filepath.Join(dir, "net", "ipv6_route"), []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func clusterReader(funcs interceptor.Funcs, objs ...client.Object) client.Reader {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
@@ -93,6 +108,7 @@ func TestDiscoverReservedRanges(t *testing.T) {
 		},
 	)
 	procDir := procDirWithRoutes(t, [2]string{"0.0.0.0", "0.0.0.0"}, [2]string{"10.42.1.0", "255.255.255.0"})
+	addRoutes6(t, procDir, "fd00:6b6c::/64", "::/0")
 
 	got, err := discoverReservedRanges(context.Background(), reader, procDir, zap.NewNop().Sugar())
 	if err != nil {
@@ -105,7 +121,9 @@ func TestDiscoverReservedRanges(t *testing.T) {
 		"10.43.0.0/16 service CIDR kubernetes",
 		"192.168.5.15/32 address of node a",
 		"192.168.5.16/32 address of node b",
+		"::/0 node route via eth0",
 		"fd00:42::/64 pod CIDR of node a",
+		"fd00:6b6c::/64 node route via eth0",
 	}
 	if g := rangeStrings(got); !slices.Equal(g, want) {
 		t.Fatalf("got\n  %s\nwant\n  %s", strings.Join(g, "\n  "), strings.Join(want, "\n  "))
@@ -149,15 +167,28 @@ func TestDiscoverReservedRangesFailsClosed(t *testing.T) {
 	}
 }
 
-func TestCheckVirtualIPRangeController(t *testing.T) {
-	reader := clusterReader(interceptor.Funcs{}, testNode("a", []string{"10.42.0.0/24"}, "198.19.0.5"))
-	err := checkVirtualIPRange(context.Background(), reader, netip.MustParsePrefix(ebpf.DefaultVirtualIPRange),
-		procDirWithRoutes(t), zap.NewNop().Sugar())
-	if err == nil || !strings.Contains(err.Error(), "198.19.0.5/32 (address of node a)") {
-		t.Fatalf("overlap with a node address not reported: %v", err)
+func TestCheckVirtualIPRangesController(t *testing.T) {
+	defaults, err := ebpf.ParseVirtualIPRanges(ebpf.DefaultVirtualIPRange)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := checkVirtualIPRange(context.Background(), reader, netip.MustParsePrefix("100.120.0.0/16"),
-		procDirWithRoutes(t), zap.NewNop().Sugar()); err != nil {
-		t.Fatalf("non-overlapping range refused: %v", err)
+	reader := clusterReader(interceptor.Funcs{}, testNode("a", []string{"10.42.0.0/24", "2001:2:0:1::/64"}, "198.19.0.5"))
+	err = checkVirtualIPRanges(context.Background(), reader, defaults, procDirWithRoutes(t), zap.NewNop().Sugar())
+	for _, want := range []string{"198.19.0.5/32 (address of node a)", "2001:2:0:1::/64 (pod CIDR of node a)"} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Errorf("overlap %s not reported: %v", want, err)
+		}
+	}
+	// The IPv6 range against a node's IPv6 routes.
+	procDir := procDirWithRoutes(t)
+	addRoutes6(t, procDir, "2001:2::/64")
+	clean := clusterReader(interceptor.Funcs{}, testNode("a", []string{"10.42.0.0/24"}, "192.168.5.15"))
+	if err := checkVirtualIPRanges(context.Background(), clean, defaults, procDir, zap.NewNop().Sugar()); err == nil ||
+		!strings.Contains(err.Error(), "2001:2::/64 (node route via eth0)") {
+		t.Errorf("overlap with a node IPv6 route not reported: %v", err)
+	}
+	other := ebpf.VirtualIPRanges{V4: netip.MustParsePrefix("100.120.0.0/16"), V6: netip.MustParsePrefix("fd00:6b6c:1::/64")}
+	if err := checkVirtualIPRanges(context.Background(), reader, other, procDirWithRoutes(t), zap.NewNop().Sugar()); err != nil {
+		t.Fatalf("non-overlapping ranges refused: %v", err)
 	}
 }

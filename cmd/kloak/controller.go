@@ -79,11 +79,12 @@ func init() {
 			`"enforce" refuses other rewrites; "audit" allows them but logs each violation, to find clients whose SNI differs from the annotation before enforcing.`)
 	controllerCmd.Flags().StringVar(&hostResolution, "host-resolution", string(ebpf.HostResolutionDNSSnoop),
 		`How the data plane works out which host a connection goes to, for secrets restricted to a hostname (getkloak.io/hosts). `+
-			`"dns-snoop" reads DNS answers as pods receive them. "virtual-ip" (experimental, spinningfactory/kloak#327) gives every such host a stable fake IP from --virtual-ip-range, `+
+			`"dns-snoop" reads DNS answers as pods receive them (IPv4 connections only). "virtual-ip" (experimental, spinningfactory/kloak#327) gives every such host a stable fake IP, and fake IPv6, from --virtual-ip-range, `+
 			`kept in maps pinned under `+ebpf.DefaultBPFPinPath+`. A kloak pod with a secret for the host gets the fake IP in DNS answers and its connects to it are redirected to the host's addresses; a host-restricted secret is only rewritten on a connection made to its host's fake IP.`)
 	controllerCmd.Flags().StringVar(&virtualIPRange, "virtual-ip-range", ebpf.DefaultVirtualIPRange,
-		`IPv4 range (/19 or larger) fake IPs come from with --host-resolution=virtual-ip. `+
-			`The controller refuses to start if it overlaps a node address, pod CIDR, service CIDR or route of the node.`)
+		`Ranges fake IPs come from with --host-resolution=virtual-ip: an IPv4 range (/19 or larger) and, optionally, an IPv6 one (/115 or larger), comma-separated. `+
+			`Without an IPv6 range, AAAA answers are left unchanged. `+
+			`The controller refuses to start if a range overlaps a node address, pod CIDR, service CIDR or route of the node.`)
 }
 
 func runController(cmd *cobra.Command, args []string) {
@@ -117,7 +118,7 @@ func runController(cmd *cobra.Command, args []string) {
 	}
 	hostRes := ebpf.HostResolutionConfig{Mode: hostResMode}
 	if hostResMode == ebpf.HostResolutionVirtualIP {
-		hostRes.VirtualIPRange, err = ebpf.ParseVirtualIPRange(virtualIPRange)
+		hostRes.VirtualIPRanges, err = ebpf.ParseVirtualIPRanges(virtualIPRange)
 		if err != nil {
 			setupLog.Errorw("invalid --virtual-ip-range", "error", err)
 			_ = setupLog.Sync()
@@ -150,7 +151,7 @@ func runController(cmd *cobra.Command, args []string) {
 			// The controller runs with hostPID: /proc/1 is in the host
 			// network namespace.
 			checkCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			err := checkVirtualIPRange(checkCtx, mgr.GetAPIReader(), hostRes.VirtualIPRange, "/proc/1", setupLog)
+			err := checkVirtualIPRanges(checkCtx, mgr.GetAPIReader(), hostRes.VirtualIPRanges, "/proc/1", setupLog)
 			cancel()
 			if err != nil {
 				setupLog.Errorw("invalid --virtual-ip-range", "error", err)
@@ -160,7 +161,7 @@ func runController(cmd *cobra.Command, args []string) {
 		} else {
 			ebpf.RemoveVirtualIPPins(hostRes.PinPath, setupLog)
 		}
-		uprobeMgr, err = ebpf.NewTLSUprobeManager(k8ssecrets.NewSource(mgr.GetClient()).WithLog(setupLog), cgroupPath, egressInterface, hostRes, setupLog)
+		uprobeMgr, err = ebpf.NewTLSUprobeManager(k8ssecrets.NewSource(mgr.GetClient()).WithLog(setupLog), cgroupPath, egressInterface, &hostRes, setupLog)
 		if err != nil {
 			setupLog.Errorw("failed to initialize eBPF uprobe manager", "error", err)
 			_ = setupLog.Sync()

@@ -28,23 +28,39 @@ func TestParseHostResolutionMode(t *testing.T) {
 	}
 }
 
-func TestParseVirtualIPRange(t *testing.T) {
-	if got, err := ParseVirtualIPRange(DefaultVirtualIPRange); err != nil || got != netip.MustParsePrefix("198.18.0.0/15") {
-		t.Fatalf("default range: %v, %v", got, err)
+func TestParseVirtualIPRanges(t *testing.T) {
+	want := VirtualIPRanges{V4: netip.MustParsePrefix("198.18.0.0/15"), V6: netip.MustParsePrefix("2001:2::/48")}
+	if got, err := ParseVirtualIPRanges(DefaultVirtualIPRange); err != nil || got != want {
+		t.Fatalf("default ranges: %v, %v", got, err)
 	}
-	if _, err := ParseVirtualIPRange("10.200.0.0/19"); err != nil {
-		t.Errorf("/19: %v", err)
+	if want.String() != DefaultVirtualIPRange {
+		t.Errorf("String() = %q", want.String())
+	}
+	for in, want := range map[string]VirtualIPRanges{
+		"10.200.0.0/19":                {V4: netip.MustParsePrefix("10.200.0.0/19")},
+		"fd00:6b6c::/115, 10.0.0.0/16": {V4: netip.MustParsePrefix("10.0.0.0/16"), V6: netip.MustParsePrefix("fd00:6b6c::/115")},
+	} {
+		if got, err := ParseVirtualIPRanges(in); err != nil || got != want {
+			t.Errorf("ParseVirtualIPRanges(%q) = %v, %v; want %v", in, got, err, want)
+		}
 	}
 	for _, bad := range []string{
 		"",
-		"198.18.0.0",        // not a prefix
-		"198.18.1.0/15",     // host bits set
-		"10.200.0.0/20",     // too small
-		"fd00:6b6c::/64",    // IPv6
-		"::ffff:0.0.0.0/96", // IPv4-mapped IPv6
+		"198.18.0.0",                      // not a prefix
+		"198.18.1.0/15",                   // host bits set
+		"10.200.0.0/20",                   // too small
+		"fd00:6b6c::/64",                  // no IPv4 range
+		"198.18.0.0/15,fd00::/116",        // IPv6 range too small
+		"198.18.0.0/15,fd00::1/64",        // IPv6 host bits set
+		"198.18.0.0/15,::ffff:0.0.0.0/96", // IPv4-mapped IPv6
+		"198.18.0.0/15,::/0",              // holds the IPv4-mapped addresses
+		"::ffff:198.18.0.0/111",           // IPv4-mapped IPv6 only
+		"198.18.0.0/15,10.0.0.0/16",       // two IPv4 ranges
+		"198.18.0.0/15,fd00::/64,fd01::/64",
+		"198.18.0.0/15,",
 	} {
-		if _, err := ParseVirtualIPRange(bad); err == nil {
-			t.Errorf("ParseVirtualIPRange(%q) succeeded", bad)
+		if _, err := ParseVirtualIPRanges(bad); err == nil {
+			t.Errorf("ParseVirtualIPRanges(%q) succeeded", bad)
 		}
 	}
 }
@@ -53,7 +69,8 @@ func TestHostResolutionConfigValidate(t *testing.T) {
 	ok := []HostResolutionConfig{
 		{},
 		{Mode: HostResolutionDNSSnoop},
-		{Mode: HostResolutionVirtualIP, VirtualIPRange: netip.MustParsePrefix(DefaultVirtualIPRange)},
+		{Mode: HostResolutionVirtualIP, VirtualIPRanges: testVIPRanges},
+		{Mode: HostResolutionVirtualIP, VirtualIPRanges: VirtualIPRanges{V4: testVIPRange}},
 	}
 	for _, c := range ok {
 		if err := c.validate(); err != nil {
@@ -63,20 +80,23 @@ func TestHostResolutionConfigValidate(t *testing.T) {
 	bad := []HostResolutionConfig{
 		{Mode: "stub"},
 		{Mode: HostResolutionVirtualIP},
-		{Mode: HostResolutionVirtualIP, VirtualIPRange: netip.MustParsePrefix("10.0.0.0/24")},
+		{Mode: HostResolutionVirtualIP, VirtualIPRanges: VirtualIPRanges{V4: netip.MustParsePrefix("10.0.0.0/24")}},
+		{Mode: HostResolutionVirtualIP, VirtualIPRanges: VirtualIPRanges{V6: testVIPRange6}},
+		{Mode: HostResolutionVirtualIP, VirtualIPRanges: VirtualIPRanges{V4: testVIPRange6}},
+		{Mode: HostResolutionVirtualIP, VirtualIPRanges: VirtualIPRanges{V4: testVIPRange, V6: testVIPRange}},
 	}
 	for _, c := range bad {
 		if err := c.validate(); err == nil {
 			t.Errorf("%+v: validated", c)
 		}
 	}
-	if got := (HostResolutionConfig{}).pinPath(); got != DefaultBPFPinPath {
+	if got := (&HostResolutionConfig{}).pinPath(); got != DefaultBPFPinPath {
 		t.Errorf("default pin path %q", got)
 	}
 }
 
 func TestCheckVirtualIPRange(t *testing.T) {
-	r := netip.MustParsePrefix(DefaultVirtualIPRange)
+	r := testVIPRange
 	clear := []ReservedRange{
 		{Prefix: netip.MustParsePrefix("0.0.0.0/0"), Source: "default route"},
 		{Prefix: netip.MustParsePrefix("10.42.0.0/16"), Source: "pod CIDR"},
@@ -102,6 +122,21 @@ func TestCheckVirtualIPRange(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "pod CIDR") || strings.Contains(err.Error(), "default route") {
 		t.Errorf("error %q names a range that does not overlap", err)
+	}
+
+	// The IPv6 range against IPv6 ranges.
+	clear6 := []ReservedRange{
+		{Prefix: netip.MustParsePrefix("::/0"), Source: "default route"},
+		{Prefix: netip.MustParsePrefix("fd42::/56"), Source: "pod CIDR"},
+		{Prefix: netip.MustParsePrefix("2001:3::/32"), Source: "just above"},
+		{Prefix: netip.MustParsePrefix("198.18.0.0/15"), Source: "IPv4"},
+	}
+	if err := CheckVirtualIPRange(testVIPRange6, clear6); err != nil {
+		t.Fatalf("no IPv6 overlap expected: %v", err)
+	}
+	err = CheckVirtualIPRange(testVIPRange6, append(clear6, ReservedRange{Prefix: netip.MustParsePrefix("2000::/3"), Source: "node route via eth0"}))
+	if err == nil || !strings.Contains(err.Error(), "2000::/3 (node route via eth0)") {
+		t.Errorf("IPv6 overlap: %v", err)
 	}
 }
 
@@ -141,6 +176,32 @@ func TestParseRoutes(t *testing.T) {
 	}
 }
 
+// route6Line formats a /proc/net/ipv6_route row for dst.
+func route6Line(dst, iface string) string {
+	p := netip.MustParsePrefix(dst)
+	a := p.Addr().As16()
+	return fmt.Sprintf("%x %02x 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 %8s\n",
+		a[:], p.Bits(), iface)
+}
+
+func TestParseRoutes6(t *testing.T) {
+	data := route6Line("fd42::/64", "cni0") + route6Line("::1/128", "lo") + route6Line("::/0", "eth0") +
+		route6Line("fe80::/64", "eth0") +
+		"fd42 40 short\n" + // too few fields
+		"zz00000000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 eth0\n" +
+		"fd420000000000000000000000000000 81 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001 eth0\n" // length > 128
+	got := parseRoutes6([]byte(data))
+	want := []route{
+		{iface: "cni0", dst: netip.MustParsePrefix("fd42::/64")},
+		{iface: "lo", dst: netip.MustParsePrefix("::1/128")},
+		{iface: "eth0", dst: netip.MustParsePrefix("::/0")},
+		{iface: "eth0", dst: netip.MustParsePrefix("fe80::/64")},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("parseRoutes6:\n got %v\nwant %v", got, want)
+	}
+}
+
 func TestHostRoutes(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(dir, "net"), 0o755); err != nil {
@@ -150,11 +211,24 @@ func TestHostRoutes(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "net", "route"), []byte(data), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	// No ipv6_route: a kernel without IPv6.
 	got, err := HostRoutes(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	want := []ReservedRange{{Prefix: netip.MustParsePrefix("10.42.0.0/24"), Source: "node route via cni0"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("HostRoutes = %v, want %v", got, want)
+	}
+
+	if err := os.WriteFile(filepath.Join(dir, "net", "ipv6_route"), []byte(route6Line("fd42::/64", "cni0")), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got, err = HostRoutes(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want = append(want, ReservedRange{Prefix: netip.MustParsePrefix("fd42::/64"), Source: "node route via cni0"})
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("HostRoutes = %v, want %v", got, want)
 	}
@@ -164,9 +238,19 @@ func TestHostRoutes(t *testing.T) {
 }
 
 var (
-	testVIPRange = netip.MustParsePrefix(DefaultVirtualIPRange)
-	testVIPNow   = time.Unix(1_800_000_000, 0)
+	testVIPRanges = mustVirtualIPRanges(DefaultVirtualIPRange)
+	testVIPRange  = testVIPRanges.V4
+	testVIPRange6 = testVIPRanges.V6
+	testVIPNow    = time.Unix(1_800_000_000, 0)
 )
+
+func mustVirtualIPRanges(s string) VirtualIPRanges {
+	r, err := ParseVirtualIPRanges(s)
+	if err != nil {
+		panic(err)
+	}
+	return r
+}
 
 func hostSet(hosts ...string) map[string]struct{} {
 	s := make(map[string]struct{}, len(hosts))
@@ -180,6 +264,14 @@ func hostSet(hosts ...string) map[string]struct{} {
 func usableVirtualIP(r netip.Prefix, ip netip.Addr) bool {
 	if !r.Contains(ip) {
 		return false
+	}
+	if ip.Is6() {
+		// Not the first or last address of r's first /64.
+		first := netip.PrefixFrom(r.Addr(), max(r.Bits(), 64)).Masked()
+		lastOff := ^uint64(0) >> max(r.Bits()-64, 0)
+		a := ip.As16()
+		off := binary.BigEndian.Uint64(a[8:]) & lastOff
+		return first.Contains(ip) && off != 0 && off != lastOff
 	}
 	v := binary.BigEndian.Uint32(ip.AsSlice())
 	base := binary.BigEndian.Uint32(r.Addr().AsSlice())
@@ -385,5 +477,131 @@ func TestPlanVirtualIPsOneActiveIPPerHost(t *testing.T) {
 	}, testVIPNow, 4096)
 	if plan.Hosts["api.example.com"] != high || len(plan.Reactivated) != 0 || !plan.Entries[low].Retired {
 		t.Fatalf("active vs retired: %+v", plan)
+	}
+}
+
+func TestPlanVirtualIPsIPv6(t *testing.T) {
+	hosts := hostSet("api.example.com", "b.example.com", "c.example.com")
+	plan := planVirtualIPs(testVIPRange6, hosts, nil, testVIPNow, 2048)
+	if len(plan.Hosts) != 3 || len(plan.Entries) != 3 || len(plan.Allocated) != 3 {
+		t.Fatalf("plan = %+v", plan)
+	}
+	seen := map[netip.Addr]bool{}
+	for host, ip := range plan.Hosts {
+		if !ip.Is6() || !usableVirtualIP(testVIPRange6, ip) {
+			t.Errorf("%s got unusable %s", host, ip)
+		}
+		if seen[ip] {
+			t.Errorf("%s shares %s", host, ip)
+		}
+		seen[ip] = true
+	}
+	if again := planVirtualIPs(testVIPRange6, hosts, nil, testVIPNow, 2048); !reflect.DeepEqual(again.Hosts, plan.Hosts) {
+		t.Fatalf("allocation not deterministic: %v vs %v", again.Hosts, plan.Hosts)
+	}
+	// A kept reservation wins, as in IPv4.
+	pinned := netip.MustParseAddr("2001:2::7")
+	plan = planVirtualIPs(testVIPRange6, hostSet("api.example.com"), map[netip.Addr]vipEntry{pinned: {Host: "api.example.com"}}, testVIPNow, 2048)
+	if plan.Hosts["api.example.com"] != pinned || len(plan.Allocated) != 0 {
+		t.Fatalf("kept reservation: %+v", plan)
+	}
+}
+
+func TestFreeVirtualIP6(t *testing.T) {
+	// A /126 holds offsets 0..3; 0 and 3 are skipped.
+	r := netip.MustParsePrefix("fd00::/126")
+	taken := map[netip.Addr]vipEntry{}
+	for range 2 {
+		ip, ok := freeVirtualIP(r, "api.example.com", taken)
+		if !ok || (ip != netip.MustParseAddr("fd00::1") && ip != netip.MustParseAddr("fd00::2")) {
+			t.Fatalf("got %s, %v (taken %v)", ip, ok, taken)
+		}
+		taken[ip] = vipEntry{Host: "x"}
+	}
+	if ip, ok := freeVirtualIP(r, "api.example.com", taken); ok {
+		t.Fatalf("full range handed out %s", ip)
+	}
+
+	// Past a /64, offsets fill the low 64 bits of the first /64; probing
+	// wraps past the all-ones offset.
+	big := netip.MustParsePrefix("2001:2::/48")
+	ip, ok := freeVirtualIP6(big, ^uint64(0), nil)
+	if !ok || ip != netip.MustParseAddr("2001:2::1") {
+		t.Fatalf("all-ones start: %s, %v", ip, ok)
+	}
+	ip, ok = freeVirtualIP6(big, 0x1234, map[netip.Addr]vipEntry{netip.MustParseAddr("2001:2::1234"): {}})
+	if !ok || ip != netip.MustParseAddr("2001:2::1235") {
+		t.Fatalf("probe past a taken address: %s, %v", ip, ok)
+	}
+	// A /96: offsets stay below 2^32, network bits intact.
+	small := netip.MustParsePrefix("fd00:1:2:3:4:5::/96")
+	ip, ok = freeVirtualIP6(small, 0x1_0000_0005, nil)
+	if !ok || ip != netip.MustParseAddr("fd00:1:2:3:4:5:0:5") {
+		t.Fatalf("/96: %s, %v", ip, ok)
+	}
+}
+
+func TestPlanVirtualIPRanges(t *testing.T) {
+	v4 := netip.MustParseAddr("198.18.7.7")
+	v6 := netip.MustParseAddr("2001:2::7")
+	existing := map[netip.Addr]vipEntry{v4: {Host: "api.example.com"}, v6: {Host: "api.example.com"}}
+
+	// Each family plans its own reservations; a host gets one IP of each.
+	p4, p6 := planVirtualIPRanges(testVIPRanges, hostSet("api.example.com", "b.example.com"), existing, testVIPNow, 8)
+	if p4.Hosts["api.example.com"] != v4 || p6.Hosts["api.example.com"] != v6 {
+		t.Fatalf("kept: %v %v", p4.Hosts, p6.Hosts)
+	}
+	if !p4.Hosts["b.example.com"].Is4() || !p6.Hosts["b.example.com"].Is6() {
+		t.Fatalf("new host: %v %v", p4.Hosts, p6.Hosts)
+	}
+	if len(p4.Released)+len(p6.Released) != 0 {
+		t.Errorf("released %v %v", p4.Released, p6.Released)
+	}
+
+	// Capacity is split: 2 of 4 entries each.
+	p4, p6 = planVirtualIPRanges(testVIPRanges, hostSet("a", "b", "c"), nil, testVIPNow, 4)
+	if len(p4.Entries) != 2 || len(p6.Entries) != 2 || len(p4.Unallocated) != 1 || len(p6.Unallocated) != 1 {
+		t.Fatalf("split capacity: v4 %v / %v, v6 %v / %v", p4.Entries, p4.Unallocated, p6.Entries, p6.Unallocated)
+	}
+
+	// Without an IPv6 range: IPv4 gets the whole map, every IPv6
+	// reservation is released and no host gets one.
+	p4, p6 = planVirtualIPRanges(VirtualIPRanges{V4: testVIPRange}, hostSet("api.example.com"), existing, testVIPNow, 4)
+	if p4.Hosts["api.example.com"] != v4 || len(p6.Hosts) != 0 || len(p6.Entries) != 0 {
+		t.Fatalf("no IPv6 range: %v %v", p4.Hosts, p6)
+	}
+	if len(p6.Released) != 1 || p6.Released[0].IP != v6 || p6.Released[0].Reason != "no virtual IP range of its family" {
+		t.Errorf("released %+v", p6.Released)
+	}
+	p4, _ = planVirtualIPRanges(VirtualIPRanges{V4: testVIPRange}, hostSet("a", "b", "c", "d"), nil, testVIPNow, 4)
+	if len(p4.Entries) != 4 {
+		t.Errorf("IPv4 alone got %d entries of 4", len(p4.Entries))
+	}
+}
+
+func TestPlanVirtualIPsTrimsToCapacity(t *testing.T) {
+	// The share of the map shrank (an IPv6 range was added): retired
+	// reservations beyond it go, oldest first; active ones stay.
+	existing := map[netip.Addr]vipEntry{
+		netip.MustParseAddr("198.18.1.1"): {Host: "a.example.com"},
+		netip.MustParseAddr("198.18.1.2"): {Host: "old.example.com", Retired: true, RetiredAt: testVIPNow.Add(-3 * time.Hour)},
+		netip.MustParseAddr("198.18.1.3"): {Host: "mid.example.com", Retired: true, RetiredAt: testVIPNow.Add(-2 * time.Hour)},
+		netip.MustParseAddr("198.18.1.4"): {Host: "new.example.com", Retired: true, RetiredAt: testVIPNow.Add(-time.Hour)},
+	}
+	plan := planVirtualIPs(testVIPRange, hostSet("a.example.com"), existing, testVIPNow, 2)
+	want := map[netip.Addr]vipEntry{
+		netip.MustParseAddr("198.18.1.1"): existing[netip.MustParseAddr("198.18.1.1")],
+		netip.MustParseAddr("198.18.1.4"): existing[netip.MustParseAddr("198.18.1.4")],
+	}
+	if !reflect.DeepEqual(plan.Entries, want) || len(plan.Released) != 2 {
+		t.Fatalf("entries %v, released %v", plan.Entries, plan.Released)
+	}
+	// Active reservations are never evicted, even beyond capacity.
+	active := map[netip.Addr]vipEntry{
+		netip.MustParseAddr("198.18.1.1"): {Host: "a.example.com"},
+		netip.MustParseAddr("198.18.1.2"): {Host: "b.example.com"},
+	}
+	if plan := planVirtualIPs(testVIPRange, hostSet("a.example.com", "b.example.com"), active, testVIPNow, 1); len(plan.Entries) != 2 {
+		t.Fatalf("active reservations evicted: %v", plan.Entries)
 	}
 }

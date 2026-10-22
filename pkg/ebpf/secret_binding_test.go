@@ -115,7 +115,7 @@ func TestVipPodHosts(t *testing.T) {
 	}
 	ip := netip.MustParseAddr
 	bindings := map[string]podBinding{
-		// The IPv6 address gets nothing: only A records are rewritten.
+		// Both addresses of a dual-stack pod.
 		"uid-api":     {podIPs: []netip.Addr{ip("10.42.0.7"), ip("fd00::7")}, refs: []secrets.Ref{{OwnerID: "ns/api"}}},
 		"uid-db-key":  {podIPs: []netip.Addr{ip("::ffff:10.42.0.8")}, refs: []secrets.Ref{{OwnerID: "ns/db", Keys: []string{"password"}}}},
 		"uid-pending": {refs: []secrets.Ref{{OwnerID: "ns/api"}}}, // no address yet
@@ -135,10 +135,11 @@ func TestVipPodHosts(t *testing.T) {
 	}{
 		{"enforce", false, []vipPodHostKey{
 			key("10.42.0.7", "api.example.com"),
+			key("fd00::7", "api.example.com"),
 			key("10.42.0.8", "db.example.com"),
 		}},
 		{"audit", true, []vipPodHostKey{
-			key("10.42.0.7", ""), key("10.42.0.8", ""), key("10.42.0.9", ""), key("10.42.0.10", ""),
+			key("10.42.0.7", ""), key("fd00::7", ""), key("10.42.0.8", ""), key("10.42.0.9", ""), key("10.42.0.10", ""),
 		}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
