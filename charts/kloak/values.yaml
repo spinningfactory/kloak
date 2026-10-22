@@ -63,9 +63,11 @@ controller:
     # (spinningfactory/kloak#327): every such host gets a stable fake IP
     # from virtualIPRange. A kloak pod with a secret restricted to the host
     # gets it in place of the host's IPv4 addresses in DNS answers, and its
-    # connects to it are redirected to one of those addresses; dns-snoop
-    # still decides the host. While the controller is not running, connects
-    # to fake IPs fail. The fake IPs and their addresses are kept in BPF maps
+    # connects to it are redirected to one of those addresses. A secret
+    # restricted to the host is only rewritten on a connection made to its
+    # fake IP (an app that connects to a hardcoded address, or resolves
+    # outside the pod's DNS, gets none). While the controller is not running,
+    # connects to fake IPs fail. The fake IPs and their addresses are kept in BPF maps
     # pinned under /sys/fs/bpf/kloak so restarts keep them; the pins stay on
     # the node after an uninstall until it reboots.
     hostResolution: dns-snoop

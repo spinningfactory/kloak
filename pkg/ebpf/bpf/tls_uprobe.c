@@ -121,6 +121,7 @@ struct scratch_buf {
   __u32 read_len;       // bytes read into data[] (max 256, for host parsing)
   __u32 total_data_len; // full TLS write length (for bpf_loop scanning)
   __u8  chain_type;     // 0=OpenSSL/BoringSSL, CHAIN_GO_TLS=Go crypto/tls
+  __u8  h_fresh;        // 1: bpf_h_extract stored this write's H in tls_conn_state
   __u32 host_offset;
   __u32 host_value_len; // length of extracted host value
   __u32 xor_fd;         // socket fd resolved by resolve_host (for tc_pending key)
@@ -284,6 +285,8 @@ enum {
   DBG_VIP_CONNECT_REDIRECT,  // vip_connect4 sent a connect to a fake IP to a real address
   DBG_VIP_CONNECT_REFUSED,   // connect to a fake IP refused: unallocated, or no address recorded yet
   DBG_VIP_DNS_UNBOUND,       // a watched host's answer left unchanged: the pod has no secret for the host
+  DBG_VIP_SOCK_HOST_DENY,    // patch refused at tcp_sendmsg: the socket did not connect to the secret host's fake IP
+  DBG_VIP_SOCK_ADDR_DENY,    // patch refused at tcp_sendmsg: the socket's real address or port is not the secret's
   DBG_MAX,
 };
 
@@ -632,6 +635,24 @@ struct {
   __type(key, int);
   __type(value, struct vip_sock_val);
 } vip_sock SEC(".maps");
+
+// Socket cookie -> host of the fake IP the socket connected to. Written by
+// vip_connect4/6; read at tcp_sendmsg (socket_filter_patches), which decides
+// a host-restricted secret on it instead of resolve_host's guess at
+// SSL_write. Keyed by cookie, not in vip_sock: a kprobe can't read socket
+// storage, and cookies are never reused. An entry goes when its socket
+// connects anywhere else or closes; a socket whose entry is missing gets no
+// host-restricted secret.
+struct vip_sock_host_val {
+  char host[MAX_HOST_LEN]; // as vip_ip_val.host
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 65536); // = sni_state
+  __type(key, __u64);
+  __type(value, struct vip_sock_host_val);
+} vip_sock_host SEC(".maps");
 
 // The (pod IP, host) pairs tc_dns_rewrite rewrites answers for: a pod gets
 // the fake IP of a host only if it references a secret restricted to that
@@ -2299,6 +2320,10 @@ int bpf_h_extract(void *ctx) {
   // CACHE_HIT / LIVE_WALK already counted above per H source.
   dbg_inc(DBG_XOR_CONN_HIT);
 
+  sd = bpf_map_lookup_elem(&scratch, &zero);
+  if (!sd)
+    return 0;
+  sd->h_fresh = 1;
   bpf_tail_call(ctx, &prog_array, 1);
   return 0;
 }
@@ -2329,10 +2354,12 @@ int bpf_xor_path(void *ctx) {
 
     // For OpenSSL/BoringSSL, if h_extract just populated tls_conn_state
     // (libcrypto-hook path), carry H through xor_pending so the kprobe
-    // doesn't need to re-walk the chain. h_valid stays 0 if tls_conn_state
-    // has no entry — kprobe will fall back to its own chain walk.
-    // Go's H derivation is shaped differently and stays in the kprobe.
-    if (sd->chain_type != CHAIN_GO_TLS) {
+    // doesn't need to re-walk the chain. Otherwise h_valid stays 0 and the
+    // kprobe walks the chain itself: an entry it stored for an earlier write
+    // may belong to an earlier connection, whose SSL object this one reuses
+    // (same ssl_ptr, another key). Go's H derivation is shaped differently
+    // and stays in the kprobe.
+    if (sd->chain_type != CHAIN_GO_TLS && sd->h_fresh) {
       struct tls_conn_key ck = {};
       ck.tgid = wi->staged_pending.tgid;
       ck.ssl_ptr = sd->ssl_ptr;
@@ -2358,6 +2385,12 @@ int bpf_xor_path(void *ctx) {
   __u32 sd_host_len = sd->host_value_len;
   // Host comparison will use sd->host_value via re-lookup later.
 
+  // Virtual IP mode: the host, IP and port restrictions are checked on the
+  // socket the record leaves on, at tcp_sendmsg (socket_filter_patches),
+  // not on resolve_host's guess of the connection.
+  struct vip_config_val *vcfg = bpf_map_lookup_elem(&vip_config, &zero);
+  int on_socket = vcfg && vcfg->mask4;
+
   struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
   if (!val || val->len == 0 || val->len > SECRET_MAX_LEN)
     goto next; // Skip this match.
@@ -2369,7 +2402,7 @@ int bpf_xor_path(void *ctx) {
   // Save allowed_host before any map lookup that could invalidate val.
   const char *val_allowed_host = val->allowed_host;
 
-  if (val_host_len > 0 || val_ip_len == 16 || val_port > 0) {
+  if (!on_socket && (val_host_len > 0 || val_ip_len == 16 || val_port > 0)) {
     __u32 sd_ip_len = sd->ip_len;
 
     // Host filtering
@@ -2851,7 +2884,10 @@ int bpf_kprobe_tcp_sendmsg_sni(void *ctx) {
 
 // tracepoint/sock/inet_sock_set_state: forget a socket's SNI when it starts
 // a new connection (SYN_SENT, before any data) or closes, so a reused
-// struct sock address never inherits another connection's SNI.
+// struct sock address never inherits another connection's SNI. On close,
+// also forget the host its connect recorded (vip_sock_host): a TCP socket
+// can connect again after a failed connect, without going through
+// vip_connect4 if the hooks are detached at that moment.
 SEC("tracepoint/sock/inet_sock_set_state")
 int tp_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx) {
   if (ctx->protocol != IPPROTO_TCP)
@@ -2860,22 +2896,45 @@ int tp_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx) {
     return 0;
   __u64 sk_key = (__u64)ctx->skaddr;
   bpf_map_delete_elem(&sni_state, &sk_key);
+  if (ctx->newstate == TCP_CLOSE) {
+    __u64 cookie = BPF_CORE_READ((struct sock *)ctx->skaddr, __sk_common.skc_cookie.counter);
+    if (cookie)
+      bpf_map_delete_elem(&vip_sock_host, &cookie);
+  }
   return 0;
 }
 
-// sni_filter_patches drops, from ghash_scratch.staged_tc, the patches whose
-// secret is restricted to a hostname that is not the SNI of `sk`, the socket
-// the patched record will leave on. Refused patches are removed, not zeroed:
-// tc treats secret_len 0 as a full SECRET_MAX_LEN patch (clamp_write_len).
-// Returns the number of patches kept.
+// socket_filter_patches drops, from ghash_scratch.staged_tc, the patches
+// whose secret may not leave on `sk`, the socket the patched record will
+// leave on:
+//   - a secret restricted to a hostname that is not the socket's SNI;
+//   - in virtual IP mode, a secret whose host, IP or port restriction the
+//     socket does not meet: the host of the fake IP it connected to
+//     (vip_sock_host), its real destination daddr (IPv4, network byte order)
+//     and port. bpf_xor_path leaves these restrictions to this check.
+// Refused patches are removed, not zeroed: tc treats secret_len 0 as a full
+// SECRET_MAX_LEN patch (clamp_write_len). Returns the number of patches kept.
 //
 // Deliberately __noinline: its own stack frame, away from the bridge
 // kprobe's, which is close to the 512-byte limit.
-static __attribute__((noinline)) __u32 sni_filter_patches(__u64 sk_key,
-                                                         __u8 memory_bio) {
+static __attribute__((noinline)) __u32 socket_filter_patches(__u64 sk_key,
+                                                            __u32 daddr,
+                                                            __u8 memory_bio) {
   __u32 zero = 0;
   __u32 *mode = bpf_map_lookup_elem(&sni_check_mode, &zero);
   __u8 audit = mode && *mode == SNI_CHECK_AUDIT;
+
+  struct vip_config_val *cfg = bpf_map_lookup_elem(&vip_config, &zero);
+  __u8 vip = cfg && cfg->mask4;
+  __u64 cookie = 0;
+  __u16 dport = 0;
+  __u8 daddr16[16];
+  ipv4_to_mapped(daddr16, (const __u8 *)&daddr);
+  if (vip) {
+    struct sock *sk = (struct sock *)sk_key;
+    cookie = BPF_CORE_READ(sk, __sk_common.skc_cookie.counter);
+    dport = __bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
+  }
 
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w)
@@ -2899,7 +2958,20 @@ static __attribute__((noinline)) __u32 sni_filter_patches(__u64 sk_key,
     struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
     if (!val) {
       keep = 0; // secret removed since the uprobe staged it
-    } else if (val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
+    } else if (vip) {
+      struct vip_sock_host_val *sh =
+          cookie ? bpf_map_lookup_elem(&vip_sock_host, &cookie) : NULL;
+      int why = vip_socket_check(sh ? sh->host : NULL, val->host_len,
+                                 val->allowed_host, val->ip_len,
+                                 (const __u8 *)val->allowed_ip, daddr16,
+                                 val->port, dport);
+      if (why != VIP_SOCK_OK) {
+        dbg_inc(why == VIP_SOCK_DENY_HOST ? DBG_VIP_SOCK_HOST_DENY
+                                          : DBG_VIP_SOCK_ADDR_DENY);
+        keep = 0;
+      }
+    }
+    if (keep && val && val->host_len > 0 && val->host_len < MAX_HOST_LEN) {
       struct sni_state_val *st = bpf_map_lookup_elem(&sni_state, &sk_key);
       __u32 status = st ? st->status : SNI_STATUS_NONE;
       if (status == SNI_STATUS_SEEN && !hosts_match(st->sni, val->allowed_host))
@@ -3008,6 +3080,51 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   __u64 ssl_ptr = pending->ssl_ptr;
   __u32 plaintext_len = pending->plaintext_len;
   __u8 chain = pending->chain_type;
+
+  // Filter the patches first: a write none of whose patches may leave on
+  // this socket must not reach the H extraction below, which stores the
+  // connection's H in tls_conn_state for the next writes with this ssl_ptr
+  // (an SSL object reused by a later connection would inherit it).
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w) return 0;
+
+  pending = bpf_map_lookup_elem(&xor_pending, &tgid);
+  if (!pending) return 0;
+
+  // Read TCP write_seq to identify the exact segment in tc_egress.
+  // tcp_sendmsg appends data starting at write_seq. The tc_egress program
+  // checks that tcp->seq falls within this range before patching.
+  // Use BPF_CORE_READ for kernel version portability (tcp_sock layout varies).
+  __u32 wseq = 0;
+  BPF_CORE_READ_INTO(&wseq, (struct tcp_sock *)sk, write_seq);
+
+  __u8 is_membio = pending->memory_bio;
+
+  __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
+  w->staged_tc.tgid = tgid;
+  w->staged_tc.ssl_ptr = ssl_ptr;
+  w->staged_tc.active = 1;
+  w->staged_tc.plaintext_len = plaintext_len;
+  w->staged_tc.patch_count = pending->patch_count;
+  if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
+    w->staged_tc.patch_count = XOR_MAX_PATCHES;
+  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < w->staged_tc.patch_count; p++)
+    w->staged_tc.patches[p] = pending->patches[p];
+
+  // SNI (and, in virtual IP mode, host / IP / port) check: keep only patches
+  // whose secret may leave on this socket. xor_pending itself is untouched,
+  // so a memory-BIO write refused on another connection's tcp_sendmsg is
+  // still bridged on its own.
+  if (socket_filter_patches((__u64)sk, daddr, is_membio) == 0) {
+    if (!is_membio)
+      bpf_map_delete_elem(&xor_pending, &tgid);
+    return 0;
+  }
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w) return 0;
+
+  pending = bpf_map_lookup_elem(&xor_pending, &tgid);
+  if (!pending) return 0;
 
   // Extract H BEFORE creating tc_pending. If H extraction fails, we must NOT
   // create tc_pending — otherwise tc_egress would XOR-patch the ciphertext
@@ -3231,40 +3348,6 @@ h_ready:;
   }
 
   // Now safe to create tc_pending — tc_egress can always find H.
-  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w) return 0;
-
-  pending = bpf_map_lookup_elem(&xor_pending, &tgid);
-  if (!pending) return 0;
-
-  // Read TCP write_seq to identify the exact segment in tc_egress.
-  // tcp_sendmsg appends data starting at write_seq. The tc_egress program
-  // checks that tcp->seq falls within this range before patching.
-  // Use BPF_CORE_READ for kernel version portability (tcp_sock layout varies).
-  __u32 wseq = 0;
-  BPF_CORE_READ_INTO(&wseq, (struct tcp_sock *)sk, write_seq);
-
-  __u8 is_membio = pending->memory_bio;
-
-  __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
-  w->staged_tc.tgid = tgid;
-  w->staged_tc.ssl_ptr = ssl_ptr;
-  w->staged_tc.active = 1;
-  w->staged_tc.plaintext_len = plaintext_len;
-  w->staged_tc.patch_count = pending->patch_count;
-  if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
-    w->staged_tc.patch_count = XOR_MAX_PATCHES;
-  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < w->staged_tc.patch_count; p++)
-    w->staged_tc.patches[p] = pending->patches[p];
-
-  // SNI check: keep only patches whose secret may leave on this socket.
-  // xor_pending itself is untouched, so a memory-BIO write refused on another
-  // connection's tcp_sendmsg is still bridged on its own.
-  if (sni_filter_patches((__u64)sk, is_membio) == 0) {
-    if (!is_membio)
-      bpf_map_delete_elem(&xor_pending, &tgid);
-    return 0;
-  }
   w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w) return 0;
 
@@ -3364,6 +3447,7 @@ int bpf_uprobe_go_tls_write(void *ctx) {
   dbg_inc(DBG_XOR_CONN_CHECK);
   scratch_data->ssl_ptr = (__u64)conn_ptr; // reuse ssl_ptr field as connection ID
   scratch_data->chain_type = CHAIN_GO_TLS;
+  scratch_data->h_fresh = 0;
   scratch_data->xor_match_count = 0;
   scratch_data->xor_current_match = 0;
 
@@ -3472,6 +3556,7 @@ int bpf_uprobe_ssl_write(void *ctx) {
   dbg_inc(DBG_XOR_CONN_CHECK);
   scratch_data->ssl_ptr = (__u64)ssl_ptr;
   scratch_data->chain_type = 0; // OpenSSL/BoringSSL
+  scratch_data->h_fresh = 0;
   scratch_data->xor_match_count = 0;
   scratch_data->xor_current_match = 0;
 
@@ -3986,11 +4071,14 @@ int tc_ghash_update(struct __sk_buff *skb) {
 // one of them, before any CNI socket load balancer sees it (vip_connect6 for
 // the v4-mapped form); vip_getpeername4/6 report the fake IP back to the app.
 //
-// Host attribution still uses the DNS snooping above: udp_recvmsg reads the
-// rewritten answer (fake IP -> host in dns_ip_map) and sys_enter_connect the
-// fake IP the app connects to, so the fake IP names the host exactly. The
-// socket and the packets carry the real address, which the tcp_sendmsg
-// kprobe and tc_egress_patch key on as before.
+// Host attribution is the socket's: vip_connect4/6 record, per socket
+// cookie, the host of the fake IP it connected to (vip_sock_host), and the
+// tcp_sendmsg kprobe checks a secret's host, IP and port against the socket
+// the record leaves on (socket_filter_patches), not against resolve_host.
+// A connection that did not go through a fake IP (a hardcoded or
+// unrewritten address) gets no host-restricted secret. The socket and the
+// packets carry the real address, which the tcp_sendmsg kprobe and
+// tc_egress_patch key on as before.
 // =============================================================================
 
 #ifndef TC_ACT_OK
@@ -4214,15 +4302,21 @@ static __always_inline int vip_redirect(struct bpf_sock_addr *ctx, __u32 dst,
   struct dns_ip_key k = {};
   ipv4_to_mapped(k.ip, (const __u8 *)&dst);
   struct vip_upstream_val *up = NULL;
-  if (bpf_map_lookup_elem(&vip_ip_host, &k))
+  struct vip_ip_val *ih = bpf_map_lookup_elem(&vip_ip_host, &k);
+  if (ih)
     up = bpf_map_lookup_elem(&vip_upstream, &k);
   *real = 0;
   if (up)
     *real = vip_upstream_pick(up, bpf_ktime_get_boot_ns(), bpf_get_prandom_u32());
-  if (!*real) {
+  if (!ih || !*real) {
     dbg_inc(DBG_VIP_CONNECT_REFUSED);
     return 0;
   }
+
+  // The host this socket's secrets are checked against (vip_sock_host).
+  // Without the entry it gets no host-restricted secret, but still connects.
+  __u64 cookie = bpf_get_socket_cookie(ctx);
+  bpf_map_update_elem(&vip_sock_host, &cookie, ih->host, BPF_ANY);
 
   struct bpf_sock *sk = ctx->sk;
   if (sk) {
@@ -4259,23 +4353,37 @@ static __always_inline int vip_v4_mapped(const struct bpf_sock_addr *ctx) {
          ctx->user_ip6[2] == __bpf_htonl(0xffff);
 }
 
+// vip_forget_host drops the host a socket's earlier connect recorded, when
+// it connects anywhere but a fake IP: a TCP socket can connect again after a
+// failed connect, a UDP socket at any time.
+static __always_inline void vip_forget_host(struct bpf_sock_addr *ctx) {
+  __u64 cookie = bpf_get_socket_cookie(ctx);
+  bpf_map_delete_elem(&vip_sock_host, &cookie);
+}
+
 SEC("cgroup/connect4")
 int vip_connect4(struct bpf_sock_addr *ctx) {
   __u32 real;
   int r = vip_redirect(ctx, ctx->user_ip4, &real);
   if (r == 1)
     ctx->user_ip4 = real;
+  else
+    vip_forget_host(ctx);
   return r != 0; // 0: EPERM
 }
 
 SEC("cgroup/connect6")
 int vip_connect6(struct bpf_sock_addr *ctx) {
-  if (!vip_v4_mapped(ctx))
+  if (!vip_v4_mapped(ctx)) {
+    vip_forget_host(ctx);
     return 1;
+  }
   __u32 real;
   int r = vip_redirect(ctx, ctx->user_ip6[3], &real);
   if (r == 1)
     ctx->user_ip6[3] = real;
+  else
+    vip_forget_host(ctx);
   return r != 0;
 }
 
