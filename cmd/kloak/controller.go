@@ -276,7 +276,9 @@ func runController(cmd *cobra.Command, args []string) {
 }
 
 // discoverTrustedDNSServers returns the list of trusted DNS server IPs.
-// Always includes the kube-dns ClusterIP (auto-discovered). If
+// Always includes the kube-dns ClusterIPs (auto-discovered): both of a
+// dual-stack kube-dns, which pods are given both of as nameservers (musl
+// queries them in parallel and takes the first answer). If
 // --trusted-dns-servers is set, those are added too (deduplicated).
 func discoverTrustedDNSServers(reader client.Reader, log *zap.SugaredLogger) []net.IP {
 	seen := make(map[string]bool)
@@ -300,8 +302,16 @@ func discoverTrustedDNSServers(reader client.Reader, log *zap.SugaredLogger) []n
 	}, svc)
 	if err != nil {
 		log.Errorw("Failed to auto-discover kube-dns service", "error", err)
-	} else if ip := net.ParseIP(svc.Spec.ClusterIP); ip != nil {
-		addIP(ip, "kube-dns auto-discovery")
+	} else {
+		clusterIPs := svc.Spec.ClusterIPs
+		if len(clusterIPs) == 0 {
+			clusterIPs = []string{svc.Spec.ClusterIP}
+		}
+		for _, s := range clusterIPs {
+			if ip := net.ParseIP(s); ip != nil { // not "None" (headless)
+				addIP(ip, "kube-dns auto-discovery")
+			}
+		}
 	}
 
 	// Add user-provided DNS servers
