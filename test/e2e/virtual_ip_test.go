@@ -32,7 +32,7 @@ func TestVirtualIPAllocation(t *testing.T) {
 	// Pins outlive an uninstall, so on a node an earlier run used the host
 	// gets its retired IP back instead of a new one.
 	oldPod := controllerPod(t)
-	ip := waitForVirtualIPLog(t, oldPod, host, "allocated virtual IP", "reactivated virtual IP")
+	ip := waitForVirtualIPLog(t, oldPod, host, vipRange, "allocated virtual IP", "reactivated virtual IP")
 	if !vipRange.Contains(ip) {
 		t.Fatalf("%s got %s, outside the virtual IP range %s", host, ip, vipRange)
 	}
@@ -50,7 +50,7 @@ func TestVirtualIPAllocation(t *testing.T) {
 		t.Fatal(err)
 	}
 	newPod := controllerPod(t)
-	if restored := waitForVirtualIPLog(t, newPod, host, "restored virtual IP"); restored != ip {
+	if restored := waitForVirtualIPLog(t, newPod, host, vipRange, "restored virtual IP"); restored != ip {
 		t.Fatalf("after a controller restart %s has %s, was %s", host, restored, ip)
 	}
 
@@ -58,7 +58,7 @@ func TestVirtualIPAllocation(t *testing.T) {
 	if err := clientset.CoreV1().Secrets(testNamespace).Delete(context.Background(), "secret-vip", metav1.DeleteOptions{}); err != nil {
 		t.Fatalf("deleting secret: %v", err)
 	}
-	if retired := waitForVirtualIPLog(t, newPod, host, "retired virtual IP"); retired != ip {
+	if retired := waitForVirtualIPLog(t, newPod, host, vipRange, "retired virtual IP"); retired != ip {
 		t.Fatalf("retired %s for %s, want %s", retired, host, ip)
 	}
 }
@@ -159,7 +159,7 @@ func TestVirtualIPPodScope(t *testing.T) {
 	// lookups only wait for the DNS rewrite to attach. Not "restored": a
 	// host retired by an earlier run is restored at startup but only
 	// reactivated by the sync.
-	waitForVirtualIPLog(t, controllerPod(t), host, "allocated virtual IP", "reactivated virtual IP")
+	waitForVirtualIPLog(t, controllerPod(t), host, vipRange, "allocated virtual IP", "reactivated virtual IP")
 
 	// The init container exits once the host resolves to a fake IP, so the
 	// pod only starts if the rewrite was attached before it ran.
@@ -283,9 +283,7 @@ func TestVirtualIPSocketHost(t *testing.T) {
 
 	controller := controllerPod(t)
 	for _, host := range []string{hostA, hostB} {
-		if ip := waitForVirtualIPLog(t, controller, host, "allocated virtual IP", "reactivated virtual IP"); !vipRange.Contains(ip) {
-			t.Fatalf("%s got %s, outside %s", host, ip, vipRange)
-		}
+		waitForVirtualIPLog(t, controller, host, vipRange, "allocated virtual IP", "reactivated virtual IP")
 	}
 	createVIPProbePod(t, vipProbePod("vip-sockhost-probe", "secret-allowed", "secret-blocked", "secret-sockhost-ip"))
 	if err := waitForPodReady(ctx, testNamespace, "vip-sockhost-probe"); err != nil {
@@ -353,6 +351,168 @@ print("ip-via-a", send(a, a, "secret-sockhost-ip"))
 	}
 }
 
+// TestVirtualIPv6 checks virtual IP host resolution over IPv6 in a
+// dual-stack cluster. The echo server gets an IPv6-only Service; a pod with
+// a secret restricted to its name gets the name's fake IPv6 in AAAA answers,
+// its IPv6 connect to it is redirected to the Service's address
+// (getpeername still reports the fake IPv6), and the secret is rewritten on
+// that connection: an IPv6 TLS connection, patched at tc. A secret
+// restricted to the Service's IPv6 address is rewritten on a connection
+// through the fake IPv6, whose socket reaches that address; a connection
+// made straight to the address gets no secret restricted to the name.
+// Skipped unless the controller runs in virtual-ip mode with an IPv6 range,
+// on a cluster with an IPv6 pod network (the virtual-ip CI leg).
+func TestVirtualIPv6(t *testing.T) {
+	_, vipRange6 := controllerVirtualIPRanges(t)
+	if !vipRange6.IsValid() {
+		t.Skip("controller has no IPv6 virtual IP range")
+	}
+	if !clusterHasIPv6(t) {
+		t.Skip("cluster has no IPv6 pod network")
+	}
+	host := "tls6." + testNamespace + ".svc.cluster.local"
+
+	gcCtx, gcCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer gcCancel()
+	for _, name := range []string{"secret-allowed", "secret-blocked", "secret-allowed-kloak", "secret-blocked-kloak"} {
+		_ = waitForSecretAbsent(gcCtx, testNamespace, name)
+	}
+	// The demo's own secrets, unused here.
+	demoAllowed := map[string][]byte{"api-key": []byte("REAL-VIP6-DEMO-KEY-11111")}
+	demoBlocked := map[string][]byte{"api-key": []byte("REAL-VIP6-DEMO-KEY-22222")}
+	createEnabledSecret(t, "secret-allowed", demoAllowed, nil,
+		map[string]string{"getkloak.io/hosts": "tls." + testNamespace + ".svc.cluster.local"})
+	createEnabledSecret(t, "secret-blocked", demoBlocked, nil, map[string]string{"getkloak.io/hosts": "example.com"})
+	assertShadowSecret(t, "secret-allowed", demoAllowed)
+	assertShadowSecret(t, "secret-blocked", demoBlocked)
+	demoManifest := filepath.Join(repoRoot, "examples", "demo-python-raw-tls", "deployment.yaml")
+	if err := applyManifest(t, demoManifest); err != nil {
+		t.Fatalf("failed to deploy demo-python-raw-tls: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
+	})
+	single := corev1.IPFamilyPolicySingleStack
+	svc := &corev1.Service{
+		ObjectMeta: metav1.ObjectMeta{Name: "tls6", Namespace: testNamespace},
+		Spec: corev1.ServiceSpec{
+			Selector:       map[string]string{"app": "demo-python-raw-tls"},
+			Ports:          []corev1.ServicePort{{Port: 8443}},
+			IPFamilies:     []corev1.IPFamily{corev1.IPv6Protocol},
+			IPFamilyPolicy: &single,
+		},
+	}
+	svc, err := clientset.CoreV1().Services(testNamespace).Create(context.Background(), svc, metav1.CreateOptions{})
+	if err != nil {
+		t.Fatalf("creating the IPv6 Service: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = clientset.CoreV1().Services(testNamespace).Delete(context.Background(), "tls6", metav1.DeleteOptions{})
+	})
+	clusterIP := svc.Spec.ClusterIP
+	if ip, err := netip.ParseAddr(clusterIP); err != nil || !ip.Is6() {
+		t.Fatalf("IPv6 Service got ClusterIP %q", clusterIP)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := waitForDeploymentReady(ctx, testNamespace, "demo-python-raw-tls"); err != nil {
+		t.Fatalf("demo-python-raw-tls not ready: %v", err)
+	}
+
+	dataHost := map[string][]byte{"api-key": []byte("REAL-VIP6-HOST-KEY-12345")}
+	dataIP := map[string][]byte{"api-key": []byte("REAL-VIP6-IP-KEY-67890")}
+	createEnabledSecret(t, "secret-vip6-host", dataHost, nil, map[string]string{"getkloak.io/hosts": host})
+	createEnabledSecret(t, "secret-vip6-ip", dataIP, nil, map[string]string{"getkloak.io/hosts": clusterIP})
+	assertShadowSecret(t, "secret-vip6-host", dataHost)
+	assertShadowSecret(t, "secret-vip6-ip", dataIP)
+	fake6 := waitForVirtualIPLog(t, controllerPod(t), host, vipRange6, "allocated virtual IP", "reactivated virtual IP")
+	createVIPProbePod(t, vipProbePod("vip6-probe", "secret-vip6-host", "secret-vip6-ip"))
+	if err := waitForPodReady(ctx, testNamespace, "vip6-probe"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Each line: <case> <address connected to> <getpeername> <first line
+	// of the echo>. The process is only traced once kloak has seen its
+	// exec, so it first waits for a rewrite that must happen.
+	const probe = `import socket, ssl, sys, time
+host, cip = sys.argv[1:3]
+def send(target, secret):
+    value = open("/etc/secrets/%s/api-key" % secret).read().strip()
+    addr = socket.getaddrinfo(target, 8443, socket.AF_INET6, socket.SOCK_STREAM)[0][4]
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+        sock.settimeout(5)
+        sock.connect(addr)
+        peer = sock.getpeername()[0]
+        with ctx.wrap_socket(sock, server_hostname=host) as tls:
+            tls.sendall(("S=%s\n" % value).encode())
+            echo = tls.recv(16384).decode(errors="replace").strip().splitlines()[0]
+    return "%s %s %s" % (addr[0], peer, echo)
+deadline = time.monotonic() + 60
+while True:
+    out = send(host, "secret-vip6-host")
+    if "REAL-" in out or time.monotonic() > deadline:
+        break
+    time.sleep(0.5)
+print("name", out)
+print("ip-via-name", send(host, "secret-vip6-ip"))
+print("name-via-ip", send(cip, "secret-vip6-host"))
+`
+	res, err := kubectl("exec", "-n", testNamespace, "vip6-probe", "-c", "app", "--", "python", "-c", probe, host, clusterIP)
+	if err != nil {
+		t.Fatalf("probe: %v\n%s", err, res)
+	}
+	t.Logf("probe:\n%s", strings.TrimSpace(res))
+	got := make(map[string][]string)
+	for _, line := range strings.Split(res, "\n") {
+		if f := strings.Fields(line); len(f) >= 4 {
+			got[f[0]] = f[1:]
+		}
+	}
+	for _, c := range []struct {
+		name, target, real string
+		rewritten          bool
+	}{
+		{"name", fake6.String(), "REAL-VIP6-HOST-KEY-12345", true},
+		// The socket's real address is the ClusterIP; the app connected to
+		// the name's fake IPv6.
+		{"ip-via-name", fake6.String(), "REAL-VIP6-IP-KEY-67890", true},
+		// No fake IPv6: the socket has no host.
+		{"name-via-ip", clusterIP, "REAL-VIP6-HOST-KEY-12345", false},
+	} {
+		f, ok := got[c.name]
+		if !ok {
+			t.Errorf("%s: no result", c.name)
+			continue
+		}
+		if f[0] != c.target || f[1] != c.target {
+			t.Errorf("%s: connected to %s, getpeername %s; want %s for both", c.name, f[0], f[1], c.target)
+		}
+		if echo := strings.Join(f[2:], " "); strings.Contains(echo, c.real) != c.rewritten {
+			t.Errorf("%s: echo %q, rewritten %v, want %v", c.name, echo, !c.rewritten, c.rewritten)
+		}
+	}
+}
+
+// clusterHasIPv6 reports whether a node of the cluster has an IPv6 pod CIDR.
+func clusterHasIPv6(t *testing.T) bool {
+	t.Helper()
+	nodes, err := clientset.CoreV1().Nodes().List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		t.Fatalf("listing nodes: %v", err)
+	}
+	for _, n := range nodes.Items {
+		for _, c := range n.Spec.PodCIDRs {
+			if p, err := netip.ParsePrefix(c); err == nil && p.Addr().Is6() {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // vipProbePod returns a kloak pod running the raw TLS demo's image (for its
 // Python), mounting each of secrets at /etc/secrets/<secret>.
 func vipProbePod(name string, secrets ...string) *corev1.Pod {
@@ -393,15 +553,24 @@ func createVIPProbePod(t *testing.T, pod *corev1.Pod) {
 	})
 }
 
-// controllerVirtualIPRange returns the virtual IP range the controller is
-// deployed with, and skips the test unless it runs in virtual-ip mode.
+// controllerVirtualIPRange returns the IPv4 virtual IP range the controller
+// is deployed with, and skips the test unless it runs in virtual-ip mode.
 func controllerVirtualIPRange(t *testing.T) netip.Prefix {
+	t.Helper()
+	v4, _ := controllerVirtualIPRanges(t)
+	return v4
+}
+
+// controllerVirtualIPRanges returns the IPv4 and IPv6 virtual IP ranges the
+// controller is deployed with (v6 is the zero Prefix without one), and skips
+// the test unless it runs in virtual-ip mode.
+func controllerVirtualIPRanges(t *testing.T) (v4, v6 netip.Prefix) {
 	t.Helper()
 	ds, err := clientset.AppsV1().DaemonSets(kloakNamespace).Get(context.Background(), "kloak-controller", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("getting controller DaemonSet: %v", err)
 	}
-	mode, vipRange := "dns-snoop", "198.18.0.0/15"
+	mode, vipRange := "dns-snoop", "198.18.0.0/15,2001:2::/48"
 	for _, c := range ds.Spec.Template.Spec.Containers {
 		if c.Name != "controller" {
 			continue
@@ -418,11 +587,18 @@ func controllerVirtualIPRange(t *testing.T) netip.Prefix {
 	if mode != "virtual-ip" {
 		t.Skipf("controller runs with --host-resolution=%s", mode)
 	}
-	p, err := netip.ParsePrefix(vipRange)
-	if err != nil {
-		t.Fatalf("controller --virtual-ip-range=%s: %v", vipRange, err)
+	for _, part := range strings.Split(vipRange, ",") {
+		p, err := netip.ParsePrefix(strings.TrimSpace(part))
+		if err != nil {
+			t.Fatalf("controller --virtual-ip-range=%s: %v", vipRange, err)
+		}
+		if p.Addr().Is4() {
+			v4 = p
+		} else {
+			v6 = p
+		}
 	}
-	return p
+	return v4, v6
 }
 
 // controllerPod returns the name of the (single-node) cluster's running
@@ -447,8 +623,9 @@ func controllerPod(t *testing.T) string {
 var virtualIPLogIP = regexp.MustCompile(`"ip":\s*"([0-9a-fA-F.:]+)"`)
 
 // waitForVirtualIPLog waits for pod's controller log to have a line with one
-// of msgs for host, and returns the IP of the last such line.
-func waitForVirtualIPLog(t *testing.T, pod, host string, msgs ...string) netip.Addr {
+// of msgs for host and an IP in r (a host has one fake IP per family), and
+// returns the IP of the last such line.
+func waitForVirtualIPLog(t *testing.T, pod, host string, r netip.Prefix, msgs ...string) netip.Addr {
 	t.Helper()
 	hostField := regexp.MustCompile(`"host":\s*"` + regexp.QuoteMeta(host) + `"`)
 	deadline := time.Now().Add(90 * time.Second)
@@ -461,7 +638,7 @@ func waitForVirtualIPLog(t *testing.T, pod, host string, msgs ...string) netip.A
 				continue
 			}
 			if m := virtualIPLogIP.FindStringSubmatch(line); m != nil {
-				if ip, err := netip.ParseAddr(m[1]); err == nil {
+				if ip, err := netip.ParseAddr(m[1]); err == nil && r.Contains(ip) {
 					found = ip
 				}
 			}
@@ -471,6 +648,6 @@ func waitForVirtualIPLog(t *testing.T, pod, host string, msgs ...string) netip.A
 		}
 		time.Sleep(2 * time.Second)
 	}
-	t.Fatalf("controller %s did not log %q for %s; last logs:\n%s", pod, msgs, host, lastLines(logs, 40))
+	t.Fatalf("controller %s did not log %q for %s in %s; last logs:\n%s", pod, msgs, host, r, lastLines(logs, 40))
 	return netip.Addr{}
 }

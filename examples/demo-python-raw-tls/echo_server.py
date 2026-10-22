@@ -15,10 +15,16 @@ def main():
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(CERT_PATH, KEY_PATH)
 
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", LISTEN_PORT))
-    srv.listen(5)
+    # IPv4 and IPv6 (dual-stack clusters), or IPv4 alone where the pod has
+    # no IPv6.
+    if socket.has_dualstack_ipv6():
+        try:
+            srv = socket.create_server(("", LISTEN_PORT), family=socket.AF_INET6,
+                                       backlog=5, reuse_port=False, dualstack_ipv6=True)
+        except OSError:
+            srv = socket.create_server(("0.0.0.0", LISTEN_PORT), backlog=5)
+    else:
+        srv = socket.create_server(("0.0.0.0", LISTEN_PORT), backlog=5)
     print(f"TLS echo server listening on :{LISTEN_PORT}", flush=True)
 
     while True:
