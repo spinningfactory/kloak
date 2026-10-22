@@ -295,12 +295,6 @@ func statInode(fi os.FileInfo) (uint64, error) {
 // worker exits with it still locked, so the Go runtime retires the thread
 // instead of handing it to other goroutines (see attachTCEgress).
 func runInNetns(ns *os.File, log *zap.SugaredLogger, fn func() ([]io.Closer, error)) ([]io.Closer, error) {
-	self, err := os.Open("/proc/self/ns/net")
-	if err != nil {
-		return nil, fmt.Errorf("opening self netns: %w", err)
-	}
-	defer func() { _ = self.Close() }()
-
 	type result struct {
 		links []io.Closer
 		err   error
@@ -314,6 +308,12 @@ func runInNetns(ns *os.File, log *zap.SugaredLogger, fn func() ([]io.Closer, err
 				runtime.UnlockOSThread()
 			}
 		}()
+		self, err := os.Open(threadNetnsPath)
+		if err != nil {
+			ch <- result{err: fmt.Errorf("opening self netns: %w", err)}
+			return
+		}
+		defer func() { _ = self.Close() }()
 		if err := unix.Setns(int(ns.Fd()), unix.CLONE_NEWNET); err != nil {
 			ch <- result{err: fmt.Errorf("setns: %w", err)}
 			return

@@ -680,14 +680,6 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	// tcAttachEntry to pin the netns inode. Closed in UntrackCgroup when
 	// the pod is deleted.
 
-	// Save our current network namespace.
-	selfNS, err := os.Open("/proc/self/ns/net")
-	if err != nil {
-		_ = containerNS.Close()
-		return fmt.Errorf("opening self netns: %w", err)
-	}
-	defer func() { _ = selfNS.Close() }()
-
 	// The host-side veth peer lives in the root network namespace. With
 	// hostPID: true, /proc/1/ns/net is the node init's netns (in kind/k3d,
 	// the node container's netns — which is where the CNI places pod veth
@@ -732,6 +724,14 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 			// the worker pool. The caller is unaffected.
 		}()
 
+		// Save this thread's network namespace (see threadNetnsPath).
+		selfNS, err := os.Open(threadNetnsPath)
+		if err != nil {
+			resultCh <- tcResult{err: fmt.Errorf("opening self netns: %w", err)}
+			return
+		}
+		defer func() { _ = selfNS.Close() }()
+
 		// Switch to the container's network namespace.
 		if err := unix.Setns(int(containerNS.Fd()), unix.CLONE_NEWNET); err != nil {
 			resultCh <- tcResult{err: fmt.Errorf("setns to container netns: %w", err)}
@@ -751,8 +751,9 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 
 		// Phase 1: inside the container netns, resolve the egress
 		// interface(s) and their host-side veth peers. net.InterfaceByName
-		// (netlink) and /proc/net/route (procfs) follow the thread's current
-		// netns; the iflink read goes through /proc/<pid>/root instead —
+		// (netlink) and /proc/thread-self/net/route (procfs) follow the
+		// thread's current netns; the iflink read goes through
+		// /proc/<pid>/root instead —
 		// /sys/class/net is scoped to the sysfs mount's netns and does NOT
 		// follow setns (see vethPeerIfindex).
 		ifNames := m.resolveEgressInterfaces(pid)
@@ -990,13 +991,22 @@ func vethPeerIfindex(sysRoot, ifName string) (int, error) {
 	return idx, nil
 }
 
-// findDefaultRouteInterface reads /proc/net/route in the current netns
-// and returns the interface name backing the default IPv4 route, or ""
-// if no default route exists.
+// threadNetnsPath is the network namespace of the calling OS thread. A
+// worker that switches its locked thread into a pod's netns opens it first,
+// to switch back to. Not /proc/self/ns/net: that is the main thread's, which
+// another worker may have switched into a pod's netns at that moment, and
+// returning there would leave this thread in that pod's netns.
+const threadNetnsPath = "/proc/thread-self/ns/net"
+
+// findDefaultRouteInterface reads the calling thread's netns routes and
+// returns the interface name backing the default IPv4 route, or "" if no
+// default route exists.
 func findDefaultRouteInterface() (string, error) {
-	data, err := os.ReadFile("/proc/net/route")
+	// Not /proc/net/route: that is /proc/self/net, the netns of the main
+	// thread, not of a worker thread setns'd into a pod.
+	data, err := os.ReadFile("/proc/thread-self/net/route")
 	if err != nil {
-		return "", fmt.Errorf("reading /proc/net/route: %w", err)
+		return "", fmt.Errorf("reading /proc/thread-self/net/route: %w", err)
 	}
 	return parseDefaultRouteInterface(data), nil
 }
