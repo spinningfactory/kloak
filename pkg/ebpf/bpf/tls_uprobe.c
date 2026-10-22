@@ -121,6 +121,7 @@ struct scratch_buf {
   __u32 read_len;       // bytes read into data[] (max 256, for host parsing)
   __u32 total_data_len; // full TLS write length (for bpf_loop scanning)
   __u8  chain_type;     // 0=OpenSSL/BoringSSL, CHAIN_GO_TLS=Go crypto/tls
+  __u8  h_fresh;        // 1: bpf_h_extract stored this write's H in tls_conn_state
   __u32 host_offset;
   __u32 host_value_len; // length of extracted host value
   __u32 xor_fd;         // socket fd resolved by resolve_host (for tc_pending key)
@@ -2319,6 +2320,10 @@ int bpf_h_extract(void *ctx) {
   // CACHE_HIT / LIVE_WALK already counted above per H source.
   dbg_inc(DBG_XOR_CONN_HIT);
 
+  sd = bpf_map_lookup_elem(&scratch, &zero);
+  if (!sd)
+    return 0;
+  sd->h_fresh = 1;
   bpf_tail_call(ctx, &prog_array, 1);
   return 0;
 }
@@ -2349,10 +2354,12 @@ int bpf_xor_path(void *ctx) {
 
     // For OpenSSL/BoringSSL, if h_extract just populated tls_conn_state
     // (libcrypto-hook path), carry H through xor_pending so the kprobe
-    // doesn't need to re-walk the chain. h_valid stays 0 if tls_conn_state
-    // has no entry — kprobe will fall back to its own chain walk.
-    // Go's H derivation is shaped differently and stays in the kprobe.
-    if (sd->chain_type != CHAIN_GO_TLS) {
+    // doesn't need to re-walk the chain. Otherwise h_valid stays 0 and the
+    // kprobe walks the chain itself: an entry it stored for an earlier write
+    // may belong to an earlier connection, whose SSL object this one reuses
+    // (same ssl_ptr, another key). Go's H derivation is shaped differently
+    // and stays in the kprobe.
+    if (sd->chain_type != CHAIN_GO_TLS && sd->h_fresh) {
       struct tls_conn_key ck = {};
       ck.tgid = wi->staged_pending.tgid;
       ck.ssl_ptr = sd->ssl_ptr;
@@ -3074,6 +3081,51 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   __u32 plaintext_len = pending->plaintext_len;
   __u8 chain = pending->chain_type;
 
+  // Filter the patches first: a write none of whose patches may leave on
+  // this socket must not reach the H extraction below, which stores the
+  // connection's H in tls_conn_state for the next writes with this ssl_ptr
+  // (an SSL object reused by a later connection would inherit it).
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w) return 0;
+
+  pending = bpf_map_lookup_elem(&xor_pending, &tgid);
+  if (!pending) return 0;
+
+  // Read TCP write_seq to identify the exact segment in tc_egress.
+  // tcp_sendmsg appends data starting at write_seq. The tc_egress program
+  // checks that tcp->seq falls within this range before patching.
+  // Use BPF_CORE_READ for kernel version portability (tcp_sock layout varies).
+  __u32 wseq = 0;
+  BPF_CORE_READ_INTO(&wseq, (struct tcp_sock *)sk, write_seq);
+
+  __u8 is_membio = pending->memory_bio;
+
+  __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
+  w->staged_tc.tgid = tgid;
+  w->staged_tc.ssl_ptr = ssl_ptr;
+  w->staged_tc.active = 1;
+  w->staged_tc.plaintext_len = plaintext_len;
+  w->staged_tc.patch_count = pending->patch_count;
+  if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
+    w->staged_tc.patch_count = XOR_MAX_PATCHES;
+  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < w->staged_tc.patch_count; p++)
+    w->staged_tc.patches[p] = pending->patches[p];
+
+  // SNI (and, in virtual IP mode, host / IP / port) check: keep only patches
+  // whose secret may leave on this socket. xor_pending itself is untouched,
+  // so a memory-BIO write refused on another connection's tcp_sendmsg is
+  // still bridged on its own.
+  if (socket_filter_patches((__u64)sk, daddr, is_membio) == 0) {
+    if (!is_membio)
+      bpf_map_delete_elem(&xor_pending, &tgid);
+    return 0;
+  }
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w) return 0;
+
+  pending = bpf_map_lookup_elem(&xor_pending, &tgid);
+  if (!pending) return 0;
+
   // Extract H BEFORE creating tc_pending. If H extraction fails, we must NOT
   // create tc_pending — otherwise tc_egress would XOR-patch the ciphertext
   // without being able to recompute the GHASH tag, causing "bad record MAC".
@@ -3296,41 +3348,6 @@ h_ready:;
   }
 
   // Now safe to create tc_pending — tc_egress can always find H.
-  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w) return 0;
-
-  pending = bpf_map_lookup_elem(&xor_pending, &tgid);
-  if (!pending) return 0;
-
-  // Read TCP write_seq to identify the exact segment in tc_egress.
-  // tcp_sendmsg appends data starting at write_seq. The tc_egress program
-  // checks that tcp->seq falls within this range before patching.
-  // Use BPF_CORE_READ for kernel version portability (tcp_sock layout varies).
-  __u32 wseq = 0;
-  BPF_CORE_READ_INTO(&wseq, (struct tcp_sock *)sk, write_seq);
-
-  __u8 is_membio = pending->memory_bio;
-
-  __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
-  w->staged_tc.tgid = tgid;
-  w->staged_tc.ssl_ptr = ssl_ptr;
-  w->staged_tc.active = 1;
-  w->staged_tc.plaintext_len = plaintext_len;
-  w->staged_tc.patch_count = pending->patch_count;
-  if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
-    w->staged_tc.patch_count = XOR_MAX_PATCHES;
-  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < w->staged_tc.patch_count; p++)
-    w->staged_tc.patches[p] = pending->patches[p];
-
-  // SNI (and, in virtual IP mode, host / IP / port) check: keep only patches
-  // whose secret may leave on this socket. xor_pending itself is untouched,
-  // so a memory-BIO write refused on another connection's tcp_sendmsg is
-  // still bridged on its own.
-  if (socket_filter_patches((__u64)sk, daddr, is_membio) == 0) {
-    if (!is_membio)
-      bpf_map_delete_elem(&xor_pending, &tgid);
-    return 0;
-  }
   w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w) return 0;
 
@@ -3430,6 +3447,7 @@ int bpf_uprobe_go_tls_write(void *ctx) {
   dbg_inc(DBG_XOR_CONN_CHECK);
   scratch_data->ssl_ptr = (__u64)conn_ptr; // reuse ssl_ptr field as connection ID
   scratch_data->chain_type = CHAIN_GO_TLS;
+  scratch_data->h_fresh = 0;
   scratch_data->xor_match_count = 0;
   scratch_data->xor_current_match = 0;
 
@@ -3538,6 +3556,7 @@ int bpf_uprobe_ssl_write(void *ctx) {
   dbg_inc(DBG_XOR_CONN_CHECK);
   scratch_data->ssl_ptr = (__u64)ssl_ptr;
   scratch_data->chain_type = 0; // OpenSSL/BoringSSL
+  scratch_data->h_fresh = 0;
   scratch_data->xor_match_count = 0;
   scratch_data->xor_current_match = 0;
 
