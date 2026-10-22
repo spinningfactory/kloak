@@ -28,6 +28,14 @@ const (
 
 	// CgroupBasePath is the base path for cgroups v2.
 	CgroupBasePath = "/sys/fs/cgroup"
+
+	// In virtual-ip mode a Pending pod is checked every sandboxPoll for its
+	// sandbox, to attach the DNS rewrite before its containers start; once
+	// pending for sandboxPollFor (a long image pull, a CNI failure), every
+	// sandboxPollSlow.
+	sandboxPoll     = 100 * time.Millisecond
+	sandboxPollFor  = 30 * time.Second
+	sandboxPollSlow = 5 * time.Second
 )
 
 // Reconciler watches pods and manages eBPF cgroup tracking.
@@ -112,11 +120,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Pod is running and enabled
 	if pod.Status.Phase != corev1.PodRunning {
-		// Virtual-ip mode: bind the pod and attach the DNS rewrite as soon
-		// as it has its network (its sandbox runs), so that its containers,
-		// init containers first, mostly start with the rewrite in place. A
-		// lookup made before gets the real addresses.
-		if pod.Status.Phase != corev1.PodPending || len(addrs) == 0 || !r.virtualIP() {
+		// Virtual-ip mode: attach the DNS rewrite as soon as the pod's
+		// sandbox runs, so that its containers, init containers first, find
+		// it in place, and bind the pod at the sandbox's address (its
+		// status reports it only later). A lookup made before gets the
+		// real addresses.
+		if pod.Status.Phase != corev1.PodPending || pod.Spec.HostNetwork || !r.virtualIP() {
 			log.Debugw("pod not running yet", "phase", pod.Status.Phase)
 			return ctrl.Result{}, nil
 		}
@@ -126,10 +135,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 		r.podKeyToUID[req.String()] = string(pod.UID)
 		r.mu.Unlock()
-		r.UprobeManager.BindPodSecrets(string(pod.UID), req.String(), addrs, nil, k8ssecrets.PodSecretRefs(pod))
-		if !r.attachDNSRewrite(pod, req.String()) {
-			return ctrl.Result{RequeueAfter: 500 * time.Millisecond}, nil
+		netnsAddrs, attached := r.attachDNSRewrite(pod, req.String())
+		if !attached {
+			poll := sandboxPoll
+			if time.Since(pod.CreationTimestamp.Time) > sandboxPollFor {
+				poll = sandboxPollSlow
+			}
+			return ctrl.Result{RequeueAfter: poll}, nil
 		}
+		if len(addrs) == 0 {
+			addrs = netnsAddrs
+		}
+		r.UprobeManager.BindPodSecrets(string(pod.UID), req.String(), addrs, nil, k8ssecrets.PodSecretRefs(pod))
 		return ctrl.Result{}, nil
 	}
 
@@ -191,7 +208,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	}
 	// Also for pods running before the controller started, and for a pod
 	// whose sandbox was recreated (a new netns).
-	dnsAttached := r.attachDNSRewrite(pod, req.String())
+	_, dnsAttached := r.attachDNSRewrite(pod, req.String())
 
 	// Attach uprobes outside the lock — this involves filesystem I/O.
 	for _, cgroupID := range needsAttach {
@@ -317,26 +334,28 @@ func (r *Reconciler) virtualIP() bool {
 
 // attachDNSRewrite attaches the virtual IP DNS rewrite in the pod's network
 // namespace, found through any process in the pod's cgroup: its sandbox's
-// runs before any container. It returns false when it should be retried.
-func (r *Reconciler) attachDNSRewrite(pod *corev1.Pod, name string) bool {
+// runs before any container. It returns the pod's IPv4 addresses as found
+// in the netns, and false when it should be retried.
+func (r *Reconciler) attachDNSRewrite(pod *corev1.Pod, name string) ([]netip.Addr, bool) {
 	if !r.virtualIP() || pod.Spec.HostNetwork {
-		return true
+		return nil, true
 	}
 	podCgroup, err := cgroups.FindPodCgroupPath(r.CgroupRoot, string(pod.UID))
 	if err != nil {
-		r.Log.Debugw("pod cgroup not found yet", "pod", name, "err", err)
-		return false
+		logging.Tracew(r.Log, "pod cgroup not found yet", "pod", name, "err", err)
+		return nil, false
 	}
 	pids, err := cgroups.ReadCgroupTreeProcs(podCgroup)
 	if err != nil || len(pids) == 0 {
-		r.Log.Debugw("no process in the pod cgroup yet", "pod", name, "path", podCgroup, "err", err)
-		return false
+		logging.Tracew(r.Log, "no process in the pod cgroup yet", "pod", name, "path", podCgroup, "err", err)
+		return nil, false
 	}
-	if err := r.UprobeManager.AttachPodDNSRewrite(string(pod.UID), name, pids); err != nil {
+	addrs, err := r.UprobeManager.AttachPodDNSRewrite(string(pod.UID), name, pids)
+	if err != nil {
 		logging.Tracew(r.Log, "could not attach the DNS rewrite yet", "pod", name, "err", err)
-		return false
+		return nil, false
 	}
-	return true
+	return addrs, true
 }
 
 // podIPs returns the pod's addresses, or none for a pod in the host network

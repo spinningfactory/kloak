@@ -60,7 +60,9 @@ func (m *TLSUprobeManager) UnbindPod(string)                         {}
 func (m *TLSUprobeManager) VirtualIPEnabled() bool                   { return false }
 func (m *TLSUprobeManager) DetachPodDNSRewrite(string)               {}
 
-func (m *TLSUprobeManager) AttachPodDNSRewrite(string, string, []int) error { return ErrNotSupported }
+func (m *TLSUprobeManager) AttachPodDNSRewrite(string, string, []int) ([]netip.Addr, error) {
+	return nil, ErrNotSupported
+}
 
 func (m *TLSUprobeManager) BindPodSecrets(string, string, []netip.Addr, []uint64, []secrets.Ref) {}
 

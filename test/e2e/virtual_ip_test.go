@@ -155,6 +155,11 @@ func TestVirtualIPPodScope(t *testing.T) {
 	data := map[string][]byte{"api-key": []byte("REAL-VIP-SCOPE-KEY-12345")}
 	createEnabledSecret(t, "secret-vip-scope", data, nil, map[string]string{"getkloak.io/hosts": host})
 	assertShadowSecret(t, "secret-vip-scope", data)
+	// The secret is synced and the host has its fake IP, so the pods' first
+	// lookups only wait for the DNS rewrite to attach. Not "restored": a
+	// host retired by an earlier run is restored at startup but only
+	// reactivated by the sync.
+	waitForVirtualIPLog(t, controllerPod(t), host, "allocated virtual IP", "reactivated virtual IP")
 
 	// The init container exits once the host resolves to a fake IP, so the
 	// pod only starts if the rewrite was attached before it ran.
@@ -204,7 +209,9 @@ while True:
 		if err != nil {
 			t.Fatalf("resolving %s in %s: %v\n%s", host, pod, err, out)
 		}
-		ip, err := netip.ParseAddr(strings.TrimSpace(out))
+		// The last line: kubectl may print warnings before it.
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		ip, err := netip.ParseAddr(strings.TrimSpace(lines[len(lines)-1]))
 		if err != nil {
 			t.Fatalf("%s resolved %s to %q", pod, host, out)
 		}

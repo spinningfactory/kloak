@@ -119,6 +119,7 @@ type dnsRewriteAttach struct {
 	// another netns and wrongly look attached (see tcAttached).
 	netns *os.File
 	links []io.Closer
+	addrs []netip.Addr // IPv4 addresses of the interfaces attached to
 }
 
 func (a *dnsRewriteAttach) close() {
@@ -131,22 +132,23 @@ func (a *dnsRewriteAttach) close() {
 // AttachPodDNSRewrite attaches tc_dns_rewrite, in virtual-ip mode, at tc
 // ingress on the egress interfaces of a pod's network namespace, so that the
 // pod is handed the fake IPs of the hosts it has secrets for
-// (BindPodSecrets). pids are processes of the pod; the first one still
-// running names the netns. The reconciler calls it as soon as the pod has
-// its network, when only its sandbox runs, so that its containers start
-// with the rewrite in place; an answer received before carries the real
+// (BindPodSecrets), and returns the IPv4 addresses of those interfaces: the
+// pod's, before its status reports them. pids are processes of the pod; the
+// first one still running names the netns. The reconciler calls it as soon
+// as the pod's sandbox runs, before its containers start, so that they find
+// the rewrite in place; an answer received before carries the real
 // addresses (which the DNS snooping still attributes). It does nothing when
 // already attached in the pod's current netns, in dns-snoop mode, or for a
 // pod in the host network namespace, where the rewrite would hand fake IPs
 // to node processes the connect redirect does not cover. A pod whose
 // sandbox was recreated gets it again in its new netns.
-func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) error {
+func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) ([]netip.Addr, error) {
 	if m.virtualIPs == nil {
-		return nil
+		return nil, nil
 	}
 	rootIno, err := netnsInode("/proc/1/ns/net")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var podNS *os.File
 	var pid int
@@ -157,17 +159,17 @@ func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) e
 		}
 	}
 	if podNS == nil {
-		return fmt.Errorf("none of the %d processes of pod %s is running", len(pids), pod)
+		return nil, fmt.Errorf("none of the %d processes of pod %s is running", len(pids), pod)
 	}
 	fi, err := podNS.Stat()
 	if err != nil {
 		_ = podNS.Close()
-		return err
+		return nil, err
 	}
 	ino, err := statInode(fi)
 	if err != nil || ino == rootIno {
 		_ = podNS.Close()
-		return err
+		return nil, err
 	}
 
 	m.dnsRewriteMu.Lock()
@@ -175,12 +177,13 @@ func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) e
 	if cur := m.dnsRewrite[podUID]; cur != nil {
 		if cur.ino == ino {
 			_ = podNS.Close()
-			return nil
+			return cur.addrs, nil
 		}
 		// A new sandbox: the old netns is gone with its interfaces.
 		delete(m.dnsRewrite, podUID)
 		cur.close()
 	}
+	var addrs []netip.Addr
 	links, err := runInNetns(podNS, m.log, func() ([]io.Closer, error) {
 		var links []io.Closer
 		for _, name := range m.resolveEgressInterfaces(pid) {
@@ -192,6 +195,7 @@ func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) e
 				var l io.Closer
 				if l, err = m.attachTCProgram(m.objs.TcDnsRewrite, iface.Index, true, podNS); err == nil {
 					links = append(links, l)
+					addrs = append(addrs, interfaceIPv4s(iface)...)
 					continue
 				}
 			}
@@ -215,12 +219,31 @@ func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) e
 			m.log.Warnw("failed to attach the DNS rewrite: the pod gets real addresses for watched hosts until it succeeds",
 				"pod", pod, "pid", pid, "error", err)
 		}
-		return err
+		return nil, err
 	}
 	delete(m.dnsRewriteFailed, podUID)
-	m.dnsRewrite[podUID] = &dnsRewriteAttach{ino: ino, netns: podNS, links: links}
-	m.log.Infow("attached DNS rewrite to pod netns", "pod", pod, "pid", pid, "netns", ino, "interfaces", len(links))
-	return nil
+	m.dnsRewrite[podUID] = &dnsRewriteAttach{ino: ino, netns: podNS, links: links, addrs: addrs}
+	m.log.Infow("attached DNS rewrite to pod netns", "pod", pod, "pid", pid, "netns", ino,
+		"interfaces", len(links), "addrs", addrs)
+	return addrs, nil
+}
+
+// interfaceIPv4s returns the IPv4 addresses of iface, in the calling
+// thread's netns.
+func interfaceIPv4s(iface *net.Interface) []netip.Addr {
+	list, err := iface.Addrs()
+	if err != nil {
+		return nil
+	}
+	var out []netip.Addr
+	for _, a := range list {
+		if n, ok := a.(*net.IPNet); ok {
+			if ip, ok := netip.AddrFromSlice(n.IP); ok && ip.Unmap().Is4() {
+				out = append(out, ip.Unmap())
+			}
+		}
+	}
+	return out
 }
 
 // DetachPodDNSRewrite removes the DNS rewrite of a pod that is gone, and
