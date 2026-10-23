@@ -1,3 +1,8 @@
+# The TLS echo server runs in its own pod, as the remote end of a real
+# connection would: kloak patches the record as it leaves the client's pod.
+# (Under a CNI that load balances Services at the socket, such as Cilium, a
+# server in the client's own pod would be reached over the pod's loopback,
+# which kloak does not patch.)
 apiVersion: v1
 kind: Service
 metadata:
@@ -6,10 +11,42 @@ metadata:
     app: tls-bun-claude
 spec:
   selector:
-    app: demo-bun-claude
+    app: demo-bun-claude-echo
   ports:
     - port: 8443
       targetPort: 8443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-bun-claude-echo
+  labels:
+    app: demo-bun-claude-echo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-bun-claude-echo
+  template:
+    metadata:
+      labels:
+        app: demo-bun-claude-echo
+    spec:
+      containers:
+        # HTTP-over-TLS echo server: returns request headers as JSON at GET
+        # /echo. The same image used by cipher_test.go and dns_whitelist_test.go.
+        - name: echo-server
+          image: kloak-tls-echo:latest
+          imagePullPolicy: Never
+          ports:
+            - containerPort: 8443
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8443
+              scheme: HTTPS
+            initialDelaySeconds: 2
+            periodSeconds: 2
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -60,21 +97,6 @@ spec:
             - name: secret-blocked-vol
               mountPath: "/etc/secrets/blocked"
               readOnly: true
-        # HTTP-over-TLS echo server: returns request headers as JSON at GET
-        # /echo. The same image used by cipher_test.go and dns_whitelist_test.go.
-        # Opted out of kloak (echo server outbound traffic is test infrastructure).
-        - name: echo-server
-          image: kloak-tls-echo:latest
-          imagePullPolicy: Never
-          ports:
-            - containerPort: 8443
-          readinessProbe:
-            httpGet:
-              path: /health
-              port: 8443
-              scheme: HTTPS
-            initialDelaySeconds: 2
-            periodSeconds: 2
       volumes:
         - name: secret-allowed-vol
           secret:
