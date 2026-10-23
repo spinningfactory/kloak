@@ -487,7 +487,7 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 			_ = mgr.Close()
 			return nil, fmt.Errorf("attaching the virtual IP connect redirect: %w", err)
 		}
-		log.Infow("virtual IP host resolution enabled (experimental): kloak pods get fake IPs for watched hosts, connects to them are redirected",
+		log.Infow("virtual IP host resolution enabled: kloak pods get fake IPs for watched hosts, connects to them are redirected",
 			"range", hostRes.VirtualIPRanges.String(), "pinPath", hostRes.pinPath(), "cgroup", kubepods)
 	}
 
@@ -528,24 +528,28 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 		m.log.Debugw("Attached tracepoint", "group", t.group, "name", t.name)
 	}
 
-	// Attach kprobe/kretprobe on udp_recvmsg for language-agnostic DNS interception.
-	kp, err := link.Kprobe("udp_recvmsg", m.objs.KprobeUdpRecvmsg, nil)
-	if err != nil {
-		return fmt.Errorf("attaching kprobe udp_recvmsg: %w", err)
-	}
-	m.linksMu.Lock()
-	m.links = append(m.links, kp)
-	m.linksMu.Unlock()
-	m.log.Debugw("Attached kprobe", "function", "udp_recvmsg")
+	// Attach kprobe/kretprobe on udp_recvmsg for language-agnostic DNS
+	// interception (dns-snoop mode). Virtual IP mode takes a connection's
+	// host from its socket and reads no DNS answer here.
+	if m.virtualIPs == nil {
+		kp, err := link.Kprobe("udp_recvmsg", m.objs.KprobeUdpRecvmsg, nil)
+		if err != nil {
+			return fmt.Errorf("attaching kprobe udp_recvmsg: %w", err)
+		}
+		m.linksMu.Lock()
+		m.links = append(m.links, kp)
+		m.linksMu.Unlock()
+		m.log.Debugw("Attached kprobe", "function", "udp_recvmsg")
 
-	krp, err := link.Kretprobe("udp_recvmsg", m.objs.KretprobeUdpRecvmsg, nil)
-	if err != nil {
-		return fmt.Errorf("attaching kretprobe udp_recvmsg: %w", err)
+		krp, err := link.Kretprobe("udp_recvmsg", m.objs.KretprobeUdpRecvmsg, nil)
+		if err != nil {
+			return fmt.Errorf("attaching kretprobe udp_recvmsg: %w", err)
+		}
+		m.linksMu.Lock()
+		m.links = append(m.links, krp)
+		m.linksMu.Unlock()
+		m.log.Debugw("Attached kretprobe", "function", "udp_recvmsg")
 	}
-	m.linksMu.Lock()
-	m.links = append(m.links, krp)
-	m.linksMu.Unlock()
-	m.log.Debugw("Attached kretprobe", "function", "udp_recvmsg")
 
 	// Attach kprobe on tcp_sendmsg to bridge xor_pending → tc_pending.
 	// This runs after SSL_write encrypts and calls write/send, giving us

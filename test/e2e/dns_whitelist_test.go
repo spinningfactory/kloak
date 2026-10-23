@@ -26,9 +26,11 @@ const (
 // The controller auto-discovers kube-dns and adds it to trusted_dns_servers.
 // This test deploys a custom CoreDNS forwarder (different ClusterIP) and
 // configures a client pod to use it. Since the custom DNS IP is NOT in the
-// whitelist, its DNS responses are dropped by the BPF kretprobe, dns_ip_map
-// is never populated, resolve_host fails, and host-filtered secrets are NOT
-// rewritten — the shadow placeholder passes through to the echo server.
+// whitelist, its answers are left unchanged, so the client connects to the
+// real address and not through the host's virtual IP (in dns-snoop mode,
+// the kretprobe drops them, so dns_ip_map is never populated and
+// resolve_host fails), and host-filtered secrets are NOT rewritten — the
+// shadow placeholder passes through to the echo server.
 func TestDNSWhitelist(t *testing.T) {
 	secretValue := "REAL-DNS-WHITELIST-12345"
 	secretName := "dns-whitelist-secret"
@@ -50,9 +52,10 @@ func TestDNSWhitelist(t *testing.T) {
 	// Deploy custom CoreDNS that answers authoritatively for the echo hostname.
 	// It does NOT forward to kube-dns, so the ONLY DNS response in the system
 	// for this hostname comes from the custom DNS IP (untrusted).
-	// This is critical because the DNS kprobe is system-wide — if CoreDNS
-	// forwarded to kube-dns, kube-dns's response would populate dns_ip_map
-	// via CoreDNS's own udp_recvmsg (peer=kube-dns=trusted).
+	// This is critical in dns-snoop mode, where the DNS kprobe is
+	// system-wide — if CoreDNS forwarded to kube-dns, kube-dns's response
+	// would populate dns_ip_map via CoreDNS's own udp_recvmsg
+	// (peer=kube-dns=trusted).
 	customDNSIP := deployCustomDNS(t, echoSvcHost, echoSvcIP)
 	t.Logf("custom DNS service IP: %s (not in trusted_dns_servers)", customDNSIP)
 
@@ -359,7 +362,7 @@ func deployCipherClientWithDNS(t *testing.T, secretName, dnsIP string) string {
 // verifyRewriteBlocked polls the echo server via the client pod and confirms
 // that the host-filtered secret is NOT rewritten. The shadow placeholder
 // should pass through because the custom DNS IP is not in trusted_dns_servers,
-// so dns_ip_map is empty and resolve_host returns no hostname.
+// so the connection has no host (see TestDNSWhitelist).
 //
 // To avoid false positives from timing (uprobe not yet attached), we require
 // at least 3 consecutive responses confirming the block before passing.

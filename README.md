@@ -30,7 +30,7 @@ Kloak transparently intercepts outbound TLS traffic in Kubernetes using eBPF upr
 - **Zero overhead** -- eBPF uprobes operate in kernel space with negligible latency impact. No userspace proxy or sidecar in the data path.
 - **Kubernetes native** -- Works with standard Kubernetes Secrets. Enable with a single label.
 - **Per-pod secret binding** -- A pod can only use the secrets it references in its spec (Secret volume, `secretKeyRef`, `envFrom`). A placeholder sent by any other pod, even one that learned it, goes out unchanged.
-- **Host and IP filtering** -- Secrets annotated with `getkloak.io/hosts` are only sent to specific destination hostnames or IP addresses, preventing exfiltration to unauthorized servers.
+- **Host and IP filtering** -- Secrets annotated with `getkloak.io/hosts` are only sent to specific destination hostnames or IP addresses, preventing exfiltration to unauthorized servers. Each restricted hostname gets its own virtual IP, so kloak knows which host a connection is for even when hosts share addresses (a CDN, a shared ingress).
 - **Port-based filtering** -- Secrets annotated with `getkloak.io/port` are restricted to connections on a specific destination port.
 - **Broad runtime support** -- Hooks into OpenSSL, BoringSSL, and Go's native `crypto/tls`. Works with Python, Node.js, Bun, Go, Rust, Ruby, PHP, curl, and any OpenSSL-linked runtime.
 
@@ -39,6 +39,8 @@ Kloak transparently intercepts outbound TLS traffic in Kubernetes using eBPF upr
 ### Prerequisites
 
 - Kubernetes cluster (1.28+) with Linux kernel 5.17+ (6.6+ attaches the tc patch program via TCX; older kernels fall back to a clsact qdisc + cls_bpf filter, see `controller.ebpf.tcAttachMode`)
+- The virtual IP ranges kloak hands out (default `198.18.0.0/15` and `2001:2::/48`, reserved for benchmarking and never routed) must not be used by the cluster or its nodes. The controller checks this at startup and refuses to start otherwise (`controller.ebpf.virtualIPRange`).
+- containerd 2.0+ or CRI-O 1.30+ is recommended: through their NRI hook, kloak sets up a pod's DNS rewrite before its containers start. On other runtimes it is set up as soon as the pod's sandbox runs, which leaves a short window at pod start (see `controller.nri` in the chart values).
 - [Helm](https://helm.sh/docs/intro/install/) 3.12+
 - `kubectl` configured with cluster access
 
@@ -52,6 +54,14 @@ helm install kloak kloak/kloak -n kloak-system --create-namespace
 
 kubectl get pods -n kloak-system
 ```
+
+### Upgrading from v0.2.x and earlier
+
+Host-restricted secrets now use virtual IPs (`controller.ebpf.hostResolution: virtual-ip`) instead of DNS snooping:
+
+- Restart kloak-enabled pods after the upgrade. Pods that were already running keep the addresses they resolved, and a connection to a real address gets no host-restricted secret.
+- If the controller refuses to start because a virtual IP range overlaps an address range of the cluster or a node, set `controller.ebpf.virtualIPRange` to free ranges.
+- `controller.ebpf.hostResolution: dns-snoop` keeps the previous behavior for now. It is deprecated and will be removed.
 
 ### Labels and Annotations
 
@@ -92,7 +102,8 @@ graph TD
         UP[TLS Uprobes]
         HX[H Extract]
         XOR[XOR Path]
-        KP[DNS Kprobe/Kretprobe]
+        DNSR[DNS Rewrite - pod netns]
+        CG[Connect Redirect - cgroup hooks]
         TP[Connect/Close Tracepoints]
         PROC[Process Tracepoints]
         TCP[tcp_sendmsg Kprobe]
@@ -115,8 +126,10 @@ graph TD
     TCP -->|Stores tc_pending| TC
     TC -->|Tail call| GHASH
     GHASH -->|Patched ciphertext + tag| Internet
-    KP -->|Populates dns_ip_map| UP
-    TP -->|Populates conn_ip_map / last_verified_fd| UP
+    DNSR -->|Virtual IPs in DNS answers| P
+    P -->|Connects to a virtual IP| CG
+    CG -->|Redirects to a real address, records the host of the socket| TCP
+    TP -->|Populates conn_ip_map| UP
     PROC -->|Tracks process lifecycle| C
 ```
 
@@ -128,9 +141,10 @@ graph TD
 | **Webhook** (Deployment) | Mutating admission webhook that intercepts Pod creation. Rewrites Secret volume mounts and environment variable references (`secretKeyRef`, `envFrom`) to point to shadow secrets. Evaluates enablement through pod labels or namespace labels. Rejects pods if the shadow secret has not been created yet (fail-closed). Two webhook entries ensure only kloak-enabled namespaces and pods are affected; non-kloak workloads are never impacted, even when the webhook is down. |
 | **TLS Uprobes** | Attach to `SSL_write` / `SSL_write_ex` (OpenSSL/BoringSSL), `crypto/tls.(*Conn).Write` (Go native), and `SSL_write` at a pre-computed file offset in symbol-stripped Bun binaries. Intercept outbound TLS writes and scan the plaintext for `kl::` placeholders. The plaintext buffer is only read, never modified. |
 | **H Extract** | Recovers the connection's AES-GCM GHASH key `H`, which is needed to fix the authentication tag after patching. For processes whose `libcrypto` exposes `EVP_CipherInit_ex`, a uprobe captures it at cipher init. Otherwise the `tcp_sendmsg` kprobe walks the library's TLS structs to it. BoringSSL keeps only the AES key schedule, so `H = AES_K(0)` is recomputed in-kernel. |
-| **XOR Path + TC Patch** | Used for every runtime. Checks the destination against the secret's host/IP/port policy, then computes `shadow XOR real` for each matched placeholder. This bridges through the `tcp_sendmsg` kprobe to a tc program on the host side of the pod's veth pair, which XOR-patches the AES-GCM ciphertext in the outgoing packet and recomputes the GHASH tag via a tail call to `tc_ghash_update`. The real secret is never written to user-space memory, and patching outside the pod's network namespace keeps the patched ciphertext out of reach of in-pod packet capture. |
-| **DNS Kprobe** | Kprobe/kretprobe on `udp_recvmsg` captures DNS responses system-wide. Parses A/AAAA records for watched hostnames and populates `dns_ip_map` (IP to hostname) with TTL tracking. |
-| **Connect/Close Tracepoints** | Hooks `sys_enter/exit_connect` to track TCP connections (fd to destination IP in `conn_ip_map`). When the destination matches a DNS-verified hostname, caches the fd in `last_verified_fd`. Hooks `sys_enter_close` to clean up stale entries. |
+| **XOR Path + TC Patch** | Used for every runtime. Computes `shadow XOR real` for each matched placeholder the pod may use. The `tcp_sendmsg` kprobe keeps only the patches whose host/IP/port policy matches the socket the record leaves on, and bridges them to a tc program on the host side of the pod's veth pair, which XOR-patches the AES-GCM ciphertext in the outgoing packet and recomputes the GHASH tag via a tail call to `tc_ghash_update`. The real secret is never written to user-space memory, and patching outside the pod's network namespace keeps the patched ciphertext out of reach of in-pod packet capture. |
+| **DNS Rewrite** | A tc program inside the pod's network namespace. For a pod that references a secret restricted to a hostname, it replaces that host's A and AAAA records in answers from a trusted resolver with the host's virtual IPs, and records the real addresses. Other pods get the real answers. The controller attaches it while the container runtime creates the pod's sandbox (NRI), before its containers start. |
+| **Connect Redirect** | `cgroup/connect4` and `connect6` programs on the pods' cgroups. A connect to a virtual IP goes to one of the host's real addresses, and the socket records the host it is for; `getpeername` still reports the virtual IP. A connect to a virtual IP with no known address is refused. |
+| **Connect/Close Tracepoints** | Hooks `sys_enter/exit_connect` to track the TCP connections a process makes (fd to destination IP in `conn_ip_map`), which tells them apart from the connections it accepts. Hooks `sys_enter_close` to clean up stale entries. |
 | **Process Tracepoints** | Hooks `sched_process_exec` and `sched_process_exit` to track container process lifecycle for uprobe attachment and cleanup. |
 
 ### Supported Runtimes
@@ -145,61 +159,62 @@ graph TD
 
 Secrets are patched into **AES-128-GCM and AES-256-GCM** records (TLS 1.2 and 1.3). Other ciphers (e.g. ChaCha20-Poly1305) and some libraries (GnuTLS, Go built with `GOEXPERIMENT=boringcrypto`) are not supported yet.
 
-## DNS-Verified Trust Chain
+## Host Verification
 
-Secrets with `getkloak.io/hosts` annotations are only rewritten when the destination is verified through the full DNS resolution chain. This prevents secret exfiltration to unauthorized servers, even if an application is compromised.
+Secrets with `getkloak.io/hosts` annotations are only rewritten on a connection to that host. This prevents secret exfiltration to unauthorized servers, even if an application is compromised.
 
 ```mermaid
 sequenceDiagram
     participant App as Application
-    participant DNS as DNS Server
-    participant KP as eBPF kprobe
-    participant TP as eBPF tracepoint
+    participant DNS as kube-dns
+    participant RW as eBPF DNS rewrite (pod netns)
+    participant CG as eBPF connect hook
     participant UP as eBPF uprobe
-    participant XOR as XOR Path
+    participant KP as eBPF tcp_sendmsg kprobe
     participant TC as tc patch (host veth)
     participant Srv as api.stripe.com
+    participant Evil as evil.com
 
-    Note over App,Srv: 1. DNS Resolution
+    Note over App,Evil: 1. DNS Resolution
     App->>DNS: resolve api.stripe.com
-    DNS-->>App: A 52.55.108.115
-    KP->>KP: dns_ip_map[52.55.108.115] = api.stripe.com
+    DNS-->>RW: A 52.55.108.115
+    RW-->>App: A 198.18.4.2 (virtual IP of api.stripe.com)
 
-    Note over App,Srv: 2. TCP Connect
-    App->>Srv: connect(fd=7, 52.55.108.115:443)
-    TP->>TP: conn_ip_map[tgid,fd=7] = 52.55.108.115
-    TP->>TP: IP in dns_ip_map -> mark fd as verified
+    Note over App,Evil: 2. TCP Connect
+    App->>CG: connect(198.18.4.2:443)
+    CG->>CG: host of the socket = api.stripe.com
+    CG->>Srv: connect(52.55.108.115:443)
 
-    Note over App,Srv: 3. TLS Write (Allowed)
+    Note over App,Evil: 3. TLS Write (Allowed)
     App->>UP: SSL_write with kl::a1b2c3d4
-    UP->>UP: resolve_host -> api.stripe.com
-    UP->>XOR: Tail call
-    XOR->>XOR: allowed_host matches -> stage XOR delta
-    App->>TC: Encrypted record leaves the pod
+    UP->>UP: stage XOR delta
+    App->>KP: Encrypted record sent on the socket
+    KP->>KP: host of the socket matches allowed_host -> keep the patch
+    KP->>TC: Encrypted record leaves the pod
     TC->>TC: XOR-patch ciphertext, recompute GCM tag
     TC->>Srv: Real secret decrypted only by api.stripe.com
 
-    Note over App,Srv: 4. TLS Write (Blocked)
+    Note over App,Evil: 4. TLS Write (Blocked)
     App->>UP: SSL_write to evil.com with kl::a1b2c3d4
-    UP->>UP: resolve_host -> evil.com
-    UP->>XOR: Tail call
-    XOR->>XOR: allowed_host mismatch -> nothing staged
-    App->>Srv: Placeholder sent as-is
+    UP->>UP: stage XOR delta
+    App->>KP: Encrypted record sent on the socket
+    KP->>KP: socket connected to evil.com, not to a virtual IP -> drop the patch
+    App->>Evil: Placeholder sent as-is
 ```
 
 ### How Host Verification Works
 
-1. **DNS capture** -- A kprobe on `udp_recvmsg` intercepts DNS responses on the node. For hostnames listed in `getkloak.io/hosts`, resolved IPs are stored in `dns_ip_map` with TTL tracking.
+1. **Virtual IPs** -- The controller gives every hostname in a `getkloak.io/hosts` annotation a stable virtual IP from `controller.ebpf.virtualIPRange` (an IPv4 and an IPv6 range). They are kept in BPF maps pinned on the node, so a controller restart keeps them.
 
-2. **Connection tracking** -- Tracepoints on `sys_enter/exit_connect` record each TCP connection's fd-to-destination-IP mapping in `conn_ip_map`. If the destination IP exists in `dns_ip_map`, the fd is marked as verified.
+2. **DNS rewrite** -- In the network namespace of each pod that references a secret restricted to the host, a tc program replaces the host's A and AAAA records in answers from a trusted resolver (kube-dns, or `controller.dns.trustedServers`) with its virtual IPs, and records the real addresses. Other pods get the real answers. With NRI (containerd 2.0+, CRI-O 1.30+), the container runtime waits for kloak to set this up before it starts the pod's containers.
 
-3. **Host resolution** -- At `SSL_write` time, `resolve_host()` chains through verified fd, `conn_ip_map`, and `dns_ip_map` to determine the hostname of the current TLS connection.
+3. **Connect redirect** -- A connect to a virtual IP goes to one of the host's real addresses, and the socket records the host it is for. A connect to a virtual IP whose host has no known address fails. The application still sees the virtual IP as its peer.
 
-4. **Secret filtering** -- The XOR path compares the resolved hostname (and IP/port, if set) against the secret's policy. Match: a patch is staged for the tc program. Mismatch: nothing is staged and the placeholder is sent as-is, keeping the secret safe.
+4. **Secret filtering** -- When the encrypted record is sent, the `tcp_sendmsg` kprobe compares the host of the socket (and the address and port it connected to, for a secret restricted to an IP or a port) with the secret's policy. Match: the patch goes on to the tc program. Mismatch: the patch is dropped and the placeholder is sent as-is, keeping the secret safe. A connection that did not go through a virtual IP (a hardcoded address, DNS over HTTPS) gets no host-restricted secret.
 
-5. **TTL enforcement** -- DNS entries include a TTL. Expired entries are skipped on lookup, requiring re-verification through fresh DNS responses.
+5. **SNI check** -- The socket's host is not enough on its own: CDNs and cloud load balancers serve many customers on the same IPs and route each TLS connection by its SNI, so a compromised app could connect to the virtual IP of `api.stripe.com` while naming another tenant's domain in its ClientHello. A kprobe on `tcp_sendmsg` records the SNI of each connection's first ClientHello, and a secret restricted to a hostname is only rewritten on a connection whose SNI is that host. The comparison is exact and case-insensitive: a client that connects to a short in-cluster name (`my-svc`) does not match an annotation with the full name (`my-svc.ns.svc.cluster.local`), so use the same name in both. Connections without SNI, with an encrypted ClientHello (ECH), or whose ClientHello could not be read are refused. Refusals are logged by the controller as an `SNI check violation`. Set `controller.ebpf.sniCheck: audit` to let them through while logging each one. Secrets restricted to an IP address, or to `*`, are not SNI-checked.
 
-6. **SNI check** -- A verified destination IP is not enough on its own: CDNs and cloud load balancers serve many customers on the same IPs and route each TLS connection by its SNI, so a compromised app could connect to an IP of `api.stripe.com` while naming another tenant's domain in its ClientHello. A kprobe on `tcp_sendmsg` records the SNI of each connection's first ClientHello, and a secret restricted to a hostname is only rewritten on a connection whose SNI is that host. The comparison is exact and case-insensitive: a client that connects to a short in-cluster name (`my-svc`) does not match an annotation with the full name (`my-svc.ns.svc.cluster.local`), so use the same name in both. Connections without SNI, with an encrypted ClientHello (ECH), or whose ClientHello could not be read are refused. Refusals are logged by the controller as an `SNI check violation`. Set `controller.ebpf.sniCheck: audit` to let them through while logging each one. Secrets restricted to an IP address, or to `*`, are not SNI-checked.
+**DNS snooping (deprecated).** `controller.ebpf.hostResolution: dns-snoop` keeps the previous mechanism: a kprobe on `udp_recvmsg` reads DNS answers on the node into a node-wide IP-to-hostname map, connect tracepoints mark the connections to those IPs, and the `SSL_write` uprobe looks the host up from the connection's fd. Hosts that share an IP can be confused, and IPv6 connections get no host-restricted secret. It will be removed in a later release.
 
 ## How It Works
 
@@ -234,7 +249,7 @@ Only the pods that reference a secret this way can use it. The controller binds 
 
 ### 3. Automatic In-Kernel Rewrite
 
-When the application makes an outbound HTTPS request, the eBPF uprobe reads the TLS write, verifies the destination through the DNS trust chain, and stages a patch. After the TLS library encrypts the record, a tc program on the host side of the pod's veth XOR-patches the ciphertext so that it decrypts to the real secret, and recomputes the AES-GCM tag. The real value never exists in the pod's memory.
+When the application makes an outbound HTTPS request, the eBPF uprobe reads the TLS write and stages a patch, which is kept only if the connection is to an allowed destination (see [Host Verification](#host-verification)). After the TLS library encrypts the record, a tc program on the host side of the pod's veth XOR-patches the ciphertext so that it decrypts to the real secret, and recomputes the AES-GCM tag. The real value never exists in the pod's memory.
 
 ```
 # What the application writes (and what is in its memory):

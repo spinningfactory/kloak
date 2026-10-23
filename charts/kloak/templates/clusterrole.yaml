@@ -26,7 +26,7 @@ rules:
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get"]
-  {{- if eq (.Values.controller.ebpf.hostResolution | default "dns-snoop") "virtual-ip" }}
+  {{- if eq (.Values.controller.ebpf.hostResolution | default "virtual-ip") "virtual-ip" }}
   # Address ranges the virtual IP range must not overlap: node pod CIDRs
   # and addresses, and the service CIDRs
   - apiGroups: [""]

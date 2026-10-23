@@ -66,7 +66,7 @@ func init() {
 	controllerCmd.Flags().StringVar(&controllerProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	controllerCmd.Flags().BoolVar(&enableEBPF, "enable-ebpf", false, "Enable eBPF traffic redirection (requires Linux + CAP_BPF).")
 	controllerCmd.Flags().StringVar(&cgroupPath, "cgroup-path", "/sys/fs/cgroup", "Path to cgroup v2 filesystem.")
-	controllerCmd.Flags().StringVar(&trustedDNSServers, "trusted-dns-servers", "", "Comma-separated trusted DNS server IPs. If empty, auto-discovers kube-dns.")
+	controllerCmd.Flags().StringVar(&trustedDNSServers, "trusted-dns-servers", "", "Comma-separated DNS server IPs trusted in addition to kube-dns's ClusterIPs and endpoint addresses, which are discovered: only their answers are rewritten for host-restricted secrets.")
 	controllerCmd.Flags().StringVar(&egressInterface, "egress-interface", "auto",
 		"Container interface whose host-side veth peer gets the tc patch program (tc ingress). "+
 			`"auto" detects from the default IPv4 route in the container netns (works for CNI veth "eth0" AND host-mode netns with non-standard names like wlp3s0/enp0s3). `+
@@ -81,10 +81,11 @@ func init() {
 	controllerCmd.Flags().StringVar(&sniCheck, "sni-check", "enforce",
 		`A secret restricted to a hostname (getkloak.io/hosts) is only rewritten on a connection whose TLS ClientHello names that host (SNI). `+
 			`"enforce" refuses other rewrites; "audit" allows them but logs each violation, to find clients whose SNI differs from the annotation before enforcing.`)
-	controllerCmd.Flags().StringVar(&hostResolution, "host-resolution", string(ebpf.HostResolutionDNSSnoop),
+	controllerCmd.Flags().StringVar(&hostResolution, "host-resolution", string(ebpf.HostResolutionVirtualIP),
 		`How the data plane works out which host a connection goes to, for secrets restricted to a hostname (getkloak.io/hosts). `+
-			`"dns-snoop" reads DNS answers as pods receive them (IPv4 connections only). "virtual-ip" (experimental, spinningfactory/kloak#327) gives every such host a stable fake IP, and fake IPv6, from --virtual-ip-range, `+
-			`kept in maps pinned under `+ebpf.DefaultBPFPinPath+`. A kloak pod with a secret for the host gets the fake IP in DNS answers and its connects to it are redirected to the host's addresses; a host-restricted secret is only rewritten on a connection made to its host's fake IP.`)
+			`"virtual-ip" gives every such host a stable fake IP, and fake IPv6, from --virtual-ip-range, `+
+			`kept in maps pinned under `+ebpf.DefaultBPFPinPath+`. A kloak pod with a secret for the host gets the fake IP in DNS answers and its connects to it are redirected to the host's addresses; a host-restricted secret is only rewritten on a connection made to its host's fake IP. `+
+			`"dns-snoop" (deprecated, to be removed) reads DNS answers as pods receive them (IPv4 connections only).`)
 	controllerCmd.Flags().StringVar(&nriSocket, "nri-socket", controller.DefaultNRISocket,
 		`NRI socket of the container runtime (containerd 2.0+, CRI-O 1.30+), used with --host-resolution=virtual-ip: the runtime then waits for kloak to attach the DNS rewrite while it creates each pod sandbox, before the pod's containers start. `+
 			`Without NRI (unreachable socket, or "" to disable), the rewrite is attached by polling pending pods, which leaves a short window at pod start in which a lookup gets the real addresses and a connection made with them no host-restricted secret.`)
@@ -131,6 +132,8 @@ func runController(cmd *cobra.Command, args []string) {
 			_ = setupLog.Sync()
 			os.Exit(1)
 		}
+	} else {
+		setupLog.Warnw("--host-resolution=dns-snoop is deprecated and will be removed in a later release; virtual-ip is the default")
 	}
 
 	// 30 s is well under the daemonset's 60 s terminationGracePeriodSeconds,
@@ -171,7 +174,8 @@ func runController(cmd *cobra.Command, args []string) {
 			err := checkVirtualIPRanges(checkCtx, mgr.GetAPIReader(), hostRes.VirtualIPRanges, "/proc/1", setupLog)
 			cancel()
 			if err != nil {
-				setupLog.Errorw("invalid --virtual-ip-range", "error", err)
+				setupLog.Errorw("invalid --virtual-ip-range: set ranges that no address of the cluster or node uses (Helm: controller.ebpf.virtualIPRange)",
+					"range", hostRes.VirtualIPRanges.String(), "error", err)
 				_ = setupLog.Sync()
 				os.Exit(1)
 			}

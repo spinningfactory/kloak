@@ -410,31 +410,27 @@ jobs:
             ghcr.io/${{ github.repository }}-demo-go:sha-${{ github.sha }}
 
   e2e:
-    # The default leg (tc "auto", "dns-snoop") keeps the original check name
-    # so required status checks still match. "clsact" reruns the suite with
-    # the pre-6.6-kernel tc fallback forced on, since CI kernels support TCX
-    # and would never exercise it. "virtual-ip" reruns it with the
-    # experimental virtual IP host resolution (spinningfactory/kloak#327), on
-    # a dual-stack cluster for its IPv6 tests, with the DNS rewrite attached
-    # through NRI (k3s's containerd serves it); "virtual-ip, polling" with NRI
-    # off, as on a runtime without it; "virtual-ip, cilium" on Cilium instead
-    # of flannel (IPv4 only), with kube-proxy replacement: socket load
-    # balancing, and its own tc programs on the pods' veths.
-    name: ${{ (matrix.tc-attach-mode == 'auto' && matrix.host-resolution == 'dns-snoop') && 'E2E Tests' || (matrix.host-resolution != 'dns-snoop' && format('E2E Tests ({0}{1}{2})', matrix.host-resolution, matrix.nri == false && ', polling' || '', matrix.cni == 'cilium' && ', cilium' || '')) || format('E2E Tests (tc {0})', matrix.tc-attach-mode) }}
+    # The default leg (tc "auto", virtual-ip host resolution, the DNS
+    # rewrite attached through NRI, which k3s's containerd serves) is named
+    # "E2E Tests", the required status check; the others are named after
+    # what they change. On flannel the cluster is dual-stack, for the IPv6
+    # tests. "tc clsact" reruns the suite with the pre-6.6-kernel tc fallback
+    # forced on, since CI kernels support TCX and would never exercise it;
+    # "polling" with NRI off, as on a runtime without it; "cilium" on Cilium
+    # instead of flannel (IPv4 only), with kube-proxy replacement: socket
+    # load balancing, and its own tc programs on the pods' veths;
+    # "dns-snoop" with the deprecated DNS snooping (IPv4 only).
+    name: ${{ format('E2E Tests{0}{1}{2}{3}', matrix.tc-attach-mode != 'auto' && format(' (tc {0})', matrix.tc-attach-mode) || '', matrix.host-resolution != 'virtual-ip' && format(' ({0})', matrix.host-resolution) || '', matrix.nri == false && ' (polling)' || '', matrix.cni != 'flannel' && format(' ({0})', matrix.cni) || '') }}
     runs-on: ubuntu-latest
     needs: [build, test]
     strategy:
       fail-fast: false
       matrix:
         tc-attach-mode: [auto, clsact]
-        host-resolution: [dns-snoop]
+        host-resolution: [virtual-ip]
         nri: [true]
         cni: [flannel]
         include:
-          - tc-attach-mode: auto
-            host-resolution: virtual-ip
-            nri: true
-            cni: flannel
           - tc-attach-mode: auto
             host-resolution: virtual-ip
             nri: false
@@ -443,6 +439,10 @@ jobs:
             host-resolution: virtual-ip
             nri: true
             cni: cilium
+          - tc-attach-mode: auto
+            host-resolution: dns-snoop
+            nri: true
+            cni: flannel
     permissions:
       contents: read
       packages: write
@@ -711,9 +711,9 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      # Every leg collects coverage: the clsact and virtual-ip legs run code
-      # the default leg never reaches (the clsact fallback, the virtual IP
-      # DNS rewrite and connect redirect). Merge Coverage adds them up. This
+      # Every leg collects coverage: the other legs run code the default leg
+      # never reaches (the clsact fallback, polling for pending pods, DNS
+      # snooping). Merge Coverage adds them up. This
       # runs after the failure dump because it uninstalls kloak.
       - name: Collect e2e coverage
         if: always()
