@@ -760,7 +760,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 		// /proc/<pid>/root instead —
 		// /sys/class/net is scoped to the sysfs mount's netns and does NOT
 		// follow setns (see vethPeerIfindex).
-		ifNames := m.resolveEgressInterfaces(pid)
+		ifNames := m.resolveEgressInterfaces(fmt.Sprintf("pid %d", pid))
 
 		// hostPeer is a container interface whose veth peer gets the tc
 		// ingress attach in the root netns.
@@ -943,7 +943,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 // hard-failure cases (explicit interface name that's missing from the
 // netns) surface later in attachTCEgress via the net.InterfaceByName
 // lookup, which has the full netns context for the error message.
-func (m *TLSUprobeManager) resolveEgressInterfaces(pid int) []string {
+func (m *TLSUprobeManager) resolveEgressInterfaces(netnsOf string) []string {
 	var external string
 	switch strings.ToLower(m.egressInterface) {
 	case "", "auto":
@@ -951,14 +951,14 @@ func (m *TLSUprobeManager) resolveEgressInterfaces(pid int) []string {
 		switch {
 		case err != nil:
 			m.log.Warnw("default-route auto-detection failed; attaching only to lo — external TLS rewrites will NOT apply",
-				"pid", pid, "error", err)
+				"netnsOf", netnsOf, "error", err)
 		case got == "":
 			m.log.Warnw("no default IPv4 route in target netns; attaching only to lo — external TLS rewrites will NOT apply (set --egress-interface explicitly if a default route exists under a non-standard name)",
-				"pid", pid)
+				"netnsOf", netnsOf)
 		default:
 			external = got
 			m.log.Debugw("auto-detected egress interface from default route",
-				"pid", pid, "interface", external)
+				"netnsOf", netnsOf, "interface", external)
 		}
 	case "none", "lo-only":
 		// explicit opt-out
@@ -2182,14 +2182,28 @@ func (m *TLSUprobeManager) SetSNICheckMode(mode SNICheckMode) {
 // or references that went away are revoked at the next sync. podUID keys
 // the binding; pod (namespace/name) is only used in logs.
 func (m *TLSUprobeManager) BindPodSecrets(podUID, pod string, podIPs []netip.Addr, cgroupIDs []uint64, refs []secrets.Ref) {
-	b := podBinding{pod: pod, podIPs: podIPs, cgroupIDs: cgroupIDs, refs: refs}
-
 	m.bindMu.Lock()
 	defer m.bindMu.Unlock()
-	m.bindings[podUID] = b
+	m.bindLocked(podUID, &podBinding{pod: pod, podIPs: podIPs, cgroupIDs: cgroupIDs, refs: refs})
+}
+
+// BindPodNetwork is BindPodSecrets for a pod whose containers may not exist
+// yet (its sandbox is being created): it keeps the container cgroups of the
+// pod's current binding, if any, and replaces its addresses and references.
+func (m *TLSUprobeManager) BindPodNetwork(podUID, pod string, podIPs []netip.Addr, refs []secrets.Ref) {
+	m.bindMu.Lock()
+	defer m.bindMu.Unlock()
+	m.bindLocked(podUID, &podBinding{pod: pod, podIPs: podIPs, cgroupIDs: m.bindings[podUID].cgroupIDs, refs: refs})
+}
+
+// bindLocked records b as podUID's binding and grants it; the caller holds
+// bindMu.
+func (m *TLSUprobeManager) bindLocked(podUID string, b *podBinding) {
+	pod := b.pod
+	m.bindings[podUID] = *b
 
 	allowed := uint8(1)
-	single := map[string]podBinding{podUID: b}
+	single := map[string]podBinding{podUID: *b}
 	for key := range secretACL(m.lastSnapshot, single) {
 		if err := m.objs.SecretAcl.Update(&key, &allowed, ebpf.UpdateAny); err != nil {
 			m.log.Errorw("failed to grant secret binding", "error", err, "pod", pod, "cgroupID", key.CgroupID)

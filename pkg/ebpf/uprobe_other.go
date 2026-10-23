@@ -64,6 +64,11 @@ func (m *TLSUprobeManager) AttachPodDNSRewrite(string, string, []int) ([]netip.A
 	return nil, ErrNotSupported
 }
 
+func (m *TLSUprobeManager) AttachPodDNSRewriteNetns(string, string, string) ([]netip.Addr, error) {
+	return nil, ErrNotSupported
+}
+
 func (m *TLSUprobeManager) BindPodSecrets(string, string, []netip.Addr, []uint64, []secrets.Ref) {}
+func (m *TLSUprobeManager) BindPodNetwork(string, string, []netip.Addr, []secrets.Ref)            {}
 
 func RemoveVirtualIPPins(string, *zap.SugaredLogger) {}

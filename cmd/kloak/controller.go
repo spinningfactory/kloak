@@ -56,6 +56,7 @@ var (
 	sniCheck            string
 	hostResolution      string
 	virtualIPRange      string
+	nriSocket           string
 )
 
 func init() {
@@ -81,6 +82,9 @@ func init() {
 		`How the data plane works out which host a connection goes to, for secrets restricted to a hostname (getkloak.io/hosts). `+
 			`"dns-snoop" reads DNS answers as pods receive them (IPv4 connections only). "virtual-ip" (experimental, spinningfactory/kloak#327) gives every such host a stable fake IP, and fake IPv6, from --virtual-ip-range, `+
 			`kept in maps pinned under `+ebpf.DefaultBPFPinPath+`. A kloak pod with a secret for the host gets the fake IP in DNS answers and its connects to it are redirected to the host's addresses; a host-restricted secret is only rewritten on a connection made to its host's fake IP.`)
+	controllerCmd.Flags().StringVar(&nriSocket, "nri-socket", controller.DefaultNRISocket,
+		`NRI socket of the container runtime (containerd 2.0+, CRI-O 1.30+), used with --host-resolution=virtual-ip: the runtime then waits for kloak to attach the DNS rewrite while it creates each pod sandbox, before the pod's containers start. `+
+			`Without NRI (unreachable socket, or "" to disable), the rewrite is attached by polling pending pods, which leaves a short window at pod start in which a lookup gets the real addresses and a connection made with them no host-restricted secret.`)
 	controllerCmd.Flags().StringVar(&virtualIPRange, "virtual-ip-range", ebpf.DefaultVirtualIPRange,
 		`Ranges fake IPs come from with --host-resolution=virtual-ip: an IPv4 range (/19 or larger) and, optionally, an IPv6 one (/115 or larger), comma-separated. `+
 			`Without an IPv6 range, AAAA answers are left unchanged. `+
@@ -90,7 +94,7 @@ func init() {
 func runController(cmd *cobra.Command, args []string) {
 	setupLog := logging.Setup().Named("setup")
 
-	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface, "tcAttachMode", tcAttachMode, "secretBinding", secretBinding, "sniCheck", sniCheck, "hostResolution", hostResolution)
+	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface, "tcAttachMode", tcAttachMode, "secretBinding", secretBinding, "sniCheck", sniCheck, "hostResolution", hostResolution, "nriSocket", nriSocket)
 
 	tcMode, err := ebpf.ParseTCAttachMode(tcAttachMode)
 	if err != nil {
@@ -190,10 +194,29 @@ func runController(cmd *cobra.Command, args []string) {
 		nodeName,
 	)
 
+	reconciler.APIReader = mgr.GetAPIReader()
+
 	if err := reconciler.SetupWithManager(mgr); err != nil {
 		setupLog.Errorw("unable to create controller", "error", err, "controller", "Pod")
 		_ = setupLog.Sync()
 		os.Exit(1)
+	}
+
+	// With NRI the container runtime waits for the DNS rewrite to be
+	// attached before a pod's containers start; without it, the reconciler
+	// polls pending pods. Added as a runnable so it starts after the cache
+	// sync (PrepareSandbox reads pods from the cache).
+	if uprobeMgr != nil && uprobeMgr.VirtualIPEnabled() && nriSocket != "" {
+		plugin := &controller.NRIPlugin{
+			Preparer:   reconciler,
+			SocketPath: nriSocket,
+			Log:        setupLog.Named("nri"),
+		}
+		if err := mgr.Add(manager.RunnableFunc(plugin.Run)); err != nil {
+			setupLog.Errorw("unable to add the NRI plugin runnable", "error", err)
+			_ = setupLog.Sync()
+			os.Exit(1)
+		}
 	}
 
 	// Create secret reconciler
