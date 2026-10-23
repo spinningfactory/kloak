@@ -305,7 +305,7 @@ var ebpfTests = []ebpfRewriteTest{
 }
 
 // TestEBPFRawTLSHostFiltering tests that DNS-verified host filtering works with
-// raw TLS sockets (non-HTTP). A TLS echo server runs as a sidecar behind a K8s
+// raw TLS sockets (non-HTTP). A TLS echo server runs in its own pod behind a K8s
 // Service. The client resolves the Service name via DNS, which populates dns_ip_map,
 // enabling host-based secret filtering at the TCP level.
 func TestEBPFRawTLSHostFiltering(t *testing.T) {

@@ -417,7 +417,7 @@ func TestVirtualIPv6(t *testing.T) {
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{Name: "tls6", Namespace: testNamespace},
 		Spec: corev1.ServiceSpec{
-			Selector:       map[string]string{"app": "demo-python-raw-tls"},
+			Selector:       map[string]string{"app": "demo-python-raw-tls-echo"},
 			Ports:          []corev1.ServicePort{{Port: 8443}},
 			IPFamilies:     []corev1.IPFamily{corev1.IPv6Protocol},
 			IPFamilyPolicy: &single,

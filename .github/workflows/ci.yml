@@ -417,8 +417,10 @@ jobs:
     # experimental virtual IP host resolution (spinningfactory/kloak#327), on
     # a dual-stack cluster for its IPv6 tests, with the DNS rewrite attached
     # through NRI (k3s's containerd serves it); "virtual-ip, polling" with NRI
-    # off, as on a runtime without it.
-    name: ${{ (matrix.tc-attach-mode == 'auto' && matrix.host-resolution == 'dns-snoop') && 'E2E Tests' || (matrix.host-resolution != 'dns-snoop' && format('E2E Tests ({0}{1})', matrix.host-resolution, matrix.nri == false && ', polling' || '')) || format('E2E Tests (tc {0})', matrix.tc-attach-mode) }}
+    # off, as on a runtime without it; "virtual-ip, cilium" on Cilium instead
+    # of flannel (IPv4 only), with kube-proxy replacement: socket load
+    # balancing, and its own tc programs on the pods' veths.
+    name: ${{ (matrix.tc-attach-mode == 'auto' && matrix.host-resolution == 'dns-snoop') && 'E2E Tests' || (matrix.host-resolution != 'dns-snoop' && format('E2E Tests ({0}{1}{2})', matrix.host-resolution, matrix.nri == false && ', polling' || '', matrix.cni == 'cilium' && ', cilium' || '')) || format('E2E Tests (tc {0})', matrix.tc-attach-mode) }}
     runs-on: ubuntu-latest
     needs: [build, test]
     strategy:
@@ -427,13 +429,20 @@ jobs:
         tc-attach-mode: [auto, clsact]
         host-resolution: [dns-snoop]
         nri: [true]
+        cni: [flannel]
         include:
           - tc-attach-mode: auto
             host-resolution: virtual-ip
             nri: true
+            cni: flannel
           - tc-attach-mode: auto
             host-resolution: virtual-ip
             nri: false
+            cni: flannel
+          - tc-attach-mode: auto
+            host-resolution: virtual-ip
+            nri: true
+            cni: cilium
     permissions:
       contents: read
       packages: write
@@ -476,10 +485,17 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
+      - name: Install Helm
+        uses: azure/setup-helm@v5
+
       - name: Install k3s
         run: |
           K3S_EXEC="--write-kubeconfig-mode 644 --disable=traefik"
-          if [ "${{ matrix.host-resolution }}" = "virtual-ip" ]; then
+          if [ "${{ matrix.cni }}" = "cilium" ]; then
+            # Cilium replaces flannel, k3s's network policy controller and
+            # kube-proxy (it load balances Services itself, at connect).
+            K3S_EXEC="$K3S_EXEC --flannel-backend=none --disable-network-policy --disable-kube-proxy --disable=servicelb"
+          elif [ "${{ matrix.host-resolution }}" = "virtual-ip" ]; then
             # Dual-stack, for TestVirtualIPv6. The runner has no IPv6
             # address: the node gets a ULA one; pods on this single node
             # reach each other and the IPv6 Services through it.
@@ -496,6 +512,18 @@ jobs:
             echo "Waiting for k3s node to register ($i/30)..."
             sleep 2
           done
+          if [ "${{ matrix.cni }}" = "cilium" ]; then
+            # The node only gets Ready once a CNI runs.
+            IFACE=$(ip -4 route show default | awk '{print $5; exit}')
+            V4=$(ip -4 -o addr show dev "$IFACE" | awk '{split($4, a, "/"); print a[1]; exit}')
+            helm repo add cilium https://helm.cilium.io
+            KUBECONFIG=/etc/rancher/k3s/k3s.yaml helm install cilium cilium/cilium --version 1.20.3 -n kube-system \
+              --set kubeProxyReplacement=true --set k8sServiceHost="$V4" --set k8sServicePort=6443 \
+              --set ipam.mode=kubernetes --set bpf.masquerade=true --set operator.replicas=1 \
+              --wait --timeout 10m
+            sudo k3s kubectl -n kube-system exec ds/cilium -c cilium-agent -- cilium-dbg status --verbose \
+              | grep -E "KubeProxyReplacement|Host Routing|Masquerading|Attach Mode|Socket LB" || true
+          fi
           sudo k3s kubectl wait --for=condition=Ready node --all --timeout=120s
           mkdir -p ~/.kube
           sudo cp /etc/rancher/k3s/k3s.yaml ~/.kube/k3s-e2e.yaml
@@ -588,9 +616,6 @@ jobs:
             kloak-tls-echo:latest kloak-http-echo:latest \
             | sudo k3s ctr -n k8s.io images import -
 
-      - name: Install Helm
-        uses: azure/setup-helm@v5
-
       - name: Start BPF trace capture
         # bpf_printk in pkg/ebpf/bpf/tls_uprobe.c (compiled with BPF_DEBUG=1
         # above) streams to /sys/kernel/tracing/trace_pipe — a kernel ring
@@ -681,7 +706,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bpf-trace-${{ matrix.tc-attach-mode }}-${{ matrix.host-resolution }}${{ matrix.nri == false && '-polling' || '' }}
+          name: bpf-trace-${{ matrix.tc-attach-mode }}-${{ matrix.host-resolution }}${{ matrix.nri == false && '-polling' || '' }}${{ matrix.cni == 'cilium' && '-cilium' || '' }}
           path: /tmp/bpf-trace.log
           retention-days: 7
           if-no-files-found: ignore
@@ -720,7 +745,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-covdata-${{ matrix.tc-attach-mode }}-${{ matrix.host-resolution }}${{ matrix.nri == false && '-polling' || '' }}
+          name: e2e-covdata-${{ matrix.tc-attach-mode }}-${{ matrix.host-resolution }}${{ matrix.nri == false && '-polling' || '' }}${{ matrix.cni == 'cilium' && '-cilium' || '' }}
           path: /tmp/e2e-covdata
           retention-days: 7
           if-no-files-found: ignore

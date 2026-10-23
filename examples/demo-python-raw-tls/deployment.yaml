@@ -1,3 +1,9 @@
+# The TLS echo server runs in its own pod, as the remote end of a real
+# connection would: kloak patches the record as it leaves the client's pod,
+# and the real value never exists inside that pod. (Under a CNI that load
+# balances Services at the socket, such as Cilium, a server in the client's
+# own pod would be reached over the pod's loopback, which kloak does not
+# patch.)
 apiVersion: v1
 kind: Service
 metadata:
@@ -6,10 +12,34 @@ metadata:
     app: tls
 spec:
   selector:
-    app: demo-python-raw-tls
+    app: demo-python-raw-tls-echo
   ports:
     - port: 8443
       targetPort: 8443
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo-python-raw-tls-echo
+  labels:
+    app: demo-python-raw-tls-echo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: demo-python-raw-tls-echo
+  template:
+    metadata:
+      labels:
+        app: demo-python-raw-tls-echo
+    spec:
+      containers:
+        - name: echo-server
+          image: kloak-demo-python-raw-tls:latest
+          imagePullPolicy: Never
+          command: ["python", "-u", "echo_server.py"]
+          ports:
+            - containerPort: 8443
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -56,12 +86,6 @@ spec:
             - name: secret-blocked-vol
               mountPath: "/etc/secrets/blocked"
               readOnly: true
-        - name: echo-server
-          image: kloak-demo-python-raw-tls:latest
-          imagePullPolicy: Never
-          command: ["python", "-u", "echo_server.py"]
-          ports:
-            - containerPort: 8443
       volumes:
         - name: secret-allowed-vol
           secret:
