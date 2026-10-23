@@ -58,20 +58,22 @@ controller:
     # lets them through but logs each one in the controller.
     sniCheck: enforce
     # How the data plane works out which host a connection goes to, for
-    # secrets restricted to a hostname. "dns-snoop" (default) reads DNS
-    # answers as pods receive them. "virtual-ip" is experimental
-    # (spinningfactory/kloak#327): every such host gets a stable fake IP
-    # from virtualIPRange, and a fake IPv6. A kloak pod with a secret
-    # restricted to the host gets them in place of the host's addresses in
-    # DNS answers (A and AAAA records), and its connects to them are
-    # redirected to one of those addresses. A secret
+    # secrets restricted to a hostname. "virtual-ip" (default): every such
+    # host gets a stable fake IP from virtualIPRange, and a fake IPv6. A
+    # kloak pod with a secret restricted to the host gets them in place of
+    # the host's addresses in DNS answers (A and AAAA records), and its
+    # connects to them are redirected to one of those addresses. A secret
     # restricted to the host is only rewritten on a connection made to its
     # fake IP (an app that connects to a hardcoded address, or resolves
     # outside the pod's DNS, gets none). While the controller is not running,
     # connects to fake IPs fail. The fake IPs and their addresses are kept in BPF maps
     # pinned under /sys/fs/bpf/kloak so restarts keep them; the pins stay on
-    # the node after an uninstall until it reboots.
-    hostResolution: dns-snoop
+    # the node after an uninstall until it reboots. Pods that were running
+    # before a node switched to virtual-ip keep the addresses they resolved:
+    # restart them so their host-restricted secrets are rewritten.
+    # "dns-snoop" (deprecated, to be removed) reads DNS answers as pods
+    # receive them, IPv4 only.
+    hostResolution: virtual-ip
     # Ranges the fake IPs come from in virtual-ip mode: an IPv4 range (/19
     # or larger) and optionally an IPv6 one (/115 or larger),
     # comma-separated (escape the comma as "\," with helm --set). Without
@@ -96,8 +98,11 @@ controller:
     enabled: true
     socketPath: /var/run/nri/nri.sock
   dns:
-    # Trusted DNS server IPs. Only DNS responses from these servers are used
-    # for host-based secret filtering. If empty, auto-discovers kube-dns ClusterIP.
+    # DNS server IPs trusted in addition to kube-dns's ClusterIPs and its
+    # endpoints' addresses, which are discovered. Only answers from trusted
+    # servers are rewritten for host-restricted secrets (read, in dns-snoop
+    # mode). Add a node-local cache that pods query at its own address, such
+    # as NodeLocal DNSCache's 169.254.20.10 when the kubelet points pods at it.
     trustedServers: []
   resources:
     requests:

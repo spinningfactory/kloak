@@ -14,7 +14,7 @@ import (
 
 func TestParseHostResolutionMode(t *testing.T) {
 	for in, want := range map[string]HostResolutionMode{
-		"":            HostResolutionDNSSnoop,
+		"":            HostResolutionVirtualIP,
 		"dns-snoop":   HostResolutionDNSSnoop,
 		" Virtual-IP": HostResolutionVirtualIP,
 	} {

@@ -24,23 +24,25 @@ type HostResolutionMode string
 
 const (
 	// HostResolutionDNSSnoop reads DNS answers as pods receive them
-	// (udp_recvmsg) and keeps a node-wide IP -> host map. The default.
+	// (udp_recvmsg) and keeps a node-wide IP -> host map. Deprecated, to be
+	// removed.
 	HostResolutionDNSSnoop HostResolutionMode = "dns-snoop"
 	// HostResolutionVirtualIP gives every watched host a stable fake IP
 	// (and fake IPv6) from reserved ranges, kept in maps pinned in bpffs,
 	// hands it to the pods with a secret for the host in DNS answers, and
 	// decides a host-restricted secret on the socket that connected to it.
-	// Experimental (spinningfactory/kloak#327).
+	// The controller's default.
 	HostResolutionVirtualIP HostResolutionMode = "virtual-ip"
 )
 
-// ParseHostResolutionMode validates a --host-resolution value.
+// ParseHostResolutionMode validates a --host-resolution value. Empty means
+// virtual-ip, the default.
 func ParseHostResolutionMode(s string) (HostResolutionMode, error) {
 	switch HostResolutionMode(strings.ToLower(strings.TrimSpace(s))) {
-	case "", HostResolutionDNSSnoop:
-		return HostResolutionDNSSnoop, nil
-	case HostResolutionVirtualIP:
+	case "", HostResolutionVirtualIP:
 		return HostResolutionVirtualIP, nil
+	case HostResolutionDNSSnoop:
+		return HostResolutionDNSSnoop, nil
 	default:
 		return "", fmt.Errorf("invalid host resolution mode %q (want dns-snoop or virtual-ip)", s)
 	}
@@ -146,7 +148,8 @@ func parseVirtualIPPrefix(s string) (netip.Prefix, error) {
 // whether the virtual IP maps are pinned is decided when the BPF objects
 // are loaded.
 type HostResolutionConfig struct {
-	// Mode is the host resolution mode. Empty means dns-snoop.
+	// Mode is the host resolution mode. Empty means dns-snoop, which needs
+	// no ranges (the controller's default, virtual-ip, does).
 	Mode HostResolutionMode
 	// VirtualIPRanges are the ranges fake IPs come from (virtual-ip mode
 	// only; see ParseVirtualIPRanges).

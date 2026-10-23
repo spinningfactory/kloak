@@ -16,12 +16,12 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// TestVirtualIPAllocation checks the experimental virtual IP host
-// resolution (--host-resolution=virtual-ip, spinningfactory/kloak#327): the
+// TestVirtualIPAllocation checks the virtual IP host resolution
+// (--host-resolution=virtual-ip, the default, spinningfactory/kloak#327): the
 // controller gives the host of a host-scoped secret a fake IP from the
 // virtual IP range, keeps it across a controller restart (the maps are
 // pinned in bpffs), and retires it once no secret uses the host. Runs only
-// when the controller is deployed in that mode (the virtual-ip CI leg).
+// when the controller is deployed in that mode (every CI leg but dns-snoop).
 func TestVirtualIPAllocation(t *testing.T) {
 	vipRange := controllerVirtualIPRange(t)
 	const host = "vip-e2e.example.com"
@@ -597,7 +597,8 @@ func controllerVirtualIPRanges(t *testing.T) (v4, v6 netip.Prefix) {
 	if err != nil {
 		t.Fatalf("getting controller DaemonSet: %v", err)
 	}
-	mode, vipRange := "dns-snoop", "198.18.0.0/15,2001:2::/48"
+	// Without the flags, the controller's defaults.
+	mode, vipRange := "virtual-ip", "198.18.0.0/15,2001:2::/48"
 	for _, c := range ds.Spec.Template.Spec.Containers {
 		if c.Name != "controller" {
 			continue
