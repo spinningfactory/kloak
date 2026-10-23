@@ -51,6 +51,7 @@ func (m *TLSUprobeManager) AttachTLS(int, uint64) error              { return Er
 func (m *TLSUprobeManager) Close() error                             { return ErrNotSupported }
 func (m *TLSUprobeManager) PollExecEvents(context.Context) error     { return ErrNotSupported }
 func (m *TLSUprobeManager) PollEvents(context.Context) error         { return ErrNotSupported }
+func (m *TLSUprobeManager) SyncSecrets(context.Context) error        { return ErrNotSupported }
 func (m *TLSUprobeManager) PopulateTrustedDNSServers([]net.IP) error { return ErrNotSupported }
 func (m *TLSUprobeManager) DumpDebugCounters()                       {}
 func (m *TLSUprobeManager) SetTCAttachMode(TCAttachMode)             {}

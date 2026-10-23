@@ -138,7 +138,7 @@ type TLSUprobeManager struct {
 	retryWG sync.WaitGroup
 
 	// bindMu guards bindings, bindingMode and lastSnapshot, and serializes
-	// every secret_acl and vip_pod_host write, so a periodic sync can't
+	// every secret_acl and vip_pod_host write, so a secret sync can't
 	// prune entries a concurrent BindPodSecrets just granted.
 	bindMu sync.Mutex
 	// bindings maps pod UID → the secrets that pod may redeem (secret_binding.go).
@@ -146,7 +146,7 @@ type TLSUprobeManager struct {
 	// bindingMode is the --secret-binding mode (SetSecretBindingMode).
 	bindingMode SecretBindingMode
 	// lastSnapshot is the most recent secrets snapshot, used to grant a new
-	// pod's bindings immediately instead of at the next periodic sync.
+	// pod's bindings immediately instead of at the next secret sync.
 	lastSnapshot []secrets.Secret
 	// bindingLogged rate-limits violation logs per (cgroup, placeholder,
 	// reason).
@@ -2011,30 +2011,25 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 	}
 }
 
-// PollEvents periodically syncs secrets and pod bindings to the eBPF maps,
-// and logs secret-binding violations reported by the data plane.
+// PollEvents logs the secret-binding violations reported by the data plane,
+// and the BPF debug counters every 5 s. Secrets are synced to the eBPF maps
+// by SyncSecrets.
 func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
-	m.log.Infow("Starting eBPF secret syncer and binding-violation reader")
+	m.log.Infow("Starting eBPF binding-violation reader")
 
-	// Trigger an initial sync
-	m.syncSecretsToBPF(ctx)
-
-	// Periodic re-sync ticker. The initial sync may have found an empty store
-	// (secret reconciler hasn't run yet), so we must keep re-syncing.
-	syncTicker := time.NewTicker(5 * time.Second)
-	defer syncTicker.Stop()
+	countersTicker := time.NewTicker(5 * time.Second)
+	defer countersTicker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-syncTicker.C:
-			m.syncSecretsToBPF(ctx)
+		case <-countersTicker.C:
 			m.DumpDebugCounters()
 		default:
 		}
 
-		// Use a short deadline so we don't block forever and miss sync ticks
+		// Use a short deadline so we don't block forever and miss counter ticks
 		m.reader.SetDeadline(time.Now().Add(1 * time.Second))
 		record, err := m.reader.Read()
 		if err != nil {
@@ -2117,31 +2112,35 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 	return nil
 }
 
-// syncSecretsToBPF updates the eBPF map with the latest shadow secret values,
-// and gives the hostnames of the secret entries virtual IPs.
-func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
+// SyncSecrets makes the eBPF maps hold the secret source's current secrets:
+// secret_map, the virtual IPs of their hosts, and the pod bindings over them
+// (secret_acl, vip_pod_host). A failed snapshot leaves the maps as they
+// were. A failed map operation does not stop the others; the error reports
+// it, and a retry completes the maps.
+func (m *TLSUprobeManager) SyncSecrets(ctx context.Context) error {
 	if m.secretSource == nil {
-		return
+		return nil
 	}
 	snapshot, err := m.secretSource.Snapshot(ctx)
 	if err != nil {
-		// Keep the previous map contents; pruning against a failed snapshot
-		// would drop every secret.
-		m.log.Errorw("failed to sync secrets to BPF map", "error", fmt.Errorf("snapshot secrets: %w", err))
-		return
+		// Pruning against a failed snapshot would drop every secret.
+		return fmt.Errorf("snapshot secrets: %w", err)
 	}
-	hosts := applySecrets(m.objs.SecretMap, snapshot, m.log)
+	hosts, secretsErr := applySecrets(m.objs.SecretMap, snapshot, m.log)
+	var vipErr error
 	if m.virtualIPs != nil {
-		m.virtualIPs.sync(hosts, time.Now())
+		vipErr = m.virtualIPs.sync(hosts, time.Now())
 	}
 
 	m.bindMu.Lock()
 	defer m.bindMu.Unlock()
 	m.lastSnapshot = snapshot
-	syncSecretACL(m.objs.SecretAcl, snapshot, m.bindings, m.log)
+	aclErr := syncSecretACL(m.objs.SecretAcl, snapshot, m.bindings, m.log)
+	var podHostErr error
 	if m.virtualIPs != nil {
-		syncVipPodHost(m.objs.VipPodHost, vipPodHosts(snapshot, m.bindings, m.bindingMode == SecretBindingAudit), m.log)
+		podHostErr = syncVipPodHost(m.objs.VipPodHost, vipPodHosts(snapshot, m.bindings, m.bindingMode == SecretBindingAudit), m.log)
 	}
+	return errors.Join(secretsErr, vipErr, aclErr, podHostErr)
 }
 
 // SetSecretBindingMode configures what the data plane does when a process
@@ -2301,7 +2300,9 @@ func (m *TLSUprobeManager) UnbindPod(podUID string) {
 	// The pod's address may already belong to a new pod: keep what the
 	// remaining bindings grant.
 	if m.virtualIPs != nil && len(b.podIPs) > 0 {
-		syncVipPodHost(m.objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, m.bindingMode == SecretBindingAudit), m.log)
+		// Failures are logged entry by entry, and the next secret sync
+		// prunes what is left.
+		_ = syncVipPodHost(m.objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, m.bindingMode == SecretBindingAudit), m.log)
 	}
 }
 

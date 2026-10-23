@@ -4,6 +4,7 @@ package ebpf
 
 import (
 	"context"
+	"errors"
 	"maps"
 	"strings"
 	"testing"
@@ -358,11 +359,11 @@ func TestApplySecrets_WatchedHosts(t *testing.T) {
 	}
 
 	want := map[string]struct{}{"api.stripe.com": {}, "api.github.com": {}}
-	if got := applySecrets(m, snapshot, testLog()); !maps.Equal(got, want) {
-		t.Errorf("hosts = %v, want %v", got, want)
+	if got, err := applySecrets(m, snapshot, testLog()); err != nil || !maps.Equal(got, want) {
+		t.Errorf("hosts = %v, %v, want %v", got, err, want)
 	}
-	if got := applySecrets(m, nil, testLog()); len(got) != 0 {
-		t.Errorf("hosts after the secrets went = %v, want none", got)
+	if got, err := applySecrets(m, nil, testLog()); err != nil || len(got) != 0 {
+		t.Errorf("hosts after the secrets went = %v, %v, want none", got, err)
 	}
 }
 
@@ -498,14 +499,18 @@ func TestSyncSecretACL_GrantsAndPrunes(t *testing.T) {
 		"b": {pod: "ns/b", cgroupIDs: []uint64{2}, refs: []secrets.Ref{{OwnerID: "ns/db"}}},
 	}
 
-	syncSecretACL(m, snapshot, bindings, testLog())
+	if err := syncSecretACL(m, snapshot, bindings, testLog()); err != nil {
+		t.Fatal(err)
+	}
 	if got, want := aclEntries(t, m), secretACL(snapshot, bindings); len(got) != len(want) {
 		t.Fatalf("after first sync: %d entries, want %d", len(got), len(want))
 	}
 
 	// Pod b goes away: its grants must be pruned, pod a's kept.
 	delete(bindings, "b")
-	syncSecretACL(m, snapshot, bindings, testLog())
+	if err := syncSecretACL(m, snapshot, bindings, testLog()); err != nil {
+		t.Fatal(err)
+	}
 	got := aclEntries(t, m)
 	for k := range got {
 		if k.CgroupID == 2 {
@@ -516,5 +521,89 @@ func TestSyncSecretACL_GrantsAndPrunes(t *testing.T) {
 		if _, ok := got[k]; !ok {
 			t.Errorf("grant for remaining pod lost: cgroup=%d", k.CgroupID)
 		}
+	}
+}
+
+// TestApplySecrets_ReportsFailedWrites checks that a write secret_map
+// refuses (it is full) is reported once the other writes are done, so that
+// the sync is retried.
+func TestApplySecrets_ReportsFailedWrites(t *testing.T) {
+	spec := loadSpec(t).Maps["secret_map"].Copy()
+	spec.MaxEntries = 1
+	m, err := ciliumebpf.NewMap(spec)
+	if err != nil {
+		t.Skipf("eBPF maps not available: %v", err)
+	}
+	t.Cleanup(func() { _ = m.Close() })
+
+	// The secret takes two entries, one for its placeholder and one for
+	// its HPACK-Huffman encoding: the second does not fit.
+	snapshot := []secrets.Secret{{OwnerID: "ns/api", Key: "token", Real: "real-token-value-0001", Shadow: "kl::token-placeholder-0001"}}
+	_, err = applySecrets(m, snapshot, testLog())
+	if err == nil || !strings.Contains(err.Error(), "secret_map: 1 failed map operations") {
+		t.Fatalf("applySecrets error = %v, want one failed secret_map operation", err)
+	}
+	var key secretKey
+	copy(key.Prefix[:], "kl::toke")
+	var val secretValue
+	if err := m.Lookup(&key, &val); err != nil {
+		t.Errorf("the placeholder's entry, written before the failure: %v", err)
+	}
+}
+
+// errSource is a secrets.Source whose snapshots fail.
+type errSource struct{ err error }
+
+func (s errSource) Snapshot(context.Context) ([]secrets.Secret, error) { return nil, s.err }
+
+// TestSyncSecrets_Manager checks that SyncSecrets fills secret_map, the
+// virtual IP of the secret's host and the pod bindings, and that a failed
+// snapshot is reported and leaves the maps as they were.
+func TestSyncSecrets_Manager(t *testing.T) {
+	objs := loadTestObjects(t)
+	ranges, err := ParseVirtualIPRanges(DefaultVirtualIPRange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := newFakeClient(
+		enabledSecret("api", "ns", map[string][]byte{"token": []byte("real-token-value-0001")}, nil,
+			map[string]string{"getkloak.io/hosts": "api.example.com"}),
+		shadowSecret("api-kloak", "ns", "api", map[string][]byte{"token": []byte("kl::token-placeholder-0001")}),
+	)
+	m := &TLSUprobeManager{
+		objs:         objs,
+		log:          testLog(),
+		secretSource: k8sSource(reader),
+		bindings: map[string]podBinding{
+			"uid": {pod: "ns/app", cgroupIDs: []uint64{41}, refs: []secrets.Ref{{OwnerID: "ns/api"}}},
+		},
+		virtualIPs: newVirtualIPAllocator(objs, ranges, testLog()),
+	}
+
+	if err := m.SyncSecrets(context.Background()); err != nil {
+		t.Fatalf("SyncSecrets: %v", err)
+	}
+	var key secretKey
+	copy(key.Prefix[:], "kl::toke")
+	var val secretValue
+	if err := objs.SecretMap.Lookup(&key, &val); err != nil {
+		t.Errorf("secret_map: %v", err)
+	}
+	if hosts, err := readVirtualIPHosts(objs.VipHostIp); err != nil || len(hosts) != 1 {
+		t.Errorf("vip_host_ip = %v, %v, want api.example.com", hosts, err)
+	}
+	if got, want := aclEntries(t, objs.SecretAcl), secretACL(m.lastSnapshot, m.bindings); len(want) == 0 || !maps.Equal(got, want) {
+		t.Errorf("secret_acl has %d entries, want the %d the binding grants", len(got), len(want))
+	}
+
+	m.secretSource = errSource{errors.New("cache not started")}
+	if err := m.SyncSecrets(context.Background()); err == nil || !strings.Contains(err.Error(), "cache not started") {
+		t.Fatalf("SyncSecrets with a failing snapshot = %v, want its error", err)
+	}
+	if err := objs.SecretMap.Lookup(&key, &val); err != nil {
+		t.Errorf("a failed snapshot pruned secret_map: %v", err)
+	}
+	if len(m.lastSnapshot) != 1 {
+		t.Errorf("a failed snapshot replaced the last one: %d secrets", len(m.lastSnapshot))
 	}
 }

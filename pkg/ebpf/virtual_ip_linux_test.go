@@ -89,7 +89,9 @@ func TestVirtualIPAllocatorSync(t *testing.T) {
 
 	// Every host gets a fake IP of each family.
 	hosts := hostSet("api.example.com", "b.example.com")
-	a.sync(hosts, testVIPNow)
+	if err := a.sync(hosts, testVIPNow); err != nil {
+		t.Fatal(err)
+	}
 	want4, want6 := planVirtualIPRanges(testVIPRanges, hosts, nil, testVIPNow, 4096)
 	check("allocate", want4, want6)
 	key := vipHostKey("api.example.com")
@@ -106,7 +108,9 @@ func TestVirtualIPAllocatorSync(t *testing.T) {
 	// vip_ip_host.
 	later := testVIPNow.Add(time.Minute)
 	hosts = hostSet("api.example.com")
-	a.sync(hosts, later)
+	if err := a.sync(hosts, later); err != nil {
+		t.Fatal(err)
+	}
 	bIP4, bIP6 := want4.Hosts["b.example.com"], want6.Hosts["b.example.com"]
 	delete(want4.Hosts, "b.example.com")
 	delete(want6.Hosts, "b.example.com")
@@ -115,11 +119,15 @@ func TestVirtualIPAllocatorSync(t *testing.T) {
 	check("retire", want4, want6)
 
 	// A second sync with nothing new changes nothing.
-	a.sync(hosts, later.Add(time.Minute))
+	if err := a.sync(hosts, later.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	check("steady", want4, want6)
 
 	// Past the retention period the reservations are released.
-	a.sync(hosts, later.Add(virtualIPRetention))
+	if err := a.sync(hosts, later.Add(virtualIPRetention)); err != nil {
+		t.Fatal(err)
+	}
 	delete(want4.Entries, bIP4)
 	delete(want6.Entries, bIP6)
 	check("release", want4, want6)
@@ -128,12 +136,16 @@ func TestVirtualIPAllocatorSync(t *testing.T) {
 	// reservations go.
 	apiIP6 := want6.Hosts["api.example.com"]
 	a.ranges = VirtualIPRanges{V4: testVIPRange}
-	a.sync(hosts, later.Add(virtualIPRetention))
+	if err := a.sync(hosts, later.Add(virtualIPRetention)); err != nil {
+		t.Fatal(err)
+	}
 	check("no IPv6 range", want4, vipPlan{})
 
 	// Back again: the same fake IPv6, derived from the host.
 	a.ranges = testVIPRanges
-	a.sync(hosts, later.Add(virtualIPRetention))
+	if err := a.sync(hosts, later.Add(virtualIPRetention)); err != nil {
+		t.Fatal(err)
+	}
 	if err := hostIP.Lookup(&key, &raw); err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +185,9 @@ func TestVirtualIPAllocatorPrunesUpstreams(t *testing.T) {
 		return err == nil
 	}
 
-	a.sync(hostSet("api.example.com", "b.example.com"), testVIPNow)
+	if err := a.sync(hostSet("api.example.com", "b.example.com"), testVIPNow); err != nil {
+		t.Fatal(err)
+	}
 	hosts, err := readVirtualIPHosts(hostIP)
 	if err != nil {
 		t.Fatal(err)
@@ -187,13 +201,17 @@ func TestVirtualIPAllocatorPrunesUpstreams(t *testing.T) {
 	// b retired: its fake IP still leads to it, and keeps its addresses.
 	// An IP reserved for no host loses them.
 	later := testVIPNow.Add(time.Minute)
-	a.sync(hostSet("api.example.com"), later)
+	if err := a.sync(hostSet("api.example.com"), later); err != nil {
+		t.Fatal(err)
+	}
 	if !has(apiIP) || !has(bIP) || has(orphan) {
 		t.Errorf("after retiring b: api %v, b %v, orphan %v; want true, true, false", has(apiIP), has(bIP), has(orphan))
 	}
 
 	// b released: its IP may go to another host, without b's addresses.
-	a.sync(hostSet("api.example.com"), later.Add(virtualIPRetention))
+	if err := a.sync(hostSet("api.example.com"), later.Add(virtualIPRetention)); err != nil {
+		t.Fatal(err)
+	}
 	if !has(apiIP) || has(bIP) {
 		t.Errorf("after releasing b: api %v, b %v; want true, false", has(apiIP), has(bIP))
 	}
@@ -220,7 +238,9 @@ func TestVirtualIPPinsSurviveReload(t *testing.T) {
 
 	hostIP, ipHost := open()
 	a := &virtualIPAllocator{hostIP: hostIP, ipHost: ipHost, ranges: testVIPRanges, log: testLog()}
-	a.sync(hostSet("api.example.com", "b.example.com"), testVIPNow)
+	if err := a.sync(hostSet("api.example.com", "b.example.com"), testVIPNow); err != nil {
+		t.Fatal(err)
+	}
 	want, err := readVirtualIPs(ipHost)
 	if err != nil || len(want) != 4 {
 		t.Fatalf("after sync: %v, %v", want, err)
@@ -327,12 +347,16 @@ func TestVipPodHostBindings(t *testing.T) {
 	check("old pod unbound", "10.42.0.7 db.example.com", "fd42::7 db.example.com")
 
 	putPodHost(t, objs, netip.MustParseAddr("10.42.0.99"), "api.example.com")
-	syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), m.log)
+	if err := syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), m.log); err != nil {
+		t.Fatal(err)
+	}
 	check("synced", "10.42.0.7 db.example.com", "fd42::7 db.example.com")
 
 	m.SetSecretBindingMode(SecretBindingAudit)
 	m.BindPodSecrets("uid-new", "ns/new", addr, nil, []secrets.Ref{{OwnerID: "ns/db"}})
-	syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, true), m.log)
+	if err := syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, true), m.log); err != nil {
+		t.Fatal(err)
+	}
 	check("audit", "10.42.0.7 ", "fd42::7 ")
 }
 
@@ -380,11 +404,15 @@ func TestBindPodNetworkKeepsCgroups(t *testing.T) {
 	if b := m.bindings["uid"]; !slices.Equal(b.cgroupIDs, []uint64{41, 42}) || b.podIPs[0] != netip.MustParseAddr("10.42.0.8") {
 		t.Fatalf("binding after BindPodNetwork: %+v", b)
 	}
-	syncSecretACL(objs.SecretAcl, m.lastSnapshot, m.bindings, m.log)
+	if err := syncSecretACL(objs.SecretAcl, m.lastSnapshot, m.bindings, m.log); err != nil {
+		t.Fatal(err)
+	}
 	if got := aclCgroups(); !slices.Equal(got, []uint64{41, 42}) {
 		t.Errorf("secret_acl cgroups after a sync: %v, want [41 42]", got)
 	}
-	syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), m.log)
+	if err := syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), m.log); err != nil {
+		t.Fatal(err)
+	}
 	var k vipPodHostKey
 	var v uint8
 	var hosts []string
