@@ -57,11 +57,10 @@ kubectl get pods -n kloak-system
 
 ### Upgrading from v0.2.x and earlier
 
-Host-restricted secrets now use virtual IPs (`controller.ebpf.hostResolution: virtual-ip`) instead of DNS snooping:
+Host-restricted secrets now use virtual IPs (see [Host Verification](#host-verification)) instead of reading the DNS answers pods receive:
 
 - Restart kloak-enabled pods after the upgrade. Pods that were already running keep the addresses they resolved, and a connection to a real address gets no host-restricted secret.
 - If the controller refuses to start because a virtual IP range overlaps an address range of the cluster or a node, set `controller.ebpf.virtualIPRange` to free ranges.
-- `controller.ebpf.hostResolution: dns-snoop` keeps the previous behavior for now. It is deprecated and will be removed.
 
 ### Labels and Annotations
 
@@ -213,8 +212,6 @@ sequenceDiagram
 4. **Secret filtering** -- When the encrypted record is sent, the `tcp_sendmsg` kprobe compares the host of the socket (and the address and port it connected to, for a secret restricted to an IP or a port) with the secret's policy. Match: the patch goes on to the tc program. Mismatch: the patch is dropped and the placeholder is sent as-is, keeping the secret safe. A connection that did not go through a virtual IP (a hardcoded address, DNS over HTTPS) gets no host-restricted secret.
 
 5. **SNI check** -- The socket's host is not enough on its own: CDNs and cloud load balancers serve many customers on the same IPs and route each TLS connection by its SNI, so a compromised app could connect to the virtual IP of `api.stripe.com` while naming another tenant's domain in its ClientHello. A kprobe on `tcp_sendmsg` records the SNI of each connection's first ClientHello, and a secret restricted to a hostname is only rewritten on a connection whose SNI is that host. The comparison is exact and case-insensitive: a client that connects to a short in-cluster name (`my-svc`) does not match an annotation with the full name (`my-svc.ns.svc.cluster.local`), so use the same name in both. Connections without SNI, with an encrypted ClientHello (ECH), or whose ClientHello could not be read are refused. Refusals are logged by the controller as an `SNI check violation`. Set `controller.ebpf.sniCheck: audit` to let them through while logging each one. Secrets restricted to an IP address, or to `*`, are not SNI-checked.
-
-**DNS snooping (deprecated).** `controller.ebpf.hostResolution: dns-snoop` keeps the previous mechanism: a kprobe on `udp_recvmsg` reads DNS answers on the node into a node-wide IP-to-hostname map, connect tracepoints mark the connections to those IPs, and the `SSL_write` uprobe looks the host up from the connection's fd. Hosts that share an IP can be confused, and IPv6 connections get no host-restricted secret. It will be removed in a later release.
 
 ## How It Works
 

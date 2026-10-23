@@ -30,7 +30,7 @@ const (
 	// CgroupBasePath is the base path for cgroups v2.
 	CgroupBasePath = "/sys/fs/cgroup"
 
-	// In virtual-ip mode a Pending pod is checked every sandboxPoll for its
+	// A Pending pod is checked every sandboxPoll for its
 	// sandbox, to attach the DNS rewrite before its containers start; once
 	// pending for sandboxPollFor (a long image pull, a CNI failure), every
 	// sandboxPollSlow.
@@ -128,13 +128,13 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 
 	// Pod is running and enabled
 	if pod.Status.Phase != corev1.PodRunning {
-		// Virtual-ip mode: attach the DNS rewrite as soon as the pod's
-		// sandbox runs, so that its containers, init containers first, find
-		// it in place, and bind the pod at the sandbox's address (its
-		// status reports it only later). With NRI the runtime already had
-		// it attached while creating the sandbox (PrepareSandbox), and this
-		// finds it in place; without NRI, a lookup made before gets the
-		// real addresses.
+		// Attach the DNS rewrite as soon as the pod's sandbox runs, so
+		// that its containers, init containers first, find it in place,
+		// and bind the pod at the sandbox's address (its status reports it
+		// only later). With NRI the runtime already had it attached while
+		// creating the sandbox (PrepareSandbox), and this finds it in
+		// place; without NRI, a lookup made before gets the real
+		// addresses.
 		if pod.Status.Phase != corev1.PodPending || pod.Spec.HostNetwork || !r.virtualIP() {
 			log.Debugw("pod not running yet", "phase", pod.Status.Phase)
 			return ctrl.Result{}, nil
@@ -336,10 +336,10 @@ func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (cg
 	return "", 0
 }
 
-// virtualIP reports whether the data plane runs in virtual-ip host
-// resolution mode.
+// virtualIP reports whether there is a data plane to attach the virtual IP
+// DNS rewrite with.
 func (r *Reconciler) virtualIP() bool {
-	return r.UprobeManager != nil && r.UprobeManager.VirtualIPEnabled()
+	return r.UprobeManager != nil
 }
 
 // Sandbox is a pod sandbox the container runtime is creating, as it reports

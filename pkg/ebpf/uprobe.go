@@ -152,8 +152,8 @@ type TLSUprobeManager struct {
 	// reason).
 	bindingLogged map[bindingLogKey]time.Time
 
-	// virtualIPs allocates the watched hosts' fake IPs in virtual-ip host
-	// resolution mode; nil otherwise.
+	// virtualIPs allocates the watched hosts' fake IPs (nil only in tests
+	// that build a manager without one).
 	virtualIPs *virtualIPAllocator
 	// dnsRewriteMu guards dnsRewrite and dnsRewriteFailed, and serializes
 	// AttachPodDNSRewrite.
@@ -373,12 +373,11 @@ func parseBPFLogLevel(s string) ebpf.LogLevel {
 // "none"/"lo-only" to attach only to loopback. See the field comment on
 // TLSUprobeManager.egressInterface for the full semantics.
 //
-// hostRes selects the host resolution mode (nil: dns-snoop). In virtual-ip
-// mode the virtual IP maps are pinned under hostRes.PinPath, which must be on
-// bpffs.
+// hostRes holds the virtual IP ranges; the virtual IP maps are pinned under
+// hostRes.PinPath, which must be on bpffs.
 func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterface string, hostRes *HostResolutionConfig, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
 	if hostRes == nil {
-		hostRes = &HostResolutionConfig{}
+		return nil, errors.New("no host resolution config")
 	}
 	log = log.Named("ebpf-uprobe")
 
@@ -389,13 +388,10 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 	if err != nil {
 		return nil, fmt.Errorf("loading eBPF collection spec: %w", err)
 	}
-	var mapOpts ebpf.MapOptions
-	if hostRes.virtualIP() {
-		if err := prepareVirtualIPPins(spec, hostRes.pinPath(), log); err != nil {
-			return nil, fmt.Errorf("preparing virtual IP map pins: %w", err)
-		}
-		mapOpts.PinPath = hostRes.pinPath()
+	if err := prepareVirtualIPPins(spec, hostRes.pinPath(), log); err != nil {
+		return nil, fmt.Errorf("preparing virtual IP map pins: %w", err)
 	}
+	mapOpts := ebpf.MapOptions{PinPath: hostRes.pinPath()}
 
 	objs := &tlsuprobeObjects{}
 	// Verifier-log level for BPF program loads. Defaults to disabled (0) so the
@@ -479,20 +475,19 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		dnsRewrite:       make(map[string]*dnsRewriteAttach),
 		dnsRewriteFailed: make(map[string]bool),
 	}
-	if hostRes.virtualIP() {
-		mgr.virtualIPs = newVirtualIPAllocator(objs, hostRes.VirtualIPRanges, log)
-		mgr.virtualIPs.logRestored()
-		// Without the redirect, a pod handed a fake IP could not connect.
-		if err := mgr.attachVirtualIPRedirect(hostRes.VirtualIPRanges, kubepods); err != nil {
-			_ = mgr.Close()
-			return nil, fmt.Errorf("attaching the virtual IP connect redirect: %w", err)
-		}
-		log.Infow("virtual IP host resolution enabled: kloak pods get fake IPs for watched hosts, connects to them are redirected",
-			"range", hostRes.VirtualIPRanges.String(), "pinPath", hostRes.pinPath(), "cgroup", kubepods)
+	mgr.virtualIPs = newVirtualIPAllocator(objs, hostRes.VirtualIPRanges, log)
+	mgr.virtualIPs.logRestored()
+	// Without the redirect, a pod handed a fake IP could not connect.
+	if err := mgr.attachVirtualIPRedirect(hostRes.VirtualIPRanges, kubepods); err != nil {
+		_ = mgr.Close()
+		return nil, fmt.Errorf("attaching the virtual IP connect redirect: %w", err)
 	}
+	log.Infow("virtual IP host resolution: kloak pods get fake IPs for watched hosts, connects to them are redirected",
+		"range", hostRes.VirtualIPRanges.String(), "pinPath", hostRes.pinPath(), "cgroup", kubepods)
 
-	// Attach tracepoints for DNS interception and connect tracking.
-	// These are system-wide but filtered per-process via tracked_tgids map.
+	// Attach the connect, process and socket tracepoints and the tcp_sendmsg
+	// kprobes. These are system-wide but filtered per-process via
+	// tracked_tgids map.
 	if err := mgr.attachTracepoints(); err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("attaching tracepoints: %w", err)
@@ -501,7 +496,7 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 	return mgr, nil
 }
 
-// attachTracepoints attaches the syscall tracepoints and kprobes for DNS and connect tracking.
+// attachTracepoints attaches the syscall tracepoints and kprobes for connect tracking and the tcp_sendmsg bridge.
 func (m *TLSUprobeManager) attachTracepoints() error {
 	type tp struct {
 		group string
@@ -526,29 +521,6 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 		m.links = append(m.links, l)
 		m.linksMu.Unlock()
 		m.log.Debugw("Attached tracepoint", "group", t.group, "name", t.name)
-	}
-
-	// Attach kprobe/kretprobe on udp_recvmsg for language-agnostic DNS
-	// interception (dns-snoop mode). Virtual IP mode takes a connection's
-	// host from its socket and reads no DNS answer here.
-	if m.virtualIPs == nil {
-		kp, err := link.Kprobe("udp_recvmsg", m.objs.KprobeUdpRecvmsg, nil)
-		if err != nil {
-			return fmt.Errorf("attaching kprobe udp_recvmsg: %w", err)
-		}
-		m.linksMu.Lock()
-		m.links = append(m.links, kp)
-		m.linksMu.Unlock()
-		m.log.Debugw("Attached kprobe", "function", "udp_recvmsg")
-
-		krp, err := link.Kretprobe("udp_recvmsg", m.objs.KretprobeUdpRecvmsg, nil)
-		if err != nil {
-			return fmt.Errorf("attaching kretprobe udp_recvmsg: %w", err)
-		}
-		m.linksMu.Lock()
-		m.links = append(m.links, krp)
-		m.linksMu.Unlock()
-		m.log.Debugw("Attached kretprobe", "function", "udp_recvmsg")
 	}
 
 	// Attach kprobe on tcp_sendmsg to bridge xor_pending → tc_pending.
@@ -2145,8 +2117,8 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 	return nil
 }
 
-// syncSecretsToBPF updates the eBPF map with the latest shadow secret values
-// and the watched_hosts map with hostnames from secret entries.
+// syncSecretsToBPF updates the eBPF map with the latest shadow secret values,
+// and gives the hostnames of the secret entries virtual IPs.
 func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 	if m.secretSource == nil {
 		return
@@ -2158,7 +2130,7 @@ func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
 		m.log.Errorw("failed to sync secrets to BPF map", "error", fmt.Errorf("snapshot secrets: %w", err))
 		return
 	}
-	hosts := applySecrets(m.objs.SecretMap, m.objs.WatchedHosts, snapshot, m.log)
+	hosts := applySecrets(m.objs.SecretMap, snapshot, m.log)
 	if m.virtualIPs != nil {
 		m.virtualIPs.sync(hosts, time.Now())
 	}
@@ -2198,7 +2170,7 @@ func (m *TLSUprobeManager) SetSNICheckMode(mode SNICheckMode) {
 
 // BindPodSecrets records which secrets a pod may redeem and grants them to
 // its container cgroups at once, so the pod's first TLS writes are rewritten.
-// In virtual-ip mode it also lets the pod at podIPs (its network, which
+// It also lets the pod at podIPs (its network, which
 // exists before its containers do) get the fake IPs of those secrets'
 // hosts. It replaces any previous binding for the pod: addresses, cgroups
 // or references that went away are revoked at the next sync. podUID keys
@@ -2342,13 +2314,6 @@ func (m *TLSUprobeManager) logSNIViolation(ev *secretBindingEvent, pod, secret s
 // debugCounterNames maps index to human-readable name (must match C enum in
 // pkg/ebpf/bpf/tls_uprobe.c — DBG_* constants).
 var debugCounterNames = []string{
-	"kprobe_entry", "kprobe_tracked", "kprobe_dport53", "kprobe_dport0",
-	"kprobe_dport_other", "kprobe_iov_ok", "kretprobe_entry", "kretprobe_ret_small",
-	"kretprobe_read_fail", "kretprobe_read_ok", "dns_parse_entry", "dns_not_response",
-	"dns_no_answers", "dns_qname_fail", "dns_not_watched", "dns_watched_hit",
-	"dns_answer_stored",
-	"resolve_ssl_fd_hit", "resolve_last_vfd_hit", "resolve_fd_scan_hit",
-	"resolve_no_fd", "resolve_no_conn", "resolve_no_dns", "resolve_host_ok",
 	"xor_conn_check", "xor_conn_hit", "xor_prescan_match", "xor_tailcall",
 	"xor_path_entered", "xor_secret_found", "xor_delta_done",
 	"tc_entry", "tc_match", "tc_patched",
@@ -2363,7 +2328,7 @@ var debugCounterNames = []string{
 	"secret_binding_deny", "secret_binding_audit",
 	"sni_captured", "sni_deny", "sni_audit",
 	"vip_dns_rewritten", "vip_dns_unchanged", "vip_connect_redirect", "vip_connect_refused",
-	"vip_dns_unbound", "vip_sock_host_deny", "vip_sock_addr_deny", "sock_ipv6_deny",
+	"vip_dns_unbound", "vip_sock_host_deny", "vip_sock_addr_deny",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

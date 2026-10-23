@@ -57,7 +57,6 @@ func (m *TLSUprobeManager) SetTCAttachMode(TCAttachMode)             {}
 func (m *TLSUprobeManager) SetSecretBindingMode(SecretBindingMode)   {}
 func (m *TLSUprobeManager) SetSNICheckMode(SNICheckMode)             {}
 func (m *TLSUprobeManager) UnbindPod(string)                         {}
-func (m *TLSUprobeManager) VirtualIPEnabled() bool                   { return false }
 func (m *TLSUprobeManager) DetachPodDNSRewrite(string)               {}
 
 func (m *TLSUprobeManager) AttachPodDNSRewrite(string, string, []int) ([]netip.Addr, error) {
@@ -69,6 +68,4 @@ func (m *TLSUprobeManager) AttachPodDNSRewriteNetns(string, string, string) ([]n
 }
 
 func (m *TLSUprobeManager) BindPodSecrets(string, string, []netip.Addr, []uint64, []secrets.Ref) {}
-func (m *TLSUprobeManager) BindPodNetwork(string, string, []netip.Addr, []secrets.Ref)            {}
-
-func RemoveVirtualIPPins(string, *zap.SugaredLogger) {}
+func (m *TLSUprobeManager) BindPodNetwork(string, string, []netip.Addr, []secrets.Ref)           {}

@@ -1,8 +1,8 @@
 // Minimal BoringSSL raw-TLS client for kloak e2e testing.
 //
 // Mirrors examples/demo-python-raw-tls/app.py but linked against BoringSSL
-// instead of OpenSSL. It resolves a Kubernetes Service name via DNS (which
-// populates kloak's dns_ip_map), connects to the resolved IP, and sends a
+// instead of OpenSSL. It resolves a Kubernetes Service name via DNS (kloak
+// hands it the name's virtual IP), connects to the resolved IP, and sends a
 // raw TLS payload carrying two secrets:
 //
 //   ALLOWED=<secret>\nBLOCKED=<secret>\n
@@ -58,8 +58,8 @@ static char *load_secret(const char *env_var, const char *fallback) {
     return strdup(fallback);
 }
 
-// tcp_connect resolves host via DNS (populating kloak's dns_ip_map) and opens
-// a TCP connection to host:port.
+// tcp_connect resolves host via DNS (getting kloak's virtual IP for it) and
+// opens a TCP connection to host:port.
 static int tcp_connect(const char *host, const char *port) {
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));

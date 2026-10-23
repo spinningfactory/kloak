@@ -281,37 +281,6 @@ func TestRequireBPFFS(t *testing.T) {
 	}
 }
 
-func TestRemoveVirtualIPPins(t *testing.T) {
-	pinPath := filepath.Join(t.TempDir(), "kloak")
-	write := func(names ...string) {
-		if err := os.MkdirAll(pinPath, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		for _, n := range names {
-			if err := os.WriteFile(filepath.Join(pinPath, n), nil, 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-
-	write(virtualIPMaps...)
-	RemoveVirtualIPPins(pinPath, testLog())
-	if _, err := os.Stat(pinPath); !os.IsNotExist(err) {
-		t.Errorf("pin directory left behind: %v", err)
-	}
-
-	// Other pins, and the directory holding them, are left alone.
-	write(append([]string{"other"}, virtualIPMaps...)...)
-	RemoveVirtualIPPins(pinPath, testLog())
-	entries, err := os.ReadDir(pinPath)
-	if err != nil || len(entries) != 1 || entries[0].Name() != "other" {
-		t.Errorf("pin directory now holds %v (%v)", entries, err)
-	}
-
-	// Nothing pinned: nothing to do.
-	RemoveVirtualIPPins(filepath.Join(t.TempDir(), "missing"), testLog())
-}
-
 // TestVipPodHostBindings checks that vip_pod_host follows the pod bindings:
 // granted at bind time, kept for an address that a new pod already holds
 // when the old pod is unbound, and pruned to exactly the bindings by a sync.

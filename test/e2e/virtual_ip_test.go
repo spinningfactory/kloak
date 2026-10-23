@@ -17,11 +17,10 @@ import (
 )
 
 // TestVirtualIPAllocation checks the virtual IP host resolution
-// (--host-resolution=virtual-ip, the default, spinningfactory/kloak#327): the
-// controller gives the host of a host-scoped secret a fake IP from the
-// virtual IP range, keeps it across a controller restart (the maps are
-// pinned in bpffs), and retires it once no secret uses the host. Runs only
-// when the controller is deployed in that mode (every CI leg but dns-snoop).
+// (spinningfactory/kloak#327): the controller gives the host of a
+// host-scoped secret a fake IP from the virtual IP range, keeps it across a
+// controller restart (the maps are pinned in bpffs), and retires it once no
+// secret uses the host.
 func TestVirtualIPAllocation(t *testing.T) {
 	vipRange := controllerVirtualIPRange(t)
 	const host = "vip-e2e.example.com"
@@ -65,9 +64,9 @@ func TestVirtualIPAllocation(t *testing.T) {
 
 // TestVirtualIPRedirect checks the virtual IP data plane on the raw TLS demo:
 // the pod resolves the echo server's host to its fake IP, its connects to
-// the fake IP reach the server (the secret is rewritten end to end, still
-// attributed by DNS snooping) and getpeername() reports the fake IP, while a
-// connect to a fake IP no host has is refused.
+// the fake IP reach the server (the secret is rewritten end to end) and
+// getpeername() reports the fake IP, while a connect to a fake IP no host
+// has is refused.
 func TestVirtualIPRedirect(t *testing.T) {
 	vipRange := controllerVirtualIPRange(t)
 	echoHostFQDN := "tls." + testNamespace + ".svc.cluster.local"
@@ -246,11 +245,10 @@ while True:
 	}
 }
 
-// TestVirtualIPSocketHost checks that, in virtual-ip mode, a secret's host
-// is the socket's: the host of the fake IP it connected to. The echo server
-// has two names leading to the same IP, its Service and an ExternalName
-// alias of it, which DNS snooping can't tell apart; here each gets its own
-// fake IP. A secret restricted to one name is rewritten on a connection to
+// TestVirtualIPSocketHost checks that a secret's host is the socket's: the
+// host of the fake IP it connected to. The echo server has two names leading
+// to the same IP, its Service and an ExternalName alias of it, which an
+// IP -> host map can't tell apart; here each gets its own fake IP. A secret restricted to one name is rewritten on a connection to
 // that name, and not on a connection to the other name even with the right
 // SNI. A secret restricted to the server's IP is rewritten on a connection
 // made through a fake IP, which reaches that IP.
@@ -384,8 +382,8 @@ print("a-via-b", send(b, a, "secret-allowed"))
 // restricted to the Service's IPv6 address is rewritten on a connection
 // through the fake IPv6, whose socket reaches that address; a connection
 // made straight to the address gets no secret restricted to the name.
-// Skipped unless the controller runs in virtual-ip mode with an IPv6 range,
-// on a cluster with an IPv6 pod network (the virtual-ip CI leg).
+// Skipped unless the controller has an IPv6 range, on a cluster with an
+// IPv6 pod network (the flannel CI legs).
 func TestVirtualIPv6(t *testing.T) {
 	_, vipRange6 := controllerVirtualIPRanges(t)
 	if !vipRange6.IsValid() {
@@ -581,7 +579,7 @@ func createVIPProbePod(t *testing.T, pod *corev1.Pod) {
 }
 
 // controllerVirtualIPRange returns the IPv4 virtual IP range the controller
-// is deployed with, and skips the test unless it runs in virtual-ip mode.
+// is deployed with.
 func controllerVirtualIPRange(t *testing.T) netip.Prefix {
 	t.Helper()
 	v4, _ := controllerVirtualIPRanges(t)
@@ -589,31 +587,24 @@ func controllerVirtualIPRange(t *testing.T) netip.Prefix {
 }
 
 // controllerVirtualIPRanges returns the IPv4 and IPv6 virtual IP ranges the
-// controller is deployed with (v6 is the zero Prefix without one), and skips
-// the test unless it runs in virtual-ip mode.
+// controller is deployed with (v6 is the zero Prefix without one).
 func controllerVirtualIPRanges(t *testing.T) (v4, v6 netip.Prefix) {
 	t.Helper()
 	ds, err := clientset.AppsV1().DaemonSets(kloakNamespace).Get(context.Background(), "kloak-controller", metav1.GetOptions{})
 	if err != nil {
 		t.Fatalf("getting controller DaemonSet: %v", err)
 	}
-	// Without the flags, the controller's defaults.
-	mode, vipRange := "virtual-ip", "198.18.0.0/15,2001:2::/48"
+	// Without the flag, the controller's default.
+	vipRange := "198.18.0.0/15,2001:2::/48"
 	for _, c := range ds.Spec.Template.Spec.Containers {
 		if c.Name != "controller" {
 			continue
 		}
 		for _, a := range c.Args {
-			if v, ok := strings.CutPrefix(a, "--host-resolution="); ok {
-				mode = v
-			}
 			if v, ok := strings.CutPrefix(a, "--virtual-ip-range="); ok {
 				vipRange = v
 			}
 		}
-	}
-	if mode != "virtual-ip" {
-		t.Skipf("controller runs with --host-resolution=%s", mode)
 	}
 	for _, part := range strings.Split(vipRange, ",") {
 		p, err := netip.ParsePrefix(strings.TrimSpace(part))

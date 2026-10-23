@@ -192,7 +192,7 @@ func vipPodHosts(snapshot []secrets.Secret, bindings map[string]podBinding, anyH
 			}
 			for _, ref := range b.refs {
 				ix.each(ref, func(s *secrets.Secret) {
-					// The hosts applySecrets puts in watched_hosts.
+					// The hosts applySecrets returns.
 					if s.Host == "" || len(s.Host) >= maxHostLen {
 						return
 					}

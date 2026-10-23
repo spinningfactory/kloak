@@ -192,8 +192,8 @@ func deployHTTPEchoServer(t *testing.T) string {
 }
 
 // retargetAllowedSecretToEcho replaces the shared httpbin-scoped secret-allowed
-// with one scoped to the in-cluster echo host, so kloak's DNS-verified host
-// filter matches the hermetic target. It recreates (rather than relabels) to
+// with one scoped to the in-cluster echo host, so kloak's host filter matches
+// the hermetic target. It recreates (rather than relabels) to
 // force a clean shadow + BPF map resync. The value is unchanged, so the
 // negative assertions elsewhere still hold.
 func retargetAllowedSecretToEcho(t *testing.T, host string) {
@@ -307,8 +307,7 @@ var ebpfTests = []ebpfRewriteTest{
 // TestEBPFRawTLSHostFiltering tests that host filtering works with raw TLS
 // sockets (non-HTTP). A TLS echo server runs in its own pod behind a K8s
 // Service. The client resolves the Service name via DNS, which gives it the
-// name's virtual IP (in dns-snoop mode, populates dns_ip_map), enabling
-// host-based secret filtering at the TCP level.
+// name's virtual IP, enabling host-based secret filtering at the TCP level.
 func TestEBPFRawTLSHostFiltering(t *testing.T) {
 	// The Service FQDN as it appears in DNS responses from CoreDNS.
 	echoHostFQDN := "tls." + testNamespace + ".svc.cluster.local"
