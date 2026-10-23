@@ -311,9 +311,11 @@ func TestVirtualIPSocketHost(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Each line: <case> <first line of the echo>. The process is only
-	// traced once kloak has seen its exec, so it first waits for a rewrite
-	// that must happen.
+	// Each line: <case> <first line of the echo>. A case that must be
+	// rewritten is retried until it is: the process is only traced once
+	// kloak has seen its exec, and the controller syncs secrets into its
+	// maps every 5 s (secret-sockhost-ip was created just now). The refused
+	// case runs last, once its secret is known to be synced.
 	const probe = `import socket, ssl, sys, time
 a, b, ip = sys.argv[1:4]
 def send(host, sni, secret):
@@ -326,15 +328,16 @@ def send(host, sni, secret):
             tls.sendall(("S=%s\n" % value).encode())
             return tls.recv(16384).decode(errors="replace").strip().splitlines()[0]
 deadline = time.monotonic() + 60
-while True:
-    out = send(a, a, "secret-allowed")
-    if "REAL-" in out or time.monotonic() > deadline:
-        break
-    time.sleep(0.5)
-print("a-via-a", out)
+def rewritten(*args):
+    while True:
+        out = send(*args)
+        if "REAL-" in out or time.monotonic() > deadline:
+            return out
+        time.sleep(0.5)
+print("a-via-a", rewritten(a, a, "secret-allowed"))
+print("b-via-b", rewritten(b, b, "secret-blocked"))
+print("ip-via-a", rewritten(a, a, "secret-sockhost-ip"))
 print("a-via-b", send(b, a, "secret-allowed"))
-print("b-via-b", send(b, b, "secret-blocked"))
-print("ip-via-a", send(a, a, "secret-sockhost-ip"))
 `
 	res, err := kubectl("exec", "-n", testNamespace, "vip-sockhost-probe", "-c", "app", "--",
 		"python", "-c", probe, hostA, hostB, svc.Spec.ClusterIP)
@@ -453,8 +456,10 @@ func TestVirtualIPv6(t *testing.T) {
 	}
 
 	// Each line: <case> <address connected to> <getpeername> <first line
-	// of the echo>. The process is only traced once kloak has seen its
-	// exec, so it first waits for a rewrite that must happen.
+	// of the echo>. A case that must be rewritten is retried until it is:
+	// the process is only traced once kloak has seen its exec, and the
+	// controller syncs secrets into its maps every 5 s. The refused case
+	// runs last, once its secret is known to be synced.
 	const probe = `import socket, ssl, sys, time
 host, cip = sys.argv[1:3]
 def send(target, secret):
@@ -472,13 +477,14 @@ def send(target, secret):
             echo = tls.recv(16384).decode(errors="replace").strip().splitlines()[0]
     return "%s %s %s" % (addr[0], peer, echo)
 deadline = time.monotonic() + 60
-while True:
-    out = send(host, "secret-vip6-host")
-    if "REAL-" in out or time.monotonic() > deadline:
-        break
-    time.sleep(0.5)
-print("name", out)
-print("ip-via-name", send(host, "secret-vip6-ip"))
+def rewritten(*args):
+    while True:
+        out = send(*args)
+        if "REAL-" in out or time.monotonic() > deadline:
+            return out
+        time.sleep(0.5)
+print("name", rewritten(host, "secret-vip6-host"))
+print("ip-via-name", rewritten(host, "secret-vip6-ip"))
 print("name-via-ip", send(cip, "secret-vip6-host"))
 `
 	res, err := kubectl("exec", "-n", testNamespace, "vip6-probe", "-c", "app", "--", "python", "-c", probe, host, clusterIP)
