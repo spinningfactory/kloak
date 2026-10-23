@@ -1919,21 +1919,13 @@ func (m *TLSUprobeManager) Close() error {
 // and attaches TLS uprobes to newly exec'd processes in tracked containers.
 func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 	m.log.Infow("Starting process exec event poller")
+	stop := closeOnDone(ctx, m.procReader)
+	defer stop()
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		m.procReader.SetDeadline(time.Now().Add(1 * time.Second))
 		record, err := m.procReader.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return nil
-			}
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				continue
 			}
 			m.log.Errorw("reading from proc events ringbuf", "error", err)
 			continue
@@ -2011,33 +2003,44 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 	}
 }
 
-// PollEvents logs the secret-binding violations reported by the data plane,
-// and the BPF debug counters every 5 s. Secrets are synced to the eBPF maps
-// by SyncSecrets.
+// closeOnDone closes r once ctx is done, the only way to stop a Read that
+// blocks until a record comes in. Close closes it again, which does nothing.
+// The returned function cancels it.
+func closeOnDone(ctx context.Context, r *ringbuf.Reader) (stop func() bool) {
+	return context.AfterFunc(ctx, func() { _ = r.Close() })
+}
+
+// PollEvents logs the secret-binding violations reported by the data plane
+// until ctx is done, and with trace logging the BPF debug counters every
+// 5 s. Secrets are synced to the eBPF maps by SyncSecrets.
 func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
 	m.log.Infow("Starting eBPF binding-violation reader")
 
-	countersTicker := time.NewTicker(5 * time.Second)
-	defer countersTicker.Stop()
+	// The counters are only logged at trace level.
+	var counters sync.WaitGroup
+	defer counters.Wait()
+	if m.log.Desugar().Core().Enabled(logging.TraceLevel) {
+		counters.Go(func() {
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					m.DumpDebugCounters()
+				}
+			}
+		})
+	}
 
+	stop := closeOnDone(ctx, m.reader)
+	defer stop()
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-countersTicker.C:
-			m.DumpDebugCounters()
-		default:
-		}
-
-		// Use a short deadline so we don't block forever and miss counter ticks
-		m.reader.SetDeadline(time.Now().Add(1 * time.Second))
 		record, err := m.reader.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return nil
-			}
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				continue
 			}
 			m.log.Errorw("reading from ringbuf", "error", err)
 			continue
