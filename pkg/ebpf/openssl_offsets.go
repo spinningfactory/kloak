@@ -86,6 +86,7 @@ var opensslOffsetTable = map[string]TLSOffsets{
 	// PROV_GCM_CTX). 3.0's GCM128_CONTEXT is 8 bytes shorter before `key`, and
 	// 3.0 has no AVX-512 GCM path, so its HashKey_1 offset is 0.
 
+	"4.1": {SSLToWRL: 3720, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88, AlgctxToGCMKey: 640, AlgctxToKeySched: 704, AlgctxToVAESHKey1: 584},
 	"4.0": {SSLToWRL: 3648, WRLToEncCtx: 4128, EncCtxToAlgctx: 168, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88, AlgctxToGCMKey: 640, AlgctxToKeySched: 704, AlgctxToVAESHKey1: 584},
 	"3.6": {SSLToWRL: 3216, WRLToEncCtx: 4128, EncCtxToAlgctx: 176, AlgctxToH: 328, SSLToVersion: 72, SSLToWBIO: 88, AlgctxToGCMKey: 640, AlgctxToKeySched: 704, AlgctxToVAESHKey1: 584},
 	// OpenSSL 3.5.x — SSLToWRL grew due to new fields in SSL_CONNECTION.
