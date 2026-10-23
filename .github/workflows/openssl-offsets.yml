@@ -23,6 +23,7 @@ jobs:
           - "3.0.16"
           - "3.6.3"
           - "4.0.1"
+          - "4.1.0"
     steps:
       - uses: actions/checkout@v7
 

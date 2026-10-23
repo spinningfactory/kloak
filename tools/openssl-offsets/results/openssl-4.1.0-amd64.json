@@ -1,0 +1,39 @@
+{
+  "openssl_version": "OpenSSL 4.1.0 23 Oct 2026",
+  "arch": "x86_64",
+  "chain": "4-hop",
+  "vaes_hkey1_status": "unrecognized",
+  "offsets": {
+    "ssl_to_wrl": 3720,
+    "ssl_to_enc_write_ctx": null,
+    "wrl_to_enc_ctx": 4128,
+    "enc_ctx_to_algctx": 168,
+    "algctx_to_gcm": 248,
+    "gcm128_h_offset": 80,
+    "algctx_to_h": 328,
+    "gcm128_key_offset": 392,
+    "gcm128_htable_offset": 96,
+    "algctx_to_gcm_key": 640,
+    "algctx_to_ks": 704,
+    "algctx_to_vaes_hkey1": 0,
+    "ssl_to_version": 72,
+    "ssl_to_wbio": 88
+  },
+  "sizes": {
+    "SSL_CONNECTION": 6088,
+    "EVP_CIPHER_CTX": 184,
+    "GCM128_CONTEXT": 448,
+    "PROV_GCM_CTX": 704
+  },
+  "kloak_config": {
+    "SSLToWRL": 3720,
+    "WRLToEncCtx": 4128,
+    "EncCtxToAlgctx": 168,
+    "AlgctxToH": 328,
+    "SSLToVersion": 72,
+    "SSLToWBIO": 88,
+    "AlgctxToGCMKey": 640,
+    "AlgctxToKeySched": 704,
+    "AlgctxToVAESHKey1": 0
+  }
+}
