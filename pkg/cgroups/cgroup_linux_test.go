@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"golang.org/x/sys/unix"
 )
 
 // TestCreateTransient_HappyPath exercises mkdir + inode read + cleanup
@@ -165,5 +167,46 @@ func TestCreateTransient_ReadOnlyParent(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "cgroupfs writable?") {
 		t.Errorf("error should hint at cgroupfs writability, got: %v", err)
+	}
+}
+
+func TestCreateTransient_ReadOnlyCgroupfs(t *testing.T) {
+	// A read-only cgroupfs, as in an unprivileged container, with and
+	// without kloak.slice already there: a read-only mount, which root
+	// (that the chmod stand-in above skips under) can't write either.
+	if os.Geteuid() != 0 {
+		t.Skip("mounting a filesystem needs root")
+	}
+	for _, tc := range []struct {
+		name      string
+		withSlice bool
+		wantSub   string
+	}{
+		{"no slice", false, "cgroupfs writable?"},
+		{"slice exists", true, "create transient cgroup"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			if err := unix.Mount("tmpfs", root, "tmpfs", 0, ""); err != nil {
+				t.Skipf("cannot mount a tmpfs: %v", err)
+			}
+			t.Cleanup(func() { _ = unix.Unmount(root, unix.MNT_DETACH) })
+			if tc.withSlice {
+				if err := os.Mkdir(filepath.Join(root, KloakSliceName), 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := unix.Mount("", root, "", unix.MS_REMOUNT|unix.MS_RDONLY, ""); err != nil {
+				t.Fatalf("remounting read-only: %v", err)
+			}
+
+			_, _, _, err := CreateTransient(root, "ro")
+			if !errors.Is(err, unix.EROFS) {
+				t.Fatalf("expected EROFS, got: %v", err)
+			}
+			if !strings.Contains(err.Error(), tc.wantSub) {
+				t.Errorf("error should contain %q, got: %v", tc.wantSub, err)
+			}
+		})
 	}
 }
