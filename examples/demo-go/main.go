@@ -66,11 +66,6 @@ func main() {
 	fmt.Println("  - X-Secret-Blocked: Should show UUID in response (not replaced)")
 	fmt.Println(strings.Repeat("=", 60))
 
-	// Brief delay for the controller to sync the secrets, and give their hosts
-	// virtual IPs, before the first DNS query.
-	fmt.Println("Waiting 10s for Kloak controller to sync...")
-	time.Sleep(10 * time.Second)
-
 	// Disable HTTP keep-alive so every request opens a fresh TLS connection.
 	// Kloak captures the GCM key (H) at the connection's cipher init; if the
 	// uprobe attaches *after* a long-lived keep-alive connection is already
