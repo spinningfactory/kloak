@@ -2173,8 +2173,8 @@ func (m *TLSUprobeManager) SetSNICheckMode(mode SNICheckMode) {
 // It also lets the pod at podIPs (its network, which
 // exists before its containers do) get the fake IPs of those secrets'
 // hosts. It replaces any previous binding for the pod: addresses, cgroups
-// or references that went away are revoked at the next sync. podUID keys
-// the binding; pod (namespace/name) is only used in logs.
+// or references that went away are revoked at once. podUID keys the
+// binding; pod (namespace/name) is only used in logs.
 func (m *TLSUprobeManager) BindPodSecrets(podUID, pod string, podIPs []netip.Addr, cgroupIDs []uint64, refs []secrets.Ref) {
 	m.bindMu.Lock()
 	defer m.bindMu.Unlock()
@@ -2190,23 +2190,78 @@ func (m *TLSUprobeManager) BindPodNetwork(podUID, pod string, podIPs []netip.Add
 	m.bindLocked(podUID, &podBinding{pod: pod, podIPs: podIPs, cgroupIDs: m.bindings[podUID].cgroupIDs, refs: refs})
 }
 
-// bindLocked records b as podUID's binding and grants it; the caller holds
-// bindMu.
+// bindLocked records b as podUID's binding, grants it, and revokes what the
+// pod's previous binding granted that b does not; the caller holds bindMu.
 func (m *TLSUprobeManager) bindLocked(podUID string, b *podBinding) {
 	pod := b.pod
+	prev, rebind := m.bindings[podUID]
 	m.bindings[podUID] = *b
 
 	allowed := uint8(1)
 	single := map[string]podBinding{podUID: *b}
-	for key := range secretACL(m.lastSnapshot, single) {
+	acl := secretACL(m.lastSnapshot, single)
+	for key := range acl {
 		if err := m.objs.SecretAcl.Update(&key, &allowed, ebpf.UpdateAny); err != nil {
 			m.log.Errorw("failed to grant secret binding", "error", err, "pod", pod, "cgroupID", key.CgroupID)
 		}
 	}
+	var podHosts map[vipPodHostKey]struct{}
 	if m.virtualIPs != nil {
-		for key := range vipPodHosts(m.lastSnapshot, single, m.bindingMode == SecretBindingAudit) {
+		podHosts = vipPodHosts(m.lastSnapshot, single, m.bindingMode == SecretBindingAudit)
+		for key := range podHosts {
 			if err := m.objs.VipPodHost.Update(&key, &allowed, ebpf.UpdateAny); err != nil {
 				m.log.Errorw("failed to grant the pod its hosts' virtual IPs", "error", err, "pod", pod)
+			}
+		}
+	}
+	if rebind {
+		m.revokeLostLocked(&prev, acl, podHosts)
+	}
+}
+
+// revokeLostLocked revokes what a pod's previous binding prev granted and
+// its new one, which grants acl and podHosts, does not: the cgroup of a
+// container that restarted, a reference or an address that went away. What
+// another binding grants is kept (an address a new pod already holds). The
+// caller holds bindMu.
+func (m *TLSUprobeManager) revokeLostLocked(prev *podBinding, acl map[secretACLKey]struct{}, podHosts map[vipPodHostKey]struct{}) {
+	single := map[string]podBinding{"": *prev}
+	var lostACL []secretACLKey
+	for key := range secretACL(m.lastSnapshot, single) {
+		if _, ok := acl[key]; !ok {
+			lostACL = append(lostACL, key)
+		}
+	}
+	var lostHosts []vipPodHostKey
+	if m.virtualIPs != nil {
+		for key := range vipPodHosts(m.lastSnapshot, single, m.bindingMode == SecretBindingAudit) {
+			if _, ok := podHosts[key]; !ok {
+				lostHosts = append(lostHosts, key)
+			}
+		}
+	}
+
+	// Most rebinds change nothing: only then look at every binding.
+	if len(lostACL) > 0 {
+		kept := secretACL(m.lastSnapshot, m.bindings)
+		for i := range lostACL {
+			if _, ok := kept[lostACL[i]]; ok {
+				continue
+			}
+			if err := m.objs.SecretAcl.Delete(&lostACL[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+				m.log.Errorw("failed to revoke secret binding", "error", err, "pod", prev.pod, "cgroupID", lostACL[i].CgroupID)
+			}
+		}
+	}
+	if len(lostHosts) > 0 {
+		kept := vipPodHosts(m.lastSnapshot, m.bindings, m.bindingMode == SecretBindingAudit)
+		for i := range lostHosts {
+			if _, ok := kept[lostHosts[i]]; ok {
+				continue
+			}
+			if err := m.objs.VipPodHost.Delete(&lostHosts[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+				m.log.Errorw("failed to remove a pod's virtual IP host", "error", err, "pod", prev.pod,
+					"podIP", netip.AddrFrom16(lostHosts[i].PodIP).Unmap().String())
 			}
 		}
 	}
