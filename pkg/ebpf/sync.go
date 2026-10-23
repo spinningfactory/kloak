@@ -15,7 +15,7 @@ import (
 )
 
 // syncSecrets pulls a snapshot from the given secrets.Source and applies
-// it to the BPF secret_map (and the watched_hosts map). The translation
+// it to the BPF secret_map. The translation
 // from a semantic secrets.Secret to the wire-format secretValue lives
 // here; nothing in this file knows where the snapshot came from.
 //
@@ -24,8 +24,7 @@ import (
 //   - upsert each (real, shadow) pair under the shadow's first 8 bytes
 //   - emit an HPACK-Huffman variant for HTTP/2 interception
 //   - prune BPF map entries that no longer appear in the snapshot
-//   - sync the watched_hosts map for DNS-verified host filtering
-func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, source secrets.Source, log *zap.SugaredLogger) error {
+func syncSecrets(ctx context.Context, secretMap *ebpf.Map, source secrets.Source, log *zap.SugaredLogger) error {
 	if source == nil {
 		return nil
 	}
@@ -34,20 +33,42 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, sour
 	if err != nil {
 		return fmt.Errorf("snapshot secrets: %w", err)
 	}
-	applySecrets(secretMap, watchedHostsMap, snapshot, log)
-	return nil
+	_, err = applySecrets(secretMap, snapshot, log)
+	return err
 }
 
-// applySecrets writes a snapshot to secret_map and watched_hosts (see
-// syncSecrets) and returns the hostnames it put in watched_hosts. Split out
-// so the manager can reuse the same snapshot for the secret_acl and virtual
-// IP syncs.
-func applySecrets(secretMap, watchedHostsMap *ebpf.Map, snapshot []secrets.Secret, log *zap.SugaredLogger) map[string]struct{} {
+// mapErrors collects the failed map operations of a sync, each logged where
+// it fails, so that the sync can report that it has to be retried.
+type mapErrors struct {
+	n     int
+	first error
+}
+
+func (e *mapErrors) add(err error) {
+	if e.first == nil {
+		e.first = err
+	}
+	e.n++
+}
+
+// err returns nil when no operation on the map name failed.
+func (e *mapErrors) err(name string) error {
+	if e.n == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s: %d failed map operations, the first: %w", name, e.n, e.first)
+}
+
+// applySecrets writes a snapshot to secret_map (see syncSecrets) and returns
+// the hostnames the synced secrets are restricted to, the watched hosts that
+// get virtual IPs. Split out so the manager can reuse the same snapshot for
+// the secret_acl and virtual IP syncs. A failed map operation does not stop
+// the others: the error reports it once they are all done.
+func applySecrets(secretMap *ebpf.Map, snapshot []secrets.Secret, log *zap.SugaredLogger) (map[string]struct{}, error) {
 	// newKeys tracks which keys we upsert so we can prune stale entries afterwards.
 	newKeys := make(map[secretKey]struct{})
-	// newHosts tracks unique hostnames to sync to the watched_hosts map.
-	newHosts := make(map[watchedHostKey]struct{})
 	hostNames := make(map[string]struct{})
+	var errs mapErrors
 
 	for i := range snapshot {
 		s := &snapshot[i]
@@ -104,10 +125,6 @@ func applySecrets(secretMap, watchedHostsMap *ebpf.Map, snapshot []secrets.Secre
 			val.HostLen = uint32(len(s.Host))
 			copy(val.AllowedHost[:], s.Host)
 			val.IpLen = 0 // Host-based filtering
-
-			var whk watchedHostKey
-			copy(whk.Host[:], s.Host)
-			newHosts[whk] = struct{}{}
 			hostNames[s.Host] = struct{}{}
 		case s.IP != nil:
 			copy(val.AllowedIp[:], s.IP.To16())
@@ -123,6 +140,7 @@ func applySecrets(secretMap, watchedHostsMap *ebpf.Map, snapshot []secrets.Secre
 		if err := secretMap.Update(&bpfKey, &val, 0); err != nil {
 			log.Errorw("failed to update BPF secret_map", "error", err,
 				"owner", s.OwnerID, "key", s.Key)
+			errs.add(err)
 		} else {
 			logging.Tracew(log, "synced secret into eBPF map",
 				"owner", s.OwnerID, "key", s.Key,
@@ -180,6 +198,7 @@ func applySecrets(secretMap, watchedHostsMap *ebpf.Map, snapshot []secrets.Secre
 				if err := secretMap.Update(&huffKey, &huffVal, 0); err != nil {
 					log.Errorw("failed to update BPF secret_map (Huffman)", "error", err,
 						"owner", s.OwnerID, "key", s.Key)
+					errs.add(err)
 				} else {
 					logging.Tracew(log, "synced Huffman secret into eBPF map",
 						"owner", s.OwnerID, "key", s.Key, "huffLen", huffLen)
@@ -206,32 +225,31 @@ func applySecrets(secretMap, watchedHostsMap *ebpf.Map, snapshot []secrets.Secre
 	}
 	if err := iter.Err(); err != nil {
 		log.Errorw("error iterating BPF secret_map for pruning", "error", err)
+		errs.add(err)
 	}
 	for i := range staleKeys {
 		if err := secretMap.Delete(&staleKeys[i]); err != nil {
 			log.Errorw("failed to delete stale BPF secret_map entry", "error", err)
+			errs.add(err)
 		} else {
 			logging.Tracew(log, "pruned stale entry from eBPF map")
 		}
 	}
 
-	// Sync watched_hosts map: add new hosts, prune stale ones.
-	if watchedHostsMap != nil {
-		syncWatchedHosts(watchedHostsMap, newHosts, log)
-	}
-
 	log.Debugw("secret sync complete",
 		"snapshotEntries", len(snapshot), "bpfKeys", len(newKeys),
-		"pruned", len(staleKeys), "watchedHosts", len(newHosts))
-	return hostNames
+		"pruned", len(staleKeys), "watchedHosts", len(hostNames))
+	return hostNames, errs.err("secret_map")
 }
 
 // syncSecretACL makes secret_acl hold exactly the entries the bindings grant
 // over the snapshot: missing entries are added, the rest pruned. Pruning is
 // what revokes a binding when a pod goes away, a container restarts with a
-// new cgroup, or a secret's placeholder changes.
-func syncSecretACL(aclMap *ebpf.Map, snapshot []secrets.Secret, bindings map[string]podBinding, log *zap.SugaredLogger) {
+// new cgroup, or a secret's placeholder changes. Like applySecrets, it
+// reports failed map operations once it has done the others.
+func syncSecretACL(aclMap *ebpf.Map, snapshot []secrets.Secret, bindings map[string]podBinding, log *zap.SugaredLogger) error {
 	desired := secretACL(snapshot, bindings)
+	var errs mapErrors
 
 	var stale []secretACLKey
 	present := make(map[secretACLKey]struct{}, len(desired))
@@ -247,6 +265,7 @@ func syncSecretACL(aclMap *ebpf.Map, snapshot []secrets.Secret, bindings map[str
 	}
 	if err := iter.Err(); err != nil {
 		log.Errorw("error iterating BPF secret_acl", "error", err)
+		errs.add(err)
 	}
 
 	allowed := uint8(1)
@@ -258,6 +277,7 @@ func syncSecretACL(aclMap *ebpf.Map, snapshot []secrets.Secret, bindings map[str
 		if err := aclMap.Update(&key, &allowed, ebpf.UpdateAny); err != nil {
 			// A missing entry fails closed: the pod's placeholder is not rewritten.
 			log.Errorw("failed to grant secret binding", "error", err, "cgroupID", key.CgroupID)
+			errs.add(err)
 			continue
 		}
 		added++
@@ -265,40 +285,11 @@ func syncSecretACL(aclMap *ebpf.Map, snapshot []secrets.Secret, bindings map[str
 	for i := range stale {
 		if err := aclMap.Delete(&stale[i]); err != nil {
 			log.Errorw("failed to revoke stale secret binding", "error", err, "cgroupID", stale[i].CgroupID)
+			errs.add(err)
 		}
 	}
 
 	logging.Tracew(log, "secret binding sync complete",
 		"bindings", len(bindings), "entries", len(desired), "added", added, "pruned", len(stale))
-}
-
-// syncWatchedHosts updates the watched_hosts BPF map with the given set of
-// hostnames. Adds missing entries and removes stale ones.
-func syncWatchedHosts(watchedHostsMap *ebpf.Map, newHosts map[watchedHostKey]struct{}, log *zap.SugaredLogger) {
-	val := uint8(1)
-	for host := range newHosts {
-		if err := watchedHostsMap.Update(&host, &val, 0); err != nil {
-			log.Errorw("failed to update watched_hosts map", "error", err, "host", string(host.Host[:]))
-		}
-	}
-
-	var staleHosts []watchedHostKey
-	var iterHost watchedHostKey
-	var iterVal uint8
-	iter := watchedHostsMap.Iterate()
-	for iter.Next(&iterHost, &iterVal) {
-		if _, exists := newHosts[iterHost]; !exists {
-			staleHosts = append(staleHosts, iterHost)
-		}
-	}
-	if err := iter.Err(); err != nil {
-		log.Errorw("error iterating watched_hosts map for pruning", "error", err)
-	}
-	for i := range staleHosts {
-		if err := watchedHostsMap.Delete(&staleHosts[i]); err != nil {
-			log.Errorw("failed to delete stale watched_hosts entry", "error", err)
-		} else {
-			logging.Tracew(log, "pruned stale watched host")
-		}
-	}
+	return errs.err("secret_acl")
 }

@@ -582,12 +582,12 @@ HELPER_INLINE __u32 tls_parse_sni(const __u8 *buf, __u32 len, char *host_out,
 }
 
 // ============================================================================
-// DNS answers for the virtual IP rewrite (tc_dns_rewrite,
-// --host-resolution=virtual-ip). dns_parse_question reads the question of a
-// response and dns_scan_addr_records lists the address records of its answer
-// section (A for an A question, AAAA for an AAAA one), so the tc program can
-// replace each address with the host's fake IP of that family. Both read the
-// first MAX_DNS_PKT bytes of the message, copied into a buffer of that size.
+// DNS answers for the virtual IP rewrite (tc_dns_rewrite). dns_parse_question
+// reads the question of a response and dns_scan_addr_records lists the
+// address records of its answer section (A for an A question, AAAA for an
+// AAAA one), so the tc program can replace each address with the host's fake
+// IP of that family. Both read the first MAX_DNS_PKT bytes of the message,
+// copied into a buffer of that size.
 // ============================================================================
 
 #ifndef MAX_DNS_PKT
@@ -1028,8 +1028,7 @@ HELPER_INLINE int vip_upstream_pick(const struct vip_upstream_val *v,
 #define VIP_SOCK_DENY_ADDR 2 // the socket's real address or port is not the allowed one
 
 // vip_socket_check applies a secret's host, IP and port restrictions to the
-// socket a record leaves on (virtual IP mode, at tcp_sendmsg), with the same
-// meaning as the uprobe's check against resolve_host: a host length of 0 or
+// socket a record leaves on (at tcp_sendmsg): a host length of 0 or
 // MAX_HOST_LEN and more, an IP length other than 16 and a port of 0 restrict
 // nothing.
 //   sock_host: the host of the fake IP the socket connected to (zero-padded,

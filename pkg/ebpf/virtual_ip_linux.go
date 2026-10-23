@@ -63,7 +63,7 @@ type vipUpstreamSlot struct {
 	ExpiresAt uint64   // CLOCK_BOOTTIME nanoseconds; 0: empty slot
 }
 
-// virtualIPMaps are the maps pinned in virtual-ip mode.
+// virtualIPMaps are the maps pinned in bpffs.
 var virtualIPMaps = []string{"vip_host_ip", "vip_ip_host", "vip_upstream"}
 
 // vipConfig returns the vip_config value for ranges.
@@ -111,12 +111,6 @@ func (m *TLSUprobeManager) attachVirtualIPRedirect(r VirtualIPRanges, cgroupPath
 	return nil
 }
 
-// VirtualIPEnabled reports whether the manager runs in virtual-ip host
-// resolution mode.
-func (m *TLSUprobeManager) VirtualIPEnabled() bool {
-	return m.virtualIPs != nil
-}
-
 // dnsRewriteAttach is tc_dns_rewrite attached in a pod's netns.
 type dnsRewriteAttach struct {
 	ino uint64
@@ -134,8 +128,7 @@ func (a *dnsRewriteAttach) close() {
 	_ = a.netns.Close()
 }
 
-// AttachPodDNSRewrite attaches tc_dns_rewrite, in virtual-ip mode, at tc
-// ingress on the egress interfaces of a pod's network namespace, so that the
+// AttachPodDNSRewrite attaches tc_dns_rewrite at tc ingress on the egress interfaces of a pod's network namespace, so that the
 // pod is handed the fake IPs of the hosts it has secrets for
 // (BindPodSecrets), and returns the addresses of those interfaces: the
 // pod's, before its status reports them. pids are processes of the pod; the
@@ -144,14 +137,11 @@ func (a *dnsRewriteAttach) close() {
 // attached while creating the sandbox (AttachPodDNSRewriteNetns, NRI); an
 // answer received before carries the real addresses, and a connection made
 // to them gets no host-restricted secret. It does nothing when already
-// attached in the pod's current netns, in dns-snoop mode, or for a pod in
-// the host network namespace, where the rewrite would hand fake IPs to node
+// attached in the pod's current netns, or for a pod in the host network
+// namespace, where the rewrite would hand fake IPs to node
 // processes the connect redirect does not cover. A pod whose sandbox was
 // recreated gets it again in its new netns.
 func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) ([]netip.Addr, error) {
-	if m.virtualIPs == nil {
-		return nil, nil
-	}
 	for _, p := range pids {
 		if f, err := os.Open(fmt.Sprintf("/proc/%d/ns/net", p)); err == nil {
 			return m.attachPodDNSRewrite(podUID, pod, f, fmt.Sprintf("pid %d", p))
@@ -167,9 +157,6 @@ func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) (
 // pod exists, so attached then, the rewrite precedes the pod's first
 // lookup.
 func (m *TLSUprobeManager) AttachPodDNSRewriteNetns(podUID, pod, path string) ([]netip.Addr, error) {
-	if m.virtualIPs == nil {
-		return nil, nil
-	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -286,8 +273,11 @@ func (m *TLSUprobeManager) DetachPodDNSRewrite(podUID string) {
 
 // syncVipPodHost makes vip_pod_host hold exactly desired (vipPodHosts):
 // pruning is what stops the rewrite for a pod that went away, or whose
-// secrets no longer name a host. Stale entries go first, making room.
-func syncVipPodHost(m *ebpf.Map, desired map[vipPodHostKey]struct{}, log *zap.SugaredLogger) {
+// secrets no longer name a host. Stale entries go first, making room. Like
+// syncSecretACL, it reports failed map operations once it has done the
+// others.
+func syncVipPodHost(m *ebpf.Map, desired map[vipPodHostKey]struct{}, log *zap.SugaredLogger) error {
+	var errs mapErrors
 	var stale []vipPodHostKey
 	present := make(map[vipPodHostKey]struct{}, len(desired))
 	var k vipPodHostKey
@@ -302,11 +292,13 @@ func syncVipPodHost(m *ebpf.Map, desired map[vipPodHostKey]struct{}, log *zap.Su
 	}
 	if err := iter.Err(); err != nil {
 		log.Errorw("error iterating BPF vip_pod_host", "error", err)
+		errs.add(err)
 	}
 	for i := range stale {
 		if err := m.Delete(&stale[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			log.Errorw("failed to remove a pod's virtual IP host", "error", err,
 				"podIP", netip.AddrFrom16(stale[i].PodIP).Unmap().String())
+			errs.add(err)
 		}
 	}
 	allowed := uint8(1)
@@ -318,8 +310,10 @@ func syncVipPodHost(m *ebpf.Map, desired map[vipPodHostKey]struct{}, log *zap.Su
 			// A missing entry leaves the pod the real addresses.
 			log.Errorw("failed to grant the pod its hosts' virtual IPs", "error", err,
 				"podIP", netip.AddrFrom16(key.PodIP).Unmap().String())
+			errs.add(err)
 		}
 	}
+	return errs.err("vip_pod_host")
 }
 
 func netnsInode(path string) (uint64, error) {
@@ -454,28 +448,6 @@ func requireBPFFS(path string) error {
 	}
 }
 
-// RemoveVirtualIPPins deletes the virtual IP map pins a previous controller
-// left in pinPath (empty means DefaultBPFPinPath) in virtual-ip mode, so that
-// switching back to dns-snoop frees them. Only the node's controller should
-// call it: it owns the pins, and removing them while it runs in virtual-ip
-// mode would lose its reservations at the next restart.
-func RemoveVirtualIPPins(pinPath string, log *zap.SugaredLogger) {
-	if pinPath == "" {
-		pinPath = DefaultBPFPinPath
-	}
-	for _, name := range virtualIPMaps {
-		path := filepath.Join(pinPath, name)
-		switch err := os.Remove(path); {
-		case err == nil:
-			log.Infow("removed virtual IP map pinned in virtual-ip mode", "path", path)
-		case !errors.Is(err, os.ErrNotExist):
-			log.Warnw("failed to remove virtual IP map pinned in virtual-ip mode", "path", path, "error", err)
-		}
-	}
-	// Only succeeds if nothing else is pinned there.
-	_ = os.Remove(pinPath)
-}
-
 // virtualIPAllocator keeps vip_ip_host and vip_host_ip in line with the
 // watched hosts (planVirtualIPRanges), and clears vip_upstream of fake IPs
 // that no longer lead to their host.
@@ -510,20 +482,20 @@ func (a *virtualIPAllocator) logRestored() {
 }
 
 // sync makes the maps hold the reservations for hosts. A failed write is
-// logged and retried at the next sync, since the plan is recomputed from
-// what vip_ip_host actually holds.
-func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
+// logged, and reported in the error once the other writes are done; a retry
+// fixes it, since the plan is recomputed from what vip_ip_host actually
+// holds.
+func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) error {
 	existing, err := readVirtualIPs(a.ipHost)
 	if err != nil {
 		// Planning from a partial read could release live reservations.
-		a.log.Errorw("failed to read vip_ip_host, skipping virtual IP sync", "error", err)
-		return
+		return fmt.Errorf("read vip_ip_host, virtual IP sync skipped: %w", err)
 	}
 	currentHosts, err := readVirtualIPHosts(a.hostIP)
 	if err != nil {
-		a.log.Errorw("failed to read vip_host_ip, skipping virtual IP sync", "error", err)
-		return
+		return fmt.Errorf("read vip_host_ip, virtual IP sync skipped: %w", err)
 	}
+	var errs mapErrors
 	p4, p6 := planVirtualIPRanges(a.ranges, hosts, existing, now, int(a.ipHost.MaxEntries()))
 	entries := make(map[netip.Addr]vipEntry, len(p4.Entries)+len(p6.Entries))
 	maps.Copy(entries, p4.Entries)
@@ -544,6 +516,7 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 		key := vipHostKey(host)
 		if err := a.hostIP.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			a.log.Errorw("failed to delete vip_host_ip entry", "host", host, "error", err)
+			errs.add(err)
 		}
 		dropped[host] = true
 	}
@@ -554,9 +527,10 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 		key := dnsIPKey{IP: ip.As16()}
 		if err := a.ipHost.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			a.log.Errorw("failed to release virtual IP", "ip", ip.String(), "error", err)
+			errs.add(err)
 		}
 	}
-	a.pruneUpstreams(existing, entries)
+	a.pruneUpstreams(existing, entries, &errs)
 	for ip, e := range entries {
 		val := vipIPValue(e)
 		if old, ok := existing[ip]; ok && vipIPValue(old) == val {
@@ -565,6 +539,7 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 		key := dnsIPKey{IP: ip.As16()}
 		if err := a.ipHost.Update(&key, &val, ebpf.UpdateAny); err != nil {
 			a.log.Errorw("failed to write vip_ip_host entry", "ip", ip.String(), "host", e.Host, "error", err)
+			errs.add(err)
 			// Without its reservation the IP must not be handed out.
 			if ip.Is4() {
 				delete(p4.Hosts, e.Host)
@@ -581,6 +556,7 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 		key := vipHostKey(host)
 		if err := a.hostIP.Update(&key, &val, ebpf.UpdateAny); err != nil {
 			a.log.Errorw("failed to write vip_host_ip entry", "host", host, "error", err)
+			errs.add(err)
 		}
 	}
 	for host := range currentHosts {
@@ -589,6 +565,7 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 			key := vipHostKey(host)
 			if err := a.hostIP.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 				a.log.Errorw("failed to delete vip_host_ip entry", "host", host, "error", err)
+				errs.add(err)
 			}
 		}
 	}
@@ -619,6 +596,7 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 				"hosts", unallocated, "capacity", a.ipHost.MaxEntries())
 		}
 	}
+	return errs.err("virtual IP maps")
 }
 
 // vipHostVals returns the vip_host_ip values for the hosts' fake IPv4s and
@@ -647,8 +625,9 @@ func dropsVirtualIP(cur, want vipHostVal) bool {
 
 // pruneUpstreams deletes the vip_upstream entries of fake IPs that are not
 // reserved in plan, or reserved for another host than in existing: their
-// addresses belong to a host the IP no longer leads to.
-func (a *virtualIPAllocator) pruneUpstreams(existing, plan map[netip.Addr]vipEntry) {
+// addresses belong to a host the IP no longer leads to. Failures are added
+// to errs.
+func (a *virtualIPAllocator) pruneUpstreams(existing, plan map[netip.Addr]vipEntry, errs *mapErrors) {
 	if a.upstream == nil {
 		return
 	}
@@ -667,10 +646,12 @@ func (a *virtualIPAllocator) pruneUpstreams(existing, plan map[netip.Addr]vipEnt
 	}
 	if err := iter.Err(); err != nil {
 		a.log.Errorw("failed to read vip_upstream", "error", err)
+		errs.add(err)
 	}
 	for i := range stale {
 		if err := a.upstream.Delete(&stale[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			a.log.Errorw("failed to delete vip_upstream entry", "ip", netip.AddrFrom16(stale[i].IP).Unmap().String(), "error", err)
+			errs.add(err)
 		}
 	}
 }

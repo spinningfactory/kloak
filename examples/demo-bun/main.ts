@@ -2,8 +2,9 @@
  * Minimal Bun raw-TLS client for kloak e2e testing.
  *
  * Mirrors examples/demo-boringssl/main.c but implemented in TypeScript using
- * Bun's built-in TLS socket API. Resolves TARGET_HOST via DNS (populating
- * kloak's dns_ip_map), connects to port 8443, and sends a raw TLS payload:
+ * Bun's built-in TLS socket API. Resolves TARGET_HOST via DNS (getting
+ * kloak's virtual IP for it), connects to port 8443, and sends a raw TLS
+ * payload:
  *
  *   ALLOWED=<secret>\nBLOCKED=<secret>\n
  *

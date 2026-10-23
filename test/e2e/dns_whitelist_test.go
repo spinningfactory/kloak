@@ -27,10 +27,9 @@ const (
 // This test deploys a custom CoreDNS forwarder (different ClusterIP) and
 // configures a client pod to use it. Since the custom DNS IP is NOT in the
 // whitelist, its answers are left unchanged, so the client connects to the
-// real address and not through the host's virtual IP (in dns-snoop mode,
-// the kretprobe drops them, so dns_ip_map is never populated and
-// resolve_host fails), and host-filtered secrets are NOT rewritten — the
-// shadow placeholder passes through to the echo server.
+// real address and not through the host's virtual IP, and host-filtered
+// secrets are NOT rewritten — the shadow placeholder passes through to the
+// echo server.
 func TestDNSWhitelist(t *testing.T) {
 	secretValue := "REAL-DNS-WHITELIST-12345"
 	secretName := "dns-whitelist-secret"
@@ -52,19 +51,15 @@ func TestDNSWhitelist(t *testing.T) {
 	// Deploy custom CoreDNS that answers authoritatively for the echo hostname.
 	// It does NOT forward to kube-dns, so the ONLY DNS response in the system
 	// for this hostname comes from the custom DNS IP (untrusted).
-	// This is critical in dns-snoop mode, where the DNS kprobe is
-	// system-wide — if CoreDNS forwarded to kube-dns, kube-dns's response
-	// would populate dns_ip_map via CoreDNS's own udp_recvmsg
-	// (peer=kube-dns=trusted).
 	customDNSIP := deployCustomDNS(t, echoSvcHost, echoSvcIP)
 	t.Logf("custom DNS service IP: %s (not in trusted_dns_servers)", customDNSIP)
 
 	// Deploy curl client configured to use the custom (untrusted) DNS server.
 	clientPod := deployCipherClientWithDNS(t, secretName, customDNSIP)
 
-	// Verify: DNS responses from the custom resolver are dropped by the BPF
-	// whitelist, so resolve_host returns no hostname, the host filter check
-	// fails, and the shadow placeholder passes through unrewritten.
+	// Verify: DNS responses from the custom resolver are not rewritten, so
+	// the connection has no host, the host filter check fails, and the
+	// shadow placeholder passes through unrewritten.
 	verifyRewriteBlocked(t, clientPod, echoSvcHost, secretValue)
 }
 

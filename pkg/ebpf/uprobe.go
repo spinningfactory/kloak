@@ -138,7 +138,7 @@ type TLSUprobeManager struct {
 	retryWG sync.WaitGroup
 
 	// bindMu guards bindings, bindingMode and lastSnapshot, and serializes
-	// every secret_acl and vip_pod_host write, so a periodic sync can't
+	// every secret_acl and vip_pod_host write, so a secret sync can't
 	// prune entries a concurrent BindPodSecrets just granted.
 	bindMu sync.Mutex
 	// bindings maps pod UID → the secrets that pod may redeem (secret_binding.go).
@@ -146,14 +146,14 @@ type TLSUprobeManager struct {
 	// bindingMode is the --secret-binding mode (SetSecretBindingMode).
 	bindingMode SecretBindingMode
 	// lastSnapshot is the most recent secrets snapshot, used to grant a new
-	// pod's bindings immediately instead of at the next periodic sync.
+	// pod's bindings immediately instead of at the next secret sync.
 	lastSnapshot []secrets.Secret
 	// bindingLogged rate-limits violation logs per (cgroup, placeholder,
 	// reason).
 	bindingLogged map[bindingLogKey]time.Time
 
-	// virtualIPs allocates the watched hosts' fake IPs in virtual-ip host
-	// resolution mode; nil otherwise.
+	// virtualIPs allocates the watched hosts' fake IPs (nil only in tests
+	// that build a manager without one).
 	virtualIPs *virtualIPAllocator
 	// dnsRewriteMu guards dnsRewrite and dnsRewriteFailed, and serializes
 	// AttachPodDNSRewrite.
@@ -373,12 +373,11 @@ func parseBPFLogLevel(s string) ebpf.LogLevel {
 // "none"/"lo-only" to attach only to loopback. See the field comment on
 // TLSUprobeManager.egressInterface for the full semantics.
 //
-// hostRes selects the host resolution mode (nil: dns-snoop). In virtual-ip
-// mode the virtual IP maps are pinned under hostRes.PinPath, which must be on
-// bpffs.
+// hostRes holds the virtual IP ranges; the virtual IP maps are pinned under
+// hostRes.PinPath, which must be on bpffs.
 func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterface string, hostRes *HostResolutionConfig, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
 	if hostRes == nil {
-		hostRes = &HostResolutionConfig{}
+		return nil, errors.New("no host resolution config")
 	}
 	log = log.Named("ebpf-uprobe")
 
@@ -389,13 +388,10 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 	if err != nil {
 		return nil, fmt.Errorf("loading eBPF collection spec: %w", err)
 	}
-	var mapOpts ebpf.MapOptions
-	if hostRes.virtualIP() {
-		if err := prepareVirtualIPPins(spec, hostRes.pinPath(), log); err != nil {
-			return nil, fmt.Errorf("preparing virtual IP map pins: %w", err)
-		}
-		mapOpts.PinPath = hostRes.pinPath()
+	if err := prepareVirtualIPPins(spec, hostRes.pinPath(), log); err != nil {
+		return nil, fmt.Errorf("preparing virtual IP map pins: %w", err)
 	}
+	mapOpts := ebpf.MapOptions{PinPath: hostRes.pinPath()}
 
 	objs := &tlsuprobeObjects{}
 	// Verifier-log level for BPF program loads. Defaults to disabled (0) so the
@@ -479,20 +475,19 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		dnsRewrite:       make(map[string]*dnsRewriteAttach),
 		dnsRewriteFailed: make(map[string]bool),
 	}
-	if hostRes.virtualIP() {
-		mgr.virtualIPs = newVirtualIPAllocator(objs, hostRes.VirtualIPRanges, log)
-		mgr.virtualIPs.logRestored()
-		// Without the redirect, a pod handed a fake IP could not connect.
-		if err := mgr.attachVirtualIPRedirect(hostRes.VirtualIPRanges, kubepods); err != nil {
-			_ = mgr.Close()
-			return nil, fmt.Errorf("attaching the virtual IP connect redirect: %w", err)
-		}
-		log.Infow("virtual IP host resolution enabled: kloak pods get fake IPs for watched hosts, connects to them are redirected",
-			"range", hostRes.VirtualIPRanges.String(), "pinPath", hostRes.pinPath(), "cgroup", kubepods)
+	mgr.virtualIPs = newVirtualIPAllocator(objs, hostRes.VirtualIPRanges, log)
+	mgr.virtualIPs.logRestored()
+	// Without the redirect, a pod handed a fake IP could not connect.
+	if err := mgr.attachVirtualIPRedirect(hostRes.VirtualIPRanges, kubepods); err != nil {
+		_ = mgr.Close()
+		return nil, fmt.Errorf("attaching the virtual IP connect redirect: %w", err)
 	}
+	log.Infow("virtual IP host resolution: kloak pods get fake IPs for watched hosts, connects to them are redirected",
+		"range", hostRes.VirtualIPRanges.String(), "pinPath", hostRes.pinPath(), "cgroup", kubepods)
 
-	// Attach tracepoints for DNS interception and connect tracking.
-	// These are system-wide but filtered per-process via tracked_tgids map.
+	// Attach the connect, process and socket tracepoints and the tcp_sendmsg
+	// kprobes. These are system-wide but filtered per-process via
+	// tracked_tgids map.
 	if err := mgr.attachTracepoints(); err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("attaching tracepoints: %w", err)
@@ -501,7 +496,7 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 	return mgr, nil
 }
 
-// attachTracepoints attaches the syscall tracepoints and kprobes for DNS and connect tracking.
+// attachTracepoints attaches the syscall tracepoints and kprobes for connect tracking and the tcp_sendmsg bridge.
 func (m *TLSUprobeManager) attachTracepoints() error {
 	type tp struct {
 		group string
@@ -526,29 +521,6 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 		m.links = append(m.links, l)
 		m.linksMu.Unlock()
 		m.log.Debugw("Attached tracepoint", "group", t.group, "name", t.name)
-	}
-
-	// Attach kprobe/kretprobe on udp_recvmsg for language-agnostic DNS
-	// interception (dns-snoop mode). Virtual IP mode takes a connection's
-	// host from its socket and reads no DNS answer here.
-	if m.virtualIPs == nil {
-		kp, err := link.Kprobe("udp_recvmsg", m.objs.KprobeUdpRecvmsg, nil)
-		if err != nil {
-			return fmt.Errorf("attaching kprobe udp_recvmsg: %w", err)
-		}
-		m.linksMu.Lock()
-		m.links = append(m.links, kp)
-		m.linksMu.Unlock()
-		m.log.Debugw("Attached kprobe", "function", "udp_recvmsg")
-
-		krp, err := link.Kretprobe("udp_recvmsg", m.objs.KretprobeUdpRecvmsg, nil)
-		if err != nil {
-			return fmt.Errorf("attaching kretprobe udp_recvmsg: %w", err)
-		}
-		m.linksMu.Lock()
-		m.links = append(m.links, krp)
-		m.linksMu.Unlock()
-		m.log.Debugw("Attached kretprobe", "function", "udp_recvmsg")
 	}
 
 	// Attach kprobe on tcp_sendmsg to bridge xor_pending → tc_pending.
@@ -1947,21 +1919,13 @@ func (m *TLSUprobeManager) Close() error {
 // and attaches TLS uprobes to newly exec'd processes in tracked containers.
 func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 	m.log.Infow("Starting process exec event poller")
+	stop := closeOnDone(ctx, m.procReader)
+	defer stop()
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
-		}
-
-		m.procReader.SetDeadline(time.Now().Add(1 * time.Second))
 		record, err := m.procReader.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return nil
-			}
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				continue
 			}
 			m.log.Errorw("reading from proc events ringbuf", "error", err)
 			continue
@@ -2039,38 +2003,44 @@ func (m *TLSUprobeManager) PollExecEvents(ctx context.Context) error {
 	}
 }
 
-// PollEvents periodically syncs secrets and pod bindings to the eBPF maps,
-// and logs secret-binding violations reported by the data plane.
+// closeOnDone closes r once ctx is done, the only way to stop a Read that
+// blocks until a record comes in. Close closes it again, which does nothing.
+// The returned function cancels it.
+func closeOnDone(ctx context.Context, r *ringbuf.Reader) (stop func() bool) {
+	return context.AfterFunc(ctx, func() { _ = r.Close() })
+}
+
+// PollEvents logs the secret-binding violations reported by the data plane
+// until ctx is done, and with trace logging the BPF debug counters every
+// 5 s. Secrets are synced to the eBPF maps by SyncSecrets.
 func (m *TLSUprobeManager) PollEvents(ctx context.Context) error {
-	m.log.Infow("Starting eBPF secret syncer and binding-violation reader")
+	m.log.Infow("Starting eBPF binding-violation reader")
 
-	// Trigger an initial sync
-	m.syncSecretsToBPF(ctx)
+	// The counters are only logged at trace level.
+	var counters sync.WaitGroup
+	defer counters.Wait()
+	if m.log.Desugar().Core().Enabled(logging.TraceLevel) {
+		counters.Go(func() {
+			t := time.NewTicker(5 * time.Second)
+			defer t.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-t.C:
+					m.DumpDebugCounters()
+				}
+			}
+		})
+	}
 
-	// Periodic re-sync ticker. The initial sync may have found an empty store
-	// (secret reconciler hasn't run yet), so we must keep re-syncing.
-	syncTicker := time.NewTicker(5 * time.Second)
-	defer syncTicker.Stop()
-
+	stop := closeOnDone(ctx, m.reader)
+	defer stop()
 	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-syncTicker.C:
-			m.syncSecretsToBPF(ctx)
-			m.DumpDebugCounters()
-		default:
-		}
-
-		// Use a short deadline so we don't block forever and miss sync ticks
-		m.reader.SetDeadline(time.Now().Add(1 * time.Second))
 		record, err := m.reader.Read()
 		if err != nil {
 			if errors.Is(err, ringbuf.ErrClosed) {
 				return nil
-			}
-			if errors.Is(err, os.ErrDeadlineExceeded) {
-				continue
 			}
 			m.log.Errorw("reading from ringbuf", "error", err)
 			continue
@@ -2145,31 +2115,35 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 	return nil
 }
 
-// syncSecretsToBPF updates the eBPF map with the latest shadow secret values
-// and the watched_hosts map with hostnames from secret entries.
-func (m *TLSUprobeManager) syncSecretsToBPF(ctx context.Context) {
+// SyncSecrets makes the eBPF maps hold the secret source's current secrets:
+// secret_map, the virtual IPs of their hosts, and the pod bindings over them
+// (secret_acl, vip_pod_host). A failed snapshot leaves the maps as they
+// were. A failed map operation does not stop the others; the error reports
+// it, and a retry completes the maps.
+func (m *TLSUprobeManager) SyncSecrets(ctx context.Context) error {
 	if m.secretSource == nil {
-		return
+		return nil
 	}
 	snapshot, err := m.secretSource.Snapshot(ctx)
 	if err != nil {
-		// Keep the previous map contents; pruning against a failed snapshot
-		// would drop every secret.
-		m.log.Errorw("failed to sync secrets to BPF map", "error", fmt.Errorf("snapshot secrets: %w", err))
-		return
+		// Pruning against a failed snapshot would drop every secret.
+		return fmt.Errorf("snapshot secrets: %w", err)
 	}
-	hosts := applySecrets(m.objs.SecretMap, m.objs.WatchedHosts, snapshot, m.log)
+	hosts, secretsErr := applySecrets(m.objs.SecretMap, snapshot, m.log)
+	var vipErr error
 	if m.virtualIPs != nil {
-		m.virtualIPs.sync(hosts, time.Now())
+		vipErr = m.virtualIPs.sync(hosts, time.Now())
 	}
 
 	m.bindMu.Lock()
 	defer m.bindMu.Unlock()
 	m.lastSnapshot = snapshot
-	syncSecretACL(m.objs.SecretAcl, snapshot, m.bindings, m.log)
+	aclErr := syncSecretACL(m.objs.SecretAcl, snapshot, m.bindings, m.log)
+	var podHostErr error
 	if m.virtualIPs != nil {
-		syncVipPodHost(m.objs.VipPodHost, vipPodHosts(snapshot, m.bindings, m.bindingMode == SecretBindingAudit), m.log)
+		podHostErr = syncVipPodHost(m.objs.VipPodHost, vipPodHosts(snapshot, m.bindings, m.bindingMode == SecretBindingAudit), m.log)
 	}
+	return errors.Join(secretsErr, vipErr, aclErr, podHostErr)
 }
 
 // SetSecretBindingMode configures what the data plane does when a process
@@ -2198,11 +2172,11 @@ func (m *TLSUprobeManager) SetSNICheckMode(mode SNICheckMode) {
 
 // BindPodSecrets records which secrets a pod may redeem and grants them to
 // its container cgroups at once, so the pod's first TLS writes are rewritten.
-// In virtual-ip mode it also lets the pod at podIPs (its network, which
+// It also lets the pod at podIPs (its network, which
 // exists before its containers do) get the fake IPs of those secrets'
 // hosts. It replaces any previous binding for the pod: addresses, cgroups
-// or references that went away are revoked at the next sync. podUID keys
-// the binding; pod (namespace/name) is only used in logs.
+// or references that went away are revoked at once. podUID keys the
+// binding; pod (namespace/name) is only used in logs.
 func (m *TLSUprobeManager) BindPodSecrets(podUID, pod string, podIPs []netip.Addr, cgroupIDs []uint64, refs []secrets.Ref) {
 	m.bindMu.Lock()
 	defer m.bindMu.Unlock()
@@ -2218,23 +2192,78 @@ func (m *TLSUprobeManager) BindPodNetwork(podUID, pod string, podIPs []netip.Add
 	m.bindLocked(podUID, &podBinding{pod: pod, podIPs: podIPs, cgroupIDs: m.bindings[podUID].cgroupIDs, refs: refs})
 }
 
-// bindLocked records b as podUID's binding and grants it; the caller holds
-// bindMu.
+// bindLocked records b as podUID's binding, grants it, and revokes what the
+// pod's previous binding granted that b does not; the caller holds bindMu.
 func (m *TLSUprobeManager) bindLocked(podUID string, b *podBinding) {
 	pod := b.pod
+	prev, rebind := m.bindings[podUID]
 	m.bindings[podUID] = *b
 
 	allowed := uint8(1)
 	single := map[string]podBinding{podUID: *b}
-	for key := range secretACL(m.lastSnapshot, single) {
+	acl := secretACL(m.lastSnapshot, single)
+	for key := range acl {
 		if err := m.objs.SecretAcl.Update(&key, &allowed, ebpf.UpdateAny); err != nil {
 			m.log.Errorw("failed to grant secret binding", "error", err, "pod", pod, "cgroupID", key.CgroupID)
 		}
 	}
+	var podHosts map[vipPodHostKey]struct{}
 	if m.virtualIPs != nil {
-		for key := range vipPodHosts(m.lastSnapshot, single, m.bindingMode == SecretBindingAudit) {
+		podHosts = vipPodHosts(m.lastSnapshot, single, m.bindingMode == SecretBindingAudit)
+		for key := range podHosts {
 			if err := m.objs.VipPodHost.Update(&key, &allowed, ebpf.UpdateAny); err != nil {
 				m.log.Errorw("failed to grant the pod its hosts' virtual IPs", "error", err, "pod", pod)
+			}
+		}
+	}
+	if rebind {
+		m.revokeLostLocked(&prev, acl, podHosts)
+	}
+}
+
+// revokeLostLocked revokes what a pod's previous binding prev granted and
+// its new one, which grants acl and podHosts, does not: the cgroup of a
+// container that restarted, a reference or an address that went away. What
+// another binding grants is kept (an address a new pod already holds). The
+// caller holds bindMu.
+func (m *TLSUprobeManager) revokeLostLocked(prev *podBinding, acl map[secretACLKey]struct{}, podHosts map[vipPodHostKey]struct{}) {
+	single := map[string]podBinding{"": *prev}
+	var lostACL []secretACLKey
+	for key := range secretACL(m.lastSnapshot, single) {
+		if _, ok := acl[key]; !ok {
+			lostACL = append(lostACL, key)
+		}
+	}
+	var lostHosts []vipPodHostKey
+	if m.virtualIPs != nil {
+		for key := range vipPodHosts(m.lastSnapshot, single, m.bindingMode == SecretBindingAudit) {
+			if _, ok := podHosts[key]; !ok {
+				lostHosts = append(lostHosts, key)
+			}
+		}
+	}
+
+	// Most rebinds change nothing: only then look at every binding.
+	if len(lostACL) > 0 {
+		kept := secretACL(m.lastSnapshot, m.bindings)
+		for i := range lostACL {
+			if _, ok := kept[lostACL[i]]; ok {
+				continue
+			}
+			if err := m.objs.SecretAcl.Delete(&lostACL[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+				m.log.Errorw("failed to revoke secret binding", "error", err, "pod", prev.pod, "cgroupID", lostACL[i].CgroupID)
+			}
+		}
+	}
+	if len(lostHosts) > 0 {
+		kept := vipPodHosts(m.lastSnapshot, m.bindings, m.bindingMode == SecretBindingAudit)
+		for i := range lostHosts {
+			if _, ok := kept[lostHosts[i]]; ok {
+				continue
+			}
+			if err := m.objs.VipPodHost.Delete(&lostHosts[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+				m.log.Errorw("failed to remove a pod's virtual IP host", "error", err, "pod", prev.pod,
+					"podIP", netip.AddrFrom16(lostHosts[i].PodIP).Unmap().String())
 			}
 		}
 	}
@@ -2274,7 +2303,9 @@ func (m *TLSUprobeManager) UnbindPod(podUID string) {
 	// The pod's address may already belong to a new pod: keep what the
 	// remaining bindings grant.
 	if m.virtualIPs != nil && len(b.podIPs) > 0 {
-		syncVipPodHost(m.objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, m.bindingMode == SecretBindingAudit), m.log)
+		// Failures are logged entry by entry, and the next secret sync
+		// prunes what is left.
+		_ = syncVipPodHost(m.objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, m.bindingMode == SecretBindingAudit), m.log)
 	}
 }
 
@@ -2342,13 +2373,6 @@ func (m *TLSUprobeManager) logSNIViolation(ev *secretBindingEvent, pod, secret s
 // debugCounterNames maps index to human-readable name (must match C enum in
 // pkg/ebpf/bpf/tls_uprobe.c — DBG_* constants).
 var debugCounterNames = []string{
-	"kprobe_entry", "kprobe_tracked", "kprobe_dport53", "kprobe_dport0",
-	"kprobe_dport_other", "kprobe_iov_ok", "kretprobe_entry", "kretprobe_ret_small",
-	"kretprobe_read_fail", "kretprobe_read_ok", "dns_parse_entry", "dns_not_response",
-	"dns_no_answers", "dns_qname_fail", "dns_not_watched", "dns_watched_hit",
-	"dns_answer_stored",
-	"resolve_ssl_fd_hit", "resolve_last_vfd_hit", "resolve_fd_scan_hit",
-	"resolve_no_fd", "resolve_no_conn", "resolve_no_dns", "resolve_host_ok",
 	"xor_conn_check", "xor_conn_hit", "xor_prescan_match", "xor_tailcall",
 	"xor_path_entered", "xor_secret_found", "xor_delta_done",
 	"tc_entry", "tc_match", "tc_patched",
@@ -2363,7 +2387,7 @@ var debugCounterNames = []string{
 	"secret_binding_deny", "secret_binding_audit",
 	"sni_captured", "sni_deny", "sni_audit",
 	"vip_dns_rewritten", "vip_dns_unchanged", "vip_connect_redirect", "vip_connect_refused",
-	"vip_dns_unbound", "vip_sock_host_deny", "vip_sock_addr_deny", "sock_ipv6_deny",
+	"vip_dns_unbound", "vip_sock_host_deny", "vip_sock_addr_deny",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.

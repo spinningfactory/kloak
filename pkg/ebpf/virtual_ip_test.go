@@ -12,22 +12,6 @@ import (
 	"time"
 )
 
-func TestParseHostResolutionMode(t *testing.T) {
-	for in, want := range map[string]HostResolutionMode{
-		"":            HostResolutionVirtualIP,
-		"dns-snoop":   HostResolutionDNSSnoop,
-		" Virtual-IP": HostResolutionVirtualIP,
-	} {
-		got, err := ParseHostResolutionMode(in)
-		if err != nil || got != want {
-			t.Errorf("ParseHostResolutionMode(%q) = %q, %v; want %q", in, got, err, want)
-		}
-	}
-	if _, err := ParseHostResolutionMode("stub"); err == nil {
-		t.Error("ParseHostResolutionMode(stub) succeeded")
-	}
-}
-
 func TestParseVirtualIPRanges(t *testing.T) {
 	want := VirtualIPRanges{V4: netip.MustParsePrefix("198.18.0.0/15"), V6: netip.MustParsePrefix("2001:2::/48")}
 	if got, err := ParseVirtualIPRanges(DefaultVirtualIPRange); err != nil || got != want {
@@ -67,10 +51,8 @@ func TestParseVirtualIPRanges(t *testing.T) {
 
 func TestHostResolutionConfigValidate(t *testing.T) {
 	ok := []HostResolutionConfig{
-		{},
-		{Mode: HostResolutionDNSSnoop},
-		{Mode: HostResolutionVirtualIP, VirtualIPRanges: testVIPRanges},
-		{Mode: HostResolutionVirtualIP, VirtualIPRanges: VirtualIPRanges{V4: testVIPRange}},
+		{VirtualIPRanges: testVIPRanges},
+		{VirtualIPRanges: VirtualIPRanges{V4: testVIPRange}},
 	}
 	for _, c := range ok {
 		if err := c.validate(); err != nil {
@@ -78,12 +60,11 @@ func TestHostResolutionConfigValidate(t *testing.T) {
 		}
 	}
 	bad := []HostResolutionConfig{
-		{Mode: "stub"},
-		{Mode: HostResolutionVirtualIP},
-		{Mode: HostResolutionVirtualIP, VirtualIPRanges: VirtualIPRanges{V4: netip.MustParsePrefix("10.0.0.0/24")}},
-		{Mode: HostResolutionVirtualIP, VirtualIPRanges: VirtualIPRanges{V6: testVIPRange6}},
-		{Mode: HostResolutionVirtualIP, VirtualIPRanges: VirtualIPRanges{V4: testVIPRange6}},
-		{Mode: HostResolutionVirtualIP, VirtualIPRanges: VirtualIPRanges{V4: testVIPRange, V6: testVIPRange}},
+		{},
+		{VirtualIPRanges: VirtualIPRanges{V4: netip.MustParsePrefix("10.0.0.0/24")}},
+		{VirtualIPRanges: VirtualIPRanges{V6: testVIPRange6}},
+		{VirtualIPRanges: VirtualIPRanges{V4: testVIPRange6}},
+		{VirtualIPRanges: VirtualIPRanges{V4: testVIPRange, V6: testVIPRange}},
 	}
 	for _, c := range bad {
 		if err := c.validate(); err == nil {

@@ -58,34 +58,29 @@ controller:
     # lets them through but logs each one in the controller.
     sniCheck: enforce
     # How the data plane works out which host a connection goes to, for
-    # secrets restricted to a hostname. "virtual-ip" (default): every such
-    # host gets a stable fake IP from virtualIPRange, and a fake IPv6. A
-    # kloak pod with a secret restricted to the host gets them in place of
-    # the host's addresses in DNS answers (A and AAAA records), and its
-    # connects to them are redirected to one of those addresses. A secret
-    # restricted to the host is only rewritten on a connection made to its
-    # fake IP (an app that connects to a hardcoded address, or resolves
-    # outside the pod's DNS, gets none). While the controller is not running,
-    # connects to fake IPs fail. The fake IPs and their addresses are kept in BPF maps
-    # pinned under /sys/fs/bpf/kloak so restarts keep them; the pins stay on
-    # the node after an uninstall until it reboots. Pods that were running
-    # before a node switched to virtual-ip keep the addresses they resolved:
-    # restart them so their host-restricted secrets are rewritten.
-    # "dns-snoop" (deprecated, to be removed) reads DNS answers as pods
-    # receive them, IPv4 only.
-    hostResolution: virtual-ip
-    # Ranges the fake IPs come from in virtual-ip mode: an IPv4 range (/19
-    # or larger) and optionally an IPv6 one (/115 or larger),
-    # comma-separated (escape the comma as "\," with helm --set). Without
-    # an IPv6 range, AAAA answers are left unchanged, and an app that
-    # connects over IPv6 gets no host-restricted secret. The defaults are
-    # reserved for benchmarking (RFC 2544, RFC 5180) and never routed. The
-    # controller refuses to start if a range overlaps a node address, a pod
-    # or service CIDR, or a route of the node.
+    # secrets restricted to a hostname: every such host gets a stable fake
+    # IP from virtualIPRange, and a fake IPv6. A kloak pod with a secret
+    # restricted to the host gets them in place of the host's addresses in
+    # DNS answers (A and AAAA records), and its connects to them are
+    # redirected to one of those addresses. A secret restricted to the host
+    # is only rewritten on a connection made to its fake IP (an app that
+    # connects to a hardcoded address, or resolves outside the pod's DNS,
+    # gets none). While the controller is not running, connects to fake IPs
+    # fail. The fake IPs and their addresses are kept in BPF maps pinned
+    # under /sys/fs/bpf/kloak so restarts keep them; the pins stay on the
+    # node after an uninstall until it reboots.
+    #
+    # virtualIPRange is an IPv4 range (/19 or larger) and optionally an IPv6
+    # one (/115 or larger), comma-separated (escape the comma as "\," with
+    # helm --set). Without an IPv6 range, AAAA answers are left unchanged,
+    # and an app that connects over IPv6 gets no host-restricted secret. The
+    # defaults are reserved for benchmarking (RFC 2544, RFC 5180) and never
+    # routed. The controller refuses to start if a range overlaps a node
+    # address, a pod or service CIDR, or a route of the node.
     virtualIPRange: 198.18.0.0/15,2001:2::/48
   cgroupPath: /host/sys/fs/cgroup
-  # NRI (Node Resource Interface) hook into the container runtime, used in
-  # virtual-ip mode: containerd 2.0+ and CRI-O 1.30+ serve it by default.
+  # NRI (Node Resource Interface) hook into the container runtime:
+  # containerd 2.0+ and CRI-O 1.30+ serve it by default.
   # The runtime then waits for kloak to attach the DNS rewrite while it
   # creates each pod sandbox, so no container of a kloak pod resolves a
   # name before it. Without NRI (disabled here or in the runtime), the
@@ -100,9 +95,9 @@ controller:
   dns:
     # DNS server IPs trusted in addition to kube-dns's ClusterIPs and its
     # endpoints' addresses, which are discovered. Only answers from trusted
-    # servers are rewritten for host-restricted secrets (read, in dns-snoop
-    # mode). Add a node-local cache that pods query at its own address, such
-    # as NodeLocal DNSCache's 169.254.20.10 when the kubelet points pods at it.
+    # servers are rewritten for host-restricted secrets. Add a node-local
+    # cache that pods query at its own address, such as NodeLocal
+    # DNSCache's 169.254.20.10 when the kubelet points pods at it.
     trustedServers: []
   resources:
     requests:

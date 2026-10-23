@@ -89,7 +89,9 @@ func TestVirtualIPAllocatorSync(t *testing.T) {
 
 	// Every host gets a fake IP of each family.
 	hosts := hostSet("api.example.com", "b.example.com")
-	a.sync(hosts, testVIPNow)
+	if err := a.sync(hosts, testVIPNow); err != nil {
+		t.Fatal(err)
+	}
 	want4, want6 := planVirtualIPRanges(testVIPRanges, hosts, nil, testVIPNow, 4096)
 	check("allocate", want4, want6)
 	key := vipHostKey("api.example.com")
@@ -106,7 +108,9 @@ func TestVirtualIPAllocatorSync(t *testing.T) {
 	// vip_ip_host.
 	later := testVIPNow.Add(time.Minute)
 	hosts = hostSet("api.example.com")
-	a.sync(hosts, later)
+	if err := a.sync(hosts, later); err != nil {
+		t.Fatal(err)
+	}
 	bIP4, bIP6 := want4.Hosts["b.example.com"], want6.Hosts["b.example.com"]
 	delete(want4.Hosts, "b.example.com")
 	delete(want6.Hosts, "b.example.com")
@@ -115,11 +119,15 @@ func TestVirtualIPAllocatorSync(t *testing.T) {
 	check("retire", want4, want6)
 
 	// A second sync with nothing new changes nothing.
-	a.sync(hosts, later.Add(time.Minute))
+	if err := a.sync(hosts, later.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
 	check("steady", want4, want6)
 
 	// Past the retention period the reservations are released.
-	a.sync(hosts, later.Add(virtualIPRetention))
+	if err := a.sync(hosts, later.Add(virtualIPRetention)); err != nil {
+		t.Fatal(err)
+	}
 	delete(want4.Entries, bIP4)
 	delete(want6.Entries, bIP6)
 	check("release", want4, want6)
@@ -128,12 +136,16 @@ func TestVirtualIPAllocatorSync(t *testing.T) {
 	// reservations go.
 	apiIP6 := want6.Hosts["api.example.com"]
 	a.ranges = VirtualIPRanges{V4: testVIPRange}
-	a.sync(hosts, later.Add(virtualIPRetention))
+	if err := a.sync(hosts, later.Add(virtualIPRetention)); err != nil {
+		t.Fatal(err)
+	}
 	check("no IPv6 range", want4, vipPlan{})
 
 	// Back again: the same fake IPv6, derived from the host.
 	a.ranges = testVIPRanges
-	a.sync(hosts, later.Add(virtualIPRetention))
+	if err := a.sync(hosts, later.Add(virtualIPRetention)); err != nil {
+		t.Fatal(err)
+	}
 	if err := hostIP.Lookup(&key, &raw); err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +185,9 @@ func TestVirtualIPAllocatorPrunesUpstreams(t *testing.T) {
 		return err == nil
 	}
 
-	a.sync(hostSet("api.example.com", "b.example.com"), testVIPNow)
+	if err := a.sync(hostSet("api.example.com", "b.example.com"), testVIPNow); err != nil {
+		t.Fatal(err)
+	}
 	hosts, err := readVirtualIPHosts(hostIP)
 	if err != nil {
 		t.Fatal(err)
@@ -187,13 +201,17 @@ func TestVirtualIPAllocatorPrunesUpstreams(t *testing.T) {
 	// b retired: its fake IP still leads to it, and keeps its addresses.
 	// An IP reserved for no host loses them.
 	later := testVIPNow.Add(time.Minute)
-	a.sync(hostSet("api.example.com"), later)
+	if err := a.sync(hostSet("api.example.com"), later); err != nil {
+		t.Fatal(err)
+	}
 	if !has(apiIP) || !has(bIP) || has(orphan) {
 		t.Errorf("after retiring b: api %v, b %v, orphan %v; want true, true, false", has(apiIP), has(bIP), has(orphan))
 	}
 
 	// b released: its IP may go to another host, without b's addresses.
-	a.sync(hostSet("api.example.com"), later.Add(virtualIPRetention))
+	if err := a.sync(hostSet("api.example.com"), later.Add(virtualIPRetention)); err != nil {
+		t.Fatal(err)
+	}
 	if !has(apiIP) || has(bIP) {
 		t.Errorf("after releasing b: api %v, b %v; want true, false", has(apiIP), has(bIP))
 	}
@@ -220,7 +238,9 @@ func TestVirtualIPPinsSurviveReload(t *testing.T) {
 
 	hostIP, ipHost := open()
 	a := &virtualIPAllocator{hostIP: hostIP, ipHost: ipHost, ranges: testVIPRanges, log: testLog()}
-	a.sync(hostSet("api.example.com", "b.example.com"), testVIPNow)
+	if err := a.sync(hostSet("api.example.com", "b.example.com"), testVIPNow); err != nil {
+		t.Fatal(err)
+	}
 	want, err := readVirtualIPs(ipHost)
 	if err != nil || len(want) != 4 {
 		t.Fatalf("after sync: %v, %v", want, err)
@@ -281,37 +301,6 @@ func TestRequireBPFFS(t *testing.T) {
 	}
 }
 
-func TestRemoveVirtualIPPins(t *testing.T) {
-	pinPath := filepath.Join(t.TempDir(), "kloak")
-	write := func(names ...string) {
-		if err := os.MkdirAll(pinPath, 0o700); err != nil {
-			t.Fatal(err)
-		}
-		for _, n := range names {
-			if err := os.WriteFile(filepath.Join(pinPath, n), nil, 0o600); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-
-	write(virtualIPMaps...)
-	RemoveVirtualIPPins(pinPath, testLog())
-	if _, err := os.Stat(pinPath); !os.IsNotExist(err) {
-		t.Errorf("pin directory left behind: %v", err)
-	}
-
-	// Other pins, and the directory holding them, are left alone.
-	write(append([]string{"other"}, virtualIPMaps...)...)
-	RemoveVirtualIPPins(pinPath, testLog())
-	entries, err := os.ReadDir(pinPath)
-	if err != nil || len(entries) != 1 || entries[0].Name() != "other" {
-		t.Errorf("pin directory now holds %v (%v)", entries, err)
-	}
-
-	// Nothing pinned: nothing to do.
-	RemoveVirtualIPPins(filepath.Join(t.TempDir(), "missing"), testLog())
-}
-
 // TestVipPodHostBindings checks that vip_pod_host follows the pod bindings:
 // granted at bind time, kept for an address that a new pod already holds
 // when the old pod is unbound, and pruned to exactly the bindings by a sync.
@@ -358,12 +347,16 @@ func TestVipPodHostBindings(t *testing.T) {
 	check("old pod unbound", "10.42.0.7 db.example.com", "fd42::7 db.example.com")
 
 	putPodHost(t, objs, netip.MustParseAddr("10.42.0.99"), "api.example.com")
-	syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), m.log)
+	if err := syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), m.log); err != nil {
+		t.Fatal(err)
+	}
 	check("synced", "10.42.0.7 db.example.com", "fd42::7 db.example.com")
 
 	m.SetSecretBindingMode(SecretBindingAudit)
 	m.BindPodSecrets("uid-new", "ns/new", addr, nil, []secrets.Ref{{OwnerID: "ns/db"}})
-	syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, true), m.log)
+	if err := syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, true), m.log); err != nil {
+		t.Fatal(err)
+	}
 	check("audit", "10.42.0.7 ", "fd42::7 ")
 }
 
@@ -411,11 +404,15 @@ func TestBindPodNetworkKeepsCgroups(t *testing.T) {
 	if b := m.bindings["uid"]; !slices.Equal(b.cgroupIDs, []uint64{41, 42}) || b.podIPs[0] != netip.MustParseAddr("10.42.0.8") {
 		t.Fatalf("binding after BindPodNetwork: %+v", b)
 	}
-	syncSecretACL(objs.SecretAcl, m.lastSnapshot, m.bindings, m.log)
+	if err := syncSecretACL(objs.SecretAcl, m.lastSnapshot, m.bindings, m.log); err != nil {
+		t.Fatal(err)
+	}
 	if got := aclCgroups(); !slices.Equal(got, []uint64{41, 42}) {
 		t.Errorf("secret_acl cgroups after a sync: %v, want [41 42]", got)
 	}
-	syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), m.log)
+	if err := syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), m.log); err != nil {
+		t.Fatal(err)
+	}
 	var k vipPodHostKey
 	var v uint8
 	var hosts []string
@@ -426,6 +423,65 @@ func TestBindPodNetworkKeepsCgroups(t *testing.T) {
 	if !slices.Equal(hosts, []string{"10.42.0.8"}) {
 		t.Errorf("vip_pod_host addresses %v, want the new address only", hosts)
 	}
+}
+
+// TestRebindRevokesLostGrants checks that rebinding a pod revokes at once,
+// without a sync, what its previous binding granted and the new one does
+// not, and keeps what another pod's binding grants.
+func TestRebindRevokesLostGrants(t *testing.T) {
+	objs := loadTestObjects(t)
+	m := &TLSUprobeManager{
+		objs:       objs,
+		log:        zap.NewNop().Sugar(),
+		bindings:   make(map[string]podBinding),
+		virtualIPs: &virtualIPAllocator{},
+		lastSnapshot: []secrets.Secret{
+			{OwnerID: "ns/api", Key: "token", Shadow: "kl::token-placeholder-0001", Host: "api.example.com"},
+			{OwnerID: "ns/db", Key: "password", Shadow: "kl::db-placeholder-000003", Host: "db.example.com"},
+		},
+	}
+	api := []secrets.Ref{{OwnerID: "ns/api"}}
+	apiAndDB := []secrets.Ref{{OwnerID: "ns/api"}, {OwnerID: "ns/db"}}
+	addr := func(s string) []netip.Addr { return []netip.Addr{netip.MustParseAddr(s)} }
+	check := func(step string) {
+		t.Helper()
+		if got, want := aclEntries(t, objs.SecretAcl), secretACL(m.lastSnapshot, m.bindings); !maps.Equal(got, want) {
+			t.Errorf("%s: secret_acl has %d entries, want the %d the bindings grant", step, len(got), len(want))
+		}
+		got := make(map[vipPodHostKey]struct{})
+		var k vipPodHostKey
+		var v uint8
+		iter := objs.VipPodHost.Iterate()
+		for iter.Next(&k, &v) {
+			got[k] = struct{}{}
+		}
+		if err := iter.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if want := vipPodHosts(m.lastSnapshot, m.bindings, false); !maps.Equal(got, want) {
+			t.Errorf("%s: vip_pod_host = %q, want %q", step, vipPodHostStrings(got), vipPodHostStrings(want))
+		}
+	}
+
+	m.BindPodSecrets("uid", "ns/app", addr("10.42.0.7"), []uint64{41, 42}, apiAndDB)
+	check("bound")
+
+	// Container 42 restarted as 43, the pod spec now references only the
+	// api secret, and the pod moved to a new address.
+	m.BindPodSecrets("uid", "ns/app", addr("10.42.0.8"), []uint64{41, 43}, api)
+	check("rebound")
+	for k := range aclEntries(t, objs.SecretAcl) {
+		if k.CgroupID == 42 {
+			t.Errorf("the restarted container's cgroup kept its grants")
+			break
+		}
+	}
+
+	// A new pod already holds the old address with the same secret: it
+	// keeps its virtual IP host when the first pod moves away again.
+	m.BindPodSecrets("uid-new", "ns/new", addr("10.42.0.8"), []uint64{51}, api)
+	m.BindPodSecrets("uid", "ns/app", addr("10.42.0.9"), []uint64{41, 43}, api)
+	check("address reused")
 }
 
 // TestAttachPodDNSRewriteNetns attaches tc_dns_rewrite in a network
