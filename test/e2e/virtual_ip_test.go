@@ -311,9 +311,10 @@ func TestVirtualIPSocketHost(t *testing.T) {
 
 	// Each line: <case> <first line of the echo>. A case that must be
 	// rewritten is retried until it is: the process is only traced once
-	// kloak has seen its exec, and the controller syncs secrets into its
-	// maps every 5 s (secret-sockhost-ip was created just now). The refused
-	// case runs last, once its secret is known to be synced.
+	// kloak has seen its exec, and the controller syncs a secret into its
+	// maps once it sees the Secret (secret-sockhost-ip was created just
+	// now). The refused case runs last, once its secret is known to be
+	// synced.
 	const probe = `import socket, ssl, sys, time
 a, b, ip = sys.argv[1:4]
 def send(host, sni, secret):
@@ -456,8 +457,8 @@ func TestVirtualIPv6(t *testing.T) {
 	// Each line: <case> <address connected to> <getpeername> <first line
 	// of the echo>. A case that must be rewritten is retried until it is:
 	// the process is only traced once kloak has seen its exec, and the
-	// controller syncs secrets into its maps every 5 s. The refused case
-	// runs last, once its secret is known to be synced.
+	// controller syncs a secret into its maps once it sees the Secret. The
+	// refused case runs last, once its secret is known to be synced.
 	const probe = `import socket, ssl, sys, time
 host, cip = sys.argv[1:3]
 def send(target, secret):

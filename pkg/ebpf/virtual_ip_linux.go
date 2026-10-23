@@ -273,8 +273,11 @@ func (m *TLSUprobeManager) DetachPodDNSRewrite(podUID string) {
 
 // syncVipPodHost makes vip_pod_host hold exactly desired (vipPodHosts):
 // pruning is what stops the rewrite for a pod that went away, or whose
-// secrets no longer name a host. Stale entries go first, making room.
-func syncVipPodHost(m *ebpf.Map, desired map[vipPodHostKey]struct{}, log *zap.SugaredLogger) {
+// secrets no longer name a host. Stale entries go first, making room. Like
+// syncSecretACL, it reports failed map operations once it has done the
+// others.
+func syncVipPodHost(m *ebpf.Map, desired map[vipPodHostKey]struct{}, log *zap.SugaredLogger) error {
+	var errs mapErrors
 	var stale []vipPodHostKey
 	present := make(map[vipPodHostKey]struct{}, len(desired))
 	var k vipPodHostKey
@@ -289,11 +292,13 @@ func syncVipPodHost(m *ebpf.Map, desired map[vipPodHostKey]struct{}, log *zap.Su
 	}
 	if err := iter.Err(); err != nil {
 		log.Errorw("error iterating BPF vip_pod_host", "error", err)
+		errs.add(err)
 	}
 	for i := range stale {
 		if err := m.Delete(&stale[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			log.Errorw("failed to remove a pod's virtual IP host", "error", err,
 				"podIP", netip.AddrFrom16(stale[i].PodIP).Unmap().String())
+			errs.add(err)
 		}
 	}
 	allowed := uint8(1)
@@ -305,8 +310,10 @@ func syncVipPodHost(m *ebpf.Map, desired map[vipPodHostKey]struct{}, log *zap.Su
 			// A missing entry leaves the pod the real addresses.
 			log.Errorw("failed to grant the pod its hosts' virtual IPs", "error", err,
 				"podIP", netip.AddrFrom16(key.PodIP).Unmap().String())
+			errs.add(err)
 		}
 	}
+	return errs.err("vip_pod_host")
 }
 
 func netnsInode(path string) (uint64, error) {
@@ -475,20 +482,20 @@ func (a *virtualIPAllocator) logRestored() {
 }
 
 // sync makes the maps hold the reservations for hosts. A failed write is
-// logged and retried at the next sync, since the plan is recomputed from
-// what vip_ip_host actually holds.
-func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
+// logged, and reported in the error once the other writes are done; a retry
+// fixes it, since the plan is recomputed from what vip_ip_host actually
+// holds.
+func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) error {
 	existing, err := readVirtualIPs(a.ipHost)
 	if err != nil {
 		// Planning from a partial read could release live reservations.
-		a.log.Errorw("failed to read vip_ip_host, skipping virtual IP sync", "error", err)
-		return
+		return fmt.Errorf("read vip_ip_host, virtual IP sync skipped: %w", err)
 	}
 	currentHosts, err := readVirtualIPHosts(a.hostIP)
 	if err != nil {
-		a.log.Errorw("failed to read vip_host_ip, skipping virtual IP sync", "error", err)
-		return
+		return fmt.Errorf("read vip_host_ip, virtual IP sync skipped: %w", err)
 	}
+	var errs mapErrors
 	p4, p6 := planVirtualIPRanges(a.ranges, hosts, existing, now, int(a.ipHost.MaxEntries()))
 	entries := make(map[netip.Addr]vipEntry, len(p4.Entries)+len(p6.Entries))
 	maps.Copy(entries, p4.Entries)
@@ -509,6 +516,7 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 		key := vipHostKey(host)
 		if err := a.hostIP.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			a.log.Errorw("failed to delete vip_host_ip entry", "host", host, "error", err)
+			errs.add(err)
 		}
 		dropped[host] = true
 	}
@@ -519,9 +527,10 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 		key := dnsIPKey{IP: ip.As16()}
 		if err := a.ipHost.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			a.log.Errorw("failed to release virtual IP", "ip", ip.String(), "error", err)
+			errs.add(err)
 		}
 	}
-	a.pruneUpstreams(existing, entries)
+	a.pruneUpstreams(existing, entries, &errs)
 	for ip, e := range entries {
 		val := vipIPValue(e)
 		if old, ok := existing[ip]; ok && vipIPValue(old) == val {
@@ -530,6 +539,7 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 		key := dnsIPKey{IP: ip.As16()}
 		if err := a.ipHost.Update(&key, &val, ebpf.UpdateAny); err != nil {
 			a.log.Errorw("failed to write vip_ip_host entry", "ip", ip.String(), "host", e.Host, "error", err)
+			errs.add(err)
 			// Without its reservation the IP must not be handed out.
 			if ip.Is4() {
 				delete(p4.Hosts, e.Host)
@@ -546,6 +556,7 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 		key := vipHostKey(host)
 		if err := a.hostIP.Update(&key, &val, ebpf.UpdateAny); err != nil {
 			a.log.Errorw("failed to write vip_host_ip entry", "host", host, "error", err)
+			errs.add(err)
 		}
 	}
 	for host := range currentHosts {
@@ -554,6 +565,7 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 			key := vipHostKey(host)
 			if err := a.hostIP.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 				a.log.Errorw("failed to delete vip_host_ip entry", "host", host, "error", err)
+				errs.add(err)
 			}
 		}
 	}
@@ -584,6 +596,7 @@ func (a *virtualIPAllocator) sync(hosts map[string]struct{}, now time.Time) {
 				"hosts", unallocated, "capacity", a.ipHost.MaxEntries())
 		}
 	}
+	return errs.err("virtual IP maps")
 }
 
 // vipHostVals returns the vip_host_ip values for the hosts' fake IPv4s and
@@ -612,8 +625,9 @@ func dropsVirtualIP(cur, want vipHostVal) bool {
 
 // pruneUpstreams deletes the vip_upstream entries of fake IPs that are not
 // reserved in plan, or reserved for another host than in existing: their
-// addresses belong to a host the IP no longer leads to.
-func (a *virtualIPAllocator) pruneUpstreams(existing, plan map[netip.Addr]vipEntry) {
+// addresses belong to a host the IP no longer leads to. Failures are added
+// to errs.
+func (a *virtualIPAllocator) pruneUpstreams(existing, plan map[netip.Addr]vipEntry, errs *mapErrors) {
 	if a.upstream == nil {
 		return
 	}
@@ -632,10 +646,12 @@ func (a *virtualIPAllocator) pruneUpstreams(existing, plan map[netip.Addr]vipEnt
 	}
 	if err := iter.Err(); err != nil {
 		a.log.Errorw("failed to read vip_upstream", "error", err)
+		errs.add(err)
 	}
 	for i := range stale {
 		if err := a.upstream.Delete(&stale[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			a.log.Errorw("failed to delete vip_upstream entry", "ip", netip.AddrFrom16(stale[i].IP).Unmap().String(), "error", err)
+			errs.add(err)
 		}
 	}
 }

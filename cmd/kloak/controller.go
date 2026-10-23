@@ -260,11 +260,19 @@ func runController(cmd *cobra.Command, args []string) {
 			_ = setupLog.Sync()
 			os.Exit(1)
 		}
+
+		// Sync secrets into the BPF maps as kloak Secrets change, and
+		// every DefaultSecretResyncPeriod.
+		secretSync := &controller.SecretSyncReconciler{Sync: uprobeMgr.SyncSecrets}
+		if err := secretSync.SetupWithManager(mgr); err != nil {
+			setupLog.Errorw("unable to create controller", "error", err, "controller", "SecretSync")
+			_ = setupLog.Sync()
+			os.Exit(1)
+		}
 	}
 
 	// Register eBPF pollers as manager runnables so they start after the
-	// informer cache is synced. Starting them before mgr.Start() would cause
-	// "cache is not started" errors when syncing secrets to the BPF map.
+	// informer cache is synced.
 	if uprobeMgr != nil {
 		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
 			return uprobeMgr.PollEvents(ctx)
