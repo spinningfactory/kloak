@@ -27,15 +27,11 @@ func k8sSource(reader client.Reader) *k8ssecrets.Source {
 	return k8ssecrets.NewSource(reader)
 }
 
-// createTestSecretMap creates a BPF hash map matching the secret_map spec.
-func createTestSecretMap(t *testing.T) *ciliumebpf.Map {
+// createTestMap creates the map name of the BPF objects on its own, with
+// their layout.
+func createTestMap(t *testing.T, name string) *ciliumebpf.Map {
 	t.Helper()
-	m, err := ciliumebpf.NewMap(&ciliumebpf.MapSpec{
-		Type:       ciliumebpf.Hash,
-		KeySize:    8,   // SECRET_KEY_LEN
-		ValueSize:  272, // sizeof(secret_value) with padding (including IP filtering fields)
-		MaxEntries: 64,
-	})
+	m, err := ciliumebpf.NewMap(loadSpec(t).Maps[name].Copy())
 	if err != nil {
 		t.Skipf("eBPF maps not available: %v", err)
 	}
@@ -43,20 +39,15 @@ func createTestSecretMap(t *testing.T) *ciliumebpf.Map {
 	return m
 }
 
+func createTestSecretMap(t *testing.T) *ciliumebpf.Map {
+	t.Helper()
+	return createTestMap(t, "secret_map")
+}
+
 // createTestWatchedHostsMap creates a BPF hash map matching the watched_hosts spec.
 func createTestWatchedHostsMap(t *testing.T) *ciliumebpf.Map {
 	t.Helper()
-	m, err := ciliumebpf.NewMap(&ciliumebpf.MapSpec{
-		Type:       ciliumebpf.Hash,
-		KeySize:    32, // MAX_HOST_LEN
-		ValueSize:  1,  // __u8
-		MaxEntries: 256,
-	})
-	if err != nil {
-		t.Skipf("eBPF maps not available: %v", err)
-	}
-	t.Cleanup(func() { _ = m.Close() })
-	return m
+	return createTestMap(t, "watched_hosts")
 }
 
 func testLog() *zap.SugaredLogger {
@@ -315,7 +306,8 @@ func TestSyncSecrets_Update(t *testing.T) {
 
 func TestSyncSecrets_FullPrefix(t *testing.T) {
 	m := createTestSecretMap(t)
-	shadow := "kl::abcd1234-5678-9abc-def0-123456789abc"
+	// Longer than the 42 bytes stored for verification.
+	shadow := "kl::abcd1234-5678-9abc-def0-123456789abc-0123"
 	reader := newFakeClient(
 		enabledSecret("my-secret", "default",
 			map[string][]byte{"api-key": []byte(shadow)}, nil, nil),

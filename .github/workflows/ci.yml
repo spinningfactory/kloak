@@ -127,16 +127,28 @@ jobs:
         run: make test-bpf-helpers
 
       - name: Run tests
-        # Include pkg/ebpf (Linux-tagged BPF tests self-skip via t.Skipf when
-        # eBPF resources aren't available on the runner) and pkg/cgroups (its
-        # utils.go is pure parsing + the cgroup_linux/cgroup_other split takes
-        # care of platform deps). cmd/kloak is included so its unit tests run;
+        # The test binaries run as root (-exec "sudo -E"; they are still built
+        # as the runner user), so the BPF tests load the programs on the
+        # runner's kernel instead of skipping: the verifier on x86, the DNS
+        # rewrite, connect redirect and tc patch run through BPF_PROG_RUN or
+        # the kernel's connect path, cgroups, network namespaces and bpffs
+        # pins. pkg/cgroups is pure parsing plus the cgroup_linux /
+        # cgroup_other split. cmd/kloak is included so its unit tests run;
         # its shutdown paths are also covered via the e2e binary. Exclude:
         #   - test/e2e      — separate job
         #   - cmd/ebpftest  — verifier-debugging CLI with no tests; Go would
         #                     still add it to the profile at 0%
         #   - tools/        — CLI utilities, coverage isn't meaningful
-        run: go test -v -race -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/ebpftest|/tools/')
+        run: go test -v -race -exec "sudo -E" -coverprofile=coverage.out $(go list ./... | grep -v -E '/test/e2e|/cmd/ebpftest|/tools/')
+
+      - name: Check the BPF tests ran
+        # A skip (no BPF, no root) would silently drop their coverage of the
+        # data plane.
+        run: |
+          if go test -exec "sudo -E" -count=1 -v -run 'TestLoadObjects$' ./pkg/ebpf/ | grep -q -- '--- SKIP'; then
+            echo "::error::the BPF objects did not load as root on this runner"
+            exit 1
+          fi
 
       - name: Upload unit coverage
         uses: actions/upload-artifact@v7

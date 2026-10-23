@@ -62,7 +62,9 @@ func TestSandboxFromNRI(t *testing.T) {
 			}
 		})
 	}
-	if got := sandboxFromNRI(&api.PodSandbox{Linux: netns}, "").NetnsPath; got != "/proc/1/root/var/run/netns/cni-1234" {
+	// The host's root by default; where its links lead (/var/run -> /run
+	// on most hosts) depends on the host and on reading them (root).
+	if got := sandboxFromNRI(&api.PodSandbox{Linux: netns}, "").NetnsPath; !strings.HasPrefix(got, "/proc/1/root/") || !strings.HasSuffix(got, "/netns/cni-1234") {
 		t.Errorf("default host root: %s", got)
 	}
 }
