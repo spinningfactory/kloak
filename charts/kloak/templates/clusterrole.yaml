@@ -21,7 +21,8 @@ rules:
   - apiGroups: ["apps"]
     resources: ["replicasets", "deployments", "daemonsets", "statefulsets"]
     verbs: ["get", "list", "watch"]
-  # Service reading for trusted DNS server auto-discovery (kube-dns)
+  # Service reading: kube-dns's ClusterIPs for the virtual IP range check
+  # (kube-dns-role.yaml covers the trusted DNS servers)
   - apiGroups: [""]
     resources: ["services"]
     verbs: ["get"]

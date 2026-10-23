@@ -10,11 +10,14 @@ import (
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/types"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
@@ -140,6 +143,16 @@ func runController(cmd *cobra.Command, args []string) {
 		Scheme:                  scheme,
 		HealthProbeBindAddress:  controllerProbeAddr,
 		GracefulShutdownTimeout: &gracefulShutdown,
+		// The trusted DNS reconciler only needs kube-dns: cache that, not
+		// every Service and EndpointSlice of the cluster.
+		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
+			&corev1.Service{}: {Namespaces: map[string]cache.Config{controller.KubeDNSNamespace: {
+				FieldSelector: fields.OneTermEqualSelector("metadata.name", controller.KubeDNSName),
+			}}},
+			&discoveryv1.EndpointSlice{}: {Namespaces: map[string]cache.Config{controller.KubeDNSNamespace: {
+				LabelSelector: labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: controller.KubeDNSName}),
+			}}},
+		}},
 	})
 	if err != nil {
 		setupLog.Errorw("unable to start manager", "error", err)
@@ -242,11 +255,24 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
-	// Configure trusted DNS servers for the eBPF DNS chain of trust.
+	// Configure trusted DNS servers for the eBPF DNS chain of trust: now,
+	// before the manager starts (an empty whitelist believes every server),
+	// then as kube-dns's endpoints change.
 	if uprobeMgr != nil {
 		dnsIPs := discoverTrustedDNSServers(mgr.GetAPIReader(), setupLog)
 		if err := uprobeMgr.PopulateTrustedDNSServers(dnsIPs); err != nil {
 			setupLog.Errorw("failed to populate trusted DNS servers", "error", err)
+		}
+		dnsReconciler := &controller.TrustedDNSReconciler{
+			Client: mgr.GetClient(),
+			Static: parseTrustedDNSServers(trustedDNSServers, setupLog),
+			Apply:  uprobeMgr.PopulateTrustedDNSServers,
+			Log:    setupLog.Named("controller").Named("TrustedDNS"),
+		}
+		if err := dnsReconciler.SetupWithManager(mgr); err != nil {
+			setupLog.Errorw("unable to create controller", "error", err, "controller", "TrustedDNS")
+			_ = setupLog.Sync()
+			os.Exit(1)
 		}
 	}
 
@@ -298,65 +324,36 @@ func runController(cmd *cobra.Command, args []string) {
 	_ = setupLog.Sync()
 }
 
-// discoverTrustedDNSServers returns the list of trusted DNS server IPs.
-// Always includes the kube-dns ClusterIPs (auto-discovered): both of a
-// dual-stack kube-dns, which pods are given both of as nameservers (musl
-// queries them in parallel and takes the first answer). If
-// --trusted-dns-servers is set, those are added too (deduplicated).
+// discoverTrustedDNSServers returns the trusted DNS server IPs
+// (controller.TrustedDNSServers): kube-dns's ClusterIPs and endpoints, and
+// --trusted-dns-servers.
 func discoverTrustedDNSServers(reader client.Reader, log *zap.SugaredLogger) []net.IP {
-	seen := make(map[string]bool)
-	var ips []net.IP
-
-	addIP := func(ip net.IP, source string) {
-		key := ip.String()
-		if seen[key] {
-			return
-		}
-		seen[key] = true
-		ips = append(ips, ip)
-		log.Infow("Added trusted DNS server", "ip", key, "source", source)
+	ips := controller.TrustedDNSServers(context.Background(), reader, parseTrustedDNSServers(trustedDNSServers, log), log)
+	for _, ip := range ips {
+		log.Infow("Added trusted DNS server", "ip", ip.String())
 	}
-
-	// Always auto-discover kube-dns
-	svc := &corev1.Service{}
-	err := reader.Get(context.Background(), types.NamespacedName{
-		Name:      "kube-dns",
-		Namespace: "kube-system",
-	}, svc)
-	if err != nil {
-		log.Errorw("Failed to auto-discover kube-dns service", "error", err)
-	} else {
-		clusterIPs := svc.Spec.ClusterIPs
-		if len(clusterIPs) == 0 {
-			clusterIPs = []string{svc.Spec.ClusterIP}
-		}
-		for _, s := range clusterIPs {
-			if ip := net.ParseIP(s); ip != nil { // not "None" (headless)
-				addIP(ip, "kube-dns auto-discovery")
-			}
-		}
-	}
-
-	// Add user-provided DNS servers
-	if trustedDNSServers != "" {
-		for _, s := range strings.Split(trustedDNSServers, ",") {
-			s = strings.TrimSpace(s)
-			if s == "" {
-				continue
-			}
-			ip := net.ParseIP(s)
-			if ip == nil {
-				log.Errorw("Invalid trusted DNS server IP", "ip", s)
-				continue
-			}
-			addIP(ip, "user-configured")
-		}
-	}
-
 	if len(ips) == 0 {
 		log.Errorw("No trusted DNS servers found — DNS whitelist will reject all DNS responses. " +
 			"Ensure kube-dns is running or provide --trusted-dns-servers")
 	}
-
 	return ips
+}
+
+// parseTrustedDNSServers parses --trusted-dns-servers, skipping (and
+// logging) what is not an IP.
+func parseTrustedDNSServers(s string, log *zap.SugaredLogger) []net.IP {
+	var out []net.IP
+	for _, f := range strings.Split(s, ",") {
+		f = strings.TrimSpace(f)
+		if f == "" {
+			continue
+		}
+		ip := net.ParseIP(f)
+		if ip == nil {
+			log.Errorw("Invalid trusted DNS server IP", "ip", f)
+			continue
+		}
+		out = append(out, ip)
+	}
+	return out
 }

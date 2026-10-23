@@ -11,7 +11,7 @@ import (
 )
 
 // TestEBPFRawTLSPortFiltering tests that port-based filtering works with
-// raw TLS sockets. A TLS echo server runs as a sidecar behind a K8s Service.
+// raw TLS sockets. A TLS echo server runs in its own pod behind a K8s Service.
 // The client connects on a specific port, and the port is verified at
 // connect() time to enable port-based secret filtering.
 func TestEBPFRawTLSPortFiltering(t *testing.T) {

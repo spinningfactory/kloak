@@ -177,8 +177,8 @@ int main(void) {
     SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
     SSL_CTX_set_cipher_list(ctx, "ECDHE-RSA-AES128-GCM-SHA256");
 
-    // Wait for the echo server sidecar to come up.
-    printf("Waiting for echo server sidecar to be ready...\n");
+    // Wait for the echo server to come up.
+    printf("Waiting for echo server to be ready...\n");
     fflush(stdout);
     for (int attempt = 0; attempt < 30; attempt++) {
         int fd = tcp_connect(target_host, LISTEN_PORT);

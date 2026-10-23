@@ -5,7 +5,7 @@ Tests that Kloak's eBPF DNS-verified host filtering works at the TCP level
 with raw TLS sockets — no HTTP library involved.
 
 Architecture:
-  1. A TLS echo server runs as a sidecar (port 8443, self-signed cert)
+  1. A TLS echo server runs in its own pod (port 8443, self-signed cert)
   2. The client resolves the K8s Service name via DNS (populates dns_ip_map)
   3. The client connects to the Service IP and sends raw TLS data with secrets
   4. The echo server returns the data — if eBPF rewrote it, the echo shows real values
@@ -74,8 +74,8 @@ def main():
     print("=" * 60)
     sys.stdout.flush()
 
-    # Wait for the echo server sidecar to start (cert generation + listen)
-    print("Waiting for echo server sidecar to be ready...")
+    # Wait for the echo server to start (cert generation + listen)
+    print("Waiting for echo server to be ready...")
     sys.stdout.flush()
     for attempt in range(30):
         try:

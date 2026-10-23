@@ -2086,9 +2086,9 @@ type dnsIPKey struct {
 	IP [16]byte
 }
 
-// PopulateTrustedDNSServers adds trusted DNS server IPs to the BPF map and
-// enables the whitelist. If ips is empty, the whitelist is not enabled and
-// all DNS responses are accepted.
+// PopulateTrustedDNSServers makes trusted_dns_servers hold exactly ips, and
+// enables the whitelist: only answers from them are believed (none when ips
+// is empty). Servers that went away (a replaced CoreDNS pod) are removed.
 func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 	if len(ips) == 0 {
 		m.log.Errorw("No trusted DNS servers — all DNS responses will be rejected")
@@ -2102,6 +2102,7 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 		return fmt.Errorf("enabling DNS whitelist: %w", err)
 	}
 
+	want := make(map[dnsIPKey]bool, len(ips))
 	for _, ip := range ips {
 		var key dnsIPKey
 		ip4 := ip.To4()
@@ -2113,13 +2114,30 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 		} else {
 			copy(key.IP[:], ip.To16())
 		}
+		want[key] = true
 		if err := m.objs.TrustedDnsServers.Update(&key, &val, 0); err != nil {
 			return fmt.Errorf("adding trusted DNS server %s: %w", ip, err)
 		}
-		m.log.Infow("Added trusted DNS server", "ip", ip.String())
+	}
+	var stale []dnsIPKey
+	var k dnsIPKey
+	var v uint8
+	iter := m.objs.TrustedDnsServers.Iterate()
+	for iter.Next(&k, &v) {
+		if !want[k] {
+			stale = append(stale, k)
+		}
+	}
+	if err := iter.Err(); err != nil {
+		return fmt.Errorf("reading trusted DNS servers: %w", err)
+	}
+	for i := range stale {
+		if err := m.objs.TrustedDnsServers.Delete(&stale[i]); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("removing trusted DNS server %s: %w", netip.AddrFrom16(stale[i].IP).Unmap(), err)
+		}
 	}
 
-	m.log.Infow("DNS server whitelist enabled", "count", len(ips))
+	m.log.Infow("DNS server whitelist enabled", "count", len(ips), "removed", len(stale))
 	return nil
 }
 

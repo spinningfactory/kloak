@@ -108,17 +108,7 @@ func TestSecretMapOperations(t *testing.T) {
 func TestDnsIpMapOperations(t *testing.T) {
 	objs := loadTestObjects(t)
 
-	type dnsIpKey struct {
-		IP [16]byte
-	}
-	type dnsIpVal struct {
-		Hostname   [32]byte
-		HostLen    uint32
-		TtlSec     uint32
-		InsertedAt uint64
-	}
-
-	key := dnsIpKey{}
+	key := dnsIPKey{}
 	// IPv4-mapped-IPv6 for 1.2.3.4
 	key.IP[10] = 0xff
 	key.IP[11] = 0xff
@@ -127,55 +117,53 @@ func TestDnsIpMapOperations(t *testing.T) {
 	key.IP[14] = 3
 	key.IP[15] = 4
 
-	val := dnsIpVal{HostLen: 11, TtlSec: 300}
-	copy(val.Hostname[:], "example.com")
+	val := tlsuprobeDnsIpVal{HostLen: 11, TtlSec: 300}
+	for i, c := range []byte("example.com") {
+		val.Hostname[i] = int8(c)
+	}
 
 	if err := objs.DnsIpMap.Update(&key, &val, ebpf.UpdateAny); err != nil {
 		t.Fatalf("failed to update dns_ip_map: %v", err)
 	}
 
-	var got dnsIpVal
+	var got tlsuprobeDnsIpVal
 	if err := objs.DnsIpMap.Lookup(&key, &got); err != nil {
 		t.Fatalf("failed to lookup dns_ip_map: %v", err)
 	}
 	if got.HostLen != 11 {
 		t.Errorf("expected hostLen=11, got %d", got.HostLen)
 	}
-	if string(got.Hostname[:got.HostLen]) != "example.com" {
-		t.Errorf("expected 'example.com', got %q", string(got.Hostname[:got.HostLen]))
+	host := make([]byte, got.HostLen)
+	for i := range host {
+		host[i] = byte(got.Hostname[i])
+	}
+	if string(host) != "example.com" {
+		t.Errorf("expected 'example.com', got %q", host)
 	}
 }
 
 func TestConnIpMapOperations(t *testing.T) {
 	objs := loadTestObjects(t)
 
-	type connIpKey struct {
-		Tgid uint32
-		Fd   uint32
-	}
-	type connIpVal struct {
-		IP [16]byte
-	}
-
-	key := connIpKey{Tgid: 1234, Fd: 5}
-	val := connIpVal{}
+	key := tlsuprobeConnIpKey{Tgid: 1234, Fd: 5}
+	val := tlsuprobeConnIpVal{Port: 443}
 	// IPv4-mapped-IPv6 for 10.0.0.1
-	val.IP[10] = 0xff
-	val.IP[11] = 0xff
-	val.IP[12] = 10
-	val.IP[13] = 0
-	val.IP[14] = 0
-	val.IP[15] = 1
+	val.Ip[10] = 0xff
+	val.Ip[11] = 0xff
+	val.Ip[12] = 10
+	val.Ip[13] = 0
+	val.Ip[14] = 0
+	val.Ip[15] = 1
 
 	if err := objs.ConnIpMap.Update(&key, &val, ebpf.UpdateAny); err != nil {
 		t.Fatalf("failed to update conn_ip_map: %v", err)
 	}
 
-	var got connIpVal
+	var got tlsuprobeConnIpVal
 	if err := objs.ConnIpMap.Lookup(&key, &got); err != nil {
 		t.Fatalf("failed to lookup conn_ip_map: %v", err)
 	}
-	if got.IP[15] != 1 || got.IP[12] != 10 {
+	if got.Ip[15] != 1 || got.Ip[12] != 10 || got.Port != 443 {
 		t.Errorf("expected IP 10.0.0.1 mapped, got different IP")
 	}
 }
