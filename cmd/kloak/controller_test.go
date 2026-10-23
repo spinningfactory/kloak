@@ -7,6 +7,7 @@ import (
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
+	discoveryv1 "k8s.io/api/discovery/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -16,6 +17,7 @@ import (
 func newFakeReader(objs ...client.Object) client.Reader {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
+	_ = discoveryv1.AddToScheme(scheme)
 	return fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 }
 
@@ -55,6 +57,24 @@ func TestDiscoverTrustedDNSServers_DualStackKubeDNS(t *testing.T) {
 
 	if len(ips) != 2 || ips[0].String() != "10.43.0.10" || ips[1].String() != "fd43::a" {
 		t.Fatalf("expected both kube-dns ClusterIPs, got %v", ips)
+	}
+}
+
+func TestDiscoverTrustedDNSServers_KubeDNSEndpoints(t *testing.T) {
+	// Under socket load balancing (Cilium), answers come from the CoreDNS
+	// pods' addresses.
+	es := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: "kube-dns-abc", Namespace: "kube-system",
+			Labels: map[string]string{discoveryv1.LabelServiceName: "kube-dns"}},
+		AddressType: discoveryv1.AddressTypeIPv4,
+		Endpoints:   []discoveryv1.Endpoint{{Addresses: []string{"10.42.0.5"}}},
+	}
+	reader := newFakeReader(kubeDNSSvc("10.43.0.10"), es)
+	trustedDNSServers = ""
+
+	ips := discoverTrustedDNSServers(reader, zap.NewNop().Sugar())
+	if len(ips) != 2 || ips[0].String() != "10.43.0.10" || ips[1].String() != "10.42.0.5" {
+		t.Fatalf("expected the ClusterIP and the endpoint, got %v", ips)
 	}
 }
 

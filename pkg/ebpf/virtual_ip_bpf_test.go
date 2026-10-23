@@ -11,6 +11,7 @@ import (
 	"net/netip"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	ciliumebpf "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 	"github.com/cilium/ebpf/link"
 	"golang.org/x/net/dns/dnsmessage"
 	"golang.org/x/sys/unix"
@@ -256,6 +258,10 @@ func answerAddrs(t *testing.T, f []byte) []netip.Addr {
 	}
 }
 
+// tcPass is TC_ACT_UNSPEC (-1), the verdict kloak's tc programs give a
+// packet they let through: the next program on the hook (a CNI's) runs.
+const tcPass = ^uint32(0)
+
 func runTC(t *testing.T, prog *ciliumebpf.Program, in []byte) []byte {
 	t.Helper()
 	out := make([]byte, len(in))
@@ -263,8 +269,8 @@ func runTC(t *testing.T, prog *ciliumebpf.Program, in []byte) []byte {
 	if err != nil {
 		t.Fatalf("running %s: %v", prog, err)
 	}
-	if ret != 0 {
-		t.Fatalf("%s returned %d, want TC_ACT_OK", prog, ret)
+	if ret != tcPass {
+		t.Fatalf("%s returned %d, want TC_ACT_UNSPEC (pass on to the next program)", prog, int32(ret))
 	}
 	return out
 }
@@ -785,5 +791,150 @@ func TestVirtualIPConnectHelper(t *testing.T) {
 		fmt.Printf("connected %s\n", netip.AddrPortFrom(netip.AddrFrom4(p.Addr), uint16(p.Port)))
 	case *unix.SockaddrInet6:
 		fmt.Printf("connected %s\n", netip.AddrPortFrom(netip.AddrFrom16(p.Addr).Unmap(), uint16(p.Port)))
+	}
+}
+
+// socketLBPrograms stand in for a CNI's socket load balancer on an ancestor
+// cgroup (Cilium's kube-proxy replacement on the root cgroup): a connect to
+// svc:port goes to backend instead, and getpeername reports svc back.
+func socketLBPrograms(t *testing.T, svc, backend netip.Addr, port int) (connect, getpeername *ciliumebpf.Program) {
+	t.Helper()
+	ip := func(a netip.Addr) int64 { return int64(binary.NativeEndian.Uint32(a.AsSlice())) }
+	be16 := make([]byte, 2)
+	binary.BigEndian.PutUint16(be16, uint16(port))
+	portNative := int64(binary.NativeEndian.Uint16(be16))
+	const userIP4, userPort = 4, 24 // offsetof(struct bpf_sock_addr, user_ip4 / user_port)
+	prog := func(attach ciliumebpf.AttachType, from, to netip.Addr, matchPort bool) *ciliumebpf.Program {
+		insns := asm.Instructions{
+			asm.LoadMem(asm.R2, asm.R1, userIP4, asm.Word),
+			asm.JNE.Imm(asm.R2, int32(ip(from)), "out"),
+		}
+		if matchPort {
+			insns = append(insns,
+				asm.LoadMem(asm.R2, asm.R1, userPort, asm.Word),
+				asm.JNE.Imm(asm.R2, int32(portNative), "out"))
+		}
+		insns = append(insns,
+			asm.Mov.Imm32(asm.R2, int32(ip(to))),
+			asm.StoreMem(asm.R1, userIP4, asm.R2, asm.Word),
+			asm.Mov.Imm(asm.R0, 1).WithSymbol("out"),
+			asm.Return())
+		p, err := ciliumebpf.NewProgram(&ciliumebpf.ProgramSpec{
+			Type: ciliumebpf.CGroupSockAddr, AttachType: attach, Instructions: insns, License: "GPL",
+		})
+		if err != nil {
+			t.Fatalf("loading the socket LB program: %v", err)
+		}
+		t.Cleanup(func() { _ = p.Close() })
+		return p
+	}
+	return prog(ciliumebpf.AttachCGroupInet4Connect, svc, backend, true),
+		prog(ciliumebpf.AttachCgroupInet4GetPeername, backend, svc, false)
+}
+
+// TestVirtualIPConnectUnderSocketLB runs the connect hooks under a socket
+// load balancer that acts after them, as Cilium's does: kloak's hooks on a
+// cgroup, the balancer's on its parent. A connect to a fake IP is redirected
+// to the "Service" address, which the balancer replaces with a backend's.
+// The socket must still record that Service address for the IP and port
+// checks (vip_sock_dst), and getpeername must still report the fake IP.
+func TestVirtualIPConnectUnderSocketLB(t *testing.T) {
+	objs := loadVirtualIPObjects(t)
+	parent, _, cleanup, err := cgroups.CreateTransient("", fmt.Sprintf("vip-lb-test-%d", os.Getpid()))
+	if err != nil {
+		t.Skipf("cannot create a cgroup: %v", err)
+	}
+	t.Cleanup(func() { _ = cleanup() })
+	pods := filepath.Join(parent, "pods")
+	if err := os.Mkdir(pods, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(pods) })
+
+	svc, backend := netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("127.0.0.2")
+	ln, err := net.Listen("tcp4", backend.String()+":0") // only the backend listens
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	lbConnect, lbPeer := socketLBPrograms(t, svc, backend, port)
+	for _, a := range []struct {
+		path   string
+		prog   *ciliumebpf.Program
+		attach ciliumebpf.AttachType
+	}{
+		{pods, objs.VipConnect4, ciliumebpf.AttachCGroupInet4Connect},
+		{pods, objs.VipGetpeername4, ciliumebpf.AttachCgroupInet4GetPeername},
+		{parent, lbConnect, ciliumebpf.AttachCGroupInet4Connect},
+		{parent, lbPeer, ciliumebpf.AttachCgroupInet4GetPeername},
+	} {
+		l, err := link.AttachCgroup(link.CgroupOptions{Path: a.path, Attach: a.attach, Program: a.prog})
+		if err != nil {
+			t.Fatalf("attaching %s to %s: %v", a.attach, a.path, err)
+		}
+		t.Cleanup(func() { _ = l.Close() })
+	}
+
+	key := dnsIPKey{IP: vipTestFake.As16()}
+	val := vipIPValue(vipEntry{Host: "api.example.com"})
+	if err := objs.VipIpHost.Update(&key, &val, ciliumebpf.UpdateAny); err != nil {
+		t.Fatal(err)
+	}
+	var up vipUpstreamVal
+	up.Slot[0] = vipUpstreamSlot{IP: svc.As16(), ExpiresAt: bootNanos(t) + uint64(time.Minute)}
+	if err := objs.VipUpstream.Update(&key, &up, ciliumebpf.UpdateAny); err != nil {
+		t.Fatal(err)
+	}
+
+	sockDst := func(out string) netip.AddrPort {
+		t.Helper()
+		var cookie uint64
+		for _, line := range strings.Split(out, "\n") {
+			if _, err := fmt.Sscanf(line, "cookie %d", &cookie); err == nil {
+				break
+			}
+		}
+		var v tlsuprobeVipSockDstVal
+		if err := objs.VipSockDst.Lookup(&cookie, &v); err != nil {
+			t.Fatalf("no vip_sock_dst entry for cookie %d: %v", cookie, err)
+		}
+		return netip.AddrPortFrom(netip.AddrFrom16(v.Ip).Unmap(), v.Port)
+	}
+	want := netip.AddrPortFrom(svc, uint16(port))
+
+	// Through the fake IP: reaches the backend; the app sees the fake IP.
+	out := connectFromCgroup(t, pods, "4", netip.AddrPortFrom(vipTestFake, uint16(port)), netip.AddrPort{})
+	if !strings.Contains(out, fmt.Sprintf("connected %s:%d", vipTestFake, port)) {
+		t.Fatalf("connect to %s: %q, want getpeername to report the fake IP", vipTestFake, out)
+	}
+	if got := sockHost(t, objs, out); got != "api.example.com" {
+		t.Errorf("socket host %q", got)
+	}
+	if got := sockDst(out); got != want {
+		t.Errorf("recorded destination %s, want the Service address %s (not the backend)", got, want)
+	}
+
+	// Straight to the Service address: recorded as connected to, the
+	// balancer's getpeername reports it.
+	out = connectFromCgroup(t, pods, "4", want, netip.AddrPort{})
+	if !strings.Contains(out, "connected "+want.String()) {
+		t.Fatalf("connect to %s: %q", want, out)
+	}
+	if got := sockDst(out); got != want {
+		t.Errorf("recorded destination %s, want %s", got, want)
+	}
+	if got := sockHost(t, objs, out); got != "" {
+		t.Errorf("socket host %q for a connect without a fake IP", got)
 	}
 }

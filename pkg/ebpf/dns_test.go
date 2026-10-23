@@ -4,6 +4,8 @@ package ebpf
 
 import (
 	"net"
+	"net/netip"
+	"slices"
 	"testing"
 
 	ciliumebpf "github.com/cilium/ebpf"
@@ -189,5 +191,41 @@ func TestPopulateTrustedDNS_LookupMiss(t *testing.T) {
 	var val uint8
 	if err := dnsMap.Lookup(&key, &val); err == nil {
 		t.Error("untrusted IP should not be in the map")
+	}
+}
+
+// TestPopulateTrustedDNSServersSyncs checks that the trusted servers are
+// replaced, not only added to: a replaced CoreDNS pod's address must stop
+// being trusted.
+func TestPopulateTrustedDNSServersSyncs(t *testing.T) {
+	objs := loadTestObjects(t)
+	m := &TLSUprobeManager{objs: objs, log: testLog()}
+	trusted := func() []string {
+		t.Helper()
+		var out []string
+		var k dnsIPKey
+		var v uint8
+		iter := objs.TrustedDnsServers.Iterate()
+		for iter.Next(&k, &v) {
+			out = append(out, netip.AddrFrom16(k.IP).Unmap().String())
+		}
+		if err := iter.Err(); err != nil {
+			t.Fatal(err)
+		}
+		slices.Sort(out)
+		return out
+	}
+	if err := m.PopulateTrustedDNSServers([]net.IP{net.ParseIP("10.43.0.10"), net.ParseIP("10.42.0.5")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.PopulateTrustedDNSServers([]net.IP{net.ParseIP("10.43.0.10"), net.ParseIP("10.42.0.7"), net.ParseIP("fd43::a")}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := trusted(), []string{"10.42.0.7", "10.43.0.10", "fd43::a"}; !slices.Equal(got, want) {
+		t.Errorf("trusted servers %v, want %v", got, want)
+	}
+	var on uint8
+	if err := objs.DnsWhitelistEnabled.Lookup(uint32(0), &on); err != nil || on != 1 {
+		t.Errorf("whitelist enabled = %d, %v", on, err)
 	}
 }

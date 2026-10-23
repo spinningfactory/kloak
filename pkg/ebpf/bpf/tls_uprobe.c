@@ -672,6 +672,30 @@ struct {
   __type(value, struct vip_sock_host_val);
 } vip_sock_host SEC(".maps");
 
+// Socket cookie -> the address and port a TCP socket connected to, as
+// vip_connect4/6 leave the connect: after their own redirect, before a
+// connect hook further up the cgroup tree runs. A CNI's socket load balancer
+// there (Cilium's kube-proxy replacement, on the root cgroup) replaces a
+// Service's ClusterIP with a backend's, so the socket's own destination is
+// the backend. socket_filter_patches checks a secret's IP and port against
+// this instead, so that they mean the same with and without socket load
+// balancing: the address the app connected to, as kube-proxy (which DNATs
+// the packets, not the socket) leaves it. Removed when the socket closes;
+// without an entry (evicted, or the socket connected before the hooks were
+// attached), the socket's own destination is used.
+struct vip_sock_dst_val {
+  __u8 ip[16]; // IPv4-mapped or IPv6
+  __u16 port;  // host byte order
+  __u16 _pad;
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 65536); // = vip_sock_host
+  __type(key, __u64);
+  __type(value, struct vip_sock_dst_val);
+} vip_sock_dst SEC(".maps");
+
 // The (pod IP, host) pairs tc_dns_rewrite rewrites answers for: a pod gets
 // the fake IP of a host only if it references a secret restricted to that
 // host (its secret_acl bindings). An all-zero host stands for every watched
@@ -2917,8 +2941,10 @@ int tp_inet_sock_set_state(struct trace_event_raw_inet_sock_set_state *ctx) {
   bpf_map_delete_elem(&sni_state, &sk_key);
   if (ctx->newstate == TCP_CLOSE) {
     __u64 cookie = BPF_CORE_READ((struct sock *)ctx->skaddr, __sk_common.skc_cookie.counter);
-    if (cookie)
+    if (cookie) {
       bpf_map_delete_elem(&vip_sock_host, &cookie);
+      bpf_map_delete_elem(&vip_sock_dst, &cookie);
+    }
   }
   return 0;
 }
@@ -2943,7 +2969,8 @@ static __always_inline void sock_dst_addr(struct sock *sk, __u8 *out) {
 //   - a secret restricted to a hostname that is not the socket's SNI;
 //   - in virtual IP mode, a secret whose host, IP or port restriction the
 //     socket does not meet: the host of the fake IP it connected to
-//     (vip_sock_host), its real destination (sock_dst_addr) and port.
+//     (vip_sock_host), and the address and port it connected to
+//     (vip_sock_dst, else its own destination, sock_dst_addr).
 //     bpf_xor_path leaves these restrictions to this check;
 //   - outside virtual IP mode, every secret on an IPv6 socket: DNS snooping
 //     (to be removed, spinningfactory/kloak#327) attributes IPv4 connections
@@ -2969,6 +2996,12 @@ static __attribute__((noinline)) __u32 socket_filter_patches(__u64 sk_key,
   if (vip) {
     cookie = BPF_CORE_READ(sk, __sk_common.skc_cookie.counter);
     dport = __bpf_ntohs(BPF_CORE_READ(sk, __sk_common.skc_dport));
+    struct vip_sock_dst_val *dst =
+        cookie ? bpf_map_lookup_elem(&vip_sock_dst, &cookie) : NULL;
+    if (dst) {
+      __builtin_memcpy(daddr16, dst->ip, 16);
+      dport = dst->port;
+    }
   }
 
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
@@ -3690,6 +3723,16 @@ int tp_sched_process_exit(struct trace_event_raw_sched_process_template *ctx) {
 // The encrypted real secret NEVER exists in user-space memory.
 // =============================================================================
 
+// The verdict of the tc programs for a packet they let through (patched or
+// not): TC_ACT_UNSPEC hands it to the next program on the hook (TCX_NEXT
+// with TCX, the next filter with cls_bpf), such as a CNI's (Cilium's on the
+// pod's host-side veth); TC_ACT_OK would end the chain there. With no
+// program after, the packet passes.
+#ifndef TC_ACT_UNSPEC
+#define TC_ACT_UNSPEC (-1)
+#endif
+#define TC_PASS TC_ACT_UNSPEC
+
 // Max non-application_data records (CCS / handshake / alert) skipped at the
 // start of a segment before the first application_data record. 4 covers a
 // TLS 1.2 client's ClientKeyExchange + CCS + Finished and a TLS 1.3 client's
@@ -3712,12 +3755,12 @@ int tc_egress_patch(struct __sk_buff *skb) {
   // header; raw IP devices have none.
   __u16 l3_proto = skb->protocol;
   if (l3_proto != __bpf_htons(0x0800) && l3_proto != __bpf_htons(0x86DD))
-    return 0 /* TC_ACT_OK */;
+    return TC_PASS;
   __u32 l3_off = 0;
   {
     struct ethhdr *eth = data;
     if ((void *)(eth + 1) > data_end)
-      return 0 /* TC_ACT_OK */;
+      return TC_PASS;
     if (eth->h_proto == l3_proto)
       l3_off = sizeof(struct ethhdr);
     // else: raw IP, l3_off stays 0
@@ -3738,12 +3781,12 @@ int tc_egress_patch(struct __sk_buff *skb) {
   if (l3_proto == __bpf_htons(0x0800)) {
     struct iphdr *ip = data + l3_off;
     if ((void *)(ip + 1) > data_end)
-      return 0 /* TC_ACT_OK */;
+      return TC_PASS;
     if (ip->protocol != 6) // Not TCP
-      return 0 /* TC_ACT_OK */;
+      return TC_PASS;
     ip_hdr_len = ip->ihl * 4;
     if (ip_hdr_len < 20)
-      return 0 /* TC_ACT_OK */;
+      return TC_PASS;
     l4_len = __bpf_ntohs(ip->tot_len) - ip_hdr_len;
     __u32 daddr = ip->daddr; // fallback: the packet's
     if (bsk) {
@@ -3756,11 +3799,11 @@ int tc_egress_patch(struct __sk_buff *skb) {
   } else {
     struct ipv6hdr *ip6 = data + l3_off;
     if ((void *)(ip6 + 1) > data_end)
-      return 0 /* TC_ACT_OK */;
+      return TC_PASS;
     // TCP right after the fixed header: a Linux TCP socket sends no
     // extension headers of its own.
     if (ip6->nexthdr != 6)
-      return 0 /* TC_ACT_OK */;
+      return TC_PASS;
     ip_hdr_len = sizeof(struct ipv6hdr);
     l4_len = __bpf_ntohs(ip6->payload_len);
     __builtin_memcpy(key.dst_ip, &ip6->daddr, 16); // fallback: the packet's
@@ -3779,11 +3822,11 @@ int tc_egress_patch(struct __sk_buff *skb) {
   // Parse TCP header
   struct tcphdr *tcp = data + l3_off + ip_hdr_len;
   if ((void *)(tcp + 1) > data_end)
-    return 0 /* TC_ACT_OK */;
+    return TC_PASS;
 
   __u32 tcp_hdr_len = tcp->doff * 4;
   if (tcp_hdr_len < 20)
-    return 0 /* TC_ACT_OK */;
+    return TC_PASS;
 
   // Save header fields to locals before helper calls invalidate direct pointers.
   __u16 sport = tcp->source;
@@ -3821,13 +3864,13 @@ int tc_egress_patch(struct __sk_buff *skb) {
       }
       // Whether we patched or not, return — this segment is a continuation,
       // not a new TLS record. Don't process it further.
-      return 0 /* TC_ACT_OK */;
+      return TC_PASS;
     }
   }
 
   // Check TLS record framing (cheap, no map lookup).
   if (payload_len < 5)
-    return 0 /* TC_ACT_OK */;
+    return TC_PASS;
 
   // Offset of the TCP payload; ghash_record_tcp_off below is relative to it.
   __u32 tcp_payload_start = payload_off;
@@ -3845,7 +3888,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
   int rec_kind = TLS_REC_INVALID;
   for (__u32 i = 0; i <= TC_MAX_LEADING_RECORDS; i++) {
     if (bpf_skb_load_bytes(skb, payload_off, tls_hdr, 5) < 0)
-      return 0 /* TC_ACT_OK */;
+      return TC_PASS;
 #ifdef KLOAK_DEBUG
     bpf_printk("kloak tc tls_hdr=%x ver=%x%x plen=%u", tls_hdr[0], tls_hdr[1], tls_hdr[2], payload_len);
 #endif
@@ -3855,7 +3898,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
     payload_off += 5 + record_len;
   }
   if (rec_kind != TLS_REC_APPDATA)
-    return 0 /* TC_ACT_OK */;
+    return TC_PASS;
 
   // Now that we know this is a valid TLS application_data record, look up
   // the pending entry. This avoids map lookups on non-TLS packets.
@@ -3864,7 +3907,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
 #ifdef KLOAK_DEBUG
     bpf_printk("kloak [3-TC] MISS sport=%u cg=%x", __bpf_ntohs(sport), (__u32)key.cgroup_id);
 #endif
-    return 0 /* TC_ACT_OK */;
+    return TC_PASS;
   }
 
   // TCP sequence check: only patch the segment that contains the password data.
@@ -3879,7 +3922,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
 #ifdef KLOAK_DEBUG
       bpf_printk("kloak [3-TC] SEQ-SKIP pkt=%u ws=%u", pkt_seq, pending->write_seq);
 #endif
-      return 0 /* TC_ACT_OK */; // wrong segment — keep tc_pending active
+      return TC_PASS; // wrong segment — keep tc_pending active
     }
   }
 
@@ -3950,7 +3993,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
   // minimum is 24; for TLS 1.3 (nonce_len=0), minimum is 17. Without this check,
   // the subtraction underflows for small records with the wrong nonce_len.
   if (record_len < 16 + nonce_len)
-    return 0 /* TC_ACT_OK */;
+    return TC_PASS;
 
   __u32 ct_len = record_len - 16 - nonce_len;
 
@@ -3960,7 +4003,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
   __u32 zero = 0;
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w)
-    return 0 /* TC_ACT_OK */;
+    return TC_PASS;
 
   __u32 pc = pending->patch_count;
   if (pc > XOR_MAX_PATCHES) pc = XOR_MAX_PATCHES;
@@ -3985,7 +4028,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
   __u32 patches_applied = 0;
   for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++) {
     w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-    if (!w) return 0 /* TC_ACT_OK */;
+    if (!w) return TC_PASS;
 
     __u32 sec_off = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_offset;
     __u32 sec_len = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len;
@@ -4019,7 +4062,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
     if (pending) pending->active = 0;
   } else {
     // No patches applied — don't proceed to GHASH (nothing changed).
-    return 0 /* TC_ACT_OK */;
+    return TC_PASS;
   }
 
 #ifdef KLOAK_DEBUG
@@ -4031,7 +4074,7 @@ int tc_egress_patch(struct __sk_buff *skb) {
 #ifdef KLOAK_DEBUG
   bpf_printk("kloak [4-PATCH] TAILCALL_FAILED");
 #endif
-  return 0 /* TC_ACT_OK */;
+  return TC_PASS;
 }
 
 // =============================================================================
@@ -4045,7 +4088,7 @@ int tc_ghash_update(struct __sk_buff *skb) {
   __u32 zero = 0;
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w || !w->ghash_active)
-    return 0 /* TC_ACT_OK */;
+    return TC_PASS;
   w->ghash_active = 0;
 
   // Copy H power table from tls_conn_state.
@@ -4053,7 +4096,7 @@ int tc_ghash_update(struct __sk_buff *skb) {
 
   w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w)
-    return 0 /* TC_ACT_OK */;
+    return TC_PASS;
 
   __u32 ct_len = w->ghash_ct_len;
   __u32 nonce_len = w->ghash_nonce_len;
@@ -4082,7 +4125,7 @@ int tc_ghash_update(struct __sk_buff *skb) {
 
   w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w)
-    return 0 /* TC_ACT_OK */;
+    return TC_PASS;
 
   // Try to read the old tag from the current segment.
   if (bpf_skb_load_bytes(skb, tag_offset, w->old_tag, 16) >= 0) {
@@ -4112,7 +4155,7 @@ int tc_ghash_update(struct __sk_buff *skb) {
 #endif
   }
 
-  return 0 /* TC_ACT_OK */;
+  return TC_PASS;
 }
 
 // =============================================================================
@@ -4140,9 +4183,6 @@ int tc_ghash_update(struct __sk_buff *skb) {
 // tc_egress_patch key on as before.
 // =============================================================================
 
-#ifndef TC_ACT_OK
-#define TC_ACT_OK 0
-#endif
 #ifndef TC_ACT_SHOT
 #define TC_ACT_SHOT 2
 #endif
@@ -4217,10 +4257,10 @@ int tc_dns_rewrite(struct __sk_buff *skb) {
   __u32 zero = 0;
   struct vip_config_val *cfg = bpf_map_lookup_elem(&vip_config, &zero);
   if (!cfg || !cfg->mask4)
-    return TC_ACT_OK;
+    return TC_PASS;
   __u16 l3_proto = skb->protocol;
   if (l3_proto != __bpf_htons(0x0800) && l3_proto != __bpf_htons(0x86DD))
-    return TC_ACT_OK;
+    return TC_PASS;
 
   // Ethernet header if present (see tc_egress_patch).
   __u32 l3_off = 0;
@@ -4231,7 +4271,7 @@ int tc_dns_rewrite(struct __sk_buff *skb) {
 
   struct dns_rewrite_buf *buf = bpf_map_lookup_elem(&dns_rewrite_scratch, &zero);
   if (!buf)
-    return TC_ACT_OK;
+    return TC_PASS;
   // The answer's source (the resolver) and destination (the pod), as 16-byte
   // addresses.
   __u8 src[16];
@@ -4240,26 +4280,26 @@ int tc_dns_rewrite(struct __sk_buff *skb) {
   if (l3_proto == __bpf_htons(0x0800)) {
     struct iphdr ip;
     if (bpf_skb_load_bytes(skb, l3_off, &ip, sizeof(ip)))
-      return TC_ACT_OK;
+      return TC_PASS;
     if (ip.version != 4 || ip.protocol != IPPROTO_UDP)
-      return TC_ACT_OK;
+      return TC_PASS;
     // A fragment carries only part of the message (MF or a fragment offset).
     if (ip.frag_off & __bpf_htons(0x3FFF))
-      return TC_ACT_OK;
+      return TC_PASS;
     __u32 ihl = ip.ihl * 4;
     if (ihl < sizeof(struct iphdr))
-      return TC_ACT_OK;
+      return TC_PASS;
     l4_off = l3_off + ihl;
     ipv4_to_mapped(src, (const __u8 *)&ip.saddr);
     ipv4_to_mapped(pk->pod_ip, (const __u8 *)&ip.daddr);
   } else {
     struct ipv6hdr ip6;
     if (bpf_skb_load_bytes(skb, l3_off, &ip6, sizeof(ip6)))
-      return TC_ACT_OK;
+      return TC_PASS;
     // UDP right after the fixed header: a message behind extension headers,
     // a fragment header included, is left unchanged.
     if (ip6.version != 6 || ip6.nexthdr != IPPROTO_UDP)
-      return TC_ACT_OK;
+      return TC_PASS;
     l4_off = l3_off + sizeof(struct ipv6hdr);
     __builtin_memcpy(src, &ip6.saddr, 16);
     __builtin_memcpy(pk->pod_ip, &ip6.daddr, 16);
@@ -4267,12 +4307,12 @@ int tc_dns_rewrite(struct __sk_buff *skb) {
 
   struct udphdr udp;
   if (bpf_skb_load_bytes(skb, l4_off, &udp, sizeof(udp)))
-    return TC_ACT_OK;
+    return TC_PASS;
   if (udp.source != __bpf_htons(53))
-    return TC_ACT_OK;
+    return TC_PASS;
 
   if (!dns_server_trusted(src))
-    return TC_ACT_OK;
+    return TC_PASS;
 
   // A message larger than the copy buffer could hold records past it: left
   // unchanged, like the DNS snooping that reads at most MAX_DNS_PKT.
@@ -4281,15 +4321,15 @@ int tc_dns_rewrite(struct __sk_buff *skb) {
   // variable-length copy below.
   __u64 udp_len = __bpf_ntohs(udp.len);
   if (udp_len < sizeof(struct udphdr) + 12)
-    return TC_ACT_OK;
+    return TC_PASS;
   barrier_var(udp_len);
   if (udp_len > sizeof(struct udphdr) + MAX_DNS_PKT)
-    return TC_ACT_OK;
+    return TC_PASS;
   __u32 msg_len = udp_len - sizeof(struct udphdr);
 
   __u32 msg_off = l4_off + sizeof(struct udphdr);
   if (bpf_skb_load_bytes(skb, msg_off, buf->msg, msg_len))
-    return TC_ACT_OK;
+    return TC_PASS;
 
   struct dns_question *q = &buf->q;
   __builtin_memset(q, 0, sizeof(*q));
@@ -4297,16 +4337,16 @@ int tc_dns_rewrite(struct __sk_buff *skb) {
   if (q->status == DNS_SCAN_RUNNING)
     bpf_loop(DNS_QNAME_STEPS, dns_question_cb, NULL, 0);
   if (dns_question_end(q) != DNS_SCAN_OK)
-    return TC_ACT_OK;
+    return TC_PASS;
   // An A question gets the host's fake IPv4, an AAAA question its fake IPv6.
   __u32 qtype = q->qtype;
   int six = qtype == DNS_TYPE_AAAA;
   if (!six && qtype != DNS_TYPE_A)
-    return TC_ACT_OK;
+    return TC_PASS;
   // q->qname is laid out as a watched_host_key.
   struct vip_host_val *hv = bpf_map_lookup_elem(&vip_host_ip, q->qname);
   if (!hv)
-    return TC_ACT_OK;
+    return TC_PASS;
   struct dns_ip_key fk = {}; // the fake IP, as vip_upstream's key
   if (six)
     __builtin_memcpy(fk.ip, hv->ip6, 16);
@@ -4315,7 +4355,7 @@ int tc_dns_rewrite(struct __sk_buff *skb) {
   // No fake IP of the question's family (an all-zero ip6: no IPv6 range),
   // or one the range no longer holds: the answer is left unchanged.
   if (!vip_addr_in_range(cfg, fk.ip))
-    return TC_ACT_OK;
+    return TC_PASS;
 
   // Only for a pod with a secret for the host (the answer's destination is
   // the pod's address): any other pod keeps the real addresses, and DNS
@@ -4325,7 +4365,7 @@ int tc_dns_rewrite(struct __sk_buff *skb) {
     __builtin_memset(pk->host, 0, MAX_HOST_LEN);
     if (!bpf_map_lookup_elem(&vip_pod_host, pk)) {
       dbg_inc(DBG_VIP_DNS_UNBOUND);
-      return TC_ACT_OK;
+      return TC_PASS;
     }
   }
 
@@ -4336,11 +4376,11 @@ int tc_dns_rewrite(struct __sk_buff *skb) {
   if (dns_answers_end(a) != DNS_SCAN_OK) {
     // The app gets the real addresses: DNS snooping still names the host.
     dbg_inc(DBG_VIP_DNS_UNCHANGED);
-    return TC_ACT_OK;
+    return TC_PASS;
   }
   __u32 n = a->n_recs;
   if (n == 0)
-    return TC_ACT_OK; // e.g. no address of the question's family
+    return TC_PASS; // e.g. no address of the question's family
 
   // Record the real addresses before handing out the fake IP, so a connect
   // that follows the answer finds them.
@@ -4367,9 +4407,9 @@ int tc_dns_rewrite(struct __sk_buff *skb) {
     recorded = 1;
   }
   if (!recorded)
-    return TC_ACT_OK;
+    return TC_PASS;
   if (bpf_map_update_elem(&vip_upstream, &fk, up, BPF_ANY))
-    return TC_ACT_OK; // nowhere to redirect to: leave the real addresses
+    return TC_PASS; // nowhere to redirect to: leave the real addresses
 
   // The record data to write: the fake IPv6, or the fake IPv4's 4 bytes.
   if (six)
@@ -4398,7 +4438,7 @@ int tc_dns_rewrite(struct __sk_buff *skb) {
   bpf_printk("kloak [vip] dns rewrite host=%s records=%u fake=%pI6", q->qname,
              n, fk.ip);
 #endif
-  return TC_ACT_OK;
+  return TC_PASS;
 }
 
 // vip_redirect decides where a connect to dst (IPv4-mapped or IPv6) goes:
@@ -4446,27 +4486,49 @@ static __always_inline int vip_redirect(struct bpf_sock_addr *ctx,
   return 1;
 }
 
-// vip_peer_fake copies to fake the fake IP a socket connected to, if peer
-// (IPv4-mapped or IPv6) and the port getpeername reports are where
-// vip_redirect sent it. Returns 0 otherwise.
+// vip_peer_fake copies to fake the fake IP a socket connected to, and sets
+// the port getpeername reports to the one the app connected to, if the
+// socket's last connect went to a fake IP (vip_forget_host clears it
+// otherwise). Returns 0 when it did not. The address getpeername reports
+// (peer) is not checked: a socket load balancer acting after vip_redirect
+// (Cilium's) replaces the real address it chose with a backend's. peer is
+// only used to keep the family: a fake IPv4 for an IPv4 peer.
 static __always_inline int vip_peer_fake(struct bpf_sock_addr *ctx,
                                          const __u8 *peer, __u8 *fake) {
   struct bpf_sock *sk = ctx->sk;
   if (!sk)
     return 0;
   struct vip_sock_val *sv = bpf_sk_storage_get(&vip_sock, sk, 0, 0);
-  if (!sv || sv->port != ctx->user_port || !vip_addr_eq(sv->real_ip, peer))
+  if (!sv || vip_addr_v4mapped(sv->fake_ip) != vip_addr_v4mapped(peer))
     return 0;
   __builtin_memcpy(fake, sv->fake_ip, 16);
+  ctx->user_port = sv->port;
   return 1;
 }
 
-// vip_forget_host drops the host a socket's earlier connect recorded, when
-// it connects anywhere but a fake IP: a TCP socket can connect again after a
-// failed connect, a UDP socket at any time.
+// vip_forget_host drops what a socket's earlier connect to a fake IP
+// recorded (its host, and the fake IP getpeername reports), when it connects
+// anywhere but a fake IP: a TCP socket can connect again after a failed
+// connect, a UDP socket at any time.
 static __always_inline void vip_forget_host(struct bpf_sock_addr *ctx) {
   __u64 cookie = bpf_get_socket_cookie(ctx);
   bpf_map_delete_elem(&vip_sock_host, &cookie);
+  struct bpf_sock *sk = ctx->sk;
+  if (sk)
+    bpf_sk_storage_delete(&vip_sock, sk);
+}
+
+// vip_record_dst records where a TCP socket connects (vip_sock_dst): dst
+// (IPv4-mapped or IPv6) and the connect's port.
+static __always_inline void vip_record_dst(struct bpf_sock_addr *ctx,
+                                           const __u8 *dst) {
+  if (ctx->type != 1) // SOCK_STREAM
+    return;
+  struct vip_sock_dst_val v = {};
+  __builtin_memcpy(v.ip, dst, 16);
+  v.port = __bpf_ntohs((__u16)ctx->user_port);
+  __u64 cookie = bpf_get_socket_cookie(ctx);
+  bpf_map_update_elem(&vip_sock_dst, &cookie, &v, BPF_ANY);
 }
 
 // bpf_sock_addr's user_ip6 as a 16-byte address, read word by word (the
@@ -4497,8 +4559,11 @@ int vip_connect4(struct bpf_sock_addr *ctx) {
     __u32 real4;
     __builtin_memcpy(&real4, &real[12], 4);
     ctx->user_ip4 = real4;
+    vip_record_dst(ctx, real);
   } else {
     vip_forget_host(ctx);
+    if (r < 0)
+      vip_record_dst(ctx, dst);
   }
   return r != 0; // 0: EPERM
 }
@@ -4511,10 +4576,14 @@ int vip_connect6(struct bpf_sock_addr *ctx) {
   __u32 dst[4], real[4];
   vip_user_ip6(ctx, dst);
   int r = vip_redirect(ctx, (const __u8 *)dst, (__u8 *)real);
-  if (r == 1)
+  if (r == 1) {
     vip_set_user_ip6(ctx, real);
-  else
+    vip_record_dst(ctx, (const __u8 *)real);
+  } else {
     vip_forget_host(ctx);
+    if (r < 0)
+      vip_record_dst(ctx, (const __u8 *)dst);
+  }
   return r != 0;
 }
 

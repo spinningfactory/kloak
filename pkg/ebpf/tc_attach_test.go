@@ -311,3 +311,120 @@ func TestAttachTCProgram_AutoUsesTCXWhenAvailable(t *testing.T) {
 		t.Errorf("TCX path installed %d clsact filters", n)
 	}
 }
+
+// cniProgram returns a sched_cls program standing in for a CNI's on the same
+// hook: it counts the packets it sees in count[0] and returns TC_ACT_OK, a
+// final verdict, like Cilium's.
+func cniProgram(t *testing.T) (*ebpf.Program, *ebpf.Map) {
+	t.Helper()
+	count, err := ebpf.NewMap(&ebpf.MapSpec{Type: ebpf.Array, KeySize: 4, ValueSize: 8, MaxEntries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = count.Close() })
+	prog, err := ebpf.NewProgram(&ebpf.ProgramSpec{
+		Type: ebpf.SchedCLS,
+		Instructions: asm.Instructions{
+			asm.StoreImm(asm.R10, -4, 0, asm.Word),
+			asm.LoadMapPtr(asm.R1, count.FD()),
+			asm.Mov.Reg(asm.R2, asm.R10),
+			asm.Add.Imm(asm.R2, -4),
+			asm.FnMapLookupElem.Call(),
+			asm.JEq.Imm(asm.R0, 0, "out"),
+			asm.Mov.Imm(asm.R1, 1),
+			asm.StoreXAdd(asm.R0, asm.R1, asm.DWord),
+			asm.Mov.Imm(asm.R0, 0).WithSymbol("out"),
+			asm.Return(),
+		},
+		License: "GPL",
+	})
+	if err != nil {
+		t.Skipf("cannot load sched_cls program: %v", err)
+	}
+	t.Cleanup(func() { _ = prog.Close() })
+	return prog, count
+}
+
+// sendUDPOverLoopback sends a datagram to 127.0.0.1 from the calling
+// thread's netns: it crosses lo's tc ingress hook.
+func sendUDPOverLoopback(t *testing.T) {
+	t.Helper()
+	fd, err := unix.Socket(unix.AF_INET, unix.SOCK_DGRAM, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = unix.Close(fd) }()
+	if err := unix.Sendto(fd, []byte("kloak"), 0, &unix.SockaddrInet4{Port: 9, Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestTCChainKeepsOtherPrograms checks that kloak's tc programs share their
+// hook with a CNI's: the patch runs first (TCX head, cls_bpf priority 1),
+// so a CNI program that redirects cannot hide packets from it, and lets the
+// packet on (TC_ACT_UNSPEC), so the CNI program still sees every packet.
+func TestTCChainKeepsOtherPrograms(t *testing.T) {
+	objs := loadTestObjects(t)
+	for _, mode := range []TCAttachMode{TCAttachTCX, TCAttachClsact} {
+		t.Run(string(mode), func(t *testing.T) {
+			e := newTCTestEnv(t)
+			e.inTestNS(t)
+			cni, count := cniProgram(t)
+			// The CNI's program is there first, as it is on a pod's veth.
+			if mode == TCAttachTCX {
+				l, err := link.AttachTCX(link.TCXOptions{Interface: e.ifindex, Program: cni, Attach: ebpf.AttachTCXIngress})
+				if errors.Is(err, ebpf.ErrNotSupported) {
+					t.Skip("kernel has no TCX")
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = l.Close() }()
+			} else {
+				if err := netlink.QdiscAdd(&netlink.GenericQdisc{
+					QdiscAttrs: netlink.QdiscAttrs{LinkIndex: e.ifindex, Handle: netlink.MakeHandle(0xffff, 0), Parent: netlink.HANDLE_CLSACT},
+					QdiscType:  "clsact",
+				}); err != nil {
+					t.Fatal(err)
+				}
+				if err := netlink.FilterAdd(&netlink.BpfFilter{
+					FilterAttrs: netlink.FilterAttrs{LinkIndex: e.ifindex, Parent: netlink.HANDLE_MIN_INGRESS,
+						Handle: 1, Priority: clsactFilterPriority + 1, Protocol: unix.ETH_P_ALL},
+					Fd: cni.FD(), Name: "cni", DirectAction: true,
+				}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			c, err := testManager(mode).attachTCProgram(objs.TcEgressPatch, e.ifindex, true, e.nsFile)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = c.Close() }()
+
+			if mode == TCAttachTCX {
+				res, err := link.QueryPrograms(link.QueryOptions{Target: e.ifindex, Attach: ebpf.AttachTCXIngress})
+				if err != nil {
+					t.Fatal(err)
+				}
+				info, err := objs.TcEgressPatch.Info()
+				if err != nil {
+					t.Fatal(err)
+				}
+				id, _ := info.ID()
+				if len(res.Programs) != 2 || res.Programs[0].ID != id {
+					t.Fatalf("TCX chain %+v: want kloak's program (id %d) first of 2", res.Programs, id)
+				}
+			}
+
+			sendUDPOverLoopback(t)
+			var n uint64
+			if err := count.Lookup(uint32(0), &n); err != nil {
+				t.Fatal(err)
+			}
+			if n == 0 {
+				t.Error("the CNI's program saw no packet: kloak's ended the chain")
+			}
+		})
+	}
+}

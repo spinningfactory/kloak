@@ -1,0 +1,34 @@
+# The controller trusts DNS answers from kube-dns: its Service's ClusterIPs
+# and its endpoints' addresses, where answers come from when the CNI load
+# balances Services at the socket (Cilium's kube-proxy replacement). It
+# watches both, as CoreDNS pods are replaced; only in kube-system.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kloak-controller-kube-dns
+  namespace: kube-system
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kloak-controller-kube-dns
+  namespace: kube-system
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kloak-controller-kube-dns
+subjects:
+  - kind: ServiceAccount
+    name: kloak-controller
+    namespace: {{ .Release.Namespace }}

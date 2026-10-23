@@ -20,7 +20,8 @@ const (
 	// clsactFilterPriority is the cls_bpf priority Kloak uses. Lower runs
 	// first; 1 puts the patch ahead of filters a CNI may install that
 	// redirect the packet (a redirect ends the filter chain, so a patch
-	// placed after it would never run).
+	// placed after it would never run). Kloak's programs return
+	// TC_ACT_UNSPEC, so the filters after it still run.
 	clsactFilterPriority = 1
 	// clsactFilterHandle identifies Kloak's filter within that priority
 	// ("kl"). It must be fixed: classic tc filters outlive the process that
@@ -64,7 +65,10 @@ func (m *TLSUprobeManager) attachTCProgram(prog *ebpf.Program, ifindex int, ingr
 		if ingress {
 			attach = ebpf.AttachTCXIngress
 		}
-		l, err := attachTCX(link.TCXOptions{Interface: ifindex, Program: prog, Attach: attach})
+		// First on the hook: a program before it (a CNI's) could redirect
+		// the packet, and the patch would never run. Kloak's programs
+		// return TC_ACT_UNSPEC (TCX_NEXT), so the others still run.
+		l, err := attachTCX(link.TCXOptions{Interface: ifindex, Program: prog, Attach: attach, Anchor: link.Head()})
 		if err == nil {
 			return l, nil
 		}
