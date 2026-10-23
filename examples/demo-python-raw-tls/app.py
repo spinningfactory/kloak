@@ -24,6 +24,11 @@ import sys
 import time
 
 LISTEN_PORT = 8443
+# Seconds a request may take (connect, handshake, echo). Without a timeout a
+# connect to an address that went away (a Service recreated with another
+# ClusterIP, still in DNS caches until its TTL runs out) blocks for the
+# kernel's SYN retries, about two minutes, and so does the whole loop.
+REQUEST_TIMEOUT = 5
 
 
 def load_secret(env_var, default):
@@ -51,7 +56,7 @@ def send_and_echo(host, server_name, secret_allowed, secret_blocked):
     # Resolve the service name via DNS, then connect: the lookup returns the
     # name's virtual IP, and the socket that connects to it carries the host
     # for host-based filtering.
-    with socket.create_connection((host, LISTEN_PORT)) as sock:
+    with socket.create_connection((host, LISTEN_PORT), timeout=REQUEST_TIMEOUT) as sock:
         with ctx.wrap_socket(sock, server_hostname=server_name) as tls:
             payload = f"ALLOWED={secret_allowed}\nBLOCKED={secret_blocked}\n"
             tls.sendall(payload.encode())
