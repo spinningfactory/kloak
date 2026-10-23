@@ -242,9 +242,15 @@ deploy_demo() {
         kubectl annotate -f - getkloak.io/hosts="example.com" --local -o yaml | \
         kubectl apply -f -
     
-    # Wait a moment for cleanup
-    sleep 2
-    
+    # The webhook refuses a pod until the shadows of its secrets exist.
+    echo "Waiting for the shadow secrets..."
+    for s in secret-allowed secret-blocked; do
+        until kubectl get secret "$s-kloak" -n "$DEMO_NAMESPACE" >/dev/null 2>&1; do
+            echo -n "."
+            sleep 1
+        done
+    done
+
     # Apply the demo deployments (webhook should mutate pods)
     kubectl apply -f "$SCRIPT_DIR/demo-python/deployment.yaml" -n "$DEMO_NAMESPACE"
     kubectl apply -f "$SCRIPT_DIR/demo-go/deployment.yaml" -n "$DEMO_NAMESPACE"

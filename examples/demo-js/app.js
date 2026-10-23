@@ -83,17 +83,6 @@ async function main() {
   );
   console.log("=".repeat(60));
 
-  // Brief delay for the kloak controller to attach uprobes before the first
-  // TLS connection. This used to be load-bearing: with connection pooling, all
-  // requests reused the first connection's SSL_CTX, so losing the attach race
-  // against that first connection meant every later request missed the rewrite
-  // permanently (kprobe_walk frozen while the demo cycled 100+ requests). We
-  // now open a fresh connection per request (agent: false + Connection: close
-  // in makeRequest), so a late attach is picked up on the next request and this
-  // delay is only a minor head-start. Mirrors examples/demo-go/main.go.
-  console.log("Waiting 10s for Kloak controller to sync...");
-  await new Promise((r) => setTimeout(r, 10000));
-
   let requestCount = 0;
   while (true) {
     requestCount++;

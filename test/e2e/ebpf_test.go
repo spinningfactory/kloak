@@ -604,7 +604,6 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 
 	// Clean up deployment before next subtest
 	_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
-	time.Sleep(2 * time.Second)
 }
 
 // TestEBPFSecretLengths verifies that secrets of different lengths (8 to 100 bytes)
@@ -654,7 +653,6 @@ func TestEBPFSecretLengths(t *testing.T) {
 			}
 			t.Cleanup(func() {
 				_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
-				time.Sleep(2 * time.Second)
 			})
 
 			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
