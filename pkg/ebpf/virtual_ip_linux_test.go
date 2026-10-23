@@ -397,6 +397,65 @@ func TestBindPodNetworkKeepsCgroups(t *testing.T) {
 	}
 }
 
+// TestRebindRevokesLostGrants checks that rebinding a pod revokes at once,
+// without a sync, what its previous binding granted and the new one does
+// not, and keeps what another pod's binding grants.
+func TestRebindRevokesLostGrants(t *testing.T) {
+	objs := loadTestObjects(t)
+	m := &TLSUprobeManager{
+		objs:       objs,
+		log:        zap.NewNop().Sugar(),
+		bindings:   make(map[string]podBinding),
+		virtualIPs: &virtualIPAllocator{},
+		lastSnapshot: []secrets.Secret{
+			{OwnerID: "ns/api", Key: "token", Shadow: "kl::token-placeholder-0001", Host: "api.example.com"},
+			{OwnerID: "ns/db", Key: "password", Shadow: "kl::db-placeholder-000003", Host: "db.example.com"},
+		},
+	}
+	api := []secrets.Ref{{OwnerID: "ns/api"}}
+	apiAndDB := []secrets.Ref{{OwnerID: "ns/api"}, {OwnerID: "ns/db"}}
+	addr := func(s string) []netip.Addr { return []netip.Addr{netip.MustParseAddr(s)} }
+	check := func(step string) {
+		t.Helper()
+		if got, want := aclEntries(t, objs.SecretAcl), secretACL(m.lastSnapshot, m.bindings); !maps.Equal(got, want) {
+			t.Errorf("%s: secret_acl has %d entries, want the %d the bindings grant", step, len(got), len(want))
+		}
+		got := make(map[vipPodHostKey]struct{})
+		var k vipPodHostKey
+		var v uint8
+		iter := objs.VipPodHost.Iterate()
+		for iter.Next(&k, &v) {
+			got[k] = struct{}{}
+		}
+		if err := iter.Err(); err != nil {
+			t.Fatal(err)
+		}
+		if want := vipPodHosts(m.lastSnapshot, m.bindings, false); !maps.Equal(got, want) {
+			t.Errorf("%s: vip_pod_host = %q, want %q", step, vipPodHostStrings(got), vipPodHostStrings(want))
+		}
+	}
+
+	m.BindPodSecrets("uid", "ns/app", addr("10.42.0.7"), []uint64{41, 42}, apiAndDB)
+	check("bound")
+
+	// Container 42 restarted as 43, the pod spec now references only the
+	// api secret, and the pod moved to a new address.
+	m.BindPodSecrets("uid", "ns/app", addr("10.42.0.8"), []uint64{41, 43}, api)
+	check("rebound")
+	for k := range aclEntries(t, objs.SecretAcl) {
+		if k.CgroupID == 42 {
+			t.Errorf("the restarted container's cgroup kept its grants")
+			break
+		}
+	}
+
+	// A new pod already holds the old address with the same secret: it
+	// keeps its virtual IP host when the first pod moves away again.
+	m.BindPodSecrets("uid-new", "ns/new", addr("10.42.0.8"), []uint64{51}, api)
+	m.BindPodSecrets("uid", "ns/app", addr("10.42.0.9"), []uint64{41, 43}, api)
+	check("address reused")
+}
+
 // TestAttachPodDNSRewriteNetns attaches tc_dns_rewrite in a network
 // namespace given by path, as the container runtime reports it while it
 // creates a pod sandbox (NRI), before the pod has any process.
