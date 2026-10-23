@@ -124,7 +124,7 @@ struct scratch_buf {
   __u8  h_fresh;        // 1: bpf_h_extract stored this write's H in tls_conn_state
   __u32 host_offset;
   __u32 host_value_len; // length of extracted host value
-  __u32 xor_fd;         // socket fd resolved by resolve_host (for tc_pending key)
+  __u8  memory_bio;     // 1: the TLS library writes to a memory BIO (see xor_pending_val)
   // Multiple secret matches per SSL_write (up to 4).
   // xor_path processes one match per invocation and tail-calls back to itself.
   #define XOR_MAX_MATCHES 4
@@ -611,6 +611,15 @@ struct {
   __type(value, struct vip_config_val);
 } vip_config SEC(".maps");
 
+// Virtual IP mode: the host, IP and port restrictions are checked on the
+// socket a record leaves on (socket_filter_patches), not through the DNS
+// chain of resolve_host.
+static __always_inline int vip_mode(void) {
+  __u32 zero = 0;
+  struct vip_config_val *cfg = bpf_map_lookup_elem(&vip_config, &zero);
+  return cfg && cfg->mask4;
+}
+
 static __always_inline int vip_in_range(const struct vip_config_val *cfg,
                                         __u32 ip4) {
   return cfg->mask4 && (ip4 & cfg->mask4) == cfg->net4;
@@ -822,7 +831,7 @@ struct xor_pending_val {
   struct xor_patch patches[XOR_MAX_PATCHES];
   __u8  active;
   __u8  chain_type;         // 0=OpenSSL/BoringSSL, CHAIN_GO_TLS=Go crypto/tls
-  __u8  memory_bio;         // 1=fd resolution failed (memory BIO app like Node.js)
+  __u8  memory_bio;         // 1=memory BIO (Node.js, Bun): the app sends the record later, maybe after other sends
   __u8  h_valid;            // 1 if ghash_h was populated at uprobe time (libcrypto-hook path)
   __u32 plaintext_len;      // SSL_write data length (for TLS version detection in tc)
   __u64 created_at;         // bpf_ktime_get_ns() — for TTL-based cleanup (memory BIO)
@@ -1937,7 +1946,8 @@ static __always_inline __u32 ssl_read_fd(__u64 ssl_ptr) {
 }
 
 // =============================================================================
-// Resolve host and port for the current SSL/TLS connection using DNS chain.
+// Resolve host and port for the current SSL/TLS connection using DNS chain
+// (dns-snoop mode; in virtual-ip mode it only clears them).
 //
 // Chain: ssl_fd_map (cache) -> BIO fd read -> last_verified_fd -> conn_ip_map -> dns_ip_map
 //
@@ -1948,11 +1958,13 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
                                          __u64 ssl_ptr, __u32 bio_fd) {
   scratch_data->host_offset = 0;
   scratch_data->host_value_len = 0;
-  scratch_data->xor_fd = 0;
   __builtin_memset(scratch_data->host_value, 0, MAX_HOST_LEN);
   scratch_data->dest_port = 0;
   __builtin_memset(scratch_data->ip_value, 0, 16);
   scratch_data->ip_len = 0;
+
+  if (vip_mode())
+    return;
 
   __u64 pid_tgid = bpf_get_current_pid_tgid();
   __u32 tgid = (__u32)(pid_tgid >> 32);
@@ -2013,7 +2025,6 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
 
   // If we have a cached fd, try it directly
   if (found) {
-    scratch_data->xor_fd = fd;
     struct conn_ip_key cik = {.tgid = tgid, .fd = fd};
     struct conn_ip_val *civ = bpf_map_lookup_elem(&conn_ip_map, &cik);
     if (!civ) { dbg_inc(DBG_RESOLVE_NO_CONN); return; }
@@ -2053,7 +2064,6 @@ static __always_inline void resolve_host(struct scratch_buf *scratch_data,
       scratch_data->ip_len = 16;
       __builtin_memcpy(scratch_data->host_value, div->hostname, MAX_HOST_LEN);
       scratch_data->host_value_len = div->host_len;
-      scratch_data->xor_fd = try_fd;
       bpf_map_update_elem(&last_verified_fd, &tgid, &try_fd, BPF_ANY);
       dbg_inc(DBG_RESOLVE_FD_SCAN_HIT);
       return;
@@ -2392,7 +2402,7 @@ int bpf_xor_path(void *ctx) {
     wi->staged_pending.active = 1;
     wi->staged_pending.chain_type = sd->chain_type;
     wi->staged_pending.plaintext_len = sd->total_data_len;
-    wi->staged_pending.memory_bio = (sd->xor_fd == 0) ? 1 : 0;
+    wi->staged_pending.memory_bio = sd->memory_bio;
     wi->staged_pending.created_at = bpf_ktime_get_ns();
 
     // For OpenSSL/BoringSSL, if h_extract just populated tls_conn_state
@@ -2431,8 +2441,7 @@ int bpf_xor_path(void *ctx) {
   // Virtual IP mode: the host, IP and port restrictions are checked on the
   // socket the record leaves on, at tcp_sendmsg (socket_filter_patches),
   // not on resolve_host's guess of the connection.
-  struct vip_config_val *vcfg = bpf_map_lookup_elem(&vip_config, &zero);
-  int on_socket = vcfg && vcfg->mask4;
+  int on_socket = vip_mode();
 
   struct secret_value *val = bpf_map_lookup_elem(&secret_map, &key);
   if (!val || val->len == 0 || val->len > SECRET_MAX_LEN)
@@ -3449,7 +3458,8 @@ h_ready:;
 //   ARM64:  R0=receiver,  R1=data,  R2=len    (pt_regs: regs[1], regs[2])
 //
 // Go doesn't call SSL_set_tlsext_host_name.
-// resolve_host() uses the DNS chain (last_verified_fd -> conn_ip_map -> dns_ip_map).
+// In dns-snoop mode, resolve_host() uses the DNS chain (last_verified_fd ->
+// conn_ip_map -> dns_ip_map).
 // -----------------------------------------------------------------------------
 
 SEC("uprobe/go_tls_write")
@@ -3505,6 +3515,10 @@ int bpf_uprobe_go_tls_write(void *ctx) {
   scratch_data->user_data_ptr = (__u64)data_ptr;
   scratch_data->read_len = read_len;
   scratch_data->total_data_len = (__u32)data_len;
+
+  // crypto/tls writes each record to its net.Conn within Write, so the
+  // record leaves on the next tcp_sendmsg, as with a socket BIO.
+  scratch_data->memory_bio = 0;
 
   // resolve_host uses last_verified_fd -> conn_ip_map -> dns_ip_map for Go.
   resolve_host(scratch_data, 0, 0);
@@ -3614,6 +3628,10 @@ int bpf_uprobe_ssl_write(void *ctx) {
   scratch_data->user_data_ptr = (__u64)data_ptr;
   scratch_data->read_len = read_len;
   scratch_data->total_data_len = (__u32)num;
+
+  // A socket BIO holds the connection's fd (a client socket, checked above);
+  // a memory BIO (Node.js, Bun) holds none.
+  scratch_data->memory_bio = bio_fd == 0;
 
   // Look up hostname via DNS chain: ssl_fd_map -> conn_ip_map -> dns_ip_map
   resolve_host(scratch_data, (__u64)ssl_ptr, bio_fd);

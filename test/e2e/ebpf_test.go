@@ -304,10 +304,11 @@ var ebpfTests = []ebpfRewriteTest{
 	},
 }
 
-// TestEBPFRawTLSHostFiltering tests that DNS-verified host filtering works with
-// raw TLS sockets (non-HTTP). A TLS echo server runs in its own pod behind a K8s
-// Service. The client resolves the Service name via DNS, which populates dns_ip_map,
-// enabling host-based secret filtering at the TCP level.
+// TestEBPFRawTLSHostFiltering tests that host filtering works with raw TLS
+// sockets (non-HTTP). A TLS echo server runs in its own pod behind a K8s
+// Service. The client resolves the Service name via DNS, which gives it the
+// name's virtual IP (in dns-snoop mode, populates dns_ip_map), enabling
+// host-based secret filtering at the TCP level.
 func TestEBPFRawTLSHostFiltering(t *testing.T) {
 	// The Service FQDN as it appears in DNS responses from CoreDNS.
 	echoHostFQDN := "tls." + testNamespace + ".svc.cluster.local"
