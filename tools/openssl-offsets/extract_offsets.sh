@@ -136,10 +136,28 @@ fi
 # transform checked below, so the offset is emitted only when every check
 # passes; otherwise 0 (recovery disabled) with status "unrecognized", which
 # fails TestOpenSSLOffsets_AgainstReferenceJSON until a human reviews it. The
-# checks read sources, not built objects, so both arches agree.
+# checks read sources, not built objects, so both arches agree. They find the
+# C code by what it defines, not by file name: 4.1 moved it from
+# cipher_aes_gcm_hw_{aesni,vaes_avx512}.inc into cipher_aes_hw_aesni.c.
 AVX512_PL=crypto/modes/asm/aes-gcm-avx512.pl
-AESNI_INC=providers/implementations/ciphers/cipher_aes_gcm_hw_aesni.inc
-VAES_INC=providers/implementations/ciphers/cipher_aes_gcm_hw_vaes_avx512.inc
+CIPHERS_DIR=providers/implementations/ciphers
+
+# Prints the one cipher source that matches the ERE $1; fails if none or
+# several do.
+cipher_source() {
+    local files
+    files=$(grep -lE "$1" "$CIPHERS_DIR"/*.c "$CIPHERS_DIR"/*.inc 2>/dev/null || true)
+    if [ -z "$files" ] || [ "$(printf '%s\n' "$files" | wc -l)" -ne 1 ]; then
+        echo "hkey1: expected one file in $CIPHERS_DIR matching '$1', found: $(printf '%s' "${files:-none}" | tr '\n' ' ')" >&2
+        return 1
+    fi
+    printf '%s\n' "$files"
+}
+
+# Prints the definition of the PROV_GCM_HW getter $2 in file $1.
+gcm_hw_getter() {
+    awk -v name="$2" 'index($0, "const PROV_GCM_HW *" name "(") == 1 { f = 1 } f { print } f && /^}/ { exit }' "$1"
+}
 
 # The instruction sequence (comments and whitespace stripped) between
 # HashKey = AES_K(0) and the HashKey_1 store that gf128_halve_to_h inverts.
@@ -161,13 +179,33 @@ vmovdqu64 %xmm16,@{[HashKeyByIdx(1,$arg2)]}'
 # tree matches; returns non-zero (printing the reason to stderr) otherwise.
 vaes_hkey1_offset() {
     # (a) The x86 dispatch still chooses only between these three GCM paths.
-    dispatch=$(sed -n '/^const PROV_GCM_HW \*ossl_prov_aes_hw_gcm/,/^}/p' "$AESNI_INC" | \
-        grep -o 'return &[a-z_]*' | sed 's/return &//' | LC_ALL=C sort -u | tr '\n' ' ')
+    # Up to 4.0 the getter that returns vaes_gcm (ossl_prov_aes_hw_gcm) also
+    # returns the other two; from 4.1 it (ossl_prov_aes_hw_gcm_aesni) returns
+    # NULL without AES-NI, which the generic ossl_prov_aes_hw_gcm replaces.
+    x86_src=$(cipher_source 'return &vaes_gcm;') || return 1
+    x86_getter=$(awk '/^const PROV_GCM_HW \*[a-z0-9_]+\(/ { name = $0; sub(/^const PROV_GCM_HW \*/, "", name); sub(/\(.*/, "", name) }
+                      /return &vaes_gcm;/ { print name; exit }' "$x86_src")
+    x86_body=$(gcm_hw_getter "$x86_src" "$x86_getter")
+    if [ -z "$x86_body" ]; then
+        echo "hkey1: no PROV_GCM_HW getter returns vaes_gcm in $x86_src" >&2; return 1
+    fi
+    targets=$(printf '%s\n' "$x86_body" | grep -o 'return &[a-z0-9_]*' | sed 's/return &//')
+    if printf '%s\n' "$x86_body" | grep -qF 'return NULL;'; then
+        generic_src=$(cipher_source '^const PROV_GCM_HW \*ossl_prov_aes_hw_gcm\(size_t keybits\)') || return 1
+        generic_body=$(gcm_hw_getter "$generic_src" ossl_prov_aes_hw_gcm)
+        if ! printf '%s\n' "$generic_body" | grep -qF "= ${x86_getter}();"; then
+            echo "hkey1: ossl_prov_aes_hw_gcm in $generic_src no longer calls $x86_getter" >&2; return 1
+        fi
+        targets="$targets
+$(printf '%s\n' "$generic_body" | grep -o '&[a-z_][a-z0-9_]*' | sed 's/&//')"
+    fi
+    dispatch=$(printf '%s\n' "$targets" | grep . | LC_ALL=C sort -u | tr '\n' ' ')
     if [ "$dispatch" != "aes_gcm aesni_gcm vaes_gcm " ]; then
-        echo "hkey1: unexpected GCM dispatch: $dispatch" >&2; return 1
+        echo "hkey1: unexpected GCM dispatch in $x86_getter: $dispatch" >&2; return 1
     fi
     # (b) vaes_gcm_setkey zeroes the context and leaves H to the asm.
-    setkey=$(sed -n '/^static int vaes_gcm_setkey/,/^}/p' "$VAES_INC")
+    vaes_src=$(cipher_source '^static int vaes_gcm_setkey\(') || return 1
+    setkey=$(sed -n '/^static int vaes_gcm_setkey/,/^}/p' "$vaes_src")
     for want in 'memset(gcmctx, 0, sizeof(*gcmctx));' 'gcmctx->key = ks;' \
                 'ossl_aes_gcm_init_avx512(ks, gcmctx);'; do
         if ! printf '%s\n' "$setkey" | grep -qF "$want"; then
@@ -207,18 +245,31 @@ vaes_hkey1_offset() {
 
 ALGCTX_TO_VAES_HKEY1=0
 VAES_HKEY1_STATUS="not_applicable"   # no AVX-512 GCM path in this version (3.0)
+VAES_HKEY1_REASON=""
 if [ -f "$AVX512_PL" ]; then
     VAES_HKEY1_STATUS="unrecognized"
-    if offs=$(vaes_hkey1_offset); then
+    hkey1_log=$(mktemp)
+    if offs=$(vaes_hkey1_offset 2>"$hkey1_log"); then
         hkey1_in_gcm=${offs% *}
         asm_htable=${offs#* }
         if [ -n "$ALGCTX_TO_GCM" ] && [ "$asm_htable" = "$GCM128_HTABLE_OFFSET" ]; then
             ALGCTX_TO_VAES_HKEY1=$((ALGCTX_TO_GCM + hkey1_in_gcm))
             VAES_HKEY1_STATUS="ok"
         else
-            echo "hkey1: asm Htable offset $asm_htable != pahole $GCM128_HTABLE_OFFSET" >&2
+            echo "hkey1: asm Htable offset $asm_htable != pahole $GCM128_HTABLE_OFFSET" >>"$hkey1_log"
         fi
     fi
+    VAES_HKEY1_REASON=$(cat "$hkey1_log")
+    rm -f "$hkey1_log"
+    [ -z "$VAES_HKEY1_REASON" ] || printf '%s\n' "$VAES_HKEY1_REASON" >&2
+fi
+
+# An unrecognized layout carries its reason in the JSON, so the auto-PR and the
+# reference-JSON test say which check failed.
+VAES_HKEY1_REASON_FIELD=""
+if [ "$VAES_HKEY1_STATUS" = "unrecognized" ]; then
+    VAES_HKEY1_REASON_FIELD="
+  \"vaes_hkey1_reason\": $(printf '%s' "${VAES_HKEY1_REASON:-no reason reported}" | jq -Rs .),"
 fi
 
 # Chain type
@@ -240,7 +291,7 @@ cat <<EOF
   "openssl_version": "${OPENSSL_VERSION}",
   "arch": "${ARCH}",
   "chain": "${CHAIN}",
-  "vaes_hkey1_status": "${VAES_HKEY1_STATUS}",
+  "vaes_hkey1_status": "${VAES_HKEY1_STATUS}",${VAES_HKEY1_REASON_FIELD}
   "offsets": {
     "ssl_to_wrl": ${SSL_TO_WRL:-null},
     "ssl_to_enc_write_ctx": ${SSL_TO_ENC_WRITE_CTX:-null},
