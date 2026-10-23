@@ -3,14 +3,21 @@
 package ebpf
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/ringbuf"
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+
+	"github.com/spinningfactory/kloak/pkg/logging"
 )
 
 func TestIsTLSLibrary(t *testing.T) {
@@ -360,5 +367,47 @@ func TestAttachUprobesOncePerContainer(t *testing.T) {
 	}
 	if got := len(m.takeCgroupLinks(2)); got != 2 {
 		t.Errorf("container 2 has %d links, want 2", got)
+	}
+}
+
+// TestPollersStopWithContext checks that the ring buffer pollers, blocked in
+// Read with no record coming, return once their context is done, and that
+// the manager's Close can still close their readers.
+func TestPollersStopWithContext(t *testing.T) {
+	objs := loadTestObjects(t)
+	reader, err := ringbuf.NewReader(objs.SecretBindingEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	procReader, err := ringbuf.NewReader(objs.ProcEvents)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Trace logging also runs the debug counters' ticker, which must stop
+	// too.
+	core, _ := observer.New(logging.TraceLevel)
+	m := &TLSUprobeManager{objs: objs, log: zap.New(core).Sugar(), reader: reader, procReader: procReader}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 2)
+	go func() { done <- m.PollEvents(ctx) }()
+	go func() { done <- m.PollExecEvents(ctx) }()
+	time.Sleep(100 * time.Millisecond) // let both block in Read
+	cancel()
+	for range 2 {
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("poller returned %v, want nil", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("a poller still runs after its context is done")
+		}
+	}
+	if err := reader.Close(); err != nil {
+		t.Errorf("closing the closed reader: %v", err)
+	}
+	if err := procReader.Close(); err != nil {
+		t.Errorf("closing the closed proc reader: %v", err)
 	}
 }
