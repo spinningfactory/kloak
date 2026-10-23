@@ -79,6 +79,9 @@ type opensslReferenceJSON struct {
 	// VAESHKey1Status is "ok", "not_applicable" (no AVX-512 GCM path) or
 	// "unrecognized" (asm layout changed — HashKey_1 recovery disabled).
 	VAESHKey1Status string `json:"vaes_hkey1_status"`
+	// VAESHKey1Reason names the discovery check that failed; set only when
+	// VAESHKey1Status is "unrecognized".
+	VAESHKey1Reason string `json:"vaes_hkey1_reason"`
 	KloakConfig     struct {
 		SSLToWRL          *uint32 `json:"SSLToWRL"`
 		WRLToEncCtx       *uint32 `json:"WRLToEncCtx"`
@@ -168,10 +171,11 @@ func TestOpenSSLOffsets_AgainstReferenceJSON(t *testing.T) {
 					t.Errorf("vaes_hkey1_status=not_applicable but AlgctxToVAESHKey1=%d in %s", *ref.KloakConfig.AlgctxToVAESHKey1, base)
 				}
 			case "unrecognized":
-				t.Errorf("%s: OpenSSL's AVX-512 GCM layout was not recognised by discovery, so "+
+				t.Errorf("%s: OpenSSL's AVX-512 GCM layout was not recognised by discovery (%s), so "+
 					"HashKey_1 recovery is disabled and OpenSSL %s cannot be rewritten on AVX-512+VAES CPUs. "+
-					"Review crypto/modes/asm/aes-gcm-avx512.pl against gf128_halve_to_h and update "+
-					"tools/openssl-offsets/extract_offsets.sh", base, version)
+					"If upstream only moved code, update the checks in tools/openssl-offsets/extract_offsets.sh; "+
+					"if the HashKey_1 precompute changed, review crypto/modes/asm/aes-gcm-avx512.pl against "+
+					"gf128_halve_to_h", base, ref.VAESHKey1Reason, version)
 			default:
 				t.Errorf("unexpected vaes_hkey1_status %q in %s — re-run discovery", ref.VAESHKey1Status, base)
 			}

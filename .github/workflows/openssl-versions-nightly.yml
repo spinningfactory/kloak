@@ -12,6 +12,9 @@ name: OpenSSL Versions Nightly
 #   1. discover  — rebuild offset JSONs for every supported (OpenSSL, arch) cell
 #                  and diff against the committed tools/openssl-offsets/results/.
 #                  Catches struct-layout drift in patch releases.
+#      prerelease-canary — run discovery on the newest pre-release of an
+#                  unreleased minor and fail if its result is unusable, so an
+#                  upstream refactor is handled weeks before watcher's PR.
 #   2. e2e       — exercise demo-python-raw-tls end-to-end against every supported
 #                  OpenSSL version. Catches BPF-interaction regressions that the
 #                  unit tests (offset arithmetic only) cannot see.
@@ -44,6 +47,7 @@ jobs:
     outputs:
       versions: ${{ steps.resolve.outputs.versions }}
       e2e_versions: ${{ steps.resolve.outputs.e2e_versions }}
+      canary: ${{ steps.resolve.outputs.canary }}
     steps:
       - uses: actions/checkout@v7
 
@@ -51,16 +55,28 @@ jobs:
         id: resolve
         run: |
           set -euo pipefail
-          # All stable releases, newest-first. First occurrence of each major.minor
-          # is the latest patch for that minor series.
           curl -fsS \
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/openssl/openssl/releases?per_page=100" \
-            | jq -r '.[] | select(.prerelease == false and .draft == false) | .tag_name' \
+            > releases.json
+          # All stable releases, newest-first. First occurrence of each major.minor
+          # is the latest patch for that minor series.
+          jq -r '.[] | select(.prerelease == false and .draft == false) | .tag_name' releases.json \
             | grep '^openssl-[0-9]' \
             | sed 's/^openssl-//' \
             | awk -F. '!seen[$1"."$2]++ { print }' > upstream-latest-by-minor.txt
           cat upstream-latest-by-minor.txt
+
+          # Newest pre-release of a minor with no stable release yet (e.g.
+          # 4.2.0-alpha1 before 4.2.0 ships), for prerelease-canary. Empty
+          # between a minor's release and the next one's first alpha.
+          canary=$(jq -r '.[] | select(.prerelease == true and .draft == false) | .tag_name' releases.json \
+            | { grep '^openssl-[0-9]' || true; } \
+            | sed 's/^openssl-//' \
+            | awk -F. 'NR==FNR { stable[$1"."$2] = 1; next } !stable[$1"."$2] { print; exit }' \
+                upstream-latest-by-minor.txt -)
+          echo "Pre-release canary: ${canary:-none}"
+          echo "canary=$canary" >> "$GITHUB_OUTPUT"
 
           # Tracked minors derived from committed reference JSON filenames.
           ls tools/openssl-offsets/results/ \
@@ -158,6 +174,57 @@ jobs:
           name: openssl-offsets-${{ matrix.openssl }}-${{ steps.arch.outputs.arch }}
           path: out/openssl-${{ matrix.openssl }}-${{ steps.arch.outputs.arch }}.json
           retention-days: 30
+
+  # ────────────────────────────────────────────────────────────────────
+  # (1b) Pre-release canary — discovery for the newest pre-release of a minor
+  # that has no stable release yet. Upstream refactors land in the alphas
+  # (4.1.0-alpha1 already moved the x86 GCM code that discovery reads, six
+  # weeks before 4.1.0), so this fails while extract_offsets.sh can still be
+  # fixed before detect-new-version opens the release's PR. amd64 only: the
+  # HashKey_1 checks read sources, and struct layouts have matched across
+  # arches in every committed result.
+  prerelease-canary:
+    name: Discover pre-release ${{ needs.resolve-matrix.outputs.canary }}
+    runs-on: ubuntu-latest
+    needs: [resolve-matrix]
+    if: needs.resolve-matrix.outputs.canary != ''
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build discovery image
+        run: |
+          docker buildx build \
+            --platform linux/amd64 \
+            --build-arg OPENSSL_VERSION=${{ needs.resolve-matrix.outputs.canary }} \
+            --load \
+            -t offsets:canary \
+            tools/openssl-offsets/
+
+      - name: Run discovery
+        run: |
+          mkdir -p out
+          docker run --rm --platform linux/amd64 offsets:canary \
+            > out/openssl-${{ needs.resolve-matrix.outputs.canary }}-amd64.json
+          cat out/openssl-${{ needs.resolve-matrix.outputs.canary }}-amd64.json
+
+      - name: Check the result is usable
+        run: |
+          if ! tools/openssl-offsets/check-results.sh out/*.json; then
+            echo "::error::OpenSSL ${{ needs.resolve-matrix.outputs.canary }}: discovery cannot produce a working table row; fix tools/openssl-offsets/extract_offsets.sh before the release"
+            exit 1
+          fi
+
+      - name: Upload result
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: openssl-offsets-canary-${{ needs.resolve-matrix.outputs.canary }}-amd64
+          path: out/
+          retention-days: 30
+          if-no-files-found: ignore
 
   # ────────────────────────────────────────────────────────────────────
   # (2) Multi-version e2e — exercises the real BPF rewrite path against a
@@ -412,6 +479,38 @@ jobs:
         run: |
           tools/openssl-offsets/apply-new-versions.sh "${{ steps.find.outputs.new }}"
 
+      # A result TestOpenSSLOffsets_AgainstReferenceJSON would reject still
+      # gets its PR (the place to do the work), but as a draft whose body says
+      # which discovery check failed.
+      - name: Check discovery results
+        id: check
+        if: steps.find.outputs.new != ''
+        run: |
+          set -euo pipefail
+          files=()
+          for v in $(echo "${{ steps.find.outputs.new }}" | tr ',' ' '); do
+            files+=("tools/openssl-offsets/results/openssl-$v-amd64.json" "tools/openssl-offsets/results/openssl-$v-arm64.json")
+          done
+          if problems=$(tools/openssl-offsets/check-results.sh "${files[@]}"); then
+            echo "draft=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf '%s\n' "$problems" | while IFS= read -r line; do echo "::warning::$line"; done
+          echo "draft=always-true" >> "$GITHUB_OUTPUT"
+          {
+            echo 'review<<KLOAK_REVIEW_EOF'
+            echo '### ⚠️ Needs work before merge'
+            echo
+            echo 'Discovery could not turn these results into a working `opensslOffsetTable` row, so `TestOpenSSLOffsets_AgainstReferenceJSON` fails on this PR:'
+            echo
+            echo '```'
+            printf '%s\n' "$problems"
+            echo '```'
+            echo
+            echo 'If upstream only moved code, fix the checks in `tools/openssl-offsets/extract_offsets.sh` on `main` and re-run this workflow: it regenerates this PR.'
+            echo 'KLOAK_REVIEW_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Open PR
         if: steps.find.outputs.new != ''
         uses: peter-evans/create-pull-request@v8
@@ -433,6 +532,7 @@ jobs:
           commit-message: "chore(openssl): add offset support for OpenSSL ${{ steps.find.outputs.new }}"
           branch: auto/openssl-versions/${{ steps.find.outputs.new }}
           delete-branch: true
+          draft: ${{ steps.check.outputs.draft }}
           title: "chore(openssl): add offset support for OpenSSL ${{ steps.find.outputs.new }}"
           labels: |
             automated
@@ -441,6 +541,8 @@ jobs:
             Automated by `.github/workflows/openssl-versions-nightly.yml`.
 
             New OpenSSL release(s) detected on GitHub: **${{ steps.find.outputs.new }}**.
+
+            ${{ steps.check.outputs.review }}
 
             Changes in this PR:
             - New `tools/openssl-offsets/results/openssl-<v>-<arch>.json` per (version, arch).
