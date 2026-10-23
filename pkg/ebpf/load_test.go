@@ -34,12 +34,6 @@ func TestLoadObjects(t *testing.T) {
 	if objs.BpfUprobeSslWrite == nil {
 		t.Error("BpfUprobeSslWrite program not loaded")
 	}
-	if objs.KprobeUdpRecvmsg == nil {
-		t.Error("KprobeUdpRecvmsg program not loaded")
-	}
-	if objs.KretprobeUdpRecvmsg == nil {
-		t.Error("KretprobeUdpRecvmsg program not loaded")
-	}
 	if objs.TpEnterConnect == nil {
 		t.Error("TpEnterConnect program not loaded")
 	}
@@ -105,43 +99,6 @@ func TestSecretMapOperations(t *testing.T) {
 	}
 }
 
-func TestDnsIpMapOperations(t *testing.T) {
-	objs := loadTestObjects(t)
-
-	key := dnsIPKey{}
-	// IPv4-mapped-IPv6 for 1.2.3.4
-	key.IP[10] = 0xff
-	key.IP[11] = 0xff
-	key.IP[12] = 1
-	key.IP[13] = 2
-	key.IP[14] = 3
-	key.IP[15] = 4
-
-	val := tlsuprobeDnsIpVal{HostLen: 11, TtlSec: 300}
-	for i, c := range []byte("example.com") {
-		val.Hostname[i] = int8(c)
-	}
-
-	if err := objs.DnsIpMap.Update(&key, &val, ebpf.UpdateAny); err != nil {
-		t.Fatalf("failed to update dns_ip_map: %v", err)
-	}
-
-	var got tlsuprobeDnsIpVal
-	if err := objs.DnsIpMap.Lookup(&key, &got); err != nil {
-		t.Fatalf("failed to lookup dns_ip_map: %v", err)
-	}
-	if got.HostLen != 11 {
-		t.Errorf("expected hostLen=11, got %d", got.HostLen)
-	}
-	host := make([]byte, got.HostLen)
-	for i := range host {
-		host[i] = byte(got.Hostname[i])
-	}
-	if string(host) != "example.com" {
-		t.Errorf("expected 'example.com', got %q", host)
-	}
-}
-
 func TestConnIpMapOperations(t *testing.T) {
 	objs := loadTestObjects(t)
 
@@ -187,25 +144,5 @@ func TestTrackedTgidsMapOperations(t *testing.T) {
 
 	if err := objs.TrackedTgids.Delete(tgid); err != nil {
 		t.Fatalf("failed to untrack tgid: %v", err)
-	}
-}
-
-func TestWatchedHostsMapOperations(t *testing.T) {
-	objs := loadTestObjects(t)
-
-	var key watchedHostKey
-	copy(key.Host[:], "api.stripe.com")
-	val := uint8(1)
-
-	if err := objs.WatchedHosts.Update(&key, &val, 0); err != nil {
-		t.Fatalf("failed to update watched_hosts: %v", err)
-	}
-
-	var got uint8
-	if err := objs.WatchedHosts.Lookup(&key, &got); err != nil {
-		t.Fatalf("failed to lookup watched_hosts: %v", err)
-	}
-	if got != 1 {
-		t.Errorf("expected 1, got %d", got)
 	}
 }

@@ -18,36 +18,6 @@ import (
 	"time"
 )
 
-// HostResolutionMode selects how the data plane works out which host a TLS
-// connection is going to (spinningfactory/kloak#327).
-type HostResolutionMode string
-
-const (
-	// HostResolutionDNSSnoop reads DNS answers as pods receive them
-	// (udp_recvmsg) and keeps a node-wide IP -> host map. Deprecated, to be
-	// removed.
-	HostResolutionDNSSnoop HostResolutionMode = "dns-snoop"
-	// HostResolutionVirtualIP gives every watched host a stable fake IP
-	// (and fake IPv6) from reserved ranges, kept in maps pinned in bpffs,
-	// hands it to the pods with a secret for the host in DNS answers, and
-	// decides a host-restricted secret on the socket that connected to it.
-	// The controller's default.
-	HostResolutionVirtualIP HostResolutionMode = "virtual-ip"
-)
-
-// ParseHostResolutionMode validates a --host-resolution value. Empty means
-// virtual-ip, the default.
-func ParseHostResolutionMode(s string) (HostResolutionMode, error) {
-	switch HostResolutionMode(strings.ToLower(strings.TrimSpace(s))) {
-	case "", HostResolutionVirtualIP:
-		return HostResolutionVirtualIP, nil
-	case HostResolutionDNSSnoop:
-		return HostResolutionDNSSnoop, nil
-	default:
-		return "", fmt.Errorf("invalid host resolution mode %q (want dns-snoop or virtual-ip)", s)
-	}
-}
-
 // DefaultVirtualIPRange is the default --virtual-ip-range: the IPv4 and IPv6
 // ranges reserved for benchmarking (RFC 2544, RFC 5180), which should never
 // be routed. The IPv6 one is global unicast as far as address selection
@@ -143,24 +113,20 @@ func parseVirtualIPPrefix(s string) (netip.Prefix, error) {
 	return p, nil
 }
 
-// HostResolutionConfig is the host resolution setup of a TLSUprobeManager.
-// It is passed at construction rather than through a setter because
-// whether the virtual IP maps are pinned is decided when the BPF objects
-// are loaded.
+// HostResolutionConfig is the host resolution setup of a TLSUprobeManager:
+// every watched host gets a stable fake IP (and fake IPv6) from
+// VirtualIPRanges, kept in maps pinned in bpffs, the pods with a secret for
+// the host get it in DNS answers, and a host-restricted secret is decided on
+// the socket that connected to it (spinningfactory/kloak#327). It is passed
+// at construction rather than through a setter because the virtual IP maps
+// are pinned when the BPF objects are loaded.
 type HostResolutionConfig struct {
-	// Mode is the host resolution mode. Empty means dns-snoop, which needs
-	// no ranges (the controller's default, virtual-ip, does).
-	Mode HostResolutionMode
-	// VirtualIPRanges are the ranges fake IPs come from (virtual-ip mode
-	// only; see ParseVirtualIPRanges).
+	// VirtualIPRanges are the ranges fake IPs come from (see
+	// ParseVirtualIPRanges).
 	VirtualIPRanges VirtualIPRanges
 	// PinPath is the bpffs directory the virtual IP maps are pinned in.
 	// Empty means DefaultBPFPinPath.
 	PinPath string
-}
-
-func (c *HostResolutionConfig) virtualIP() bool {
-	return c.Mode == HostResolutionVirtualIP
 }
 
 func (c *HostResolutionConfig) pinPath() string {
@@ -171,22 +137,15 @@ func (c *HostResolutionConfig) pinPath() string {
 }
 
 func (c *HostResolutionConfig) validate() error {
-	switch c.Mode {
-	case "", HostResolutionDNSSnoop:
-		return nil
-	case HostResolutionVirtualIP:
-		r := c.VirtualIPRanges
-		if !r.V4.IsValid() {
-			return fmt.Errorf("virtual-ip host resolution needs an IPv4 virtual IP range")
-		}
-		if !r.V4.Addr().Is4() || (r.V6.IsValid() && !r.V6.Addr().Is6()) {
-			return fmt.Errorf("virtual IP ranges %s are of the wrong family", r)
-		}
-		_, err := ParseVirtualIPRanges(r.String())
-		return err
-	default:
-		return fmt.Errorf("invalid host resolution mode %q", c.Mode)
+	r := c.VirtualIPRanges
+	if !r.V4.IsValid() {
+		return fmt.Errorf("host resolution needs an IPv4 virtual IP range")
 	}
+	if !r.V4.Addr().Is4() || (r.V6.IsValid() && !r.V6.Addr().Is6()) {
+		return fmt.Errorf("virtual IP ranges %s are of the wrong family", r)
+	}
+	_, err := ParseVirtualIPRanges(r.String())
+	return err
 }
 
 // ReservedRange is an address range the virtual IP range must not overlap,

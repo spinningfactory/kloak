@@ -1,5 +1,4 @@
-{{- /* NRI is only used in virtual-ip mode. */}}
-{{- $nri := and .Values.controller.nri.enabled (eq (.Values.controller.ebpf.hostResolution | default "virtual-ip") "virtual-ip") }}
+{{- $nri := .Values.controller.nri.enabled }}
 apiVersion: apps/v1
 kind: DaemonSet
 metadata:
@@ -50,7 +49,6 @@ spec:
             - --tc-attach-mode={{ .Values.controller.ebpf.tcAttachMode | default "auto" }}
             - --secret-binding={{ .Values.controller.ebpf.secretBinding | default "enforce" }}
             - --sni-check={{ .Values.controller.ebpf.sniCheck | default "enforce" }}
-            - --host-resolution={{ .Values.controller.ebpf.hostResolution | default "virtual-ip" }}
             {{- if .Values.controller.ebpf.virtualIPRange }}
             - --virtual-ip-range={{ .Values.controller.ebpf.virtualIPRange }}
             {{- end }}

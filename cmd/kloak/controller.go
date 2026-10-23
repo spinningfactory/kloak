@@ -57,7 +57,6 @@ var (
 	tcAttachMode        string
 	secretBinding       string
 	sniCheck            string
-	hostResolution      string
 	virtualIPRange      string
 	nriSocket           string
 )
@@ -81,16 +80,13 @@ func init() {
 	controllerCmd.Flags().StringVar(&sniCheck, "sni-check", "enforce",
 		`A secret restricted to a hostname (getkloak.io/hosts) is only rewritten on a connection whose TLS ClientHello names that host (SNI). `+
 			`"enforce" refuses other rewrites; "audit" allows them but logs each violation, to find clients whose SNI differs from the annotation before enforcing.`)
-	controllerCmd.Flags().StringVar(&hostResolution, "host-resolution", string(ebpf.HostResolutionVirtualIP),
-		`How the data plane works out which host a connection goes to, for secrets restricted to a hostname (getkloak.io/hosts). `+
-			`"virtual-ip" gives every such host a stable fake IP, and fake IPv6, from --virtual-ip-range, `+
-			`kept in maps pinned under `+ebpf.DefaultBPFPinPath+`. A kloak pod with a secret for the host gets the fake IP in DNS answers and its connects to it are redirected to the host's addresses; a host-restricted secret is only rewritten on a connection made to its host's fake IP. `+
-			`"dns-snoop" (deprecated, to be removed) reads DNS answers as pods receive them (IPv4 connections only).`)
 	controllerCmd.Flags().StringVar(&nriSocket, "nri-socket", controller.DefaultNRISocket,
-		`NRI socket of the container runtime (containerd 2.0+, CRI-O 1.30+), used with --host-resolution=virtual-ip: the runtime then waits for kloak to attach the DNS rewrite while it creates each pod sandbox, before the pod's containers start. `+
+		`NRI socket of the container runtime (containerd 2.0+, CRI-O 1.30+): the runtime then waits for kloak to attach the DNS rewrite while it creates each pod sandbox, before the pod's containers start. `+
 			`Without NRI (unreachable socket, or "" to disable), the rewrite is attached by polling pending pods, which leaves a short window at pod start in which a lookup gets the real addresses and a connection made with them no host-restricted secret.`)
 	controllerCmd.Flags().StringVar(&virtualIPRange, "virtual-ip-range", ebpf.DefaultVirtualIPRange,
-		`Ranges fake IPs come from with --host-resolution=virtual-ip: an IPv4 range (/19 or larger) and, optionally, an IPv6 one (/115 or larger), comma-separated. `+
+		`Ranges fake IPs come from. Every host a secret is restricted to (getkloak.io/hosts) gets a stable fake IP, and fake IPv6, kept in maps pinned under `+ebpf.DefaultBPFPinPath+`. `+
+			`A kloak pod with a secret for the host gets the fake IP in DNS answers and its connects to it are redirected to the host's addresses; a host-restricted secret is only rewritten on a connection made to its host's fake IP. `+
+			`An IPv4 range (/19 or larger) and, optionally, an IPv6 one (/115 or larger), comma-separated. `+
 			`Without an IPv6 range, AAAA answers are left unchanged. `+
 			`The controller refuses to start if a range overlaps a node address, pod CIDR, service CIDR or route of the node.`)
 }
@@ -98,7 +94,7 @@ func init() {
 func runController(cmd *cobra.Command, args []string) {
 	setupLog := logging.Setup().Named("setup")
 
-	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface, "tcAttachMode", tcAttachMode, "secretBinding", secretBinding, "sniCheck", sniCheck, "hostResolution", hostResolution, "nriSocket", nriSocket)
+	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface, "tcAttachMode", tcAttachMode, "secretBinding", secretBinding, "sniCheck", sniCheck, "virtualIPRange", virtualIPRange, "nriSocket", nriSocket)
 
 	tcMode, err := ebpf.ParseTCAttachMode(tcAttachMode)
 	if err != nil {
@@ -118,23 +114,13 @@ func runController(cmd *cobra.Command, args []string) {
 		_ = setupLog.Sync()
 		os.Exit(1)
 	}
-	hostResMode, err := ebpf.ParseHostResolutionMode(hostResolution)
+	vipRanges, err := ebpf.ParseVirtualIPRanges(virtualIPRange)
 	if err != nil {
-		setupLog.Errorw("invalid --host-resolution", "error", err)
+		setupLog.Errorw("invalid --virtual-ip-range", "error", err)
 		_ = setupLog.Sync()
 		os.Exit(1)
 	}
-	hostRes := ebpf.HostResolutionConfig{Mode: hostResMode}
-	if hostResMode == ebpf.HostResolutionVirtualIP {
-		hostRes.VirtualIPRanges, err = ebpf.ParseVirtualIPRanges(virtualIPRange)
-		if err != nil {
-			setupLog.Errorw("invalid --virtual-ip-range", "error", err)
-			_ = setupLog.Sync()
-			os.Exit(1)
-		}
-	} else {
-		setupLog.Warnw("--host-resolution=dns-snoop is deprecated and will be removed in a later release; virtual-ip is the default")
-	}
+	hostRes := ebpf.HostResolutionConfig{VirtualIPRanges: vipRanges}
 
 	// 30 s is well under the daemonset's 60 s terminationGracePeriodSeconds,
 	// leaving headroom for our own cleanup (uprobe/link Close) and any final
@@ -167,20 +153,16 @@ func runController(cmd *cobra.Command, args []string) {
 	var uprobeMgr *ebpf.TLSUprobeManager
 
 	if enableEBPF {
-		if hostResMode == ebpf.HostResolutionVirtualIP {
-			// The controller runs with hostPID: /proc/1 is in the host
-			// network namespace.
-			checkCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			err := checkVirtualIPRanges(checkCtx, mgr.GetAPIReader(), hostRes.VirtualIPRanges, "/proc/1", setupLog)
-			cancel()
-			if err != nil {
-				setupLog.Errorw("invalid --virtual-ip-range: set ranges that no address of the cluster or node uses (Helm: controller.ebpf.virtualIPRange)",
-					"range", hostRes.VirtualIPRanges.String(), "error", err)
-				_ = setupLog.Sync()
-				os.Exit(1)
-			}
-		} else {
-			ebpf.RemoveVirtualIPPins(hostRes.PinPath, setupLog)
+		// The controller runs with hostPID: /proc/1 is in the host network
+		// namespace.
+		checkCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err = checkVirtualIPRanges(checkCtx, mgr.GetAPIReader(), hostRes.VirtualIPRanges, "/proc/1", setupLog)
+		cancel()
+		if err != nil {
+			setupLog.Errorw("invalid --virtual-ip-range: set ranges that no address of the cluster or node uses (Helm: controller.ebpf.virtualIPRange)",
+				"range", hostRes.VirtualIPRanges.String(), "error", err)
+			_ = setupLog.Sync()
+			os.Exit(1)
 		}
 		uprobeMgr, err = ebpf.NewTLSUprobeManager(k8ssecrets.NewSource(mgr.GetClient()).WithLog(setupLog), cgroupPath, egressInterface, &hostRes, setupLog)
 		if err != nil {
@@ -223,7 +205,7 @@ func runController(cmd *cobra.Command, args []string) {
 	// attached before a pod's containers start; without it, the reconciler
 	// polls pending pods. Added as a runnable so it starts after the cache
 	// sync (PrepareSandbox reads pods from the cache).
-	if uprobeMgr != nil && uprobeMgr.VirtualIPEnabled() && nriSocket != "" {
+	if uprobeMgr != nil && nriSocket != "" {
 		plugin := &controller.NRIPlugin{
 			Preparer:   reconciler,
 			SocketPath: nriSocket,

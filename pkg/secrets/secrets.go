@@ -40,13 +40,13 @@ type Secret struct {
 	Shadow string
 
 	// Host is a hostname filter. If non-empty, the rewrite happens only
-	// on connections whose connect-time destination IP came from a DNS
-	// answer for this hostname (the BPF dns_ip_map / conn_ip_map chain
-	// enforces this). Empty means any host.
+	// on connections made to the hostname's virtual IP, which kloak hands
+	// the pod in DNS answers for it. Empty means any host.
 	Host string
 
-	// IP is an alternative to Host: a literal destination IP that
-	// bypasses DNS verification. Mutually exclusive with Host (k8s
+	// IP is an alternative to Host: a literal destination IP, matched
+	// against the address the connection was made to (after the virtual
+	// IP redirect), with no DNS involved. Mutually exclusive with Host (k8s
 	// adapter populates this when Host parses as a literal IP).
 	IP net.IP
 

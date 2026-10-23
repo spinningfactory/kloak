@@ -1,17 +1,19 @@
 """
-Demo: DNS-verified host filtering with raw TLS sockets (non-HTTP).
+Demo: host filtering with raw TLS sockets (non-HTTP).
 
-Tests that Kloak's eBPF DNS-verified host filtering works at the TCP level
-with raw TLS sockets — no HTTP library involved.
+Tests that Kloak's eBPF host filtering works at the TCP level with raw TLS
+sockets — no HTTP library involved.
 
 Architecture:
   1. A TLS echo server runs in its own pod (port 8443, self-signed cert)
-  2. The client resolves the K8s Service name via DNS (populates dns_ip_map)
-  3. The client connects to the Service IP and sends raw TLS data with secrets
+  2. The client resolves the K8s Service name via DNS: kloak hands it the
+     name's virtual IP
+  3. The client connects to it (kloak redirects the connect to the Service
+     IP) and sends raw TLS data with secrets
   4. The echo server returns the data — if eBPF rewrote it, the echo shows real values
 
 The allowed secret (hosts=<service-name>) should be rewritten because the
-connection target was DNS-verified via the Service name.
+connection was made to the Service name's virtual IP.
 The blocked secret (hosts=example.com) should NOT be rewritten.
 """
 
@@ -46,9 +48,9 @@ def send_and_echo(host, server_name, secret_allowed, secret_blocked):
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
-    # Resolve the service name via DNS, then connect.
-    # This DNS lookup populates dns_ip_map, and the connect() to the
-    # resolved IP sets last_verified_fd for host-based filtering.
+    # Resolve the service name via DNS, then connect: the lookup returns the
+    # name's virtual IP, and the socket that connects to it carries the host
+    # for host-based filtering.
     with socket.create_connection((host, LISTEN_PORT)) as sock:
         with ctx.wrap_socket(sock, server_hostname=server_name) as tls:
             payload = f"ALLOWED={secret_allowed}\nBLOCKED={secret_blocked}\n"
@@ -64,7 +66,7 @@ def main():
     interval = int(os.getenv("REQUEST_INTERVAL", "5"))
 
     print("=" * 60)
-    print("Kloak Demo: Raw TLS Echo (DNS-Verified Host Filtering)")
+    print("Kloak Demo: Raw TLS Echo (Host Filtering)")
     print("=" * 60)
     print(f"OpenSSL: {ssl.OPENSSL_VERSION}")
     print(f"Target: {target_host}:{LISTEN_PORT}")

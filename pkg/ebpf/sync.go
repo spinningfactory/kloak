@@ -15,7 +15,7 @@ import (
 )
 
 // syncSecrets pulls a snapshot from the given secrets.Source and applies
-// it to the BPF secret_map (and the watched_hosts map). The translation
+// it to the BPF secret_map. The translation
 // from a semantic secrets.Secret to the wire-format secretValue lives
 // here; nothing in this file knows where the snapshot came from.
 //
@@ -24,8 +24,7 @@ import (
 //   - upsert each (real, shadow) pair under the shadow's first 8 bytes
 //   - emit an HPACK-Huffman variant for HTTP/2 interception
 //   - prune BPF map entries that no longer appear in the snapshot
-//   - sync the watched_hosts map for DNS-verified host filtering
-func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, source secrets.Source, log *zap.SugaredLogger) error {
+func syncSecrets(ctx context.Context, secretMap *ebpf.Map, source secrets.Source, log *zap.SugaredLogger) error {
 	if source == nil {
 		return nil
 	}
@@ -34,19 +33,17 @@ func syncSecrets(ctx context.Context, secretMap, watchedHostsMap *ebpf.Map, sour
 	if err != nil {
 		return fmt.Errorf("snapshot secrets: %w", err)
 	}
-	applySecrets(secretMap, watchedHostsMap, snapshot, log)
+	applySecrets(secretMap, snapshot, log)
 	return nil
 }
 
-// applySecrets writes a snapshot to secret_map and watched_hosts (see
-// syncSecrets) and returns the hostnames it put in watched_hosts. Split out
-// so the manager can reuse the same snapshot for the secret_acl and virtual
-// IP syncs.
-func applySecrets(secretMap, watchedHostsMap *ebpf.Map, snapshot []secrets.Secret, log *zap.SugaredLogger) map[string]struct{} {
+// applySecrets writes a snapshot to secret_map (see syncSecrets) and returns
+// the hostnames the synced secrets are restricted to, the watched hosts that
+// get virtual IPs. Split out so the manager can reuse the same snapshot for
+// the secret_acl and virtual IP syncs.
+func applySecrets(secretMap *ebpf.Map, snapshot []secrets.Secret, log *zap.SugaredLogger) map[string]struct{} {
 	// newKeys tracks which keys we upsert so we can prune stale entries afterwards.
 	newKeys := make(map[secretKey]struct{})
-	// newHosts tracks unique hostnames to sync to the watched_hosts map.
-	newHosts := make(map[watchedHostKey]struct{})
 	hostNames := make(map[string]struct{})
 
 	for i := range snapshot {
@@ -104,10 +101,6 @@ func applySecrets(secretMap, watchedHostsMap *ebpf.Map, snapshot []secrets.Secre
 			val.HostLen = uint32(len(s.Host))
 			copy(val.AllowedHost[:], s.Host)
 			val.IpLen = 0 // Host-based filtering
-
-			var whk watchedHostKey
-			copy(whk.Host[:], s.Host)
-			newHosts[whk] = struct{}{}
 			hostNames[s.Host] = struct{}{}
 		case s.IP != nil:
 			copy(val.AllowedIp[:], s.IP.To16())
@@ -215,14 +208,9 @@ func applySecrets(secretMap, watchedHostsMap *ebpf.Map, snapshot []secrets.Secre
 		}
 	}
 
-	// Sync watched_hosts map: add new hosts, prune stale ones.
-	if watchedHostsMap != nil {
-		syncWatchedHosts(watchedHostsMap, newHosts, log)
-	}
-
 	log.Debugw("secret sync complete",
 		"snapshotEntries", len(snapshot), "bpfKeys", len(newKeys),
-		"pruned", len(staleKeys), "watchedHosts", len(newHosts))
+		"pruned", len(staleKeys), "watchedHosts", len(hostNames))
 	return hostNames
 }
 
@@ -270,35 +258,4 @@ func syncSecretACL(aclMap *ebpf.Map, snapshot []secrets.Secret, bindings map[str
 
 	logging.Tracew(log, "secret binding sync complete",
 		"bindings", len(bindings), "entries", len(desired), "added", added, "pruned", len(stale))
-}
-
-// syncWatchedHosts updates the watched_hosts BPF map with the given set of
-// hostnames. Adds missing entries and removes stale ones.
-func syncWatchedHosts(watchedHostsMap *ebpf.Map, newHosts map[watchedHostKey]struct{}, log *zap.SugaredLogger) {
-	val := uint8(1)
-	for host := range newHosts {
-		if err := watchedHostsMap.Update(&host, &val, 0); err != nil {
-			log.Errorw("failed to update watched_hosts map", "error", err, "host", string(host.Host[:]))
-		}
-	}
-
-	var staleHosts []watchedHostKey
-	var iterHost watchedHostKey
-	var iterVal uint8
-	iter := watchedHostsMap.Iterate()
-	for iter.Next(&iterHost, &iterVal) {
-		if _, exists := newHosts[iterHost]; !exists {
-			staleHosts = append(staleHosts, iterHost)
-		}
-	}
-	if err := iter.Err(); err != nil {
-		log.Errorw("error iterating watched_hosts map for pruning", "error", err)
-	}
-	for i := range staleHosts {
-		if err := watchedHostsMap.Delete(&staleHosts[i]); err != nil {
-			log.Errorw("failed to delete stale watched_hosts entry", "error", err)
-		} else {
-			logging.Tracew(log, "pruned stale watched host")
-		}
-	}
 }

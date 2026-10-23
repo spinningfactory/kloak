@@ -63,7 +63,7 @@ type vipUpstreamSlot struct {
 	ExpiresAt uint64   // CLOCK_BOOTTIME nanoseconds; 0: empty slot
 }
 
-// virtualIPMaps are the maps pinned in virtual-ip mode.
+// virtualIPMaps are the maps pinned in bpffs.
 var virtualIPMaps = []string{"vip_host_ip", "vip_ip_host", "vip_upstream"}
 
 // vipConfig returns the vip_config value for ranges.
@@ -111,12 +111,6 @@ func (m *TLSUprobeManager) attachVirtualIPRedirect(r VirtualIPRanges, cgroupPath
 	return nil
 }
 
-// VirtualIPEnabled reports whether the manager runs in virtual-ip host
-// resolution mode.
-func (m *TLSUprobeManager) VirtualIPEnabled() bool {
-	return m.virtualIPs != nil
-}
-
 // dnsRewriteAttach is tc_dns_rewrite attached in a pod's netns.
 type dnsRewriteAttach struct {
 	ino uint64
@@ -134,8 +128,7 @@ func (a *dnsRewriteAttach) close() {
 	_ = a.netns.Close()
 }
 
-// AttachPodDNSRewrite attaches tc_dns_rewrite, in virtual-ip mode, at tc
-// ingress on the egress interfaces of a pod's network namespace, so that the
+// AttachPodDNSRewrite attaches tc_dns_rewrite at tc ingress on the egress interfaces of a pod's network namespace, so that the
 // pod is handed the fake IPs of the hosts it has secrets for
 // (BindPodSecrets), and returns the addresses of those interfaces: the
 // pod's, before its status reports them. pids are processes of the pod; the
@@ -144,14 +137,11 @@ func (a *dnsRewriteAttach) close() {
 // attached while creating the sandbox (AttachPodDNSRewriteNetns, NRI); an
 // answer received before carries the real addresses, and a connection made
 // to them gets no host-restricted secret. It does nothing when already
-// attached in the pod's current netns, in dns-snoop mode, or for a pod in
-// the host network namespace, where the rewrite would hand fake IPs to node
+// attached in the pod's current netns, or for a pod in the host network
+// namespace, where the rewrite would hand fake IPs to node
 // processes the connect redirect does not cover. A pod whose sandbox was
 // recreated gets it again in its new netns.
 func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) ([]netip.Addr, error) {
-	if m.virtualIPs == nil {
-		return nil, nil
-	}
 	for _, p := range pids {
 		if f, err := os.Open(fmt.Sprintf("/proc/%d/ns/net", p)); err == nil {
 			return m.attachPodDNSRewrite(podUID, pod, f, fmt.Sprintf("pid %d", p))
@@ -167,9 +157,6 @@ func (m *TLSUprobeManager) AttachPodDNSRewrite(podUID, pod string, pids []int) (
 // pod exists, so attached then, the rewrite precedes the pod's first
 // lookup.
 func (m *TLSUprobeManager) AttachPodDNSRewriteNetns(podUID, pod, path string) ([]netip.Addr, error) {
-	if m.virtualIPs == nil {
-		return nil, nil
-	}
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -452,28 +439,6 @@ func requireBPFFS(path string) error {
 		}
 		dir = parent
 	}
-}
-
-// RemoveVirtualIPPins deletes the virtual IP map pins a previous controller
-// left in pinPath (empty means DefaultBPFPinPath) in virtual-ip mode, so that
-// switching back to dns-snoop frees them. Only the node's controller should
-// call it: it owns the pins, and removing them while it runs in virtual-ip
-// mode would lose its reservations at the next restart.
-func RemoveVirtualIPPins(pinPath string, log *zap.SugaredLogger) {
-	if pinPath == "" {
-		pinPath = DefaultBPFPinPath
-	}
-	for _, name := range virtualIPMaps {
-		path := filepath.Join(pinPath, name)
-		switch err := os.Remove(path); {
-		case err == nil:
-			log.Infow("removed virtual IP map pinned in virtual-ip mode", "path", path)
-		case !errors.Is(err, os.ErrNotExist):
-			log.Warnw("failed to remove virtual IP map pinned in virtual-ip mode", "path", path, "error", err)
-		}
-	}
-	// Only succeeds if nothing else is pinned there.
-	_ = os.Remove(pinPath)
 }
 
 // virtualIPAllocator keeps vip_ip_host and vip_host_ip in line with the

@@ -16,10 +16,10 @@ import (
 //
 // The raw TLS demo first connects to the echo Service by its full name with
 // a matching SNI (positive control: the allowed secret is rewritten). It is
-// then patched to send SNI "evil.example" on the same DNS-verified
-// connection, which is what a compromised pod would do to reach another
-// tenant behind a shared front end: the destination IP still passes the host
-// check, but the rewrite must be refused and the controller must log it.
+// then patched to send SNI "evil.example" on the same connection, made to
+// the name's virtual IP, which is what a compromised pod would do to reach
+// another tenant behind a shared front end: the connection still passes the
+// host check, but the rewrite must be refused and the controller must log it.
 func TestEBPFSNIFiltering(t *testing.T) {
 	gcCtx, gcCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer gcCancel()
