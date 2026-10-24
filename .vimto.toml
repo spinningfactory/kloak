@@ -1,0 +1,14 @@
+# vimto (lmb.io/vimto) runs the BPF tests in a throwaway VM on another kernel,
+# using the kernel images from github.com/cilium/ci-kernels:
+#
+#   vimto -kernel ghcr.io/cilium/ci-kernels:6.6 -- go test ./pkg/ebpf/
+#
+# The CI kernel matrix (.github/workflows/kernels.yml) runs exactly this.
+kernel = "ghcr.io/cilium/ci-kernels:stable"
+smp = "cpus=2"
+memory = "size=2G"
+user = "root"
+setup = [
+  "mount -t cgroup2 -o nosuid,noexec,nodev cgroup2 /sys/fs/cgroup",
+  "mount -t bpf bpf /sys/fs/bpf",
+]

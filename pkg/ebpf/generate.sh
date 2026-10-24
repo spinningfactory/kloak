@@ -29,11 +29,17 @@ case "$ARCH" in
         ;;
 esac
 
+# BPF_DEBUG=1 compiles in the bpf_printk trace markers, as the Dockerfile does.
+DEBUG_DEFINE=
+if [ "${BPF_DEBUG:-0}" = 1 ]; then
+    DEBUG_DEFINE=-DKLOAK_DEBUG
+fi
+
 # -tags linux constrains the generated _bpfel.go / _bpfeb.go to linux builds
 # so macOS unit tests still compile (cilium/ebpf is Linux-only). See PR #217.
 exec go run github.com/cilium/ebpf/cmd/bpf2go \
     -cc clang \
-    -cflags "-O2 -g -Wall -Werror -D__TARGET_ARCH_${ARCH}" \
+    -cflags "-O2 -g -Wall -Werror -D__TARGET_ARCH_${ARCH} ${DEBUG_DEFINE}" \
     -tags linux \
     tlsuprobe \
     bpf/tls_uprobe.c -- -I../ebpf

@@ -24,6 +24,8 @@ Run a single test: `go test -v -run TestName ./pkg/some_package/`
 
 The BPF tests (`pkg/ebpf`, loading the objects, `BPF_PROG_RUN`, cgroup hooks, network namespaces, bpffs pins) skip without root; CI's `Test` job runs every test binary as root (`go test -exec "sudo -E"`) and fails if the objects don't load. Locally on Linux: `go test -exec "sudo -E" ./pkg/ebpf/`.
 
+The `Kernels` workflow (`.github/workflows/kernels.yml`) runs `pkg/ebpf` on every kernel series still maintained upstream from 5.17 up (the list is read from github.com/cilium/ci-kernels on every run, so nothing to bump on a release), x86 and arm64, with and without `BPF_DEBUG`. `TestVerifierBudget` loads each program on its own and fails above 500K verified instructions (half the kernel's limit). On another kernel locally (Linux host, `go install lmb.io/vimto@v0.4.0`): `vimto -kernel ghcr.io/cilium/ci-kernels:6.6 -- go test ./pkg/ebpf/` (`.vimto.toml` runs it as root; `VIMTO_DISABLE_KVM=true` without KVM). Those kernels have no clsact or cls_bpf, so the clsact attach tests skip there.
+
 eBPF e2e tests are behind a build tag: `go test -v -tags=e2e_ebpf -run TestEBPFBunHostFiltering ./test/e2e/` (needs a cluster with kloak + demo images; see `.github/workflows/ci.yml`).
 
 ## eBPF Development

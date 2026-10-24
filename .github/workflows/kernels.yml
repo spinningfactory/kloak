@@ -1,0 +1,135 @@
+name: Kernels
+
+# Loads the BPF programs and runs the BPF tests (pkg/ebpf) on every kernel
+# series still maintained upstream, from the oldest kloak supports up, on x86
+# and arm64, with and without BPF_DEBUG. The verifier is what differs most
+# between kernels: a program it accepts on one can be rejected on the next
+# (tc_ghash_update on 7.2), and its cost moves a lot (TestVerifierBudget).
+#
+# The kernels come from github.com/cilium/ci-kernels, read on every run: its
+# list follows kernel.org's (mainline, stable and every longterm series), so
+# new releases are tested and end-of-life series dropped without changing
+# this file. Each kernel boots in a VM (lmb.io/vimto) on the runner.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Must match the golang image in the Dockerfile (see ci.yml's lint job).
+  GO_VERSION: '1.27'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Oldest kernel kloak supports (bpf_loop): older series are left out.
+  MIN_KERNEL: '5.17'
+  VIMTO_VERSION: v0.4.0
+
+jobs:
+  kernels:
+    name: Kernel list
+    runs-on: ubuntu-latest
+    outputs:
+      kernels: ${{ steps.list.outputs.kernels }}
+    steps:
+      - name: Read ci-kernels' kernel list
+        id: list
+        run: |
+          curl -fsSL --retry 3 -o versions.json \
+            https://raw.githubusercontent.com/cilium/ci-kernels/main/matrix/versions.json
+          # "7.3-rc4" -> [7, 3]; arrays compare element by element.
+          KERNELS=$(jq -c --arg min "$MIN_KERNEL" '
+            def series: [scan("[0-9]+") | tonumber] | .[0:2];
+            map(select((.version | series) >= ($min | series)) | {version, channel})
+          ' versions.json)
+          if [ "$(jq length <<< "$KERNELS")" -eq 0 ]; then
+            echo "::error::no kernel >= $MIN_KERNEL in ci-kernels' list"
+            exit 1
+          fi
+          echo "kernels=$KERNELS" >> "$GITHUB_OUTPUT"
+          jq -r '"Kernels: " + (map(.version + " (" + .channel + ")") | join(", "))' <<< "$KERNELS"
+
+  test:
+    name: Linux ${{ matrix.kernel.version }} (${{ matrix.arch }})
+    needs: kernels
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    # Mainline is a release candidate: a failure there is an early warning
+    # of what the next release will break, not a reason to block a PR.
+    continue-on-error: ${{ matrix.kernel.channel == 'mainline' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ${{ fromJSON(needs.kernels.outputs.kernels) }}
+        arch: [x86, arm64]
+    env:
+      KERNEL_IMAGE: ghcr.io/cilium/ci-kernels:${{ matrix.kernel.version }}
+      KLOAK_TARGET_ARCH: ${{ matrix.arch }}
+      # Fail, don't skip, when the objects don't load.
+      KLOAK_REQUIRE_BPF: '1'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install clang and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev \
+            ${{ matrix.arch == 'arm64' && 'qemu-system-arm' || 'qemu-system-x86' }}
+
+      - name: Enable KVM
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 0666 /dev/kvm
+          else
+            echo "::notice::no KVM on this runner, the VM is emulated (slower)"
+            echo "VIMTO_DISABLE_KVM=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Install vimto
+        run: CGO_ENABLED=0 go install lmb.io/vimto@${{ env.VIMTO_VERSION }}
+
+      - name: Generate eBPF bindings
+        run: go generate ./pkg/ebpf/
+
+      - name: Run the BPF tests
+        shell: bash
+        run: |
+          vimto -kernel "$KERNEL_IMAGE" -- go test -count=1 -v ./pkg/ebpf/ | tee test.log
+
+      - name: Load the debug build
+        # BPF_DEBUG=1 compiles in the bpf_printk markers (the e2e image's
+        # build), which changes what the verifier sees.
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          BPF_DEBUG=1 go generate ./pkg/ebpf/
+          vimto -kernel "$KERNEL_IMAGE" -- go test -count=1 -v \
+            -run 'TestLoadObjects$|TestVerifierBudget' ./pkg/ebpf/ | tee test-debug.log
+
+      - name: Report verifier cost
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          report() { # log title
+            [ -f "$1" ] || return 0
+            echo "### $2"
+            echo "| Program | Verified instructions |"
+            echo "|---|---:|"
+            awk '/^=== RUN   TestVerifierBudget\// { split($3, a, "/"); prog = a[2] }
+                 /verified [0-9]+ instructions/ { for (i = 1; i < NF; i++) if ($i == "verified") print "| " prog " | " $(i+1) " |" }' "$1"
+          }
+          {
+            report test.log "Linux ${{ matrix.kernel.version }} (${{ matrix.arch }})"
+            report test-debug.log "Linux ${{ matrix.kernel.version }} (${{ matrix.arch }}, BPF_DEBUG=1)"
+          } >> "$GITHUB_STEP_SUMMARY"
