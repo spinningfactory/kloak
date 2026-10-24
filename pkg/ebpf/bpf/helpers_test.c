@@ -265,6 +265,32 @@ static void test_gf128_mul_known_vector(void) {
   assert(bytes_equal(h_cubed_1, h_cubed_2, 16));
 }
 
+static void test_gf128_mul_gcm_vector(void) {
+  // GCM spec test case 2 (K = 0, P = 0^128, IV = 0^96): X1 = C * H, and
+  // GHASH = (X1 ^ len(A)||len(C)) * H, which is T ^ E(K, Y0). Checks the
+  // reduction too, which the algebraic tests above can't tell apart.
+  __u8 h[16], c[16], x1[16], ghash[16], result[16], ws_v[16], ws_z[16];
+  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", h, 16);
+  hex_to_bytes("0388dace60b6a392f328c2b971b2fe78", c, 16);
+  hex_to_bytes("5e2ec746917062882c85b0685353deb7", x1, 16);
+  hex_to_bytes("f38cbb1ad69223dcc3457ae5b6b0f885", ghash, 16);
+
+  gf128_mul(c, h, result);
+  assert(bytes_equal(result, x1, 16));
+  gf128_mul_ws(c, h, result, ws_v, ws_z);
+  assert(bytes_equal(result, x1, 16));
+
+  // The steps one by one, as the BPF gf128_mul_iter callback runs them.
+  __builtin_memset(ws_z, 0, 16);
+  __builtin_memcpy(ws_v, h, 16);
+  __u8 a[16];
+  __builtin_memcpy(a, x1, 16);
+  a[15] ^= 0x80; // len(A) || len(C) = 0 || 128
+  for (__u32 i = 0; i < 128; i++)
+    gf128_mul_step(a, ws_v, ws_z, i);
+  assert(bytes_equal(ws_z, ghash, 16));
+}
+
 static void test_gf128_mul_commutativity(void) {
   __u8 a[16], b[16], ab[16], ba[16];
   hex_to_bytes("0388dace60b6a392f328c2b971b2fe78", a, 16);
@@ -575,6 +601,60 @@ static void test_gf128_halve_to_h_edges(void) {
     hex_to_bytes(hs[i], h, 16);
     check_hkey1_roundtrip(h, h[0] >> 7);
   }
+}
+
+// ============================================================================
+// ghash_block_delta
+// ============================================================================
+
+// The block delta as ghash_block_iter built it with a branch per byte.
+static void block_delta_branchy(const __u8 *xor_delta, __u32 b, __u32 sec_off,
+                                __u32 len, __u8 out[16]) {
+  memset(out, 0, 16);
+  __u32 sec_end = sec_off + len;
+  for (__u32 i = 0; i < 16; i++) {
+    __u32 pos = (b & 0x3FF) * 16 + i;
+    if (pos >= sec_off && pos < sec_end)
+      out[i] = xor_delta[(pos - sec_off) & (SECRET_MAX_LEN - 1)];
+  }
+}
+
+static void check_block_delta(const __u8 *xor_delta, __u32 b, __u32 sec_off,
+                              __u32 len) {
+  __u8 want[16], got[16];
+  block_delta_branchy(xor_delta, b, sec_off, len, want);
+  memset(got, 0xAA, 16);
+  ghash_block_delta(xor_delta, b, sec_off, len, got);
+  if (memcmp(want, got, 16) != 0) {
+    printf("\n    block=%u sec_off=%u len=%u", b, sec_off, len);
+    print_hex("want", want, 16);
+    print_hex("got ", got, 16);
+  }
+  assert(memcmp(want, got, 16) == 0);
+}
+
+static void test_ghash_block_delta(void) {
+  __u8 xor_delta[SECRET_MAX_LEN];
+  for (int i = 0; i < SECRET_MAX_LEN; i++)
+    xor_delta[i] = (__u8)(i * 37 + 1); // no zero bytes, so a miss shows
+
+  // Every patch (len 1..SECRET_MAX_LEN) at every offset in the first 400
+  // bytes, against every block it can touch and its neighbours.
+  for (__u32 len = 1; len <= SECRET_MAX_LEN; len++)
+    for (__u32 sec_off = 0; sec_off < 400; sec_off++)
+      for (__u32 b = 0; b < 35; b++)
+        check_block_delta(xor_delta, b, sec_off, len);
+
+  // The last blocks, a block number past the 0x3FF mask, and offsets so
+  // large that the old u32 sec_end wrapped.
+  static const __u32 offs[] = {16352, 16367, 16368, 16383, 16384,
+                               0xFFFFFFFFu - SECRET_MAX_LEN, 0xFFFFFFF0u,
+                               0xFFFFFFFFu};
+  static const __u32 blocks[] = {0, 1, 1021, 1022, 1023, 1024, 1025, 0xFFFFFFFFu};
+  for (unsigned o = 0; o < sizeof(offs) / sizeof(offs[0]); o++)
+    for (unsigned k = 0; k < sizeof(blocks) / sizeof(blocks[0]); k++)
+      for (__u32 len = 1; len <= SECRET_MAX_LEN; len++)
+        check_block_delta(xor_delta, blocks[k], offs[o], len);
 }
 
 // ============================================================================
@@ -1393,6 +1473,7 @@ int main(void) {
   RUN_TEST(test_gf128_mul_identity);
   RUN_TEST(test_gf128_mul_zero);
   RUN_TEST(test_gf128_mul_known_vector);
+  RUN_TEST(test_gf128_mul_gcm_vector);
   RUN_TEST(test_gf128_mul_commutativity);
   RUN_TEST(test_gf128_h_power_1);
   RUN_TEST(test_gf128_h_power_2);
@@ -1418,6 +1499,9 @@ int main(void) {
   printf("gf128_halve_to_h (OpenSSL AVX-512 / Go H recovery):\n");
   RUN_TEST(test_gf128_halve_to_h_aes_keys);
   RUN_TEST(test_gf128_halve_to_h_edges);
+
+  printf("ghash_block_delta:\n");
+  RUN_TEST(test_ghash_block_delta);
 
   printf("tls_parse_sni (SNI check):\n");
   RUN_TEST(test_sni_go);

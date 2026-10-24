@@ -1778,18 +1778,7 @@ static int gf128_mul_iter(__u32 i, void *_unused) {
   if (!w)
     return 1; // stop
 
-  __u32 byte_idx = (i >> 3) & 0xF;  // i/8 clamped to [0,15] for verifier
-  __u32 bit_idx = i & 7;            // i%8 clamped to [0,7]
-  if (w->mul_a[byte_idx] & ((__u8)0x80 >> bit_idx)) {
-    for (int j = 0; j < 16; j++)
-      w->mul_z[j] ^= w->mul_v[j];
-  }
-  __u8 carry = w->mul_v[15] & 1;
-  for (int j = 15; j > 0; j--)
-    w->mul_v[j] = (w->mul_v[j] >> 1) | (w->mul_v[j - 1] << 7);
-  w->mul_v[0] >>= 1;
-  if (carry)
-    w->mul_v[0] ^= 0xe1;
+  gf128_mul_step(w->mul_a, w->mul_v, w->mul_z, i);
   return 0;
 }
 
@@ -1896,16 +1885,8 @@ static int ghash_block_iter(__u32 block_idx, void *_unused) {
     return 1;
 
   // Build 16-byte block delta.
-  __builtin_memset(w->block_delta, 0, 16);
-  __u32 sec_off = w->ghash_secret_offset;
-  __u32 sec_end = sec_off + w->ghash_patch_len;
-  for (__u32 i = 0; i < 16; i++) {
-    __u32 pos = (b & 0x3FF) * 16 + i;
-    if (pos >= sec_off && pos < sec_end) {
-      __u32 si = (pos - sec_off) & (SECRET_MAX_LEN - 1);
-      w->block_delta[i] = w->ghash_xor_delta[si];
-    }
-  }
+  ghash_block_delta(w->ghash_xor_delta, b, w->ghash_secret_offset,
+                    w->ghash_patch_len, w->block_delta);
 
   // Compute H^power via bpf_loop (no inline functions — avoids stale w).
   __u32 power = w->ghash_ct_blocks - b + 1;
@@ -2123,8 +2104,9 @@ int bpf_kprobe_tcp_sendmsg_sni(void *ctx) {
   if (bpf_probe_read_user(s->buf, n, (void *)base) < 0)
     return 0;
   __builtin_memset(&s->st, 0, sizeof(s->st));
-  __u32 host_len = 0;
-  __u32 status = tls_parse_sni(s->buf, n, s->st.sni, &host_len);
+  // The host length goes straight to the map value, not the stack: see the
+  // end of tls_parse_sni.
+  __u32 status = tls_parse_sni(s->buf, n, s->st.sni, &s->st.len);
 
   if (cur_status == SNI_STATUS_SEEN) {
     // Only a fully valid ClientHello can change a decided connection: an
@@ -2143,7 +2125,6 @@ int bpf_kprobe_tcp_sendmsg_sni(void *ctx) {
   if (status == SNI_NOT_CLIENT_HELLO)
     status = SNI_STATUS_MALFORMED; // a handshake record, but not a ClientHello
   s->st.status = status;
-  s->st.len = host_len;
   bpf_map_update_elem(&sni_state, &sk_key, &s->st, BPF_ANY);
   dbg_inc(DBG_SNI_CAPTURED);
   return 0;
