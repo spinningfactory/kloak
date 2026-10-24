@@ -2104,8 +2104,9 @@ int bpf_kprobe_tcp_sendmsg_sni(void *ctx) {
   if (bpf_probe_read_user(s->buf, n, (void *)base) < 0)
     return 0;
   __builtin_memset(&s->st, 0, sizeof(s->st));
-  __u32 host_len = 0;
-  __u32 status = tls_parse_sni(s->buf, n, s->st.sni, &host_len);
+  // The host length goes straight to the map value, not the stack: see the
+  // end of tls_parse_sni.
+  __u32 status = tls_parse_sni(s->buf, n, s->st.sni, &s->st.len);
 
   if (cur_status == SNI_STATUS_SEEN) {
     // Only a fully valid ClientHello can change a decided connection: an
@@ -2124,7 +2125,6 @@ int bpf_kprobe_tcp_sendmsg_sni(void *ctx) {
   if (status == SNI_NOT_CLIENT_HELLO)
     status = SNI_STATUS_MALFORMED; // a handshake record, but not a ClientHello
   s->st.status = status;
-  s->st.len = host_len;
   bpf_map_update_elem(&sni_state, &sk_key, &s->st, BPF_ANY);
   dbg_inc(DBG_SNI_CAPTURED);
   return 0;

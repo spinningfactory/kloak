@@ -495,7 +495,8 @@ HELPER_INLINE int sni_host_char_ok(__u8 c) {
 // *host_len. Returns SNI_NOT_CLIENT_HELLO when the buffer does not start with
 // a handshake record carrying a ClientHello, otherwise an SNI_STATUS_* value.
 // An ECH extension wins over a readable server_name: with ECH the outer SNI
-// is the front end's public name, not the host the request is for.
+// is the front end's public name, not the host the request is for. In BPF,
+// host_len must point into map memory, not the stack (see the copy below).
 HELPER_INLINE __u32 tls_parse_sni(const __u8 *buf, __u32 len, char *host_out,
                                   __u32 *host_len) {
   *host_len = 0;
@@ -596,6 +597,17 @@ HELPER_INLINE __u32 tls_parse_sni(const __u8 *buf, __u32 len, char *host_out,
     return SNI_STATUS_MALFORMED; // more than TLS_SNI_MAX_EXTS extensions
   if (!found)
     return SNI_STATUS_ABSENT;
+
+  // Park name_off in *host_len and read it back, for the BPF verifier: the
+  // BPF caller points host_len into map memory, whose contents it does not
+  // track, so name_off comes back with no range. Otherwise it is tracked
+  // precisely (it indexes buf), with a range that differs with the
+  // extension that held server_name, and each of those paths walks the copy
+  // loop below on its own: 86% of the 859K instructions Linux 7.2's
+  // verifier spent on bpf_kprobe_tcp_sendmsg_sni.
+  *(volatile __u32 *)host_len = name_off;
+  name_off = *(volatile __u32 *)host_len;
+  *host_len = 0;
 
   for (__u32 j = 0; j < MAX_HOST_LEN; j++) {
     if (j >= n)
