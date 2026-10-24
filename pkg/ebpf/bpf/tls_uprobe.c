@@ -1705,9 +1705,6 @@ int bpf_xor_path(void *ctx) {
 
   dbg_inc(DBG_XOR_SECRET_FOUND);
 
-  // Compute XOR delta: shadow bytes ^ real bytes.
-  __u32 delta_len = clamp_write_len(val_len);
-
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w) return 0;
   sd = bpf_map_lookup_elem(&scratch, &zero);
@@ -1719,9 +1716,14 @@ int bpf_xor_path(void *ctx) {
   bpf_probe_read_user(w->ct_buf, SECRET_MAX_LEN,
                       (void *)(sd->user_data_ptr + local_i));
 
+  // XOR delta: shadow bytes ^ real bytes, over the whole buffer. The bytes
+  // past the secret are never applied (tc and the GHASH delta stop at its
+  // length), and a constant bound is one every verifier can follow: bounded
+  // by the length too, clang counts the loop down on a second register whose
+  // range Linux 6.1's verifier loses, and it rejects the program.
   val = bpf_map_lookup_elem(&secret_map, &key);
   if (!val) goto next;
-  for (__u32 j = 0; j < SECRET_MAX_LEN && j < delta_len; j++)
+  for (__u32 j = 0; j < SECRET_MAX_LEN; j++)
     w->ct_buf[j] ^= val->real_secret[j];
 
   // Store patch in staged_pending.
@@ -3233,7 +3235,9 @@ int tc_egress_patch(struct __sk_buff *skb) {
       continue;
     }
 
-    for (__u32 i = 0; i < SECRET_MAX_LEN && i < patch_len; i++)
+    // The whole buffer, for the verifier (see bpf_xor_path): only patch_len
+    // bytes are stored back.
+    for (__u32 i = 0; i < SECRET_MAX_LEN; i++)
       w->ct_buf[i] ^= w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].xor_delta[i];
 
     bpf_skb_store_bytes(skb, patch_off, w->ct_buf, patch_len, 0);
