@@ -125,30 +125,46 @@ HELPER_INLINE int is_kloak_prefix_huffman(const unsigned char *buf) {
 // Reference: NIST SP 800-38D Section 6.3.
 // ============================================================================
 
+// One of the 128 steps of a GF(2^128) multiply, for bit i of a (MSB-first:
+// bit 0 is the MSB of byte 0): z ^= v if the bit is set, then v = v * x, a
+// 1-bit right shift that folds the bit shifted out of v[15] back in as R.
+// Start with z = 0 and v = b; after steps 0..127, z = a * b.
+//
+// The loop is fully unrolled, so every index is a constant: left as a loop,
+// clang walks v with a pointer offset by a negative constant, which the
+// verifier rejects as an unbounded access since Linux 7.2 (it now keeps a
+// pointer's constant offset in its variable bounds). It is one pass with no
+// branch on the bit: with the branch, clang loads all of v ahead of it and
+// spills it, which takes the BPF callback's stack frame from 8 bytes to 144.
+// The reduction stays a branch, where the verifier can prune the callback's
+// repeated visits once i is dead: made branch-free too, it cost Linux 7.2's
+// verifier 60K more instructions in tc_ghash_update.
+HELPER_INLINE void gf128_mul_step(const __u8 a[16], __u8 v[16], __u8 z[16],
+                                  __u32 i) {
+  // The masks keep the index bounded for the verifier (i < 128 anyway).
+  __u8 mask = -(__u8)((a[(i >> 3) & 0xF] >> (7 - (i & 7))) & 1);
+  __u8 prev = 0;
+#pragma GCC unroll 16
+  for (int j = 0; j < 16; j++) {
+    __u8 cur = v[j];
+    z[j] ^= cur & mask;
+    v[j] = (cur >> 1) | (__u8)(prev << 7);
+    prev = cur;
+  }
+  if (prev & 1)
+    v[0] ^= 0xe1;
+}
+
 // Multiply two 128-bit elements in GF(2^128) using the GHASH bit convention.
 // result = a * b in GF(2^128) with reduction polynomial x^128 + x^7 + x^2 + x + 1.
 HELPER_INLINE void gf128_mul(const __u8 a[16], const __u8 b[16], __u8 result[16]) {
   __u8 v[16], z[16];
-  int i, j;
 
   __builtin_memset(z, 0, 16);
   __builtin_memcpy(v, b, 16);
 
-  for (i = 0; i < 128; i++) {
-    // If bit i of a is set (MSB-first: bit 0 is the MSB of byte 0)
-    if (a[i / 8] & ((__u8)0x80 >> (i % 8))) {
-      for (j = 0; j < 16; j++)
-        z[j] ^= v[j];
-    }
-    // Right-shift v by 1 bit (MSB-first convention)
-    __u8 carry = v[15] & 1;
-    for (j = 15; j > 0; j--)
-      v[j] = (v[j] >> 1) | (v[j - 1] << 7);
-    v[0] >>= 1;
-    // If the shifted-out bit was 1, XOR with reduction polynomial
-    if (carry)
-      v[0] ^= 0xe1;
-  }
+  for (__u32 i = 0; i < 128; i++)
+    gf128_mul_step(a, v, z, i);
   __builtin_memcpy(result, z, 16);
 }
 
@@ -200,23 +216,11 @@ HELPER_INLINE void gf128_h_power_table(const __u8 h_powers[11][16],
 // ws_v and ws_z must each be 16-byte buffers (e.g., fields in a per-CPU map).
 HELPER_INLINE void gf128_mul_ws(const __u8 a[16], const __u8 b[16], __u8 result[16],
                                  __u8 ws_v[16], __u8 ws_z[16]) {
-  int i, j;
-
   __builtin_memset(ws_z, 0, 16);
   __builtin_memcpy(ws_v, b, 16);
 
-  for (i = 0; i < 128; i++) {
-    if (a[i / 8] & ((__u8)0x80 >> (i % 8))) {
-      for (j = 0; j < 16; j++)
-        ws_z[j] ^= ws_v[j];
-    }
-    __u8 carry = ws_v[15] & 1;
-    for (j = 15; j > 0; j--)
-      ws_v[j] = (ws_v[j] >> 1) | (ws_v[j - 1] << 7);
-    ws_v[0] >>= 1;
-    if (carry)
-      ws_v[0] ^= 0xe1;
-  }
+  for (__u32 i = 0; i < 128; i++)
+    gf128_mul_step(a, ws_v, ws_z, i);
   __builtin_memcpy(result, ws_z, 16);
 }
 

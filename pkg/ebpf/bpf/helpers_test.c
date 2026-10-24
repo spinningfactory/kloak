@@ -265,6 +265,32 @@ static void test_gf128_mul_known_vector(void) {
   assert(bytes_equal(h_cubed_1, h_cubed_2, 16));
 }
 
+static void test_gf128_mul_gcm_vector(void) {
+  // GCM spec test case 2 (K = 0, P = 0^128, IV = 0^96): X1 = C * H, and
+  // GHASH = (X1 ^ len(A)||len(C)) * H, which is T ^ E(K, Y0). Checks the
+  // reduction too, which the algebraic tests above can't tell apart.
+  __u8 h[16], c[16], x1[16], ghash[16], result[16], ws_v[16], ws_z[16];
+  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", h, 16);
+  hex_to_bytes("0388dace60b6a392f328c2b971b2fe78", c, 16);
+  hex_to_bytes("5e2ec746917062882c85b0685353deb7", x1, 16);
+  hex_to_bytes("f38cbb1ad69223dcc3457ae5b6b0f885", ghash, 16);
+
+  gf128_mul(c, h, result);
+  assert(bytes_equal(result, x1, 16));
+  gf128_mul_ws(c, h, result, ws_v, ws_z);
+  assert(bytes_equal(result, x1, 16));
+
+  // The steps one by one, as the BPF gf128_mul_iter callback runs them.
+  __builtin_memset(ws_z, 0, 16);
+  __builtin_memcpy(ws_v, h, 16);
+  __u8 a[16];
+  __builtin_memcpy(a, x1, 16);
+  a[15] ^= 0x80; // len(A) || len(C) = 0 || 128
+  for (__u32 i = 0; i < 128; i++)
+    gf128_mul_step(a, ws_v, ws_z, i);
+  assert(bytes_equal(ws_z, ghash, 16));
+}
+
 static void test_gf128_mul_commutativity(void) {
   __u8 a[16], b[16], ab[16], ba[16];
   hex_to_bytes("0388dace60b6a392f328c2b971b2fe78", a, 16);
@@ -1393,6 +1419,7 @@ int main(void) {
   RUN_TEST(test_gf128_mul_identity);
   RUN_TEST(test_gf128_mul_zero);
   RUN_TEST(test_gf128_mul_known_vector);
+  RUN_TEST(test_gf128_mul_gcm_vector);
   RUN_TEST(test_gf128_mul_commutativity);
   RUN_TEST(test_gf128_h_power_1);
   RUN_TEST(test_gf128_h_power_2);

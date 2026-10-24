@@ -1778,18 +1778,7 @@ static int gf128_mul_iter(__u32 i, void *_unused) {
   if (!w)
     return 1; // stop
 
-  __u32 byte_idx = (i >> 3) & 0xF;  // i/8 clamped to [0,15] for verifier
-  __u32 bit_idx = i & 7;            // i%8 clamped to [0,7]
-  if (w->mul_a[byte_idx] & ((__u8)0x80 >> bit_idx)) {
-    for (int j = 0; j < 16; j++)
-      w->mul_z[j] ^= w->mul_v[j];
-  }
-  __u8 carry = w->mul_v[15] & 1;
-  for (int j = 15; j > 0; j--)
-    w->mul_v[j] = (w->mul_v[j] >> 1) | (w->mul_v[j - 1] << 7);
-  w->mul_v[0] >>= 1;
-  if (carry)
-    w->mul_v[0] ^= 0xe1;
+  gf128_mul_step(w->mul_a, w->mul_v, w->mul_z, i);
   return 0;
 }
 
