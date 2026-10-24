@@ -1885,16 +1885,8 @@ static int ghash_block_iter(__u32 block_idx, void *_unused) {
     return 1;
 
   // Build 16-byte block delta.
-  __builtin_memset(w->block_delta, 0, 16);
-  __u32 sec_off = w->ghash_secret_offset;
-  __u32 sec_end = sec_off + w->ghash_patch_len;
-  for (__u32 i = 0; i < 16; i++) {
-    __u32 pos = (b & 0x3FF) * 16 + i;
-    if (pos >= sec_off && pos < sec_end) {
-      __u32 si = (pos - sec_off) & (SECRET_MAX_LEN - 1);
-      w->block_delta[i] = w->ghash_xor_delta[si];
-    }
-  }
+  ghash_block_delta(w->ghash_xor_delta, b, w->ghash_secret_offset,
+                    w->ghash_patch_len, w->block_delta);
 
   // Compute H^power via bpf_loop (no inline functions — avoids stale w).
   __u32 power = w->ghash_ct_blocks - b + 1;

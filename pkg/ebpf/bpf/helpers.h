@@ -25,6 +25,8 @@ typedef uint64_t __u64;
 #endif
 typedef uint16_t __u16;
 typedef int int32_t;
+// libbpf's, from bpf_helpers.h.
+#define barrier_var(var) asm volatile("" : "+r"(var))
 #endif
 
 // Parse HTTP "Host: " header from a data buffer.
@@ -288,6 +290,36 @@ HELPER_INLINE void gf128_halve_to_h(__u64 lo, __u64 hi, __u8 out[16]) {
   for (int i = 0; i < 8; i++) {
     out[i] = (__u8)(hi >> (56 - 8 * i));
     out[8 + i] = (__u8)(lo >> (56 - 8 * i));
+  }
+}
+
+// ghash_block_delta writes the XOR delta of GHASH block `block` (bytes
+// block * 16 .. block * 16 + 15 of the ciphertext; block is masked to 10
+// bits) to out:
+// byte i is xor_delta[pos - sec_off] when pos = block * 16 + i falls in the
+// patch [sec_off, sec_off + len), and 0 elsewhere. len is at most
+// SECRET_MAX_LEN.
+//
+// The range check is arithmetic, not a comparison: BPF has no conditional
+// set, so a comparison is a branch, and 16 of them against bounds the
+// verifier doesn't know made Linux 7.2's verifier walk ~320K instructions of
+// tc_ghash_update here. d is pos - sec_off in 64 bits, negative (top bit
+// set) when pos is before the patch; the byte is in the patch when d's top
+// bit is clear and d - len's is set. The loop is unrolled so every out index
+// is a constant (see gf128_mul_step), and barrier_var keeps each byte's
+// arithmetic in its own iteration: without it clang computes all 16 up
+// front and spills them, taking the callback's stack frame from 32 bytes to
+// 248.
+HELPER_INLINE void ghash_block_delta(const __u8 xor_delta[SECRET_MAX_LEN],
+                                     __u32 block, __u32 sec_off, __u32 len,
+                                     __u8 out[16]) {
+  __u64 start = (__u64)(block & 0x3FF) * 16 - sec_off;
+#pragma GCC unroll 16
+  for (int i = 0; i < 16; i++) {
+    __u64 d = start + i;
+    barrier_var(d);
+    __u8 in = (__u8)((~d & (d - len)) >> 63);
+    out[i] = xor_delta[d & (SECRET_MAX_LEN - 1)] & -in;
   }
 }
 

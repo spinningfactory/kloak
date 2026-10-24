@@ -604,6 +604,60 @@ static void test_gf128_halve_to_h_edges(void) {
 }
 
 // ============================================================================
+// ghash_block_delta
+// ============================================================================
+
+// The block delta as ghash_block_iter built it with a branch per byte.
+static void block_delta_branchy(const __u8 *xor_delta, __u32 b, __u32 sec_off,
+                                __u32 len, __u8 out[16]) {
+  memset(out, 0, 16);
+  __u32 sec_end = sec_off + len;
+  for (__u32 i = 0; i < 16; i++) {
+    __u32 pos = (b & 0x3FF) * 16 + i;
+    if (pos >= sec_off && pos < sec_end)
+      out[i] = xor_delta[(pos - sec_off) & (SECRET_MAX_LEN - 1)];
+  }
+}
+
+static void check_block_delta(const __u8 *xor_delta, __u32 b, __u32 sec_off,
+                              __u32 len) {
+  __u8 want[16], got[16];
+  block_delta_branchy(xor_delta, b, sec_off, len, want);
+  memset(got, 0xAA, 16);
+  ghash_block_delta(xor_delta, b, sec_off, len, got);
+  if (memcmp(want, got, 16) != 0) {
+    printf("\n    block=%u sec_off=%u len=%u", b, sec_off, len);
+    print_hex("want", want, 16);
+    print_hex("got ", got, 16);
+  }
+  assert(memcmp(want, got, 16) == 0);
+}
+
+static void test_ghash_block_delta(void) {
+  __u8 xor_delta[SECRET_MAX_LEN];
+  for (int i = 0; i < SECRET_MAX_LEN; i++)
+    xor_delta[i] = (__u8)(i * 37 + 1); // no zero bytes, so a miss shows
+
+  // Every patch (len 1..SECRET_MAX_LEN) at every offset in the first 400
+  // bytes, against every block it can touch and its neighbours.
+  for (__u32 len = 1; len <= SECRET_MAX_LEN; len++)
+    for (__u32 sec_off = 0; sec_off < 400; sec_off++)
+      for (__u32 b = 0; b < 35; b++)
+        check_block_delta(xor_delta, b, sec_off, len);
+
+  // The last blocks, a block number past the 0x3FF mask, and offsets so
+  // large that the old u32 sec_end wrapped.
+  static const __u32 offs[] = {16352, 16367, 16368, 16383, 16384,
+                               0xFFFFFFFFu - SECRET_MAX_LEN, 0xFFFFFFF0u,
+                               0xFFFFFFFFu};
+  static const __u32 blocks[] = {0, 1, 1021, 1022, 1023, 1024, 1025, 0xFFFFFFFFu};
+  for (unsigned o = 0; o < sizeof(offs) / sizeof(offs[0]); o++)
+    for (unsigned k = 0; k < sizeof(blocks) / sizeof(blocks[0]); k++)
+      for (__u32 len = 1; len <= SECRET_MAX_LEN; len++)
+        check_block_delta(xor_delta, blocks[k], offs[o], len);
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -1445,6 +1499,9 @@ int main(void) {
   printf("gf128_halve_to_h (OpenSSL AVX-512 / Go H recovery):\n");
   RUN_TEST(test_gf128_halve_to_h_aes_keys);
   RUN_TEST(test_gf128_halve_to_h_edges);
+
+  printf("ghash_block_delta:\n");
+  RUN_TEST(test_ghash_block_delta);
 
   printf("tls_parse_sni (SNI check):\n");
   RUN_TEST(test_sni_go);
