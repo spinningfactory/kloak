@@ -138,3 +138,19 @@ jobs:
             report test.log "Linux ${{ matrix.kernel.version }} (${{ matrix.arch }})"
             report test-debug.log "Linux ${{ matrix.kernel.version }} (${{ matrix.arch }}, BPF_DEBUG=1)"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # The check to require in branch protection: the jobs above are named after
+  # kernel versions, which change with every release. Mainline failures don't
+  # count (continue-on-error).
+  result:
+    name: All kernels
+    needs: test
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the kernel jobs
+        run: |
+          if [ "${{ needs.test.result }}" != success ]; then
+            echo "::error::a kernel job did not pass (${{ needs.test.result }})"
+            exit 1
+          fi
