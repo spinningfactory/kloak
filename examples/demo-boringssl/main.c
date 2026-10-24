@@ -24,8 +24,14 @@
 #include <unistd.h>
 #include <netdb.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 
 #define LISTEN_PORT "8443"
+// Seconds a request may block in connect, the handshake or the echo. Without
+// a timeout a connect that gets no answer blocks for the kernel's SYN
+// retries, about two minutes, and so does the whole loop, the readiness
+// check included.
+#define REQUEST_TIMEOUT_SEC 5
 
 // read_file slurps a file and trims trailing whitespace/newlines. Returns a
 // malloc'd string (caller frees) or NULL.
@@ -59,8 +65,10 @@ static char *load_secret(const char *env_var, const char *fallback) {
 }
 
 // tcp_connect resolves host via DNS (getting kloak's virtual IP for it) and
-// opens a TCP connection to host:port.
-static int tcp_connect(const char *host, const char *port) {
+// opens a TCP connection to host:port. Every blocking call on the socket
+// gives up after timeout_sec, connect included (Linux applies SO_SNDTIMEO
+// to it).
+static int tcp_connect(const char *host, const char *port, int timeout_sec) {
     struct addrinfo hints, *res = NULL;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_UNSPEC;
@@ -68,6 +76,9 @@ static int tcp_connect(const char *host, const char *port) {
     if (getaddrinfo(host, port, &hints, &res) != 0) return -1;
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd < 0) { freeaddrinfo(res); return -1; }
+    struct timeval tv = { .tv_sec = timeout_sec };
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     if (connect(fd, res->ai_addr, res->ai_addrlen) < 0) {
         close(fd);
         freeaddrinfo(res);
@@ -82,7 +93,7 @@ static int tcp_connect(const char *host, const char *port) {
 static int send_and_echo(SSL_CTX *ctx, const char *host,
                          const char *secret_allowed, const char *secret_blocked,
                          int req_num) {
-    int fd = tcp_connect(host, LISTEN_PORT);
+    int fd = tcp_connect(host, LISTEN_PORT, REQUEST_TIMEOUT_SEC);
     if (fd < 0) {
         printf("\n--- Request #%d ---\nError: TCP connect to %s:%s failed\n",
                req_num, host, LISTEN_PORT);
@@ -181,7 +192,7 @@ int main(void) {
     printf("Waiting for echo server to be ready...\n");
     fflush(stdout);
     for (int attempt = 0; attempt < 30; attempt++) {
-        int fd = tcp_connect(target_host, LISTEN_PORT);
+        int fd = tcp_connect(target_host, LISTEN_PORT, 1);
         if (fd >= 0) { close(fd); printf("Echo server is ready.\n"); fflush(stdout); break; }
         sleep(1);
     }
