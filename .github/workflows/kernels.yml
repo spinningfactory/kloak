@@ -88,12 +88,16 @@ jobs:
             ${{ matrix.arch == 'arm64' && 'qemu-system-arm' || 'qemu-system-x86' }}
 
       - name: Enable KVM
+        # GitHub's arm64 runners have no KVM. Emulated, one load of the
+        # objects takes ~30s and the whole package doesn't fit in the job,
+        # so only the load tests run there: they are where an arch differs.
         run: |
           if [ -e /dev/kvm ]; then
             sudo chmod 0666 /dev/kvm
           else
-            echo "::notice::no KVM on this runner, the VM is emulated (slower)"
+            echo "::notice::no KVM on this runner: the VM is emulated, only the load tests run"
             echo "VIMTO_DISABLE_KVM=true" >> "$GITHUB_ENV"
+            echo 'TEST_RUN=TestLoadObjects$|TestVerifierBudget' >> "$GITHUB_ENV"
           fi
 
       - name: Install vimto
@@ -105,7 +109,8 @@ jobs:
       - name: Run the BPF tests
         shell: bash
         run: |
-          vimto -kernel "$KERNEL_IMAGE" -- go test -count=1 -v ./pkg/ebpf/ | tee test.log
+          vimto -kernel "$KERNEL_IMAGE" -- go test -count=1 -v -timeout 20m \
+            ${TEST_RUN:+-run "$TEST_RUN"} ./pkg/ebpf/ | tee test.log
 
       - name: Load the debug build
         # BPF_DEBUG=1 compiles in the bpf_printk markers (the e2e image's
@@ -114,7 +119,7 @@ jobs:
         shell: bash
         run: |
           BPF_DEBUG=1 go generate ./pkg/ebpf/
-          vimto -kernel "$KERNEL_IMAGE" -- go test -count=1 -v \
+          vimto -kernel "$KERNEL_IMAGE" -- go test -count=1 -v -timeout 20m \
             -run 'TestLoadObjects$|TestVerifierBudget' ./pkg/ebpf/ | tee test-debug.log
 
       - name: Report verifier cost

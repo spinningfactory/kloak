@@ -21,6 +21,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 
 	"github.com/spinningfactory/kloak/pkg/secrets"
 )
@@ -490,7 +491,9 @@ func TestRebindRevokesLostGrants(t *testing.T) {
 func TestAttachPodDNSRewriteNetns(t *testing.T) {
 	objs := loadTestObjects(t)
 	podNS := newNetns(t)
-	h, err := netlink.NewHandleAt(netns.NsHandle(podNS.Fd()))
+	// Route only: with no family, it also opens XFRM and netfilter sockets,
+	// which a kernel built without them refuses.
+	h, err := netlink.NewHandleAt(netns.NsHandle(podNS.Fd()), unix.NETLINK_ROUTE)
 	if err != nil {
 		t.Fatal(err)
 	}
