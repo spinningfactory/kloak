@@ -1,0 +1,276 @@
+name: Kernels
+
+# Loads the BPF programs and runs the BPF tests (pkg/ebpf) on every kernel
+# series still maintained upstream, from the oldest kloak supports up, on x86
+# and arm64, with and without BPF_DEBUG. The verifier is what differs most
+# between kernels: a program it accepts on one can be rejected on the next
+# (tc_ghash_update on 7.2), and its cost moves a lot (TestVerifierBudget).
+#
+# The kernels come from github.com/cilium/ci-kernels, read on every run: its
+# list follows kernel.org's (mainline, stable and every longterm series), so
+# new releases are tested and end-of-life series dropped without changing
+# this file. Each kernel boots in a VM (lmb.io/vimto) on the runner.
+#
+# Pull requests and pushes run the kernels only when they change BPF_PATHS.
+# The daily run tests main on whatever kernels were released since, and keeps
+# the baseline that pull requests' verifier costs are compared with fresh.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened]
+  schedule:
+    - cron: '23 5 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Must match the golang image in the Dockerfile (see ci.yml's lint job).
+  GO_VERSION: '1.27'
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Oldest kernel kloak supports (bpf_loop): older series are left out.
+  MIN_KERNEL: '5.17'
+  VIMTO_VERSION: v0.4.0
+  # What the kernel jobs build and test (an extended regex over the changed
+  # files): the BPF programs, their loader and tests, the cilium/ebpf
+  # version, and this workflow.
+  BPF_PATHS: '^(pkg/ebpf/|go\.(mod|sum)$|\.vimto\.toml$|\.github/workflows/kernels\.yml$|\.github/scripts/kernel-report\.py$)'
+
+jobs:
+  kernels:
+    name: Kernel list
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run: ${{ steps.changes.outputs.run }}
+      kernels: ${{ steps.list.outputs.kernels }}
+    steps:
+      - name: Check for BPF changes
+        id: changes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          # A pull request's files are all those it changes against its base,
+          # so once it touches BPF_PATHS, every later push runs too.
+          case "$GITHUB_EVENT_NAME" in
+            pull_request)
+              FILES=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR/files" -q '.[].filename') ;;
+            push)
+              # The compare API lists at most 300 files: run when it may
+              # have left some out, or the push has no previous commit.
+              FILES=ALL
+              if [[ ! "$BEFORE" =~ ^0*$ ]]; then
+                COMPARE=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BEFORE...$GITHUB_SHA")
+                if [ "$(jq '.files | length' <<< "$COMPARE")" -lt 300 ]; then
+                  FILES=$(jq -r '.files[].filename' <<< "$COMPARE")
+                fi
+              fi ;;
+            *)
+              FILES=ALL ;;
+          esac
+          if [ "$FILES" = ALL ] || grep -qE "$BPF_PATHS" <<< "$FILES"; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "No change to the BPF programs or their tests: the kernel jobs are skipped." | tee -a "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Read ci-kernels' kernel list
+        id: list
+        if: steps.changes.outputs.run == 'true'
+        run: |
+          curl -fsSL --retry 3 -o versions.json \
+            https://raw.githubusercontent.com/cilium/ci-kernels/main/matrix/versions.json
+          # "7.3-rc4" -> [7, 3]; arrays compare element by element.
+          KERNELS=$(jq -c --arg min "$MIN_KERNEL" '
+            def series: [scan("[0-9]+") | tonumber] | .[0:2];
+            map(select((.version | series) >= ($min | series)) | {version, channel})
+          ' versions.json)
+          if [ "$(jq length <<< "$KERNELS")" -eq 0 ]; then
+            echo "::error::no kernel >= $MIN_KERNEL in ci-kernels' list"
+            exit 1
+          fi
+          echo "kernels=$KERNELS" >> "$GITHUB_OUTPUT"
+          jq -r '"Kernels: " + (map(.version + " (" + .channel + ")") | join(", "))' <<< "$KERNELS"
+
+  test:
+    name: Linux ${{ matrix.kernel.version }} (${{ matrix.arch }})
+    needs: kernels
+    if: needs.kernels.outputs.run == 'true'
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 30
+    # Mainline is a release candidate: a failure there is an early warning
+    # of what the next release will break, not a reason to block a PR.
+    continue-on-error: ${{ matrix.kernel.channel == 'mainline' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: ${{ fromJSON(needs.kernels.outputs.kernels) }}
+        arch: [x86, arm64]
+    env:
+      KERNEL_IMAGE: ghcr.io/cilium/ci-kernels:${{ matrix.kernel.version }}
+      KLOAK_TARGET_ARCH: ${{ matrix.arch }}
+      # Fail, don't skip, when the objects don't load.
+      KLOAK_REQUIRE_BPF: '1'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Install clang and qemu
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev \
+            ${{ matrix.arch == 'arm64' && 'qemu-system-arm' || 'qemu-system-x86' }}
+
+      - name: Enable KVM
+        # GitHub's arm64 runners have no KVM. Emulated, one load of the
+        # objects takes ~30s and the whole package doesn't fit in the job,
+        # so only the load tests run there: they are where an arch differs.
+        run: |
+          if [ -e /dev/kvm ]; then
+            sudo chmod 0666 /dev/kvm
+          else
+            echo "::notice::no KVM on this runner: the VM is emulated, only the load tests run"
+            echo "VIMTO_DISABLE_KVM=true" >> "$GITHUB_ENV"
+            echo 'TEST_RUN=TestLoadObjects$|TestVerifierBudget' >> "$GITHUB_ENV"
+          fi
+
+      - name: Install vimto
+        run: CGO_ENABLED=0 go install lmb.io/vimto@${{ env.VIMTO_VERSION }}
+
+      - name: Generate eBPF bindings
+        run: go generate ./pkg/ebpf/
+
+      - name: Run the BPF tests
+        shell: bash
+        run: |
+          vimto -kernel "$KERNEL_IMAGE" -- go test -count=1 -v -timeout 20m \
+            ${TEST_RUN:+-run "$TEST_RUN"} ./pkg/ebpf/ | tee test.log
+
+      - name: Load the debug build
+        # BPF_DEBUG=1 compiles in the bpf_printk markers (the e2e image's
+        # build), which changes what the verifier sees.
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: |
+          BPF_DEBUG=1 go generate ./pkg/ebpf/
+          vimto -kernel "$KERNEL_IMAGE" -- go test -count=1 -v -timeout 20m \
+            -run 'TestLoadObjects$|TestVerifierBudget' ./pkg/ebpf/ | tee test-debug.log
+
+      - name: Collect the logs for the report
+        if: ${{ !cancelled() }}
+        run: |
+          mkdir report
+          cp test.log test-debug.log report/ 2>/dev/null || true
+          jq -n --arg version '${{ matrix.kernel.version }}' --arg channel '${{ matrix.kernel.channel }}' \
+            --arg arch '${{ matrix.arch }}' --arg status '${{ job.status }}' \
+            '{$version, $channel, $arch, $status}' > report/meta.json
+
+      - name: Upload the logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: kernel-logs-${{ matrix.kernel.version }}-${{ matrix.arch }}
+          path: report/
+          # main's are the baseline of every pull request's report.
+          retention-days: 30
+
+  # Sums the kernel jobs up in the run's summary and, on a pull request, in a
+  # comment it keeps up to date, with the verifier costs compared to the base
+  # branch's latest run. Fork pull requests get no comment: their token can't
+  # write to pull requests (see ci.yml's Coverage Report).
+  report:
+    name: Kernel report
+    needs: [kernels, test]
+    if: ${{ !cancelled() && needs.kernels.outputs.run == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PR: ${{ github.event.pull_request.number }}
+      BASE_REF: ${{ github.event.pull_request.base.ref }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+
+      - name: Download this run's logs
+        # No logs (every kernel job failed early) is reported, not an error.
+        continue-on-error: true
+        uses: actions/download-artifact@v8
+        with:
+          pattern: kernel-logs-*
+          path: current
+
+      - name: Download the base branch's logs
+        if: github.event_name == 'pull_request'
+        run: |
+          # The latest run on the base branch that ran the kernels (a push
+          # that changed none of BPF_PATHS has no logs).
+          gh run list --repo "$GITHUB_REPOSITORY" --workflow kernels.yml --branch "$BASE_REF" \
+              --status completed --limit 20 --json databaseId,url -q '.[] | "\(.databaseId) \(.url)"' |
+          while read -r ID URL; do
+            if gh run download "$ID" --repo "$GITHUB_REPOSITORY" --pattern 'kernel-logs-*' --dir base 2>/dev/null; then
+              echo "BASE_RUN_URL=$URL" >> "$GITHUB_ENV"
+              echo "Comparing with $URL"
+              break
+            fi
+          done
+
+      - name: Build the report
+        run: |
+          python3 .github/scripts/kernel-report.py current base > report.md
+          cat report.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Comment on the pull request
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false
+        run: |
+          MARKER=$(head -1 report.md)
+          ID=$(gh api --paginate "repos/$GITHUB_REPOSITORY/issues/$PR/comments" \
+            -q ".[] | select(.user.login == \"github-actions[bot]\" and (.body | startswith(\"$MARKER\"))) | .id" | head -1)
+          if [ -n "$ID" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$ID" -F body=@report.md > /dev/null
+          else
+            gh pr comment "$PR" --repo "$GITHUB_REPOSITORY" --body-file report.md
+          fi
+
+  # The check to require in branch protection: the jobs above are named after
+  # kernel versions, which change with every release. Mainline failures don't
+  # count (continue-on-error), and it passes when there was nothing to test.
+  result:
+    name: All kernels
+    needs: [kernels, test]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check the kernel jobs
+        env:
+          LIST: ${{ needs.kernels.result }}
+          RUN: ${{ needs.kernels.outputs.run }}
+          TEST: ${{ needs.test.result }}
+        run: |
+          if [ "$LIST" != success ]; then
+            echo "::error::the kernel list job did not pass ($LIST)"
+            exit 1
+          fi
+          if [ "$RUN" = true ] && [ "$TEST" != success ]; then
+            echo "::error::a kernel job did not pass ($TEST)"
+            exit 1
+          fi
