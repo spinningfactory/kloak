@@ -139,17 +139,25 @@ HELPER_INLINE __u8 patch_tail_mask(__u8 pad_bits) {
 // entry, whose real is Huffman(real value) with EOS padding, that is the
 // real value's code followed by the next character's bits, unchanged.
 //
+// real is zero past len (sync copies only the secret), so the bytes of buf
+// past the placeholder are left as they are. They are never applied anyway:
+// tc stores back only len bytes, and the GHASH delta masks the rest
+// (ghash_block_delta).
+//
 // The last byte is prepared before the loop rather than masked after it: its
 // bits after the placeholder are set to real's, which the loop's XOR then
-// clears. The verifier walks code after the loop once per loop exit (up to
-// SECRET_MAX_LEN of them) until its next prune point, which made the mask
-// after the loop double bpf_xor_path's verifier cost.
+// clears. With the loop bounded by len, the verifier walked code after it
+// once per loop exit, which made a mask after it double bpf_xor_path's
+// verifier cost. The loop covers the whole buffer, a constant bound every
+// verifier can follow: bounded by len too, clang counts the loop down on a
+// second register whose range Linux 6.1's and 6.6's verifiers lose, and they
+// reject bpf_xor_path.
 HELPER_INLINE void patch_delta(__u8 buf[SECRET_MAX_LEN],
                                const char real[SECRET_MAX_LEN], __u32 len,
                                __u8 pad_bits) {
   __u32 last = (len - 1) & (SECRET_MAX_LEN - 1);
   buf[last] ^= (buf[last] ^ (__u8)real[last]) & (__u8)~patch_tail_mask(pad_bits);
-  for (__u32 j = 0; j < SECRET_MAX_LEN && j < len; j++)
+  for (__u32 j = 0; j < SECRET_MAX_LEN; j++)
     buf[j] ^= real[j];
 }
 

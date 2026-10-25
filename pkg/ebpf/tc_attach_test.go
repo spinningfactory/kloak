@@ -102,6 +102,52 @@ func (e *tcTestEnv) inTestNS(t *testing.T) {
 	}
 }
 
+// needTCX skips the test on a kernel without TCX (Linux < 6.6).
+func (e *tcTestEnv) needTCX(t *testing.T) {
+	t.Helper()
+	e.inTestNS(t)
+	l, err := link.AttachTCX(link.TCXOptions{Interface: e.ifindex, Program: e.prog, Attach: ebpf.AttachTCXIngress})
+	if errors.Is(err, ebpf.ErrNotSupported) {
+		t.Skip("kernel has no TCX")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = l.Close()
+}
+
+// needClsact skips the test on a kernel without the clsact qdisc or the
+// cls_bpf classifier. Distro kernels have both; the kernels of the CI kernel
+// matrix (github.com/cilium/ci-kernels) are built without them.
+func (e *tcTestEnv) needClsact(t *testing.T) {
+	t.Helper()
+	e.inTestNS(t)
+	qdisc := &netlink.GenericQdisc{
+		QdiscAttrs: netlink.QdiscAttrs{LinkIndex: e.ifindex, Handle: netlink.MakeHandle(0xffff, 0), Parent: netlink.HANDLE_CLSACT},
+		QdiscType:  "clsact",
+	}
+	err := netlink.QdiscAdd(qdisc)
+	if errors.Is(err, unix.ENOENT) {
+		t.Skip("kernel has no clsact qdisc (CONFIG_NET_SCH_INGRESS)")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Deleting the qdisc deletes the filter too.
+	defer func() { _ = netlink.QdiscDel(qdisc) }()
+	err = netlink.FilterAdd(&netlink.BpfFilter{
+		FilterAttrs: netlink.FilterAttrs{LinkIndex: e.ifindex, Parent: netlink.HANDLE_MIN_INGRESS,
+			Handle: 1, Priority: 1, Protocol: unix.ETH_P_ALL},
+		Fd: e.prog.FD(), Name: "probe", DirectAction: true,
+	})
+	if errors.Is(err, unix.ENOENT) {
+		t.Skip("kernel has no cls_bpf classifier (CONFIG_NET_CLS_BPF)")
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func (e *tcTestEnv) kloakFilters(t *testing.T, parent uint32) []*netlink.BpfFilter {
 	t.Helper()
 	e.inTestNS(t)
@@ -124,6 +170,7 @@ func testManager(mode TCAttachMode) *TLSUprobeManager {
 
 func TestAttachClsact_ReplacesInsteadOfStacking(t *testing.T) {
 	e := newTCTestEnv(t)
+	e.needClsact(t)
 
 	e.inTestNS(t)
 	first, err := attachClsact(e.prog, e.ifindex, true, e.nsFile)
@@ -161,6 +208,7 @@ func TestAttachClsact_ReplacesInsteadOfStacking(t *testing.T) {
 
 func TestAttachClsact_KeepsExistingQdisc(t *testing.T) {
 	e := newTCTestEnv(t)
+	e.needClsact(t)
 	e.inTestNS(t)
 	// Simulate a CNI that already owns a clsact qdisc on the interface.
 	qdisc := &netlink.GenericQdisc{
@@ -197,6 +245,7 @@ func TestAttachClsact_KeepsExistingQdisc(t *testing.T) {
 
 func TestClsactFilterClose_FromAnotherThread(t *testing.T) {
 	e := newTCTestEnv(t)
+	e.needClsact(t)
 	e.inTestNS(t)
 	c, err := attachClsact(e.prog, e.ifindex, true, e.nsFile)
 	if err != nil {
@@ -226,6 +275,7 @@ func noTCX(t *testing.T) {
 
 func TestAttachTCProgram_AutoFallsBackToClsact(t *testing.T) {
 	e := newTCTestEnv(t)
+	e.needClsact(t)
 	noTCX(t)
 	e.inTestNS(t)
 	m := testManager(TCAttachAuto)
@@ -275,6 +325,7 @@ func TestAttachTCProgram_AutoKeepsOtherTCXErrors(t *testing.T) {
 
 func TestAttachTCProgram_ClsactModeNeverTriesTCX(t *testing.T) {
 	e := newTCTestEnv(t)
+	e.needClsact(t)
 	real := attachTCX
 	t.Cleanup(func() { attachTCX = real })
 	attachTCX = func(link.TCXOptions) (link.Link, error) {
@@ -294,12 +345,10 @@ func TestAttachTCProgram_ClsactModeNeverTriesTCX(t *testing.T) {
 
 func TestAttachTCProgram_AutoUsesTCXWhenAvailable(t *testing.T) {
 	e := newTCTestEnv(t)
+	e.needTCX(t)
 	e.inTestNS(t)
 	m := testManager(TCAttachAuto)
 	c, err := m.attachTCProgram(e.prog, e.ifindex, true, e.nsFile)
-	if errors.Is(err, ebpf.ErrNotSupported) {
-		t.Skip("kernel has no TCX")
-	}
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -381,6 +430,7 @@ func TestTCChainKeepsOtherPrograms(t *testing.T) {
 				}
 				defer func() { _ = l.Close() }()
 			} else {
+				e.needClsact(t)
 				if err := netlink.QdiscAdd(&netlink.GenericQdisc{
 					QdiscAttrs: netlink.QdiscAttrs{LinkIndex: e.ifindex, Handle: netlink.MakeHandle(0xffff, 0), Parent: netlink.HANDLE_CLSACT},
 					QdiscType:  "clsact",

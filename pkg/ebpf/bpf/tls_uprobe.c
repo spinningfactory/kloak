@@ -3234,7 +3234,9 @@ int tc_egress_patch(struct __sk_buff *skb) {
       continue;
     }
 
-    for (__u32 i = 0; i < SECRET_MAX_LEN && i < patch_len; i++)
+    // The whole buffer, for the verifier (see bpf_xor_path): only patch_len
+    // bytes are stored back.
+    for (__u32 i = 0; i < SECRET_MAX_LEN; i++)
       w->ct_buf[i] ^= w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].xor_delta[i];
 
     bpf_skb_store_bytes(skb, patch_off, w->ct_buf, patch_len, 0);
