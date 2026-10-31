@@ -119,27 +119,45 @@ func (h *Handler) isEnabled(ctx context.Context, pod *corev1.Pod, namespace stri
 	return false, nil
 }
 
-// rewriteSecretVolumes swaps Secret volume mounts that point at kloak-enabled
-// secrets with their shadow counterparts. Returns an error if a kloak-enabled
+// rewriteSecretVolumes swaps direct and projected Secret volume references
+// that point at kloak-enabled secrets with their shadow counterparts.
+// Returns an error if a kloak-enabled
 // secret has no valid shadow (fail closed — controller may not have reconciled
 // yet, or someone deleted the shadow by hand).
 func (h *Handler) rewriteSecretVolumes(ctx context.Context, pod *corev1.Pod, namespace string) error {
 	for i := range pod.Spec.Volumes {
 		vol := &pod.Spec.Volumes[i]
-		if vol.Secret == nil {
+		if vol.Secret != nil {
+			optional := vol.Secret.Optional != nil && *vol.Secret.Optional
+			ok, shadow, err := h.lookupKloakSecret(ctx, vol.Secret.SecretName, namespace, optional)
+			if err != nil {
+				return err
+			}
+			if ok {
+				h.log.Debugw("rewriting volume to use shadow secret",
+					"original", vol.Secret.SecretName, "shadow", shadow)
+				vol.Secret.SecretName = shadow
+			}
+		}
+		if vol.Projected == nil {
 			continue
 		}
-		optional := vol.Secret.Optional != nil && *vol.Secret.Optional
-		ok, shadow, err := h.lookupKloakSecret(ctx, vol.Secret.SecretName, namespace, optional)
-		if err != nil {
-			return err
+		for j := range vol.Projected.Sources {
+			secret := vol.Projected.Sources[j].Secret
+			if secret == nil {
+				continue
+			}
+			optional := secret.Optional != nil && *secret.Optional
+			ok, shadow, err := h.lookupKloakSecret(ctx, secret.Name, namespace, optional)
+			if err != nil {
+				return err
+			}
+			if ok {
+				h.log.Debugw("rewriting projected volume to use shadow secret",
+					"original", secret.Name, "shadow", shadow)
+				secret.Name = shadow
+			}
 		}
-		if !ok {
-			continue
-		}
-		h.log.Debugw("rewriting volume to use shadow secret",
-			"original", vol.Secret.SecretName, "shadow", shadow)
-		vol.Secret.SecretName = shadow
 	}
 	return nil
 }
