@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net/netip"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -41,6 +42,12 @@ const (
 	// sandboxPodLookupTimeout bounds PrepareSandbox's read of a pod the
 	// cache does not have yet: the container runtime waits for it.
 	sandboxPodLookupTimeout = time.Second
+
+	// containerPrepareTimeout bounds how long PrepareContainer holds the
+	// start of a container: the container runtime waits for it (it serves
+	// one NRI request at a time), and disconnects a plugin that takes
+	// longer than its timeout, 2 s by default.
+	containerPrepareTimeout = 1500 * time.Millisecond
 )
 
 // Reconciler watches pods and manages eBPF cgroup tracking.
@@ -68,6 +75,11 @@ type Reconciler struct {
 	// namespace recorded for them, released when the pod goes.
 	exitedCgroups map[string]map[uint64]struct{}
 
+	// startedCgroups maps pod UID -> the cgroups of its containers that
+	// PrepareContainer attached before they started, until the pod's status
+	// lists them.
+	startedCgroups map[string]map[uint64]containerCgroup
+
 	// podKeyToUID maps "namespace/name" -> pod UID, so that on a NotFound
 	// delete event (where we only have the namespaced name) we can look up
 	// the UID and clean up trackedPods correctly.
@@ -80,15 +92,16 @@ func NewReconciler(c client.Client, log *zap.SugaredLogger, scheme *runtime.Sche
 		cgroupRoot = CgroupBasePath
 	}
 	return &Reconciler{
-		Client:        c,
-		Log:           log,
-		Scheme:        scheme,
-		UprobeManager: uprobeMgr,
-		CgroupRoot:    cgroupRoot,
-		NodeName:      nodeName,
-		trackedPods:   make(map[string]map[uint64]bool),
-		exitedCgroups: make(map[string]map[uint64]struct{}),
-		podKeyToUID:   make(map[string]string),
+		Client:         c,
+		Log:            log,
+		Scheme:         scheme,
+		UprobeManager:  uprobeMgr,
+		CgroupRoot:     cgroupRoot,
+		NodeName:       nodeName,
+		trackedPods:    make(map[string]map[uint64]bool),
+		exitedCgroups:  make(map[string]map[uint64]struct{}),
+		startedCgroups: make(map[string]map[uint64]containerCgroup),
+		podKeyToUID:    make(map[string]string),
 	}
 }
 
@@ -204,6 +217,18 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	existingCgroups := r.trackedPods[uid]
 	if existingCgroups == nil {
 		existingCgroups = make(map[uint64]bool)
+	}
+
+	// The containers PrepareContainer attached before they started, which
+	// the status may not list yet: running while their cgroup is there.
+	for cgroupID, c := range r.startedCgroups[uid] {
+		if _, listed := containers[cgroupID]; listed {
+			delete(r.startedCgroups[uid], cgroupID)
+		} else if _, err := os.Stat(c.path); err == nil {
+			containers[cgroupID] = c
+		} else {
+			delete(r.startedCgroups[uid], cgroupID)
+		}
 	}
 
 	// Collect cgroups that need uprobe attachment:
@@ -383,6 +408,127 @@ type Sandbox struct {
 	IPs []netip.Addr
 }
 
+// Container is a container the container runtime is about to start, as it
+// reports it over NRI.
+type Container struct {
+	ID   string
+	Name string
+}
+
+// PrepareContainer attaches the TLS uprobes for a container of a kloak pod
+// that the container runtime is about to start (NRI). The runtime waits for
+// it: the container's process exists, in the container's cgroup, but has
+// not run the container's command, so the command's first TLS write is
+// rewritten. It tracks the container (for exec events, on which the
+// command's executable is attached: the TLS linked into a Go or Bun binary,
+// say), binds the pod's secrets to it, and attaches the TLS libraries in its
+// filesystem, which its processes go through (the command's, and those it
+// starts), and the pod's tc patch program.
+//
+// It returns within containerPrepareTimeout: an attach that takes longer
+// goes on in the background while the container starts. One that fails is
+// retried by the reconciler, which attaches the container once the pod's
+// status reports it running, as it does without NRI.
+func (r *Reconciler) PrepareContainer(ctx context.Context, sb *Sandbox, c *Container) {
+	// Most containers are not kloak pods': no API read for them.
+	if r.UprobeManager == nil || sb.Annotations[AnnotationEnabled] != "true" {
+		return
+	}
+	start := time.Now()
+	name := sb.Namespace + "/" + sb.Name
+	log := r.Log.With("pod", name, "container", c.Name)
+	pod, err := r.sandboxPod(ctx, sb)
+	if err != nil {
+		log.Debugw("pod of a container being started not found; the reconciler attaches the container when it sees it running", "error", err)
+		return
+	}
+	if !r.isEnabled(pod) {
+		return
+	}
+	path, err := cgroups.FindContainerCgroupPath(r.CgroupRoot, sb.UID, c.ID)
+	if err != nil {
+		log.Debugw("cgroup of a container being started not found", "id", c.ID, "error", err)
+		return
+	}
+	cgroupID, err := cgroups.GetCgroupInodeFromPath(path)
+	if err != nil {
+		log.Debugw("cgroup of a container being started unreadable", "path", path, "error", err)
+		return
+	}
+	pids, err := cgroups.ReadCgroupProcs(path)
+	if err != nil || len(pids) == 0 {
+		log.Debugw("no process in the cgroup of a container being started", "path", path, "error", err)
+		return
+	}
+
+	// Claim the container, for the reconciler to leave it to this attach.
+	uid := string(pod.UID)
+	r.mu.Lock()
+	if r.trackedPods[uid] == nil {
+		r.trackedPods[uid] = make(map[uint64]bool)
+	}
+	r.podKeyToUID[name] = uid
+	if _, tracked := r.trackedPods[uid][cgroupID]; tracked {
+		r.mu.Unlock()
+		return
+	}
+	r.trackedPods[uid][cgroupID] = true
+	if r.startedCgroups == nil {
+		r.startedCgroups = make(map[string]map[uint64]containerCgroup)
+	}
+	if r.startedCgroups[uid] == nil {
+		r.startedCgroups[uid] = make(map[uint64]containerCgroup)
+	}
+	r.startedCgroups[uid][cgroupID] = containerCgroup{path: path, name: c.Name}
+	r.mu.Unlock()
+
+	if err := r.UprobeManager.TrackCgroup(cgroupID, path); err != nil {
+		log.Errorw("failed to track cgroup for exec events", "error", err, "cgroupID", cgroupID)
+	}
+	r.UprobeManager.BindPodContainer(uid, name, sb.IPs, cgroupID, k8ssecrets.PodSecretRefs(pod))
+
+	done := make(chan error, 1)
+	go func() {
+		pid := pids[0]
+		err := r.UprobeManager.AttachContainerTLS(pid, cgroupID)
+		if err == nil {
+			r.UprobeManager.RecordCgroupNetns(cgroupID, pid)
+		}
+		r.mu.Lock()
+		_, tracked := r.trackedPods[uid][cgroupID]
+		_, exited := r.exitedCgroups[uid][cgroupID]
+		if tracked {
+			r.trackedPods[uid][cgroupID] = err == nil
+		}
+		r.mu.Unlock()
+		switch {
+		case tracked:
+		case exited:
+			// The container exited while this attached.
+			_ = r.UprobeManager.UntrackExitedCgroup(cgroupID)
+		default:
+			// The pod went while this attached.
+			_ = r.UprobeManager.UntrackCgroup(cgroupID)
+		}
+		done <- err
+	}()
+	timer := time.NewTimer(time.Until(start.Add(containerPrepareTimeout)))
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err != nil {
+			// No TLS library in the container: its command may carry its
+			// own TLS, attached on its exec event or by the reconciler.
+			logging.Tracew(log, "no TLS library attached before the container started", "cgroupID", cgroupID, "err", err)
+			return
+		}
+		log.Infow("TLS uprobes attached before the container started (NRI)", "cgroupID", cgroupID, "took", time.Since(start).String())
+	case <-timer.C:
+		log.Warnw("the container starts before its TLS uprobes are attached, which goes on in the background; its first TLS writes may not be rewritten",
+			"cgroupID", cgroupID, "after", time.Since(start).String())
+	}
+}
+
 // PrepareSandbox attaches the virtual IP DNS rewrite in a kloak pod's
 // network namespace and binds the pod at its addresses, while the container
 // runtime creates the pod's sandbox or one of its containers (NRI): the
@@ -523,6 +669,7 @@ func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, erro
 	// Remove the pod from our tracking.
 	delete(r.trackedPods, uid)
 	delete(r.exitedCgroups, uid)
+	delete(r.startedCgroups, uid)
 	delete(r.podKeyToUID, namespacedName)
 	r.mu.Unlock()
 	r.Log.Infow("stopped tracking pod", "pod", namespacedName, "uid", uid, "cgroupCount", len(cgroupIDs)+len(exited))

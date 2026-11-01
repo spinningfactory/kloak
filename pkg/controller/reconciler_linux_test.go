@@ -177,3 +177,63 @@ func TestGetContainerCgroups(t *testing.T) {
 		t.Errorf("getContainerCgroups = %v, want %v", got, want)
 	}
 }
+
+// TestReconcileStartedContainer checks a container that PrepareContainer
+// attached before it started (NRI), which the pod's status does not list
+// yet: it stays tracked while its cgroup is there, and is untracked as an
+// exited container once its cgroup is gone.
+func TestReconcileStartedContainer(t *testing.T) {
+	root := t.TempDir()
+	const uid = "started-uid"
+	appID := fakeContainerCgroup(t, root, uid, "app1")
+	sidecarID := fakeContainerCgroup(t, root, uid, "sidecar1")
+	sidecarPath := filepath.Join(root, "kubepods", "besteffort", "pod"+uid, "sidecar1")
+
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{Name: "p", Namespace: "default", UID: uid,
+			Annotations: map[string]string{AnnotationEnabled: "true"}},
+		Status: corev1.PodStatus{
+			Phase:             corev1.PodRunning,
+			ContainerStatuses: []corev1.ContainerStatus{runningStatus("app", "app1")},
+		},
+	}
+	ctx := context.Background()
+	c := fake.NewClientBuilder().WithScheme(testScheme()).WithObjects(pod).Build()
+	r := NewReconciler(c, zap.NewNop().Sugar(), testScheme(), nil, root, "")
+	// As PrepareContainer leaves it for a container it attached.
+	r.trackedPods[uid] = map[uint64]bool{sidecarID: true}
+	r.startedCgroups[uid] = map[uint64]containerCgroup{sidecarID: {path: sidecarPath, name: "sidecar"}}
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Namespace: "default", Name: "p"}}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.RLock()
+	tracked, exited := maps.Clone(r.trackedPods[uid]), maps.Clone(r.exitedCgroups[uid])
+	r.mu.RUnlock()
+	if attached, ok := tracked[sidecarID]; !ok || !attached {
+		t.Errorf("the started container is not tracked as attached: tracked %v", tracked)
+	}
+	if _, ok := tracked[appID]; !ok || len(exited) != 0 {
+		t.Errorf("tracked %v, exited %v; want the app container tracked too, nothing exited", tracked, exited)
+	}
+
+	// Its cgroup is gone: it exited.
+	if err := os.Remove(sidecarPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if _, ok := r.trackedPods[uid][sidecarID]; ok {
+		t.Error("the started container is still tracked after its cgroup went away")
+	}
+	if _, ok := r.exitedCgroups[uid][sidecarID]; !ok {
+		t.Errorf("the started container is not recorded as exited: %v", r.exitedCgroups[uid])
+	}
+	if len(r.startedCgroups[uid]) != 0 {
+		t.Errorf("still recorded as started: %v", r.startedCgroups[uid])
+	}
+}

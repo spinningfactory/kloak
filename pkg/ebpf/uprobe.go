@@ -15,6 +15,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1217,8 +1218,23 @@ func (m *TLSUprobeManager) ReleaseCgroupNetns(cgroupID uint64) {
 // mount = same inode). The BPF cgroup filter restricts interception to tracked
 // containers only.
 func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
-	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+	return m.attachTLS(pid, cgroupID, true)
+}
 
+// AttachContainerTLS is AttachTLS for the process of a container the
+// container runtime is about to start: the process has not run the
+// container's command yet, and its executable is still the runtime's own. It
+// attaches the TLS libraries in the container's filesystem, which every
+// process of the container that loads them goes through (the command's, and
+// the processes it starts), and the pod's tc patch program. The command's
+// executable is attached on its exec event (PollExecEvents), with what
+// depends on it: the TLS linked into it, and its H-extraction strategy.
+func (m *TLSUprobeManager) AttachContainerTLS(pid int, cgroupID uint64) error {
+	return m.attachTLS(pid, cgroupID, false)
+}
+
+// attachTLS is AttachTLS, for the process's executable too when withExe.
+func (m *TLSUprobeManager) attachTLS(pid int, cgroupID uint64, withExe bool) error {
 	// Register the process for DNS/connect tracking.
 	if err := m.TrackTGID(uint32(pid)); err != nil {
 		m.log.Errorw("failed to track TGID for DNS/connect", "error", err, "pid", pid)
@@ -1229,14 +1245,113 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 	// H extraction now happens in the entry uprobe via 4-step pointer chain.
 	// The offsets are pushed to the BPF config map by pushTLSOffsets below.
 
+	sslSymbols := []string{"SSL_write", "SSL_write_ex"}
+	gnutlsSymbols := []string{"gnutls_record_send", "gnutls_record_send2"}
+	attached := false
+
+	// 1-2. The TLS linked into the executable.
+	if withExe {
+		done, exeAttached, err := m.attachExecutable(pid, cgroupID, append(sslSymbols, gnutlsSymbols...))
+		if err != nil || done {
+			return err
+		}
+		attached = exeAttached
+	}
+
+	// 3. Scan all TLS shared libraries in the container filesystem and attach
+	// system-wide uprobes. Uses /proc/<pid>/root to access the container's
+	// overlay mount — all processes in the same container share the same
+	// overlay inode, so the uprobe fires for any of them.
+	containerLibs := findContainerTLSLibraries(pid)
+	logging.Tracew(m.log, "found container TLS libraries", "pid", pid, "count", len(containerLibs), "libs", containerLibs)
+
+	for _, containerPath := range containerLibs {
+		hostPath := fmt.Sprintf("/proc/%d/root%s", pid, containerPath)
+		libEx, err := link.OpenExecutable(hostPath)
+		if err != nil {
+			continue
+		}
+		libDev, libIno, err := fileID(hostPath)
+		if err != nil {
+			continue
+		}
+		for _, sym := range append(sslSymbols, gnutlsSymbols...) {
+			key := uprobeKey{cgroupID: cgroupID, dev: libDev, ino: libIno, symbol: sym}
+			created, err := m.attachUprobes(key, func() ([]io.Closer, error) {
+				up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
+				return []io.Closer{up}, err
+			})
+			if err != nil {
+				continue
+			}
+			if created {
+				m.log.Debugw("Attached uprobe (system-wide)", "pid", pid, "symbol", sym, "lib", containerPath)
+			}
+			attached = true
+		}
+	}
+
+	if attached {
+		// Try to detect the OpenSSL version and push struct offsets for the
+		// XOR-patch path. Non-fatal: if detection fails, the XOR path simply
+		// won't activate and the shadow secret is sent as-is (fail-secure).
+		m.pushTLSOffsets(pid, cgroupID, containerLibs, withExe)
+
+		// Attach the libcrypto EVP_CipherInit_ex hooks for the libcrypto-hook
+		// H-extraction strategy. If libcrypto.so is found and at least one of
+		// EVP_CipherInit_ex2 / EVP_CipherInit_ex resolves, write
+		// tls_strategy[tgid] = STRATEGY_LIBCRYPTO_HOOK so SSL_write routes
+		// through h_extract → cache lookup. Otherwise (BoringSSL, statically
+		// linked) leave strategy at 0 (default) — process stays on the legacy
+		// kprobe-walks-chain path that's been on main since launch. Without
+		// the executable (the container runtime's own, until it runs the
+		// container's command), the hooks are attached but the strategy is
+		// left to the command's exec event, which knows what the command is
+		// (a Bun binary must stay on the kprobe walk).
+		if m.attachLibcryptoCipherInit(pid, cgroupID, containerLibs, withExe) && withExe {
+			tgid := uint32(pid)
+			strategyVal := strategyLibcryptoHook
+			if err := m.objs.TlsStrategy.Update(&tgid, &strategyVal, 0); err != nil {
+				m.log.Errorw("Failed to set tls_strategy for libcrypto hook",
+					"error", err, "pid", pid)
+			} else {
+				m.log.Debugw("Process on libcrypto-hook H-extraction path",
+					"pid", pid)
+			}
+		}
+
+		// Attach tc egress to the container's eth0 for kernel-only ciphertext
+		// patching. Required for secret rewriting.
+		if err := m.attachTCEgress(pid); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				m.log.Debugw("Process exited before tc egress could attach", "error", err, "pid", pid)
+			} else {
+				m.log.Errorw("Failed to attach tc egress to container — secrets will not be rewritten", "error", err, "pid", pid)
+			}
+		}
+
+		return nil
+	}
+	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
+}
+
+// attachExecutable attaches the uprobes for the TLS linked into a process's
+// executable: Go crypto/tls, a Bun single-executable, or a statically linked
+// OpenSSL, BoringSSL or GnuTLS exporting symbols. done reports an executable
+// that carries all of the process's TLS (Go, Bun): its offsets are pushed and
+// the pod's tc program attached, and there is nothing else to attach.
+// attached reports that symbols were attached in the executable.
+func (m *TLSUprobeManager) attachExecutable(pid int, cgroupID uint64, symbols []string) (done, attached bool, err error) {
+	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+
 	// Open the executable to check for statically linked TLS
 	ex, err := link.OpenExecutable(exePath)
 	if err != nil {
-		return fmt.Errorf("opening executable %s: %w", exePath, err)
+		return false, false, fmt.Errorf("opening executable %s: %w", exePath, err)
 	}
 	exeDev, exeIno, err := fileID(exePath)
 	if err != nil {
-		return fmt.Errorf("stat executable %s: %w", exePath, err)
+		return false, false, fmt.Errorf("stat executable %s: %w", exePath, err)
 	}
 	exeKey := func(symbol string, offset uint64) uprobeKey {
 		return uprobeKey{cgroupID: cgroupID, pid: pid, dev: exeDev, ino: exeIno, symbol: symbol, offset: offset}
@@ -1262,7 +1377,7 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 		if err := m.attachTCEgress(pid); err != nil {
 			m.log.Errorw("Failed to attach tc egress for Go TLS — secrets will not be rewritten", "error", err, "pid", pid)
 		}
-		return nil
+		return true, false, nil
 	}
 
 	// 2. Bun single-executable (e.g. Claude Code): detect by version string
@@ -1301,24 +1416,16 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 				m.log.Errorw("Failed to attach tc egress for Bun — secrets will not be rewritten",
 					"error", err, "pid", pid)
 			}
-			return nil
+			return true, false, nil
 		} else {
 			m.log.Warnw("Bun detected but SSL_write uprobe failed — falling through to symbol scan",
 				"pid", pid, "error", err)
 		}
 	}
 
-	// 3. Scan all TLS shared libraries in the container filesystem and attach
-	// system-wide uprobes. Uses /proc/<pid>/root to access the container's
-	// overlay mount — all processes in the same container share the same
-	// overlay inode, so the uprobe fires for any of them.
-	sslSymbols := []string{"SSL_write", "SSL_write_ex"}
-	gnutlsSymbols := []string{"gnutls_record_send", "gnutls_record_send2"}
-	attached := false
-
 	// Try main executable first (statically linked OpenSSL/BoringSSL/GnuTLS).
 	// Use PID-scoped because the main exe is unique per container.
-	for _, sym := range append(sslSymbols, gnutlsSymbols...) {
+	for _, sym := range symbols {
 		created, err := m.attachUprobes(exeKey(sym, 0), func() ([]io.Closer, error) {
 			up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid})
 			return []io.Closer{up}, err
@@ -1331,75 +1438,7 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 		}
 		attached = true
 	}
-
-	// Scan container filesystem for all TLS shared libraries
-	containerLibs := findContainerTLSLibraries(pid)
-	logging.Tracew(m.log, "found container TLS libraries", "pid", pid, "count", len(containerLibs), "libs", containerLibs)
-
-	for _, containerPath := range containerLibs {
-		hostPath := fmt.Sprintf("/proc/%d/root%s", pid, containerPath)
-		libEx, err := link.OpenExecutable(hostPath)
-		if err != nil {
-			continue
-		}
-		libDev, libIno, err := fileID(hostPath)
-		if err != nil {
-			continue
-		}
-		for _, sym := range append(sslSymbols, gnutlsSymbols...) {
-			key := uprobeKey{cgroupID: cgroupID, dev: libDev, ino: libIno, symbol: sym}
-			created, err := m.attachUprobes(key, func() ([]io.Closer, error) {
-				up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
-				return []io.Closer{up}, err
-			})
-			if err != nil {
-				continue
-			}
-			if created {
-				m.log.Debugw("Attached uprobe (system-wide)", "pid", pid, "symbol", sym, "lib", containerPath)
-			}
-			attached = true
-		}
-	}
-
-	if attached {
-		// Try to detect the OpenSSL version and push struct offsets for the
-		// XOR-patch path. Non-fatal: if detection fails, the XOR path simply
-		// won't activate and the shadow secret is sent as-is (fail-secure).
-		m.pushTLSOffsets(pid, cgroupID, containerLibs)
-
-		// Attach the libcrypto EVP_CipherInit_ex hooks for the libcrypto-hook
-		// H-extraction strategy. If libcrypto.so is found and at least one of
-		// EVP_CipherInit_ex2 / EVP_CipherInit_ex resolves, write
-		// tls_strategy[tgid] = STRATEGY_LIBCRYPTO_HOOK so SSL_write routes
-		// through h_extract → cache lookup. Otherwise (BoringSSL, statically
-		// linked) leave strategy at 0 (default) — process stays on the legacy
-		// kprobe-walks-chain path that's been on main since launch.
-		if m.attachLibcryptoCipherInit(pid, cgroupID, containerLibs) {
-			tgid := uint32(pid)
-			strategyVal := strategyLibcryptoHook
-			if err := m.objs.TlsStrategy.Update(&tgid, &strategyVal, 0); err != nil {
-				m.log.Errorw("Failed to set tls_strategy for libcrypto hook",
-					"error", err, "pid", pid)
-			} else {
-				m.log.Debugw("Process on libcrypto-hook H-extraction path",
-					"pid", pid)
-			}
-		}
-
-		// Attach tc egress to the container's eth0 for kernel-only ciphertext
-		// patching. Required for secret rewriting.
-		if err := m.attachTCEgress(pid); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				m.log.Debugw("Process exited before tc egress could attach", "error", err, "pid", pid)
-			} else {
-				m.log.Errorw("Failed to attach tc egress to container — secrets will not be rewritten", "error", err, "pid", pid)
-			}
-		}
-
-		return nil
-	}
-	return fmt.Errorf("could not find compatible TLS symbols for PID %d", pid)
+	return false, attached, nil
 }
 
 // Strategy values must match #defines in pkg/ebpf/bpf/tls_uprobe.c.
@@ -1408,11 +1447,14 @@ const (
 	strategyLibcryptoHook uint8 = 1
 )
 
-// processUsesBoringSSL reports whether the process's main exe or any of its
-// TLS libraries is BoringSSL. Used to keep BoringSSL on the kprobe-walk H
-// strategy (it must not take the OpenSSL libcrypto-hook path).
-func (m *TLSUprobeManager) processUsesBoringSSL(pid int, containerLibs []string) bool {
-	paths := append([]string{fmt.Sprintf("/proc/%d/exe", pid)}, containerLibs...)
+// processUsesBoringSSL reports whether any of the process's TLS libraries,
+// or its main exe when withExe, is BoringSSL. Used to keep BoringSSL on the
+// kprobe-walk H strategy (it must not take the OpenSSL libcrypto-hook path).
+func (m *TLSUprobeManager) processUsesBoringSSL(pid int, containerLibs []string, withExe bool) bool {
+	paths := containerLibs
+	if withExe {
+		paths = append([]string{fmt.Sprintf("/proc/%d/exe", pid)}, containerLibs...)
+	}
 	for _, p := range paths {
 		base := filepath.Base(p)
 		// Only the exe and libssl/libcrypto objects can be BoringSSL; skip the
@@ -1436,7 +1478,7 @@ func (m *TLSUprobeManager) processUsesBoringSSL(pid int, containerLibs []string)
 //
 // Tries two attach points:
 //
-//  1. The main executable (/proc/<pid>/exe), PID-scoped. This catches apps
+//  1. The main executable (/proc/<pid>/exe), PID-scoped, when withExe. This catches apps
 //     that statically link OpenSSL into the binary — most notably Node.js,
 //     which bundles OpenSSL 3.x inside the `node` ELF and exports
 //     EVP_CipherInit_ex / _ex2 directly. PID-scoped because the exe is
@@ -1455,7 +1497,7 @@ func (m *TLSUprobeManager) processUsesBoringSSL(pid int, containerLibs []string)
 // BoringSSL apps that don't expose EVP_CipherInit_ex anywhere (rare in
 // practice — Node.js publishes as OpenSSL despite the historical "uses
 // BoringSSL" reputation) stay on STRATEGY_KPROBE_WALK.
-func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, cgroupID uint64, containerLibs []string) bool {
+func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, cgroupID uint64, containerLibs []string, withExe bool) bool {
 	// BoringSSL must stay on STRATEGY_KPROBE_WALK. Its libcrypto also exports
 	// EVP_CipherInit_ex, but BoringSSL's cipher init does NOT populate the
 	// OpenSSL evp_h_cache that h_extract reads, and the OpenSSL provider chain
@@ -1463,7 +1505,7 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, cgroupID uint64, c
 	// STRATEGY_LIBCRYPTO_HOOK and route SSL_write to h_extract, which bails on
 	// ssl_to_wrl==0 — bypassing the kprobe BoringSSL H-walk entirely (the path
 	// that recomputes H from the AES round keys). So skip the hook for BoringSSL.
-	if m.processUsesBoringSSL(pid, containerLibs) {
+	if m.processUsesBoringSSL(pid, containerLibs, withExe) {
 		m.log.Debugw("BoringSSL process — skipping EVP_CipherInit hook, staying on kprobe-walk",
 			"pid", pid)
 		return false
@@ -1480,47 +1522,49 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, cgroupID uint64, c
 	attached := false
 
 	// 1. Main executable, PID-scoped — for statically-linked OpenSSL (Node.js).
-	exePath := fmt.Sprintf("/proc/%d/exe", pid)
-	exeEx, err := link.OpenExecutable(exePath)
-	var exeDev, exeIno uint64
-	if err == nil {
-		exeDev, exeIno, err = fileID(exePath)
-	}
-	if err == nil {
-		exeAttached := false
-		for _, sym := range cipherInitSymbols {
-			key := uprobeKey{cgroupID: cgroupID, pid: pid, dev: exeDev, ino: exeIno, symbol: sym}
-			created, err := m.attachUprobes(key, func() ([]io.Closer, error) {
-				up, errEntry := exeEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit,
-					&link.UprobeOptions{PID: pid})
-				if errEntry != nil {
-					return nil, errEntry
-				}
-				ret, errRet := exeEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit,
-					&link.UprobeOptions{PID: pid})
-				if errRet != nil {
-					_ = up.Close()
-					return nil, errRet
-				}
-				return []io.Closer{up, ret}, nil
-			})
-			if err != nil {
-				continue
-			}
-			if created {
-				m.log.Debugw("Attached EVP_CipherInit hooks (main exe, PID-scoped)",
-					"pid", pid, "symbol", sym)
-			}
-			attached = true
-			exeAttached = true
+	if withExe {
+		exePath := fmt.Sprintf("/proc/%d/exe", pid)
+		exeEx, err := link.OpenExecutable(exePath)
+		var exeDev, exeIno uint64
+		if err == nil {
+			exeDev, exeIno, err = fileID(exePath)
 		}
-		if !exeAttached {
-			m.log.Debugw("Main exe has no EVP_CipherInit symbols — likely dynamically links libcrypto",
-				"pid", pid)
+		if err == nil {
+			exeAttached := false
+			for _, sym := range cipherInitSymbols {
+				key := uprobeKey{cgroupID: cgroupID, pid: pid, dev: exeDev, ino: exeIno, symbol: sym}
+				created, err := m.attachUprobes(key, func() ([]io.Closer, error) {
+					up, errEntry := exeEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit,
+						&link.UprobeOptions{PID: pid})
+					if errEntry != nil {
+						return nil, errEntry
+					}
+					ret, errRet := exeEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit,
+						&link.UprobeOptions{PID: pid})
+					if errRet != nil {
+						_ = up.Close()
+						return nil, errRet
+					}
+					return []io.Closer{up, ret}, nil
+				})
+				if err != nil {
+					continue
+				}
+				if created {
+					m.log.Debugw("Attached EVP_CipherInit hooks (main exe, PID-scoped)",
+						"pid", pid, "symbol", sym)
+				}
+				attached = true
+				exeAttached = true
+			}
+			if !exeAttached {
+				m.log.Debugw("Main exe has no EVP_CipherInit symbols — likely dynamically links libcrypto",
+					"pid", pid)
+			}
+		} else {
+			m.log.Debugw("Failed to open main exe for cipher_init attach",
+				"pid", pid, "error", err)
 		}
-	} else {
-		m.log.Debugw("Failed to open main exe for cipher_init attach",
-			"pid", pid, "error", err)
 	}
 
 	// 2. libcrypto.so libraries, system-wide — for dynamically-linked apps.
@@ -1589,26 +1633,31 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, cgroupID uint64, c
 // or the main executable (for statically linked OpenSSL) and pushes struct
 // offsets to the tls_offset_config BPF map, keyed by (cgroup_id, exe_inode).
 // See the tls_binary_key commentary in tls_uprobe.c for why the composite key.
-func (m *TLSUprobeManager) pushTLSOffsets(pid int, cgroupID uint64, containerLibs []string) {
+// Without withExe (the executable is the container runtime's own), only the
+// container's libraries are read, and only the cgroup's fallback entry
+// (exe_inode 0) is written, which the container's processes use until their
+// own executable's is pushed.
+func (m *TLSUprobeManager) pushTLSOffsets(pid int, cgroupID uint64, containerLibs []string, withExe bool) {
 	exePath := fmt.Sprintf("/proc/%d/exe", pid)
-
-	// Resolve the exe's inode — stat follows the /proc/<pid>/exe symlink to
-	// the actual on-disk binary.
-	var st syscall.Stat_t
-	if err := syscall.Stat(exePath, &st); err != nil {
-		m.log.Errorw("Failed to stat exe for TLS offset push", "error", err, "pid", pid)
-		return
-	}
-	exeInode := st.Ino
 
 	// Try the main executable FIRST — if the binary statically links OpenSSL
 	// (e.g., Node.js bundles OpenSSL 3.5), its struct offsets differ from the
 	// system libssl. The main exe's version takes precedence because the
 	// PID-scoped uprobe fires for its SSL_write, not the shared library's.
 	// Fall back to shared libraries for dynamically linked apps.
-	paths := make([]string, 1+len(containerLibs))
-	paths[0] = exePath
-	copy(paths[1:], containerLibs)
+	var exeInode uint64
+	paths := containerLibs
+	if withExe {
+		// Resolve the exe's inode — stat follows the /proc/<pid>/exe symlink to
+		// the actual on-disk binary.
+		var st syscall.Stat_t
+		if err := syscall.Stat(exePath, &st); err != nil {
+			m.log.Errorw("Failed to stat exe for TLS offset push", "error", err, "pid", pid)
+			return
+		}
+		exeInode = st.Ino
+		paths = append([]string{exePath}, containerLibs...)
+	}
 
 	for _, libPath := range paths {
 		// OpenSSL: read the version string, look up the 3-/4-hop chain offsets.
@@ -2256,6 +2305,25 @@ func (m *TLSUprobeManager) BindPodNetwork(podUID, pod string, podIPs []netip.Add
 	m.bindMu.Lock()
 	defer m.bindMu.Unlock()
 	m.bindLocked(podUID, &podBinding{pod: pod, podIPs: podIPs, cgroupIDs: m.bindings[podUID].cgroupIDs, refs: refs})
+}
+
+// BindPodContainer adds a container's cgroup to a pod's binding, for a
+// container the container runtime is about to start, which the pod's
+// status does not list yet: its writes redeem the pod's secrets from the
+// first one. It keeps the binding's other cgroups and its addresses (podIPs
+// when it has none yet), and replaces its references.
+func (m *TLSUprobeManager) BindPodContainer(podUID, pod string, podIPs []netip.Addr, cgroupID uint64, refs []secrets.Ref) {
+	m.bindMu.Lock()
+	defer m.bindMu.Unlock()
+	cur := m.bindings[podUID]
+	if len(cur.podIPs) > 0 {
+		podIPs = cur.podIPs
+	}
+	cgroupIDs := cur.cgroupIDs
+	if !slices.Contains(cgroupIDs, cgroupID) {
+		cgroupIDs = append(slices.Clone(cgroupIDs), cgroupID)
+	}
+	m.bindLocked(podUID, &podBinding{pod: pod, podIPs: podIPs, cgroupIDs: cgroupIDs, refs: refs})
 }
 
 // bindLocked records b as podUID's binding, grants it, and revokes what the

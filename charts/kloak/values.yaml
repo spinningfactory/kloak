@@ -84,12 +84,15 @@ controller:
   # containerd 2.0+ and CRI-O 1.30+ serve it by default.
   # The runtime then waits for kloak to attach the DNS rewrite while it
   # creates each pod sandbox, so no container of a kloak pod resolves a
-  # name before it. Without NRI (disabled here or in the runtime), the
-  # controller attaches the rewrite by polling pending pods, which leaves a
-  # short window at pod start: a lookup made in it gets the real addresses,
-  # and a connection made with them gets no host-restricted secret until the
-  # app resolves the name again. The controller logs which way each node
-  # runs. The socket's directory is mounted from the host.
+  # name before it, and a container's TLS uprobes before it starts, so its
+  # first TLS write is rewritten. Without NRI (disabled here or in the
+  # runtime), the controller attaches the rewrite by polling pending pods,
+  # and a container's uprobes once the pod's status reports it running,
+  # which leaves a short window at pod start: a lookup made in it gets the
+  # real addresses, and a connection made with them gets no host-restricted
+  # secret until the app resolves the name again; a TLS write made in it
+  # sends the placeholder unchanged. The controller logs which way each
+  # node runs. The socket's directory is mounted from the host.
   nri:
     enabled: true
     socketPath: /var/run/nri/nri.sock
