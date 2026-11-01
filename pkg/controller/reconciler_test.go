@@ -391,3 +391,25 @@ func TestPodIPs(t *testing.T) {
 		})
 	}
 }
+
+func TestHasRunningContainer(t *testing.T) {
+	running := corev1.ContainerState{Running: &corev1.ContainerStateRunning{}}
+	waiting := corev1.ContainerState{Waiting: &corev1.ContainerStateWaiting{}}
+	for _, c := range []struct {
+		name   string
+		status corev1.PodStatus
+		want   bool
+	}{
+		{"no status", corev1.PodStatus{}, false},
+		{"waiting", corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{ContainerID: "containerd://a", State: waiting}}}, false},
+		{"running without an ID", corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{State: running}}}, false},
+		{"running init container", corev1.PodStatus{InitContainerStatuses: []corev1.ContainerStatus{{ContainerID: "containerd://i", State: running}}}, true},
+		{"running container", corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{ContainerID: "containerd://a", State: running}}}, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := hasRunningContainer(&corev1.Pod{Status: c.status}); got != c.want {
+				t.Errorf("hasRunningContainer = %v, want %v", got, c.want)
+			}
+		})
+	}
+}

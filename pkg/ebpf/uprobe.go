@@ -1117,6 +1117,19 @@ func (m *TLSUprobeManager) RecordCgroupNetns(cgroupID uint64, pid int) {
 // referencing a netns is untracked, the pinned netns fd is closed, allowing
 // the kernel to free the inode for reuse.
 func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
+	err := m.UntrackExitedCgroup(cgroupID)
+	m.ReleaseCgroupNetns(cgroupID)
+	return err
+}
+
+// UntrackExitedCgroup untracks the cgroup of a container that exited while
+// its pod lives on (an init container that completed, a container that
+// restarted in a new cgroup) as UntrackCgroup does, but keeps the pod's
+// network namespace recorded for it: while it is, the pod's tc patch
+// program stays recorded as attached, and a later container of the pod
+// finds it instead of attaching it a second time (which would patch each
+// record twice). ReleaseCgroupNetns releases it, with the pod.
+func (m *TLSUprobeManager) UntrackExitedCgroup(cgroupID uint64) error {
 	m.cgroupPaths.Delete(cgroupID)
 
 	// Detach the container's uprobes in the background: each detach can
@@ -1132,29 +1145,6 @@ func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 			}
 			logging.Tracew(m.log, "detached uprobes of untracked container", "cgroupID", cgroupID, "links", len(links))
 		}()
-	}
-
-	// Clean up tcAttached: close the pinned netns fd so the kernel can
-	// reclaim the inode. Check if any other cgroup still maps to the same
-	// netns before closing (multi-container pods share a netns).
-	if inoVal, ok := m.cgroupToNetns.LoadAndDelete(cgroupID); ok {
-		ino := inoVal.(uint64)
-		// Check if any other cgroup still references this netns.
-		otherRefs := false
-		m.cgroupToNetns.Range(func(_, v any) bool {
-			if v.(uint64) == ino {
-				otherRefs = true
-				return false // stop iteration
-			}
-			return true
-		})
-		if !otherRefs {
-			if entry, ok := m.tcAttached.LoadAndDelete(ino); ok {
-				if e, ok := entry.(*tcAttachEntry); ok && e.netnsFd != nil {
-					_ = e.netnsFd.Close()
-				}
-			}
-		}
 	}
 
 	// Remove TLS offset entries belonging to this cgroup. Both go_tls_offset_config
@@ -1191,6 +1181,35 @@ func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 	}
 
 	return m.objs.TrackedCgroups.Delete(cgroupID)
+}
+
+// ReleaseCgroupNetns forgets the network namespace recorded for a cgroup
+// (RecordCgroupNetns). Once no cgroup records it, the pinned netns fd is
+// closed so the kernel can reclaim the inode (multi-container pods share a
+// netns).
+func (m *TLSUprobeManager) ReleaseCgroupNetns(cgroupID uint64) {
+	inoVal, ok := m.cgroupToNetns.LoadAndDelete(cgroupID)
+	if !ok {
+		return
+	}
+	ino := inoVal.(uint64)
+	// Check if any other cgroup still references this netns.
+	otherRefs := false
+	m.cgroupToNetns.Range(func(_, v any) bool {
+		if v.(uint64) == ino {
+			otherRefs = true
+			return false // stop iteration
+		}
+		return true
+	})
+	if otherRefs {
+		return
+	}
+	if entry, ok := m.tcAttached.LoadAndDelete(ino); ok {
+		if e, ok := entry.(*tcAttachEntry); ok && e.netnsFd != nil {
+			_ = e.netnsFd.Close()
+		}
+	}
 }
 
 // AttachTLS attaches system-wide eBPF uprobes to all TLS libraries in a
