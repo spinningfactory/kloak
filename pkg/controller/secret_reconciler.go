@@ -79,22 +79,6 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// 4. Reconcile Shadow Secret
 	log.Infow("Reconciling enabled secret")
 
-	// Validate secret length: eBPF requires at least secrets.ShadowPrefixLen bytes
-	// for the BPF key lookup. Short secrets cannot be processed correctly by eBPF
-	// and are not supported.
-	for key, originalBytes := range secret.Data {
-		originalLen := len(originalBytes)
-		if originalLen < secrets.ShadowPrefixLen {
-			log.Info("Skipping secret with value too short for eBPF (minimum ShadowPrefixLen bytes required)",
-				"secret", req.String(),
-				"key", key,
-				"length", originalLen,
-				"minimumRequired", secrets.ShadowPrefixLen)
-			// Return early without creating shadow secret
-			return ctrl.Result{}, nil
-		}
-	}
-
 	// Fetch existing shadow secret to preserve ULIDs if possible
 	var existingShadow corev1.Secret
 	shadowExists := false
@@ -126,10 +110,25 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// 8-byte prefix.
 	var shadowsInBatch []string
 
+	// Keys the data plane can't handle are left out of the shadow, and the
+	// others are still shadowed: a pod gets no value for a skipped key,
+	// never the real one, and a stale shadow value is not kept paired with
+	// a real value it no longer matches. The validating webhook rejects
+	// such values at admission; this covers clusters where it is missing
+	// or bypassed.
+	skipped := 0
+
 	for key, originalBytes := range secret.Data {
 		originalValue := string(originalBytes)
 		originalLen := len(originalBytes)
 		var shadowValue string
+
+		if err := canShadowValue(originalValue); err != nil {
+			log.Warnw("Not shadowing key: its value can't be rewritten by the data plane",
+				"key", key, "length", originalLen, "error", err)
+			skipped++
+			continue
+		}
 
 		// Try to reuse existing UUID. Reuse is only safe when the existing
 		// shadow's HPACK Huffman bit length still equals the real value's:
@@ -180,6 +179,14 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		newData[key] = []byte(shadowValue)
 	}
 
+	// No key can be shadowed: don't create a shadow, so the webhook keeps
+	// refusing pods that reference this secret. An existing shadow is
+	// still updated below, so it drops the keys it can no longer hold.
+	if len(newData) == 0 && skipped > 0 && !shadowExists {
+		log.Warnw("Not creating shadow secret: no key can be shadowed", "skipped", skipped)
+		return ctrl.Result{}, nil
+	}
+
 	// Create or Update Shadow Secret
 	shadowSecret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -221,6 +228,17 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	return ctrl.Result{}, nil
+}
+
+// canShadowValue returns why value can't be shadowed, or nil. The BPF
+// lookup keys on the first secrets.ShadowPrefixLen bytes of the shadow, and
+// the shadow must match the value's HPACK Huffman bit length
+// (secrets.CanShadow). The error never includes the value.
+func canShadowValue(value string) error {
+	if len(value) < secrets.ShadowPrefixLen {
+		return fmt.Errorf("value is %d bytes, minimum %d required (BPF key lookup)", len(value), secrets.ShadowPrefixLen)
+	}
+	return secrets.CanShadow(len(value), secrets.HuffmanBits(value))
 }
 
 // isPrefixUsed checks if a prefix is already used in the given shadows.

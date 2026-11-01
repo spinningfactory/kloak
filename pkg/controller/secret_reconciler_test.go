@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"sort"
 	"strings"
 	"testing"
 
@@ -385,6 +386,126 @@ func TestSecretReconciler_ShortSecret(t *testing.T) {
 	} else if !errors.IsNotFound(err) {
 		t.Fatalf("unexpected error: %v", err)
 	}
+}
+
+// A key the data plane can't handle is left out of the shadow, and the
+// other keys are still shadowed (spinningfactory/kloak#270).
+func TestSecretReconciler_SkipsUnshadowableKeys(t *testing.T) {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "mixed",
+			Namespace: "default",
+			Labels:    map[string]string{AnnotationSecretEnabled: "true"},
+			UID:       "mixed-uid",
+		},
+		Data: map[string][]byte{
+			"token": []byte("tok_live_abcdefghijklmnop"),
+			"pin":   []byte("abc"),      // shorter than ShadowPrefixLen
+			"code":  []byte("12345678"), // no same-length shadow matches its Huffman length
+		},
+	}
+
+	r, c := newSecretReconciler(secret)
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "mixed", Namespace: "default"}}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatal(err)
+	}
+
+	shadow := &corev1.Secret{}
+	if err := c.Get(ctx, types.NamespacedName{Name: "mixed-kloak", Namespace: "default"}, shadow); err != nil {
+		t.Fatalf("shadow secret not found: %v", err)
+	}
+	if len(shadow.Data) != 1 {
+		t.Errorf("shadow keys = %v, want only token", keysOf(shadow.Data))
+	}
+	if got := shadow.Data["token"]; len(got) != len(secret.Data["token"]) || !strings.HasPrefix(string(got), secrets.ValuePrefix) {
+		t.Errorf("token shadow = %q, want a %d-byte %q value", got, len(secret.Data["token"]), secrets.ValuePrefix)
+	}
+}
+
+// Adding a too-short key to an already-shadowed Secret, or shortening one
+// of its keys, still updates the shadow: the valid keys follow the real
+// values and the short ones are dropped (spinningfactory/kloak#270).
+func TestSecretReconciler_ShortKeyUpdatesExistingShadow(t *testing.T) {
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "rotated",
+			Namespace: "default",
+			Labels:    map[string]string{AnnotationSecretEnabled: "true"},
+			UID:       "rotated-uid",
+		},
+		Data: map[string][]byte{
+			"token":    []byte("tok_live_abcdefghijklmnop"),
+			"password": []byte("super-secret-password!!!"),
+		},
+	}
+
+	r, c := newSecretReconciler(secret)
+	ctx := context.Background()
+	req := ctrl.Request{NamespacedName: types.NamespacedName{Name: "rotated", Namespace: "default"}}
+	shadowNN := types.NamespacedName{Name: "rotated-kloak", Namespace: "default"}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("first reconcile failed: %v", err)
+	}
+
+	// Rotate token to a new length, shorten password, add a short pin.
+	if err := c.Get(ctx, req.NamespacedName, secret); err != nil {
+		t.Fatal(err)
+	}
+	secret.Data["token"] = []byte("tok_live_rotated-to-a-longer-value")
+	secret.Data["password"] = []byte("short")
+	secret.Data["pin"] = []byte("1234")
+	if err := c.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("second reconcile failed: %v", err)
+	}
+
+	shadow := &corev1.Secret{}
+	if err := c.Get(ctx, shadowNN, shadow); err != nil {
+		t.Fatal(err)
+	}
+	if len(shadow.Data) != 1 {
+		t.Errorf("shadow keys = %v, want only token", keysOf(shadow.Data))
+	}
+	if got, want := len(shadow.Data["token"]), len(secret.Data["token"]); got != want {
+		t.Errorf("token shadow length = %d, want %d (shadow not updated)", got, want)
+	}
+
+	// Once no key can be shadowed, the existing shadow is emptied rather
+	// than left pairing old shadows with the new real values.
+	if err := c.Get(ctx, req.NamespacedName, secret); err != nil {
+		t.Fatal(err)
+	}
+	secret.Data["token"] = []byte("tiny")
+	if err := c.Update(ctx, secret); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := r.Reconcile(ctx, req); err != nil {
+		t.Fatalf("third reconcile failed: %v", err)
+	}
+
+	if err := c.Get(ctx, shadowNN, shadow); err != nil {
+		t.Fatalf("existing shadow should be kept: %v", err)
+	}
+	if len(shadow.Data) != 0 {
+		t.Errorf("shadow keys = %v, want none", keysOf(shadow.Data))
+	}
+}
+
+func keysOf(m map[string][]byte) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 func TestSecretReconciler_NotFoundSecret(t *testing.T) {

@@ -102,12 +102,12 @@ func (v *SecretValidator) Handle(ctx context.Context, req admission.Request) adm
 }
 
 // validateSecretData enforces the length constraints that the BPF pipeline
-// imposes on secret values. The reconciler refuses to create a shadow if
-// any entry is shorter than minDataLen (so the secret never gets rewritten
-// and pods mounting it are blocked by the mutating webhook with a confusing
-// "shadow not found" error). sync.go silently truncates entries longer than
-// maxDataLen, producing incorrect rewrites on the wire. Surface both at
-// admission time.
+// imposes on secret values. The reconciler leaves entries shorter than
+// minDataLen out of the shadow (so pods silently get no value for them, and
+// a secret with no other entry gets no shadow at all, which the mutating
+// webhook reports as a confusing "shadow not found" error). sync.go
+// silently truncates entries longer than maxDataLen, producing incorrect
+// rewrites on the wire. Surface both at admission time.
 //
 // stringData is merged into data by the apiserver; we check both to cover
 // the case where the webhook sees the pre-merged object.
