@@ -156,7 +156,7 @@ graph TD
 | Bun (incl. single-executable apps) | BoringSSL (statically linked, symbols stripped) | `SSL_write` uprobe at a per-version file offset (`tools/bun-offsets/`) |
 | Go | crypto/tls (native) | `crypto/tls.(*Conn).Write` uprobe |
 
-Secrets are patched into **AES-128-GCM and AES-256-GCM** records (TLS 1.2 and 1.3). Other ciphers (e.g. ChaCha20-Poly1305) and some libraries (GnuTLS, Go built with `GOEXPERIMENT=boringcrypto`) are not supported yet.
+Secrets are patched into **AES-128-GCM and AES-256-GCM** records (TLS 1.2 and 1.3). Other ciphers (e.g. ChaCha20-Poly1305) and some libraries (GnuTLS, Go built with `GOEXPERIMENT=boringcrypto`, the OpenSSL backend of Microsoft's and Red Hat's Go toolchains) are not supported yet ([#365](https://github.com/spinningfactory/kloak/issues/365)).
 
 ## Host Verification
 

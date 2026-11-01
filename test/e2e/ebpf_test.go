@@ -293,7 +293,7 @@ var ebpfTests = []ebpfRewriteTest{
 		demoDir:        "demo-go-boring",
 		deploymentName: "demo-go-boring",
 		appLabel:       "app=demo-go-boring",
-		skip:           "BoringSSL H extraction not yet implemented",
+		skip:           "Go BoringCrypto not supported yet (spinningfactory/kloak#365)",
 	},
 	{
 		name:           "gnutls",

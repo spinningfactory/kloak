@@ -255,6 +255,7 @@ enum {
   DBG_VIP_DNS_UNBOUND,       // a watched host's answer left unchanged: the pod has no secret for the host
   DBG_VIP_SOCK_HOST_DENY,    // patch refused at tcp_sendmsg: the socket did not connect to the secret host's fake IP
   DBG_VIP_SOCK_ADDR_DENY,    // patch refused at tcp_sendmsg: the socket's real address or port is not the secret's
+  DBG_GO_AEAD_TYPE_DENY,     // Go: the connection's AEAD is not Go's own AES-GCM (BoringCrypto, OpenSSL, ChaCha20): no H, no patch
   DBG_MAX,
 };
 
@@ -1023,12 +1024,29 @@ struct {
 // aead_iface_off is the offset to the inner aead interface data_ptr within the AEAD wrapper.
 #define CHAIN_GO_TLS 2
 
+// AEAD type check. The H×2 read above is only valid for Go's own AES-GCM
+// types: behind the same cipher.AEAD interface, a GOEXPERIMENT=boringcrypto
+// build has a crypto/internal/boring.aesGCM (no H×2 table), an OpenSSL-backed
+// toolchain (Microsoft Go, Red Hat golang-fips) its OpenSSL cipher, and a
+// ChaCha20-Poly1305 suite a chacha20poly1305; reading H from any of them sends
+// the record with a wrong tag (spinningfactory/kloak#365). The concrete type is
+// identified by its Seal method: an itab is {inter, _type, hash, fun[]}, fun
+// at 24 (Go 1.20 through 1.27), and cipher.AEAD's methods sorted by name are
+// NonceSize, Open, Overhead, Seal, so fun[3] is (*T).Seal. Userspace finds
+// each allowed type's Seal in the binary's pclntab (kept by -s -w) and pushes
+// it as an offset from mm->start_code, which removes the PIE load bias.
+#define GO_ITAB_FUN_OFF 24
+#define GO_AEAD_SEAL_SLOT 3
+#define GO_AEAD_SEAL_MAX 8
+
 struct go_tls_offsets {
   __u32 conn_to_cipher;   // Conn* + off → halfConn.cipher interface data_ptr (combined offset)
   __u32 aead_iface_off;   // wrapper + off → inner aead interface data_ptr
   __u32 h2_hi_off;        // GCM* + off → high 64 bits of H×2 (byte-swapped, arch-dependent)
   __u32 h2_lo_off;        // GCM* + off → low 64 bits of H×2 (byte-swapped, arch-dependent)
   __u32 conn_vers_off;    // Conn* + off → uint16 negotiated TLS version (e.g. 0x0303, 0x0304)
+  __u32 aead_seal_count;  // valid entries in aead_seal_off; 0 = no type check (pclntab unreadable)
+  __u32 aead_seal_off[GO_AEAD_SEAL_MAX]; // (*T).Seal - mm->start_code, per allowed AEAD type T
 };
 
 // Per-binary Go crypto/tls offsets. Shares the tls_binary_key struct with
@@ -2435,6 +2453,33 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 #endif
       dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
       return 0;
+    }
+
+    // Only read H from Go's own AES-GCM types (see GO_AEAD_SEAL_SLOT). The
+    // itab pointer is the interface word just before the data pointer.
+    __u32 seal_count = go_off->aead_seal_count;
+    if (seal_count > 0 && go_off->aead_iface_off >= 8) {
+      __u64 itab = 0, seal = 0;
+      bpf_probe_read_user(&itab, 8,
+          (void *)(cipher_data + go_off->aead_iface_off - 8));
+      if (itab)
+        bpf_probe_read_user(&seal, 8,
+            (void *)(itab + GO_ITAB_FUN_OFF + GO_AEAD_SEAL_SLOT * 8));
+      __u64 rel = seal - BPF_CORE_READ(task, mm, start_code);
+      int allowed = 0;
+      for (__u32 i = 0; i < GO_AEAD_SEAL_MAX; i++) {
+        if (i < seal_count && seal && rel == go_off->aead_seal_off[i])
+          allowed = 1;
+      }
+      if (!allowed) {
+#ifdef KLOAK_DEBUG
+        bpf_printk("kloak [2-KPROBE-GO] H-fail: AEAD type not allowed itab=%llx seal_rel=%llx",
+                   itab, rel);
+#endif
+        dbg_inc(DBG_GO_AEAD_TYPE_DENY);
+        dbg_inc(DBG_KPROBE_BRIDGE_H_FAIL);
+        return 0;
+      }
     }
 
     // Read H×2 as two separate 64-bit words (arch-aware offsets from userspace).

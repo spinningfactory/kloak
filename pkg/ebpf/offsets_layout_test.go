@@ -27,6 +27,22 @@ func TestBPFTLSOffsetsLayout(t *testing.T) {
 	}
 }
 
+// TestGoTLSOffsetsLayout pins GoTLSOffsets, written to go_tls_offset_config
+// as is, to the generated struct go_tls_offsets: a mismatch would make the
+// kprobe read every Go offset, or the AEAD type check, from the wrong field.
+func TestGoTLSOffsetsLayout(t *testing.T) {
+	if got, want := binary.Size(GoTLSOffsets{}), binary.Size(tlsuprobeGoTlsOffsets{}); got != want {
+		t.Fatalf("GoTLSOffsets is %d bytes, struct go_tls_offsets is %d — keep go_tls_offsets.go in sync with tls_uprobe.c", got, want)
+	}
+	got, want := fieldNames(GoTLSOffsets{}), fieldNames(tlsuprobeGoTlsOffsets{})
+	if !slices.Equal(got, want) {
+		t.Fatalf("GoTLSOffsets field order %v does not match struct go_tls_offsets %v", got, want)
+	}
+	if n := len(tlsuprobeGoTlsOffsets{}.AeadSealOff); n != goAEADSealMax {
+		t.Fatalf("goAEADSealMax is %d, GO_AEAD_SEAL_MAX is %d", goAEADSealMax, n)
+	}
+}
+
 func fieldNames(v any) []string {
 	rt := reflect.TypeOf(v)
 	names := make([]string, 0, rt.NumField())

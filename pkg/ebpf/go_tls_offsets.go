@@ -32,6 +32,13 @@ type GoTLSOffsets struct {
 	H2HiOff      uint32 // GCM + off → high 64 bits of H×2 (byte-swapped)
 	H2LoOff      uint32 // GCM + off → low 64 bits of H×2 (byte-swapped)
 	ConnVersOff  uint32 // Conn + off → uint16 negotiated TLS version (e.g. 0x0303, 0x0304)
+
+	// AEAD type check (see go_crypto_backend.go): the kprobe reads H only when
+	// the connection's AEAD is one of Go's own AES-GCM types, identified by
+	// its Seal method. AEADSealOff holds each allowed (*T).Seal as an offset
+	// from the process's mm->start_code; AEADSealCount 0 disables the check.
+	AEADSealCount uint32
+	AEADSealOff   [goAEADSealMax]uint32
 }
 
 // goTLSOffsetTableBase stores architecture-independent offsets plus the

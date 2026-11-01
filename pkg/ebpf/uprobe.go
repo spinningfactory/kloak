@@ -1722,12 +1722,42 @@ func (m *TLSUprobeManager) pushGoTLSOffsets(pid int, cgroupID uint64) {
 		return
 	}
 
+	// The offsets above lead to Go's own AES-GCM H×2 table. A BoringCrypto
+	// build never has one there, and an OpenSSL-backed toolchain may not:
+	// reading H from them sends records with a wrong tag (#365).
+	gc, err := inspectGoCrypto(exePath)
+	if gc.Backend == goCryptoBoring {
+		m.log.Errorw("Go binary uses BoringCrypto (GOEXPERIMENT=boringcrypto), which kloak does not support yet "+
+			"(spinningfactory/kloak#365) — Go secrets will NOT be rewritten", "pid", pid, "goVersion", version)
+		return
+	}
+	var sealOffs []uint32
+	if err == nil {
+		sealOffs, err = goAEADSealOffsets(pid, gc)
+	}
+	if err != nil {
+		if gc.Backend != goCryptoNative {
+			m.log.Errorw("Go binary may use an unsupported crypto backend and its AES-GCM type cannot be checked "+
+				"(spinningfactory/kloak#365) — Go secrets will NOT be rewritten",
+				"error", err, "pid", pid, "goVersion", version, "backend", gc.Backend)
+			return
+		}
+		m.log.Warnw("Go AES-GCM type check unavailable — rewriting without it",
+			"error", err, "pid", pid, "goVersion", version)
+	}
+	offsets.setAEADSealOffsets(sealOffs)
+	if gc.Backend == goCryptoOpenSSL {
+		m.log.Infow("Go binary has an OpenSSL crypto backend (spinningfactory/kloak#365): "+
+			"only connections that use Go's own AES-GCM will be rewritten", "pid", pid, "goVersion", version)
+	}
+
 	m.log.Debugw("Detected Go TLS offsets",
 		"pid", pid, "cgroupID", cgroupID, "exeInode", exeInode, "goVersion", version,
 		"connToCipher", offsets.ConnToCipher,
 		"aeadIfaceOff", offsets.AEADIfaceOff,
 		"h2HiOff", offsets.H2HiOff,
-		"h2LoOff", offsets.H2LoOff)
+		"h2LoOff", offsets.H2LoOff,
+		"aeadSealOff", offsets.AEADSealOff[:offsets.AEADSealCount])
 
 	key := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: exeInode}
 	if err := m.objs.GoTlsOffsetConfig.Update(&key, &offsets, 0); err != nil {
@@ -2454,6 +2484,7 @@ var debugCounterNames = []string{
 	"sni_captured", "sni_deny", "sni_audit",
 	"vip_dns_rewritten", "vip_dns_unchanged", "vip_connect_redirect", "vip_connect_refused",
 	"vip_dns_unbound", "vip_sock_host_deny", "vip_sock_addr_deny",
+	"go_aead_type_deny",
 }
 
 // DumpDebugCounters reads and logs all debug counters from the BPF map.
