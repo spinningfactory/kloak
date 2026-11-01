@@ -68,7 +68,7 @@ func init() {
 	controllerCmd.Flags().StringVar(&trustedDNSServers, "trusted-dns-servers", "", "Comma-separated DNS server IPs trusted in addition to kube-dns's ClusterIPs and endpoint addresses, which are discovered: only their answers are rewritten for host-restricted secrets.")
 	controllerCmd.Flags().StringVar(&egressInterface, "egress-interface", "auto",
 		"Container interface whose host-side veth peer gets the tc patch program (tc ingress). "+
-			`"auto" detects from the default IPv4 route in the container netns (works for CNI veth "eth0" AND host-mode netns with non-standard names like wlp3s0/enp0s3). `+
+			`"auto" detects from the default route in the container netns, IPv4 or else IPv6 (works for CNI veth "eth0" AND host-mode netns with non-standard names like wlp3s0/enp0s3). `+
 			`Use an explicit name (e.g., "eth0") to pin, or "none"/"lo-only" to disable external attachment. `+
 			`Loopback is never patched.`)
 	controllerCmd.Flags().StringVar(&tcAttachMode, "tc-attach-mode", "auto",
