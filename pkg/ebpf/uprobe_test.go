@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -143,6 +144,40 @@ func TestParseDefaultRouteInterface(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := parseDefaultRouteInterface([]byte(tc.body)); got != tc.want {
+				t.Errorf("got %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestParseDefaultRoute6Interface(t *testing.T) {
+	// Rows as Linux 7.2 prints them for an IPv6-only netns: eth0 with
+	// fd99::2/64, a default route via fd99::1, and the kernel's null entry
+	// (a ::/0 reject route on lo).
+	const (
+		prefix      = "fd990000000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000001 00000000 00000001     eth0\n"
+		local       = "fd990000000000000000000000000002 80 00000000000000000000000000000000 00 00000000000000000000000000000000 00000000 00000002 00000000 80200001     eth0\n"
+		dflt        = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fd990000000000000000000000000001 00000400 00000001 00000000 00000003     eth0\n"
+		nullEntry   = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n"
+		unreachable = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 00000001 00000001 00000000 00200200       lo\n"
+		net1Dflt    = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 fd980000000000000000000000000001 00000100 00000001 00000000 00000003     net1\n"
+	)
+	cases := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"IPv6-only pod netns", prefix + dflt + local + nullEntry, "eth0"},
+		{"null entry listed first", nullEntry + prefix + dflt, "eth0"},
+		{"unreachable default with a lower metric", unreachable + dflt, "eth0"},
+		{"lowest metric wins", dflt + net1Dflt, "net1"},
+		{"no default route, only the null entry", prefix + local + nullEntry, ""},
+		{"empty", "", ""},
+		{"unparsable metric is skipped", strings.Replace(net1Dflt, "00000100", "zz", 1) + dflt, "eth0"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseDefaultRoute6Interface([]byte(tc.body)); got != tc.want {
 				t.Errorf("got %q, want %q", got, tc.want)
 			}
 		})

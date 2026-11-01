@@ -29,9 +29,10 @@ controller:
     enabled: true
     # Container interface whose host-side veth peer gets the tc patch
     # program (tc ingress on the host veth — keeps rewritten ciphertext
-    # out of reach of in-pod packet capture). "auto" (default) reads
-    # /proc/net/route inside the netns and picks the interface backing
-    # the default IPv4 route — works for the standard CNI "eth0"
+    # out of reach of in-pod packet capture). "auto" (default) reads the
+    # netns's routes and picks the interface backing the default IPv4
+    # route, or the default IPv6 route in an IPv6-only pod — works for
+    # the standard CNI "eth0"
     # convention AND for host-mode netns where the default route exits
     # via a non-standard name. Pin to a specific name (e.g. "eth0",
     # "wlp3s0", "enp0s3") to override. Use "none" or "lo-only" to disable

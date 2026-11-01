@@ -21,6 +21,7 @@ import (
 	"github.com/vishvananda/netlink"
 	"github.com/vishvananda/netns"
 	"go.uber.org/zap"
+	"golang.org/x/sys/unix"
 
 	"github.com/spinningfactory/kloak/pkg/secrets"
 )
@@ -545,5 +546,62 @@ func TestAttachPodDNSRewriteNetns(t *testing.T) {
 	}
 	if _, err := m.AttachPodDNSRewriteNetns("uid-gone", "ns/gone", "/proc/self/fd/9999"); err == nil {
 		t.Error("attached through a path that does not exist")
+	}
+}
+
+// TestAttachPodDNSRewriteNetnsIPv6Only attaches tc_dns_rewrite in an
+// IPv6-only pod netns, which has no IPv4 default route to find the pod's
+// interface by (spinningfactory/kloak#360). The kernel lists reject routes
+// as default routes too: an unreachable one with a lower metric must not
+// win.
+func TestAttachPodDNSRewriteNetnsIPv6Only(t *testing.T) {
+	objs := loadTestObjects(t)
+	podNS := newNetns(t)
+	h, err := netlink.NewHandleAt(netns.NsHandle(podNS.Fd()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer h.Close()
+	link := &netlink.Dummy{LinkAttrs: netlink.LinkAttrs{Name: "eth0"}}
+	if err := h.LinkAdd(link); err != nil {
+		t.Skipf("cannot create a dummy interface: %v", err)
+	}
+	if err := h.LinkSetUp(link); err != nil {
+		t.Fatal(err)
+	}
+	addr, _ := netlink.ParseAddr("fd42::7/64")
+	addr.Flags = unix.IFA_F_NODAD
+	if err := h.AddrAdd(link, addr); err != nil {
+		t.Skipf("cannot add an IPv6 address (IPv6 disabled?): %v", err)
+	}
+	if err := h.RouteAdd(&netlink.Route{LinkIndex: link.Attrs().Index, Gw: net.ParseIP("fd42::1")}); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.RouteAdd(&netlink.Route{
+		Dst:      &net.IPNet{IP: net.IPv6zero, Mask: net.CIDRMask(0, 128)},
+		Type:     unix.RTN_UNREACHABLE,
+		Priority: 1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &TLSUprobeManager{
+		objs:             objs,
+		log:              zap.NewNop().Sugar(),
+		virtualIPs:       &virtualIPAllocator{},
+		tcMode:           newTCModeResolver(TCAttachAuto),
+		dnsRewrite:       make(map[string]*dnsRewriteAttach),
+		dnsRewriteFailed: make(map[string]bool),
+	}
+	t.Cleanup(func() { m.DetachPodDNSRewrite("uid") })
+	got, err := m.AttachPodDNSRewriteNetns("uid", "ns/app", fmt.Sprintf("/proc/self/fd/%d", podNS.Fd()))
+	if err != nil {
+		t.Fatalf("attach: %v", err)
+	}
+	if want := []netip.Addr{netip.MustParseAddr("fd42::7")}; !slices.Equal(got, want) {
+		t.Fatalf("addresses %v, want %v", got, want)
+	}
+	if a := m.dnsRewrite["uid"]; a == nil || len(a.links) != 1 {
+		t.Fatalf("attachment %+v", a)
 	}
 }

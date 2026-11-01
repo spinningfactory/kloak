@@ -104,8 +104,9 @@ type TLSUprobeManager struct {
 	// egressInterface selects which container-netns NIC is used to locate
 	// the tc patch attach point (the host side of its veth pair):
 	//
-	//	"" or "auto"     — read /proc/net/route inside the netns and pick
-	//	                   the interface backing the default IPv4 route.
+	//	"" or "auto"     — read the netns's routes and pick the interface
+	//	                   backing the default IPv4 route, or the default
+	//	                   IPv6 route without one (IPv6-only pods).
 	//	                   Works for the standard CNI veth-named-"eth0"
 	//	                   convention AND for host-mode netns where the
 	//	                   default route exits via e.g. enp0s3 / wlp3s0.
@@ -894,8 +895,8 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 
 // resolveEgressInterfaces returns the ordered interface names used to locate
 // tc attach points for the current netns. Must be called AFTER setns
-// to the target netns, since the resolution reads /proc/net/route and
-// performs netns-local interface lookups.
+// to the target netns, since the resolution reads the netns's route tables
+// and performs netns-local interface lookups.
 //
 // The list may include "lo" for backward compatibility with the flag
 // semantics below, but the caller never attaches to it: loopback traffic
@@ -903,11 +904,12 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 // side (see the attachTCEgress doc comment). The external interface is
 // chosen by:
 //
-//   - empty / "auto": parse /proc/net/route inside the netns and pick
-//     the interface whose Destination is 0.0.0.0 (the default IPv4
-//     route). Returns no external interface if no default route exists
-//     and logs a warning — external TLS rewrites will NOT apply until
-//     a route is configured (typical for a netns mid-CNI-setup).
+//   - empty / "auto": pick the interface of the netns's default IPv4
+//     route, or of its default IPv6 route when it has no IPv4 one (see
+//     findDefaultRouteInterface). Returns no external interface if no
+//     default route exists and logs a warning — external TLS rewrites
+//     will NOT apply until a route is configured (typical for a netns
+//     mid-CNI-setup).
 //   - "none" / "lo-only": opt out of external interface attachment.
 //   - any other value: trust it as an explicit interface name.
 //
@@ -929,7 +931,7 @@ func (m *TLSUprobeManager) resolveEgressInterfaces(netnsOf string) []string {
 			m.log.Warnw("default-route auto-detection failed; attaching only to lo — external TLS rewrites will NOT apply",
 				"netnsOf", netnsOf, "error", err)
 		case got == "":
-			m.log.Warnw("no default IPv4 route in target netns; attaching only to lo — external TLS rewrites will NOT apply (set --egress-interface explicitly if a default route exists under a non-standard name)",
+			m.log.Warnw("no default route (IPv4 or IPv6) in target netns; attaching only to lo — external TLS rewrites will NOT apply (set --egress-interface explicitly if a default route exists under a non-standard name)",
 				"netnsOf", netnsOf)
 		default:
 			external = got
@@ -979,16 +981,61 @@ func vethPeerIfindex(sysRoot, ifName string) (int, error) {
 const threadNetnsPath = "/proc/thread-self/ns/net"
 
 // findDefaultRouteInterface reads the calling thread's netns routes and
-// returns the interface name backing the default IPv4 route, or "" if no
-// default route exists.
+// returns the interface name backing the default IPv4 route or, when there
+// is none (an IPv6-only netns), the default IPv6 route. Returns "" if
+// neither exists.
 func findDefaultRouteInterface() (string, error) {
-	// Not /proc/net/route: that is /proc/self/net, the netns of the main
-	// thread, not of a worker thread setns'd into a pod.
+	// Not /proc/net: that is /proc/self/net, the netns of the main thread,
+	// not of a worker thread setns'd into a pod.
 	data, err := os.ReadFile("/proc/thread-self/net/route")
 	if err != nil {
 		return "", fmt.Errorf("reading /proc/thread-self/net/route: %w", err)
 	}
-	return parseDefaultRouteInterface(data), nil
+	if iface := parseDefaultRouteInterface(data); iface != "" {
+		return iface, nil
+	}
+	data, err = os.ReadFile("/proc/thread-self/net/ipv6_route")
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil // a kernel without IPv6
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading /proc/thread-self/net/ipv6_route: %w", err)
+	}
+	return parseDefaultRoute6Interface(data), nil
+}
+
+// rtfReject is RTF_REJECT (include/uapi/linux/ipv6_route.h): an
+// unreachable, prohibit or blackhole route.
+const rtfReject = 0x0200
+
+// parseDefaultRoute6Interface walks a /proc/net/ipv6_route body ("dst
+// dst_len src src_len next_hop metric refcnt use flags iface", in hex) and
+// returns the interface of the default route (::/0) with the lowest metric,
+// or "" if there is none. Reject routes are skipped: the kernel lists its
+// null entry as a ::/0 reject route on lo, metric 0xffffffff, and `ip -6
+// route add unreachable default` adds another.
+func parseDefaultRoute6Interface(data []byte) string {
+	const unspecified = "00000000000000000000000000000000"
+	var iface string
+	var best uint64
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 10 || fields[0] != unspecified || fields[1] != "00" {
+			continue
+		}
+		metric, err := strconv.ParseUint(fields[5], 16, 32)
+		if err != nil {
+			continue
+		}
+		flags, err := strconv.ParseUint(fields[8], 16, 32)
+		if err != nil || flags&rtfReject != 0 {
+			continue
+		}
+		if iface == "" || metric < best {
+			iface, best = fields[9], metric
+		}
+	}
+	return iface
 }
 
 // parseDefaultRouteInterface walks a /proc/net/route body and returns
