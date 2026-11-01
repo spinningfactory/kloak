@@ -47,6 +47,8 @@ func (m *TLSUprobeManager) UntrackTGID(uint32) error                 { return Er
 func (m *TLSUprobeManager) TrackCgroup(uint64, string) error         { return ErrNotSupported }
 func (m *TLSUprobeManager) RecordCgroupNetns(uint64, int)            {}
 func (m *TLSUprobeManager) UntrackCgroup(uint64) error               { return ErrNotSupported }
+func (m *TLSUprobeManager) UntrackExitedCgroup(uint64) error         { return ErrNotSupported }
+func (m *TLSUprobeManager) ReleaseCgroupNetns(uint64)                {}
 func (m *TLSUprobeManager) AttachTLS(int, uint64) error              { return ErrNotSupported }
 func (m *TLSUprobeManager) Close() error                             { return ErrNotSupported }
 func (m *TLSUprobeManager) PollExecEvents(context.Context) error     { return ErrNotSupported }

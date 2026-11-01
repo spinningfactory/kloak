@@ -62,6 +62,12 @@ type Reconciler struct {
 	// failed (e.g. libssl not loaded yet) and should be retried.
 	trackedPods map[string]map[uint64]bool
 
+	// exitedCgroups maps pod UID -> the cgroups of its containers that
+	// exited (init containers that completed, containers that restarted).
+	// They are untracked when they exit, but for the pod's network
+	// namespace recorded for them, released when the pod goes.
+	exitedCgroups map[string]map[uint64]struct{}
+
 	// podKeyToUID maps "namespace/name" -> pod UID, so that on a NotFound
 	// delete event (where we only have the namespaced name) we can look up
 	// the UID and clean up trackedPods correctly.
@@ -81,6 +87,7 @@ func NewReconciler(c client.Client, log *zap.SugaredLogger, scheme *runtime.Sche
 		CgroupRoot:    cgroupRoot,
 		NodeName:      nodeName,
 		trackedPods:   make(map[string]map[uint64]bool),
+		exitedCgroups: make(map[string]map[uint64]struct{}),
 		podKeyToUID:   make(map[string]string),
 	}
 }
@@ -124,44 +131,64 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
+	uid := string(pod.UID)
 	addrs := podIPs(pod)
 
-	// Pod is running and enabled
-	if pod.Status.Phase != corev1.PodRunning {
-		// Attach the DNS rewrite as soon as the pod's sandbox runs, so
-		// that its containers, init containers first, find it in place,
-		// and bind the pod at the sandbox's address (its status reports it
-		// only later). With NRI the runtime already had it attached while
-		// creating the sandbox (PrepareSandbox), and this finds it in
-		// place; without NRI, a lookup made before gets the real
-		// addresses.
-		if pod.Status.Phase != corev1.PodPending || pod.Spec.HostNetwork || !r.virtualIP() {
-			log.Debugw("pod not running yet", "phase", pod.Status.Phase)
-			return ctrl.Result{}, nil
+	switch pod.Status.Phase {
+	case corev1.PodRunning, corev1.PodPending:
+	case corev1.PodSucceeded, corev1.PodFailed:
+		// Every container of the pod has exited for good.
+		r.mu.RLock()
+		_, tracked := r.trackedPods[uid]
+		r.mu.RUnlock()
+		if tracked {
+			return r.handleDelete(uid, req.String())
 		}
-		r.mu.Lock()
-		if r.trackedPods[string(pod.UID)] == nil {
-			r.trackedPods[string(pod.UID)] = make(map[uint64]bool)
-		}
-		r.podKeyToUID[req.String()] = string(pod.UID)
-		r.mu.Unlock()
-		netnsAddrs, attached := r.attachDNSRewrite(pod, req.String())
-		if !attached {
+		return ctrl.Result{}, nil
+	default:
+		log.Debugw("pod not running", "phase", pod.Status.Phase)
+		return ctrl.Result{}, nil
+	}
+	pending := pod.Status.Phase == corev1.PodPending
+
+	// Attach the DNS rewrite as soon as the pod's sandbox runs, so that its
+	// containers, init containers first, find it in place, and bind the pod
+	// at the sandbox's address (its status reports it only later). With NRI
+	// the runtime already had it attached while creating the sandbox
+	// (PrepareSandbox), and this finds it in place; without NRI, a lookup
+	// made before gets the real addresses. For a running pod, this covers
+	// pods running before the controller started, and a pod whose sandbox
+	// was recreated (a new netns).
+	if !pod.Spec.HostNetwork && r.virtualIP() {
+		// Tracked first, for handleDelete to detach it.
+		r.trackPod(uid, req.String())
+	}
+	netnsAddrs, dnsAttached := r.attachDNSRewrite(pod, req.String())
+	if len(addrs) == 0 {
+		addrs = netnsAddrs
+	}
+	refs := k8ssecrets.PodSecretRefs(pod)
+	if pending {
+		if !dnsAttached {
 			poll := sandboxPoll
 			if time.Since(pod.CreationTimestamp.Time) > sandboxPollFor {
 				poll = sandboxPollSlow
 			}
 			return ctrl.Result{RequeueAfter: poll}, nil
 		}
-		if len(addrs) == 0 {
-			addrs = netnsAddrs
+		// A pending pod's init containers run: they are attached below as a
+		// running pod's containers are. Until one runs, only the pod's
+		// network is bound. Its status changes when one starts, which
+		// reconciles the pod again.
+		if !hasRunningContainer(pod) {
+			if !pod.Spec.HostNetwork && r.virtualIP() {
+				r.UprobeManager.BindPodNetwork(uid, req.String(), addrs, refs)
+			}
+			return ctrl.Result{}, nil
 		}
-		r.UprobeManager.BindPodSecrets(string(pod.UID), req.String(), addrs, nil, k8ssecrets.PodSecretRefs(pod))
-		return ctrl.Result{}, nil
 	}
 
-	// Get cgroup IDs for all containers in this pod
-	cgroupIDs, err := r.getContainerCgroupIDs(pod)
+	containers, err := r.getContainerCgroups(pod)
 	if err != nil {
 		// This is expected during container startup - will retry on next reconcile
 		log.Debugw("cgroup IDs not available yet", "reason", err.Error())
@@ -174,7 +201,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	var needsAttach []uint64
 
 	r.mu.Lock()
-	existingCgroups := r.trackedPods[string(pod.UID)]
+	existingCgroups := r.trackedPods[uid]
 	if existingCgroups == nil {
 		existingCgroups = make(map[uint64]bool)
 	}
@@ -182,11 +209,12 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// Collect cgroups that need uprobe attachment:
 	// - New cgroups not yet tracked
 	// - Previously tracked cgroups where attachment failed (value=false)
-	for cgroupID := range cgroupIDs {
+	for cgroupID, c := range containers {
 		attached, tracked := existingCgroups[cgroupID]
 		if !tracked {
 			existingCgroups[cgroupID] = false // tracked but not yet attached
-			log.Infow("tracking container cgroup", "cgroupID", cgroupID)
+			delete(r.exitedCgroups[uid], cgroupID)
+			log.Infow("tracking container cgroup", "cgroupID", cgroupID, "container", c.name)
 			needsAttach = append(needsAttach, cgroupID)
 		} else if !attached {
 			// Retry attachment (e.g. libssl not loaded on first attempt)
@@ -194,62 +222,80 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		}
 	}
 
-	// Remove old cgroups that are no longer present (container restarted with new cgroup)
+	// A cgroup no longer listed is a container that exited: an init
+	// container that completed, or a container that restarted (in a new
+	// cgroup). It is untracked now, except for the pod's network namespace
+	// recorded for it, released with the pod: a later container's tc attach
+	// finds the pod's tc program in place through it instead of attaching a
+	// second one.
+	var exitedNow []uint64
 	for cgroupID := range existingCgroups {
-		if !cgroupIDs[cgroupID] {
-			delete(existingCgroups, cgroupID)
-			log.Infow("removed stale cgroup", "cgroupID", cgroupID)
+		if _, ok := containers[cgroupID]; ok {
+			continue
 		}
+		delete(existingCgroups, cgroupID)
+		if r.exitedCgroups == nil {
+			r.exitedCgroups = make(map[string]map[uint64]struct{})
+		}
+		if r.exitedCgroups[uid] == nil {
+			r.exitedCgroups[uid] = make(map[uint64]struct{})
+		}
+		r.exitedCgroups[uid][cgroupID] = struct{}{}
+		exitedNow = append(exitedNow, cgroupID)
 	}
 
-	r.trackedPods[string(pod.UID)] = existingCgroups
-	r.podKeyToUID[req.String()] = string(pod.UID)
+	r.trackedPods[uid] = existingCgroups
+	r.podKeyToUID[req.String()] = uid
 	r.mu.Unlock()
+
+	for _, cgroupID := range exitedNow {
+		log.Infow("container exited, untracking its cgroup", "cgroupID", cgroupID)
+		if r.UprobeManager != nil {
+			if err := r.UprobeManager.UntrackExitedCgroup(cgroupID); err != nil {
+				log.Debugw("failed to untrack the cgroup of an exited container", "cgroupID", cgroupID, "err", err)
+			}
+		}
+	}
 
 	// Bind before attaching, so that by the time the uprobes fire this pod's
 	// containers can redeem exactly the secrets its spec references. Rebinding
 	// on every reconcile picks up containers restarted with a new cgroup.
 	if r.UprobeManager != nil {
-		ids := make([]uint64, 0, len(cgroupIDs))
-		for id := range cgroupIDs {
+		ids := make([]uint64, 0, len(containers))
+		for id := range containers {
 			ids = append(ids, id)
 		}
-		r.UprobeManager.BindPodSecrets(string(pod.UID), req.String(), addrs, ids, k8ssecrets.PodSecretRefs(pod))
+		r.UprobeManager.BindPodSecrets(uid, req.String(), addrs, ids, refs)
 	}
-	// Also for pods running before the controller started, and for a pod
-	// whose sandbox was recreated (a new netns).
-	_, dnsAttached := r.attachDNSRewrite(pod, req.String())
 
 	// Attach uprobes outside the lock — this involves filesystem I/O.
 	for _, cgroupID := range needsAttach {
-		cgroupPath, pid := r.attachUprobesToCgroup(cgroupID, pod)
-		if cgroupPath != "" {
-			r.mu.Lock()
-			if tracked := r.trackedPods[string(pod.UID)]; tracked != nil {
-				tracked[cgroupID] = true // mark as successfully attached
-			}
-			r.mu.Unlock()
-
-			// Register the cgroup for exec/exit tracepoint tracking so new
-			// processes spawned inside the container are automatically detected.
-			if r.UprobeManager != nil {
-				if err := r.UprobeManager.TrackCgroup(cgroupID, cgroupPath); err != nil {
-					log.Errorw("failed to track cgroup for exec events", "error", err, "cgroupID", cgroupID)
-				}
-				// Record which netns this cgroup belongs to, so UntrackCgroup
-				// can clean up the pinned netns fd and allow inode reuse.
-				if pid > 0 {
-					r.UprobeManager.RecordCgroupNetns(cgroupID, pid)
-				}
-			}
+		c := containers[cgroupID]
+		pid, ok := r.attachUprobesToCgroup(cgroupID, c)
+		if !ok {
+			continue
 		}
+		r.mu.Lock()
+		if tracked := r.trackedPods[uid]; tracked != nil {
+			tracked[cgroupID] = true // mark as successfully attached
+		}
+		r.mu.Unlock()
+
+		// Register the cgroup for exec/exit tracepoint tracking so new
+		// processes spawned inside the container are automatically detected.
+		if err := r.UprobeManager.TrackCgroup(cgroupID, c.path); err != nil {
+			log.Errorw("failed to track cgroup for exec events", "error", err, "cgroupID", cgroupID)
+		}
+		// Record which netns this cgroup belongs to, so UntrackCgroup
+		// can clean up the pinned netns fd and allow inode reuse.
+		r.UprobeManager.RecordCgroupNetns(cgroupID, pid)
 	}
 
 	// If any cgroups still need attachment, requeue to retry later.
 	// This handles runtimes like Python where libssl loads lazily.
 	r.mu.RLock()
 	needsRetry := !dnsAttached
-	if tracked := r.trackedPods[string(pod.UID)]; tracked != nil {
+	if tracked := r.trackedPods[uid]; tracked != nil {
 		for _, attached := range tracked {
 			if !attached {
 				needsRetry = true
@@ -265,75 +311,54 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	return ctrl.Result{}, nil
 }
 
-// attachUprobesToCgroup reads the cgroup's procs file to find a PID and calls the uprobe manager.
-// Returns the cgroup filesystem path and one of the container's PIDs on success, or empty string and 0 on failure.
-func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, pod *corev1.Pod) (cgroupPath string, attachedPID int) {
+// attachUprobesToCgroup attaches the TLS uprobes for the processes of a
+// container, c with cgroup ID cgroupID. It returns one of the container's
+// PIDs the attach succeeded for, and whether it succeeded for any.
+func (r *Reconciler) attachUprobesToCgroup(cgroupID uint64, c containerCgroup) (int, bool) {
 	if r.UprobeManager == nil {
-		return "", 0
+		return 0, false
 	}
 
-	logging.Tracew(r.Log, "trying to attach uprobes to container", "cgroup", cgroupID)
+	logging.Tracew(r.Log, "trying to attach uprobes to container", "cgroup", cgroupID, "container", c.name)
 
-	// Find the container cgroup path again to read cgroup.procs
-	for i := range pod.Status.ContainerStatuses {
-		status := &pod.Status.ContainerStatuses[i]
-		if status.ContainerID == "" {
-			continue
-		}
-		parts := strings.SplitN(status.ContainerID, "://", 2)
-		if len(parts) != 2 {
-			continue
-		}
-		containerID := parts[1]
-
-		containerCgroupPath, err := cgroups.FindContainerCgroupPath(r.CgroupRoot, string(pod.UID), containerID)
-		if err != nil {
-			continue
-		}
-
-		// Verify this is the right cgroup by checking inode
-		inode, err := cgroups.GetCgroupInodeFromPath(containerCgroupPath)
-		if err != nil || inode != cgroupID {
-			continue
-		}
-
-		// Read PIDs from cgroup.procs
-		pids, err := cgroups.ReadCgroupProcs(containerCgroupPath)
-		if err != nil {
-			r.Log.Errorw("failed to read cgroup.procs", "error", err, "path", containerCgroupPath)
-			return "", 0
-		}
-
-		if len(pids) == 0 {
-			r.Log.Debugw("no PIDs found in cgroup.procs", "path", containerCgroupPath)
-			return "", 0
-		}
-
-		// Attempt to attach uprobes to every PID in the cgroup.
-		// Containers may run multiple processes; we probe all of them so that
-		// whichever process makes TLS calls is instrumented. AttachTLS skips
-		// PIDs that have no compatible TLS symbols.
-		attached := false
-		attachedPid := 0
-		for _, pid := range pids {
-			if err := r.UprobeManager.AttachTLS(pid, cgroupID); err != nil {
-				logging.Tracew(r.Log, "could not attach TLS uprobes to pid", "pid", pid, "container", status.Name, "err", err)
-			} else {
-				r.Log.Infow("Successfully attached TLS uprobes", "pid", pid, "container", status.Name)
-				attached = true
-				if attachedPid == 0 {
-					attachedPid = pid
-				}
-			}
-		}
-		if attached {
-			return containerCgroupPath, attachedPid
-		}
-		return "", 0
+	pids, err := cgroups.ReadCgroupProcs(c.path)
+	if err != nil {
+		// The container exited since its status was read.
+		r.Log.Debugw("failed to read cgroup.procs", "error", err, "path", c.path)
+		return 0, false
+	}
+	if len(pids) == 0 {
+		r.Log.Debugw("no PIDs found in cgroup.procs", "path", c.path)
+		return 0, false
 	}
 
-	r.Log.Debugw("could not find matching container for cgroup", "cgroupID", cgroupID)
-	return "", 0
+	// Attempt to attach uprobes to every PID in the cgroup.
+	// Containers may run multiple processes; we probe all of them so that
+	// whichever process makes TLS calls is instrumented. AttachTLS skips
+	// PIDs that have no compatible TLS symbols.
+	attachedPid := 0
+	for _, pid := range pids {
+		if err := r.UprobeManager.AttachTLS(pid, cgroupID); err != nil {
+			logging.Tracew(r.Log, "could not attach TLS uprobes to pid", "pid", pid, "container", c.name, "err", err)
+			continue
+		}
+		r.Log.Infow("Successfully attached TLS uprobes", "pid", pid, "container", c.name)
+		if attachedPid == 0 {
+			attachedPid = pid
+		}
+	}
+	return attachedPid, attachedPid != 0
+}
+
+// trackPod records a pod as tracked, for handleDelete to release what is
+// attached for it.
+func (r *Reconciler) trackPod(uid, key string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.trackedPods[uid] == nil {
+		r.trackedPods[uid] = make(map[uint64]bool)
+	}
+	r.podKeyToUID[key] = uid
 }
 
 // virtualIP reports whether there is a data plane to attach the virtual IP
@@ -383,12 +408,7 @@ func (r *Reconciler) PrepareSandbox(ctx context.Context, sb *Sandbox) bool {
 		return false
 	}
 
-	r.mu.Lock()
-	if r.trackedPods[string(pod.UID)] == nil {
-		r.trackedPods[string(pod.UID)] = make(map[uint64]bool)
-	}
-	r.podKeyToUID[name] = string(pod.UID)
-	r.mu.Unlock()
+	r.trackPod(string(pod.UID), name)
 
 	netnsAddrs, err := r.UprobeManager.AttachPodDNSRewriteNetns(string(pod.UID), name, sb.NetnsPath)
 	if err != nil {
@@ -481,9 +501,12 @@ func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, erro
 		r.mu.Unlock()
 		return ctrl.Result{}, nil
 	}
+	exited := r.exitedCgroups[uid]
 
 	// Untrack the cgroups: this stops exec/exit tracking for them and
-	// detaches the uprobes attached for their processes.
+	// detaches the uprobes attached for their processes. Those of the
+	// containers that exited are untracked already, all but the pod's
+	// network namespace recorded for them.
 	if r.UprobeManager != nil {
 		r.UprobeManager.UnbindPod(uid)
 		r.UprobeManager.DetachPodDNSRewrite(uid)
@@ -492,13 +515,17 @@ func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, erro
 				r.Log.Debugw("failed to untrack cgroup", "cgroupID", cgroupID, "err", err)
 			}
 		}
+		for cgroupID := range exited {
+			r.UprobeManager.ReleaseCgroupNetns(cgroupID)
+		}
 	}
 
 	// Remove the pod from our tracking.
 	delete(r.trackedPods, uid)
+	delete(r.exitedCgroups, uid)
 	delete(r.podKeyToUID, namespacedName)
 	r.mu.Unlock()
-	r.Log.Infow("stopped tracking pod", "pod", namespacedName, "uid", uid, "cgroupCount", len(cgroupIDs))
+	r.Log.Infow("stopped tracking pod", "pod", namespacedName, "uid", uid, "cgroupCount", len(cgroupIDs)+len(exited))
 
 	return ctrl.Result{}, nil
 }
@@ -511,18 +538,39 @@ func (r *Reconciler) isEnabled(pod *corev1.Pod) bool {
 	return pod.Annotations[AnnotationEnabled] == "true"
 }
 
-// getContainerCgroupIDs retrieves the cgroup IDs for all running containers in a pod.
-// For cgroups v2, we get the inode number of each container's cgroup directory.
-// We track container cgroups (not pod cgroups) because bpf_get_current_cgroup_id()
-// returns the container's .scope cgroup, not the pod's .slice cgroup.
-func (r *Reconciler) getContainerCgroupIDs(pod *corev1.Pod) (map[uint64]bool, error) {
-	cgroupIDs := make(map[uint64]bool)
+// containerCgroup is the cgroup of a running container.
+type containerCgroup struct {
+	path string // the cgroup's directory
+	name string // the container's name, for logs
+}
 
-	// Helper to collect cgroup IDs from container statuses
+// hasRunningContainer reports whether the pod's status lists a running
+// container, init containers included.
+func hasRunningContainer(pod *corev1.Pod) bool {
+	for _, statuses := range [][]corev1.ContainerStatus{pod.Status.InitContainerStatuses, pod.Status.ContainerStatuses} {
+		for i := range statuses {
+			if statuses[i].ContainerID != "" && statuses[i].State.Running != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// getContainerCgroups returns the cgroups of the pod's running containers,
+// init containers included (a pending pod's, or a running pod's sidecars),
+// by cgroup ID. For cgroups v2, that is the inode number of the container's
+// cgroup directory. We track container cgroups (not pod cgroups) because
+// bpf_get_current_cgroup_id() returns the container's .scope cgroup, not the
+// pod's .slice cgroup. A container that is not running is left out: its
+// cgroup is gone, and the lookup could fall back to the pod's.
+func (r *Reconciler) getContainerCgroups(pod *corev1.Pod) (map[uint64]containerCgroup, error) {
+	containers := make(map[uint64]containerCgroup)
+
 	collectFromStatuses := func(statuses []corev1.ContainerStatus) {
 		for i := range statuses {
 			status := &statuses[i]
-			if status.ContainerID == "" {
+			if status.ContainerID == "" || status.State.Running == nil {
 				continue
 			}
 
@@ -547,21 +595,18 @@ func (r *Reconciler) getContainerCgroupIDs(pod *corev1.Pod) (map[uint64]bool, er
 			}
 
 			logging.Tracew(r.Log, "found container cgroup", "container", status.Name, "cgroupPath", containerCgroupPath, "cgroupID", cgroupID)
-			cgroupIDs[cgroupID] = true
+			containers[cgroupID] = containerCgroup{path: containerCgroupPath, name: status.Name}
 		}
 	}
 
-	// Collect from app containers (these are the ones that matter for traffic interception)
 	collectFromStatuses(pod.Status.ContainerStatuses)
-
-	// Also collect from init containers if they're still running
 	collectFromStatuses(pod.Status.InitContainerStatuses)
 
-	if len(cgroupIDs) == 0 {
+	if len(containers) == 0 {
 		return nil, fmt.Errorf("no container cgroups found for pod %s/%s", pod.Namespace, pod.Name)
 	}
 
-	return cgroupIDs, nil
+	return containers, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
