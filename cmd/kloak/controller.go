@@ -81,8 +81,8 @@ func init() {
 		`A secret restricted to a hostname (getkloak.io/hosts) is only rewritten on a connection whose TLS ClientHello names that host (SNI). `+
 			`"enforce" refuses other rewrites; "audit" allows them but logs each violation, to find clients whose SNI differs from the annotation before enforcing.`)
 	controllerCmd.Flags().StringVar(&nriSocket, "nri-socket", controller.DefaultNRISocket,
-		`NRI socket of the container runtime (containerd 2.0+, CRI-O 1.30+): the runtime then waits for kloak to attach the DNS rewrite while it creates each pod sandbox, before the pod's containers start. `+
-			`Without NRI (unreachable socket, or "" to disable), the rewrite is attached by polling pending pods, which leaves a short window at pod start in which a lookup gets the real addresses and a connection made with them no host-restricted secret.`)
+		`NRI socket of the container runtime (containerd 2.0+, CRI-O 1.30+): the runtime then waits for kloak to attach the DNS rewrite while it creates each pod sandbox, before the pod's containers start, and a container's TLS uprobes before it starts. `+
+			`Without NRI (unreachable socket, or "" to disable), the rewrite is attached by polling pending pods, and a container's uprobes once the pod's status reports it running, which leaves a short window at pod start in which a lookup gets the real addresses and a connection made with them no host-restricted secret, and a TLS write sends the placeholder unchanged.`)
 	controllerCmd.Flags().StringVar(&virtualIPRange, "virtual-ip-range", ebpf.DefaultVirtualIPRange,
 		`Ranges fake IPs come from. Every host a secret is restricted to (getkloak.io/hosts) gets a stable fake IP, and fake IPv6, kept in maps pinned under `+ebpf.DefaultBPFPinPath+`. `+
 			`A kloak pod with a secret for the host gets the fake IP in DNS answers and its connects to it are redirected to the host's addresses; a host-restricted secret is only rewritten on a connection made to its host's fake IP. `+
@@ -202,9 +202,11 @@ func runController(cmd *cobra.Command, args []string) {
 	}
 
 	// With NRI the container runtime waits for the DNS rewrite to be
-	// attached before a pod's containers start; without it, the reconciler
-	// polls pending pods. Added as a runnable so it starts after the cache
-	// sync (PrepareSandbox reads pods from the cache).
+	// attached before a pod's containers start, and for a container's TLS
+	// uprobes before it starts; without it, the reconciler polls pending
+	// pods and attaches running containers. Added as a runnable so it starts
+	// after the cache sync (PrepareSandbox and PrepareContainer read pods
+	// from the cache).
 	if uprobeMgr != nil && nriSocket != "" {
 		plugin := &controller.NRIPlugin{
 			Preparer:   reconciler,

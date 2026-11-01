@@ -40,7 +40,7 @@ Kloak transparently intercepts outbound TLS traffic in Kubernetes using eBPF upr
 
 - Kubernetes cluster (1.28+) with Linux kernel 5.17+ (6.6+ attaches the tc patch program via TCX; older kernels fall back to a clsact qdisc + cls_bpf filter, see `controller.ebpf.tcAttachMode`)
 - The virtual IP ranges kloak hands out (default `198.18.0.0/15` and `2001:2::/48`, reserved for benchmarking and never routed) must not be used by the cluster or its nodes. The controller checks this at startup and refuses to start otherwise (`controller.ebpf.virtualIPRange`).
-- containerd 2.0+ or CRI-O 1.30+ is recommended: through their NRI hook, kloak sets up a pod's DNS rewrite before its containers start. On other runtimes it is set up as soon as the pod's sandbox runs, which leaves a short window at pod start (see `controller.nri` in the chart values).
+- containerd 2.0+ or CRI-O 1.30+ is recommended: through their NRI hook, kloak sets up a pod's DNS rewrite before its containers start, and attaches each container's TLS uprobes before it starts, so even its first request gets the secret. On other runtimes the rewrite is set up as soon as the pod's sandbox runs and a container is attached once the pod's status reports it running, which leaves a short window at pod start (see `controller.nri` in the chart values).
 - [Helm](https://helm.sh/docs/intro/install/) 3.12+
 - `kubectl` configured with cluster access
 

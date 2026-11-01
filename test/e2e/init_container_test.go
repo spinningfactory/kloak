@@ -22,7 +22,9 @@ import (
 // The init container sends its placeholder to the echo server, once a
 // second for up to a minute, until it comes back rewritten, and prints the
 // echoed request and the attempt it took; it fails if the placeholder never
-// comes back rewritten.
+// comes back rewritten. With NRI, the container runtime waits for the
+// controller to attach the init container before it starts it, so its first
+// attempt must be rewritten.
 func TestEBPFInitContainerRewrite(t *testing.T) {
 	const (
 		secretValue = "REAL-INIT-CONTAINER-12345"
@@ -48,7 +50,11 @@ func TestEBPFInitContainerRewrite(t *testing.T) {
 		t.Fatalf("the init container's placeholder never came back rewritten; its log:\n%s\n=== Controller logs ===\n%s",
 			logs, controllerLogs())
 	}
-	t.Logf("init container: %s", firstLineWith(logs, "rewritten on attempt"))
+	attempt := firstLineWith(logs, "rewritten on attempt")
+	t.Logf("init container: %s", attempt)
+	if controllerUsesNRI(t, controllerPod(t)) && attempt != "rewritten on attempt 1" {
+		t.Errorf("with NRI, the init container's first request was not rewritten: %s", attempt)
+	}
 }
 
 // initContainerClientPod returns a kloak pod whose init container, "send",

@@ -153,6 +153,19 @@ func TestSandboxPod(t *testing.T) {
 	}
 }
 
+func TestPrepareContainerSkips(t *testing.T) {
+	// Without the eBPF data plane, nothing is prepared and the pod is not
+	// looked up.
+	c := fake.NewClientBuilder().WithScheme(testScheme()).Build()
+	r := NewReconciler(c, zap.NewNop().Sugar(), testScheme(), nil, "", "")
+	sb := Sandbox{UID: "u", Namespace: "ns", Name: "app",
+		Annotations: map[string]string{AnnotationEnabled: "true"}}
+	r.PrepareContainer(context.Background(), &sb, &Container{ID: "c1", Name: "app"})
+	if n := r.GetTrackedPodCount(); n != 0 {
+		t.Errorf("%d pods tracked", n)
+	}
+}
+
 func TestPrepareSandboxSkips(t *testing.T) {
 	// Without the virtual-ip data plane (here: no eBPF manager), nothing
 	// is prepared and the pod is not looked up.
@@ -168,12 +181,24 @@ func TestPrepareSandboxSkips(t *testing.T) {
 	}
 }
 
-// fakePreparer records the sandboxes it is asked to prepare; it reports
-// ready the sandbox IDs in ready.
+// fakePreparer records the sandboxes and the containers it is asked to
+// prepare; it reports ready the sandbox IDs in ready.
 type fakePreparer struct {
-	mu    sync.Mutex
-	ready map[string]bool
-	calls []Sandbox
+	mu         sync.Mutex
+	ready      map[string]bool
+	calls      []Sandbox
+	containers []preparedContainer
+}
+
+type preparedContainer struct {
+	sandbox   Sandbox
+	container Container
+}
+
+func (f *fakePreparer) PrepareContainer(_ context.Context, sb *Sandbox, c *Container) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.containers = append(f.containers, preparedContainer{*sb, *c})
 }
 
 func (f *fakePreparer) PrepareSandbox(_ context.Context, sb *Sandbox) bool {
@@ -342,6 +367,29 @@ func TestNRIPlugin(t *testing.T) {
 	}
 	if n := prep.count("ready"); n != 1 {
 		t.Errorf("a container of a prepared sandbox prepared it again (%d calls)", n)
+	}
+
+	// Synchronous: a container is prepared by the time StartContainer
+	// returns, every time it starts.
+	for i := 1; i <= 2; i++ {
+		if err := rt.StartContainer(bg, &adaptation.StartContainerRequest{Pod: sandbox("ready"),
+			Container: &api.Container{Id: "ready-c", PodSandboxId: "ready", Name: "c"}}); err != nil {
+			t.Fatal(err)
+		}
+		prep.mu.Lock()
+		n := len(prep.containers)
+		var last preparedContainer
+		if n > 0 {
+			last = prep.containers[n-1]
+		}
+		prep.mu.Unlock()
+		if n != i {
+			t.Fatalf("StartContainer #%d: %d containers prepared", i, n)
+		}
+		if last.container != (Container{ID: "ready-c", Name: "c"}) || last.sandbox.UID != "uid-ready" ||
+			last.sandbox.Annotations[AnnotationEnabled] != "true" || len(last.sandbox.IPs) != 1 {
+			t.Errorf("StartContainer prepared %+v", last)
+		}
 	}
 
 	// Not prepared at sandbox creation (the pod was not found, say): each

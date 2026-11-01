@@ -29,25 +29,30 @@ const (
 	nriPluginIdx = "50"
 )
 
-// SandboxPreparer prepares a pod sandbox the container runtime is creating
-// (Reconciler.PrepareSandbox).
-type SandboxPreparer interface {
+// Preparer prepares what the container runtime creates: a pod sandbox
+// (Reconciler.PrepareSandbox), and each container before it starts
+// (Reconciler.PrepareContainer).
+type Preparer interface {
 	PrepareSandbox(ctx context.Context, sb *Sandbox) bool
+	PrepareContainer(ctx context.Context, sb *Sandbox, c *Container)
 }
 
 // NRIPlugin hooks kloak into the container runtime through NRI (the Node
 // Resource Interface of containerd and CRI-O). The runtime calls it while
-// it creates each pod sandbox, and again before each container, and waits
-// for it: kloak attaches the virtual IP DNS rewrite then (PrepareSandbox),
-// before any container of the pod resolves a name. Without NRI (a runtime
-// without it, NRI disabled, or the socket not mounted), the Reconciler
-// attaches the rewrite by polling Pending pods instead.
+// it creates each pod sandbox, and again before it creates and before it
+// starts each container, and waits for it. Kloak attaches the virtual IP
+// DNS rewrite while the sandbox is created (PrepareSandbox), before any
+// container of the pod resolves a name, and a container's TLS uprobes
+// before it starts (PrepareContainer), so that its first TLS write is
+// rewritten. Without NRI (a runtime without it, NRI disabled, or the
+// socket not mounted), the Reconciler attaches the rewrite by polling
+// Pending pods, and the uprobes once it sees a container running.
 //
 // The plugin never fails a runtime request: an error would fail the pod's
 // sandbox or container. A request taking longer than the runtime's timeout
 // (2 s by default) disconnects the plugin, which reconnects.
 type NRIPlugin struct {
-	Preparer   SandboxPreparer
+	Preparer   Preparer
 	SocketPath string
 	// HostRoot is the host's root filesystem as this process sees it: the
 	// runtime reports network namespace paths in the host's mount
@@ -156,6 +161,15 @@ func (p *NRIPlugin) prepare(ctx context.Context, pod *api.PodSandbox) {
 	p.mu.Unlock()
 }
 
+// prepareContainer runs PrepareContainer for a container the runtime is
+// about to start.
+func (p *NRIPlugin) prepareContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) {
+	sb := sandboxFromNRI(pod, p.HostRoot)
+	logging.Tracew(p.Log, "NRI container start", "sandbox", sb.ID, "pod", sb.Namespace+"/"+sb.Name,
+		"kloak", sb.Annotations[AnnotationEnabled], "container", ctr.GetName(), "id", ctr.GetId())
+	p.Preparer.PrepareContainer(ctx, sb, &Container{ID: ctr.GetId(), Name: ctr.GetName()})
+}
+
 func (p *NRIPlugin) forget(pod *api.PodSandbox) {
 	p.mu.Lock()
 	delete(p.prepared, pod.GetId())
@@ -251,7 +265,7 @@ func inRoot(root, path string) string {
 type nriHandlers struct{ p *NRIPlugin }
 
 func (h *nriHandlers) Configure(_ context.Context, _, runtime, version string) (api.EventMask, error) {
-	h.p.Log.Infow("connected to the container runtime through NRI: the DNS rewrite is attached while each pod sandbox is created",
+	h.p.Log.Infow("connected to the container runtime through NRI: the DNS rewrite is attached while each pod sandbox is created, and the TLS uprobes before each container starts",
 		"runtime", runtime, "version", version, "socket", h.p.SocketPath)
 	return 0, nil // the events of the methods below
 }
@@ -272,6 +286,12 @@ func (h *nriHandlers) RunPodSandbox(ctx context.Context, pod *api.PodSandbox) er
 func (h *nriHandlers) CreateContainer(ctx context.Context, pod *api.PodSandbox, _ *api.Container) (*api.ContainerAdjustment, []*api.ContainerUpdate, error) {
 	h.p.prepare(ctx, pod)
 	return nil, nil, nil
+}
+
+// StartContainer attaches a container's TLS uprobes before it starts.
+func (h *nriHandlers) StartContainer(ctx context.Context, pod *api.PodSandbox, ctr *api.Container) error {
+	h.p.prepareContainer(ctx, pod, ctr)
+	return nil
 }
 
 func (h *nriHandlers) RemovePodSandbox(_ context.Context, pod *api.PodSandbox) error {

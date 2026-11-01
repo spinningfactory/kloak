@@ -50,6 +50,7 @@ func (m *TLSUprobeManager) UntrackCgroup(uint64) error               { return Er
 func (m *TLSUprobeManager) UntrackExitedCgroup(uint64) error         { return ErrNotSupported }
 func (m *TLSUprobeManager) ReleaseCgroupNetns(uint64)                {}
 func (m *TLSUprobeManager) AttachTLS(int, uint64) error              { return ErrNotSupported }
+func (m *TLSUprobeManager) AttachContainerTLS(int, uint64) error     { return ErrNotSupported }
 func (m *TLSUprobeManager) Close() error                             { return ErrNotSupported }
 func (m *TLSUprobeManager) PollExecEvents(context.Context) error     { return ErrNotSupported }
 func (m *TLSUprobeManager) PollEvents(context.Context) error         { return ErrNotSupported }
@@ -72,3 +73,4 @@ func (m *TLSUprobeManager) AttachPodDNSRewriteNetns(string, string, string) ([]n
 
 func (m *TLSUprobeManager) BindPodSecrets(string, string, []netip.Addr, []uint64, []secrets.Ref) {}
 func (m *TLSUprobeManager) BindPodNetwork(string, string, []netip.Addr, []secrets.Ref)           {}
+func (m *TLSUprobeManager) BindPodContainer(string, string, []netip.Addr, uint64, []secrets.Ref) {}
