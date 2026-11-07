@@ -6,7 +6,10 @@ RUN apt-get update && apt-get install -y curl unzip ca-certificates && rm -rf /v
 # matches the running binary. Profile builds use identical optimisation flags
 # to production but retain the symbol table (the production binary is stripped).
 # The ARG lets the nightly workflow pin to the version under test.
-ARG BUN_VERSION=1.3.14
+# Not 1.3.12-1.3.14: on Linux 7.0 kernels (GitHub's runners from 7.0.0-1019)
+# they abort a few seconds in with "embedder failed to suspend thread ... for
+# TLC" (oven-sh/bun#31832).
+ARG BUN_VERSION=1.4.4
 ARG TARGETARCH=amd64
 
 RUN set -e; \
