@@ -2,13 +2,19 @@ package k8s
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"testing"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
+	"golang.org/x/sys/unix"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
@@ -198,20 +204,114 @@ func TestSnapshot_MultipleDataKeys(t *testing.T) {
 	}
 }
 
-func TestSnapshot_BadPortAnnotationFallsBackToWildcard(t *testing.T) {
+// The data plane reads port 0 as any port, so a port annotation that does
+// not parse must not be synced as one (spinningfactory/kloak#368): the
+// Secret is skipped and logged, while the other Secrets still sync with
+// their own port filters, and an absent or empty annotation stays a
+// wildcard.
+func TestSnapshot_PortAnnotation(t *testing.T) {
 	scheme := newScheme(t)
-	enabled := makeEnabled("default", "bad", map[string]string{"k": "real-val-1234"}, map[string]string{
-		AnnotationPort: "garbage",
-	})
-	shadow := makeShadow("default", "bad", map[string]string{"k": "kl::0011223344"})
-	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(enabled, shadow).Build()
 
-	got, _ := NewSource(c).Snapshot(context.Background())
-	if len(got) != 1 {
-		t.Fatalf("len=%d", len(got))
+	bad := map[string]string{
+		"garbage":    "garbage",
+		"semicolon":  "443;",
+		"named":      "https",
+		"zero":       "0",
+		"overflow":   "70000",
+		"bad-proto":  "443/sctp",
+		"two-slash":  "443/tcp/extra",
+		"whitespace": "   ",
 	}
-	if got[0].Port != 0 || got[0].Protocol != 0 {
-		t.Errorf("bad port annotation should yield wildcard, got Port=%d Protocol=%d", got[0].Port, got[0].Protocol)
+	type want struct {
+		port  uint16
+		proto uint8
+	}
+	good := map[string]struct {
+		ann  map[string]string
+		want want
+	}{
+		"tcp":      {map[string]string{AnnotationHosts: "api.example.com", AnnotationPort: "443/tcp"}, want{443, unix.IPPROTO_TCP}},
+		"default":  {map[string]string{AnnotationPort: " 8443 "}, want{8443, unix.IPPROTO_TCP}},
+		"udp":      {map[string]string{AnnotationPort: "53/UDP"}, want{53, unix.IPPROTO_UDP}},
+		"empty":    {map[string]string{AnnotationPort: ""}, want{0, 0}},
+		"no-port":  {map[string]string{AnnotationHosts: "api.example.com"}, want{0, 0}},
+		"no-annos": {nil, want{0, 0}},
+	}
+
+	var objs []client.Object
+	n := 0
+	add := func(name string, ann map[string]string) {
+		n++
+		// Two data keys, so a skipped Secret must lose all of them.
+		objs = append(objs,
+			makeEnabled("default", name, map[string]string{"a": "real-val-a-1234", "b": "real-val-b-1234"}, ann),
+			makeShadow("default", name, map[string]string{
+				"a": fmt.Sprintf("kl::a%03d-shadow1", n),
+				"b": fmt.Sprintf("kl::b%03d-shadow1", n),
+			}))
+	}
+	for name, raw := range bad {
+		add("bad-"+name, map[string]string{AnnotationHosts: "api.example.com", AnnotationPort: raw})
+	}
+	for name, g := range good {
+		add("good-"+name, g.ann)
+	}
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
+
+	core, logs := observer.New(zap.InfoLevel)
+	got, err := NewSource(c).WithLog(zap.New(core).Sugar()).Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	seen := make(map[string]int)
+	for _, s := range got {
+		name := strings.TrimPrefix(s.OwnerID, "default/")
+		g, ok := good[strings.TrimPrefix(name, "good-")]
+		if !ok || !strings.HasPrefix(name, "good-") {
+			t.Errorf("%s[%s] synced with Port=%d Protocol=%d, want it skipped", s.OwnerID, s.Key, s.Port, s.Protocol)
+			continue
+		}
+		seen[name]++
+		if s.Port != g.want.port || s.Protocol != g.want.proto {
+			t.Errorf("%s[%s]: Port=%d Protocol=%d, want %d %d", s.OwnerID, s.Key, s.Port, s.Protocol, g.want.port, g.want.proto)
+		}
+	}
+	for name := range good {
+		if seen["good-"+name] != 2 {
+			t.Errorf("good-%s: %d keys synced, want 2", name, seen["good-"+name])
+		}
+	}
+
+	// One error per skipped Secret, naming it and the value it carries.
+	skipped := logs.FilterMessage("skipping secret: invalid port annotation")
+	if skipped.Len() != len(bad) {
+		t.Errorf("%d skip logs, want %d: %v", skipped.Len(), len(bad), skipped.All())
+	}
+	for _, e := range skipped.All() {
+		f := e.ContextMap()
+		name, _ := f["secret"].(string)
+		raw, ok := bad[strings.TrimPrefix(name, "bad-")]
+		if e.Level != zap.ErrorLevel || f["namespace"] != "default" || !ok || f["value"] != raw {
+			t.Errorf("skip log %s %v, want error level naming a bad Secret and its value", e.Level, f)
+		}
+	}
+}
+
+// The logger is optional: without one, a bad port still skips the Secret.
+func TestSnapshot_BadPortSkippedWithoutLogger(t *testing.T) {
+	scheme := newScheme(t)
+	c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(
+		makeEnabled("default", "bad", map[string]string{"k": "real-val-1234"}, map[string]string{AnnotationPort: "garbage"}),
+		makeShadow("default", "bad", map[string]string{"k": "kl::0011223344"}),
+	).Build()
+
+	got, err := NewSource(c).Snapshot(context.Background())
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("bad port annotation should skip the secret, got %+v", got)
 	}
 }
 
