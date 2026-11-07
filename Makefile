@@ -105,8 +105,8 @@ boringssl-offsets:
 # extracts the SSL_write virtual address via nm, converts to file offset via
 # tools/bun-offsets/va_to_offset.py, and writes
 # tools/bun-offsets/results/bun-VERSION-ARCH.json.
-# Override with: BUN_VERSION=1.3.14 ARCH=arm64 make bun-offsets-discover
-BUN_VERSION ?= 1.3.14
+# Override with: BUN_VERSION=1.4.4 ARCH=arm64 make bun-offsets-discover
+BUN_VERSION ?= 1.4.4
 bun-offsets-discover:
 	BUN_VERSION=$(BUN_VERSION) ARCH=$(or $(ARCH),amd64) tools/bun-offsets/discover.sh
 
