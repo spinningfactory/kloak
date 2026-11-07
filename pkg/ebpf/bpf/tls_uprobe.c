@@ -125,10 +125,10 @@ struct scratch_buf {
   // Multiple secret matches per SSL_write (up to 4).
   // xor_path processes one match per invocation and tail-calls back to itself.
   #define XOR_MAX_MATCHES 4
-  __u32 xor_match_count;   // total matches found by pre-scan
+  __u32 xor_match_count;   // placeholders the pre-scan confirmed in secret_map
   __u32 xor_current_match; // index of the next match to process
   struct {
-     __u32 pos;                    // byte offset of kl:: prefix in data[]
+     __u32 pos;                    // byte offset of the placeholder in the write buffer
      struct secret_key key;        // 8-byte key prefix
    } xor_matches[XOR_MAX_MATCHES];
    char data[MAX_DATA_SIZE];
@@ -215,7 +215,8 @@ static __always_inline void report_secret_event(const struct secret_key *key,
 enum {
   DBG_XOR_CONN_CHECK = 0,         // entry uprobe checked tls_conn_state
   DBG_XOR_CONN_HIT,           // tls_conn_state found + AES-GCM confirmed
-  DBG_XOR_PRESCAN_MATCH,      // pre-scan found kl:: prefix
+  DBG_XOR_PRESCAN_MATCH,      // pre-scan confirmed a placeholder in secret_map: it took a match slot
+  DBG_XOR_PRESCAN_UNCONFIRMED, // pre-scan candidate (kl:: or its Huffman prefix) not in secret_map: skipped
   DBG_XOR_TAILCALL,           // tail-called to xor_path
   DBG_XOR_PATH_ENTERED,       // bpf_xor_path entered
   DBG_XOR_SECRET_FOUND,       // secret_map lookup succeeded in xor_path
@@ -1333,10 +1334,19 @@ static __always_inline __u32 ssl_read_fd(__u64 ssl_ptr) {
 }
 
 // -----------------------------------------------------------------------------
-// Prescan: bpf_loop callback to find all kl:: prefixes in the SSL_write buffer.
-// Scans in MAX_DATA_SIZE chunks with SECRET_KEY_LEN-1 overlap so that tokens
-// straddling chunk boundaries are always detected. Match positions are stored as
-// global byte offsets (relative to the start of the SSL_write buffer).
+// Prescan: bpf_loop callback that finds the placeholders in the SSL_write (or
+// Go Write) buffer, one MAX_DATA_SIZE-byte chunk per call. The chunks overlap
+// by SECRET_KEY_LEN-1 bytes and try each start position of the write exactly
+// once, so a placeholder straddling two chunks is found once
+// (prescan_scan_len in helpers.h). Match positions are stored as global byte
+// offsets (relative to the start of the write buffer).
+//
+// A candidate (kl::, or its HPACK Huffman prefix) takes one of the
+// XOR_MAX_MATCHES slots only once its key is confirmed in secret_map: a stray
+// kl:: in a body, or the Huffman prefix in binary data (1 position in 2^24),
+// would otherwise use up the slots and hide the placeholders after it. A
+// placeholder in secret_map that the writer's pod is not bound to still takes
+// a slot: bpf_xor_path checks the pod binding and reports the refusal.
 // -----------------------------------------------------------------------------
 
 struct prescan_ctx {
@@ -1366,22 +1376,28 @@ static int prescan_chunk(__u32 chunk_idx, void *ctx) {
   bpf_probe_read_user(sd->data, read_len,
                       (void *)(pctx->user_data_ptr + offset));
 
-  __u32 scan_limit = read_len >= SECRET_KEY_LEN ? read_len - SECRET_KEY_LEN + 1 : 0;
-  for (__u32 i = 0; i < MAX_DATA_SIZE && i < scan_limit; i++) {
-    if (sd->xor_match_count >= XOR_MAX_MATCHES)
-      break;
+  // i < CHUNK_STRIDE keeps the key at data[i] inside data[] for the verifier.
+  __u32 scan_len = prescan_scan_len(read_len);
+  for (__u32 i = 0; i < CHUNK_STRIDE && i < scan_len; i++) {
+    if (!is_kloak_candidate((const unsigned char *)&sd->data[i]))
+      continue;
 
-    __u32 si = i & (MAX_DATA_SIZE - 1); // verifier-friendly bitmask
-    if (is_kloak_prefix(&sd->data[si]) ||
-        is_kloak_prefix_huffman((const unsigned char *)&sd->data[si])) {
-      __u32 idx = sd->xor_match_count;
-      if (idx >= XOR_MAX_MATCHES) break;
-      sd->xor_matches[idx & (XOR_MAX_MATCHES - 1)].pos = offset + i;
-      __builtin_memcpy(sd->xor_matches[idx & (XOR_MAX_MATCHES - 1)].key.prefix,
-                       &sd->data[si], SECRET_KEY_LEN);
-      sd->xor_match_count = idx + 1;
-      dbg_inc(DBG_XOR_PRESCAN_MATCH);
+    // Confirm the candidate: its key is the SECRET_KEY_LEN bytes at data[i].
+    if (!bpf_map_lookup_elem(&secret_map, &sd->data[i])) {
+      dbg_inc(DBG_XOR_PRESCAN_UNCONFIRMED);
+      continue;
     }
+
+    __u32 idx = sd->xor_match_count;
+    if (idx >= XOR_MAX_MATCHES)
+      return 1;
+    sd->xor_matches[idx & (XOR_MAX_MATCHES - 1)].pos = offset + i;
+    __builtin_memcpy(sd->xor_matches[idx & (XOR_MAX_MATCHES - 1)].key.prefix,
+                     &sd->data[i], SECRET_KEY_LEN);
+    sd->xor_match_count = idx + 1;
+    dbg_inc(DBG_XOR_PRESCAN_MATCH);
+    if (idx + 1 >= XOR_MAX_MATCHES)
+      return 1; // all slots taken: stop scanning
   }
 
   return 0;
@@ -2715,7 +2731,7 @@ int bpf_uprobe_go_tls_write(void *ctx) {
       .user_data_ptr = scratch_data->user_data_ptr,
       .total_len = scratch_data->total_data_len,
     };
-    __u32 num_chunks = (pctx.total_len + CHUNK_STRIDE - 1) / CHUNK_STRIDE;
+    __u32 num_chunks = prescan_num_chunks(pctx.total_len);
     bpf_loop(num_chunks, prescan_chunk, &pctx, 0);
   }
 
@@ -2819,16 +2835,16 @@ int bpf_uprobe_ssl_write(void *ctx) {
   scratch_data->xor_match_count = 0;
   scratch_data->xor_current_match = 0;
 
-  // Scan the FULL SSL_write buffer for kl:: prefixes using bpf_loop.
-  // Each chunk reads MAX_DATA_SIZE bytes with SECRET_KEY_LEN-1 overlap,
-  // so tokens spanning chunk boundaries are always detected. Match positions
-  // are stored as global offsets relative to the SSL_write buffer start.
+  // Scan the FULL SSL_write buffer for placeholders using bpf_loop
+  // (prescan_chunk): only those confirmed in secret_map take a match slot.
+  // Match positions are stored as global offsets relative to the SSL_write
+  // buffer start.
   {
     struct prescan_ctx pctx = {
       .user_data_ptr = scratch_data->user_data_ptr,
       .total_len = scratch_data->total_data_len,
     };
-    __u32 num_chunks = (pctx.total_len + CHUNK_STRIDE - 1) / CHUNK_STRIDE;
+    __u32 num_chunks = prescan_num_chunks(pctx.total_len);
     bpf_loop(num_chunks, prescan_chunk, &pctx, 0);
   }
 

@@ -23,6 +23,12 @@ typedef uint64_t __u64;
 #ifndef MAX_DATA_SIZE
 #define MAX_DATA_SIZE 256
 #endif
+#ifndef SECRET_KEY_LEN
+#define SECRET_KEY_LEN 8
+#endif
+#ifndef CHUNK_STRIDE
+#define CHUNK_STRIDE (MAX_DATA_SIZE - (SECRET_KEY_LEN - 1))
+#endif
 typedef uint16_t __u16;
 typedef int int32_t;
 // libbpf's, from bpf_helpers.h.
@@ -118,6 +124,39 @@ HELPER_INLINE int is_kloak_prefix_huffman(const unsigned char *buf) {
   return (buf[0] == 0xeb && buf[1] == 0x45 && buf[2] == 0xcb)
              ? 1
              : 0;
+}
+
+// is_kloak_candidate reports whether a placeholder may start at buf: "kl::"
+// (HTTP/1.1) or its HPACK Huffman prefix (HTTP/2). It is only a filter: the
+// prescan confirms a candidate by looking its SECRET_KEY_LEN bytes up in
+// secret_map before it takes a match slot. Caller must ensure buf has >= 4
+// bytes.
+HELPER_INLINE int is_kloak_candidate(const unsigned char *buf) {
+  return is_kloak_prefix((const char *)buf) || is_kloak_prefix_huffman(buf);
+}
+
+// Prescan chunking (prescan_chunk in tls_uprobe.c). Chunk k of a write reads
+// up to MAX_DATA_SIZE bytes at k * CHUNK_STRIDE and tries prescan_scan_len()
+// start positions in it: those whose SECRET_KEY_LEN-byte key lies inside the
+// chunk. A full chunk tries CHUNK_STRIDE positions, so the chunks tile the
+// write's start positions: each is tried exactly once, and a key straddling
+// two chunks is tried in the first, which holds all of it. The chunks overlap
+// by SECRET_KEY_LEN - 1 bytes only to hold that key's tail.
+_Static_assert(CHUNK_STRIDE == MAX_DATA_SIZE - SECRET_KEY_LEN + 1,
+               "prescan chunks must tile the start positions");
+
+// prescan_num_chunks returns the number of chunks the prescan reads for a
+// write of total_len bytes.
+HELPER_INLINE __u32 prescan_num_chunks(__u32 total_len) {
+  return (total_len + CHUNK_STRIDE - 1) / CHUNK_STRIDE;
+}
+
+// prescan_scan_len returns how many start positions the prescan tries in a
+// chunk of read_len bytes (at most CHUNK_STRIDE).
+HELPER_INLINE __u32 prescan_scan_len(__u32 read_len) {
+  if (read_len > MAX_DATA_SIZE)
+    read_len = MAX_DATA_SIZE;
+  return read_len >= SECRET_KEY_LEN ? read_len - SECRET_KEY_LEN + 1 : 0;
 }
 
 // The bits of a patch's last byte that belong to the placeholder. An
