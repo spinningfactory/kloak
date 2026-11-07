@@ -3,8 +3,8 @@
 # Bun release version and architecture.
 #
 # Usage:
-#   BUN_VERSION=1.3.14 ARCH=amd64 ./discover.sh
-#   BUN_VERSION=1.3.14 ARCH=arm64 ./discover.sh
+#   BUN_VERSION=1.4.4 ARCH=amd64 ./discover.sh
+#   BUN_VERSION=1.4.4 ARCH=arm64 ./discover.sh
 #
 # Downloads the official Bun profile build (production optimisation flags,
 # symbol table retained) from GitHub releases, extracts the SSL_write virtual
@@ -25,7 +25,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 RESULTS_DIR="$SCRIPT_DIR/results"
 
-BUN_VERSION="${BUN_VERSION:-1.3.14}"
+BUN_VERSION="${BUN_VERSION:-1.4.4}"
 ARCH="${ARCH:-amd64}"
 
 case "$ARCH" in
