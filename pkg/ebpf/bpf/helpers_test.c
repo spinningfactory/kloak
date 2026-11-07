@@ -191,6 +191,101 @@ static void test_prefix_exact_four(void) {
 }
 
 // ============================================================================
+// patch_delta — the XOR delta bpf_xor_path stages for a placeholder
+// ============================================================================
+
+#include "hpack_tail_fixtures.h"
+
+static void print_hex(const char *label, const __u8 *data, int len);
+
+static void test_patch_tail_mask(void) {
+  assert(patch_tail_mask(0) == 0xff);
+  assert(patch_tail_mask(1) == 0xfe);
+  assert(patch_tail_mask(5) == 0xe0);
+  assert(patch_tail_mask(7) == 0x80);
+  for (__u8 p = 0; p < 8; p++)
+    assert(patch_tail_mask(p) == (__u8)(0xff << p));
+}
+
+// What bpf_xor_path and tc do to the len bytes at off of wire: read the
+// placeholder's bytes (bpf_probe_read_user reads SECRET_MAX_LEN of them, past
+// the placeholder), turn them into the delta, and XOR it onto the wire.
+static void apply_patch(const unsigned char *wire, __u32 wire_len, __u32 off,
+                        const unsigned char *real_secret, __u32 len,
+                        __u8 pad_bits, unsigned char *out) {
+  __u8 buf[SECRET_MAX_LEN] = {0};
+  char real[SECRET_MAX_LEN] = {0};
+  memcpy(buf, wire + off, wire_len - off);
+  memcpy(real, real_secret, len);
+  len = clamp_write_len(len);
+  patch_delta(buf, real, len, pad_bits);
+  memcpy(out, wire, wire_len);
+  for (__u32 j = 0; j < len; j++)
+    out[off + j] ^= buf[j];
+}
+
+// A raw placeholder has no pad bits: the delta is shadow ^ real over all of
+// its bytes, and nothing after it changes.
+static void test_patch_delta_raw(void) {
+  const char *wire = "X-Key: kl::abcdefgh;tail\r\n";
+  const char *want = "X-Key: real-value12;tail\r\n";
+  unsigned char out[64];
+  apply_patch((const unsigned char *)wire, strlen(wire), 7,
+              (const unsigned char *)"real-value12", 12, 0, out);
+  assert(memcmp(out, want, strlen(want)) == 0);
+}
+
+// spinningfactory/kloak#228 (1.7): for an HPACK-Huffman placeholder, the
+// patch must not touch the bits after the placeholder's code, which are the
+// next character's when text follows it in the same header value. Every case
+// is Go's hpack encoding of prefix + shadow + suffix, which must become that
+// of prefix + real + suffix, for every shadow bit length mod 8.
+static void test_patch_delta_hpack_tail(void) {
+  unsigned pads = 0;
+  int unmasked_wrong = 0, short_key_misses = 0;
+  for (size_t i = 0; i < sizeof(hpack_tail_cases) / sizeof(hpack_tail_cases[0]); i++) {
+    const struct hpack_tail_case *c = &hpack_tail_cases[i];
+    const struct hpack_tail_entry *e = &hpack_tail_entries[c->entry];
+    pads |= 1u << e->pad_bits;
+    assert(c->offset + e->len <= c->len);
+
+    // The prescan's match: Huffman "kl::" on a byte boundary, keyed by the
+    // 8 bytes from there.
+    __u32 pos = 0;
+    while (pos + 3 <= c->len && !is_kloak_prefix_huffman(c->wire + pos))
+      pos++;
+    assert(pos == c->offset);
+    if (memcmp(c->wire + pos, e->key, sizeof(e->key)) != 0) {
+      // Only a code of exactly 8 bytes that does not end on a byte boundary:
+      // its key's last bits are the padding sync keyed it by, but on the
+      // wire, the text after it. No match, the placeholder goes out as is.
+      assert(e->len == sizeof(e->key) && e->pad_bits != 0 && c->suffix[0]);
+      short_key_misses++;
+      continue;
+    }
+
+    unsigned char out[HPACK_TAIL_MAX];
+    apply_patch(c->wire, c->len, c->offset, e->real_secret, e->len,
+                e->pad_bits, out);
+    if (memcmp(out, c->want, c->len) != 0) {
+      printf("\n    %s: \"%s\" + shadow + \"%s\"", e->shadow, c->prefix, c->suffix);
+      print_hex("got ", out, c->len);
+      print_hex("want", c->want, c->len);
+      printf("\n");
+      assert(0);
+    }
+    // The patch before the fix replaced the bits after the code with the
+    // real's EOS padding.
+    apply_patch(c->wire, c->len, c->offset, e->real_secret, e->len, 0, out);
+    if (memcmp(out, c->want, c->len) != 0)
+      unmasked_wrong++;
+  }
+  assert(pads == 0xff);
+  assert(unmasked_wrong > 0);
+  assert(short_key_misses > 0);
+}
+
+// ============================================================================
 // gf128_mul — GHASH GF(2^128) multiplication
 // Test vectors from "The Galois/Counter Mode of Operation (GCM)"
 // McGrew & Viega, and NIST SP 800-38D.
@@ -1468,6 +1563,11 @@ int main(void) {
   RUN_TEST(test_prefix_uppercase);
   RUN_TEST(test_prefix_wrong_second_char);
   RUN_TEST(test_prefix_exact_four);
+
+  printf("patch_delta:\n");
+  RUN_TEST(test_patch_tail_mask);
+  RUN_TEST(test_patch_delta_raw);
+  RUN_TEST(test_patch_delta_hpack_tail);
 
   printf("gf128_mul:\n");
   RUN_TEST(test_gf128_mul_identity);

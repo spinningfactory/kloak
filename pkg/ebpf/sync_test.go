@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"maps"
@@ -11,6 +12,7 @@ import (
 
 	ciliumebpf "github.com/cilium/ebpf"
 	"go.uber.org/zap"
+	"golang.org/x/net/http2/hpack"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -537,14 +539,16 @@ func TestApplySecrets_ReportsFailedWrites(t *testing.T) {
 	t.Cleanup(func() { _ = m.Close() })
 
 	// The secret takes two entries, one for its placeholder and one for
-	// its HPACK-Huffman encoding: the second does not fit.
-	snapshot := []secrets.Secret{{OwnerID: "ns/api", Key: "token", Real: "real-token-value-0001", Shadow: "kl::token-placeholder-0001"}}
+	// its HPACK-Huffman encoding: the second does not fit. The shadow has
+	// its real's Huffman bit length, as the generator makes them.
+	p := hpackTailPairs[0]
+	snapshot := []secrets.Secret{{OwnerID: "ns/api", Key: "token", Real: p.real, Shadow: p.shadow}}
 	_, err = applySecrets(m, snapshot, testLog())
 	if err == nil || !strings.Contains(err.Error(), "secret_map: 1 failed map operations") {
 		t.Fatalf("applySecrets error = %v, want one failed secret_map operation", err)
 	}
 	var key secretKey
-	copy(key.Prefix[:], "kl::toke")
+	copy(key.Prefix[:], p.shadow)
 	var val secretValue
 	if err := m.Lookup(&key, &val); err != nil {
 		t.Errorf("the placeholder's entry, written before the failure: %v", err)
@@ -605,5 +609,118 @@ func TestSyncSecrets_Manager(t *testing.T) {
 	}
 	if len(m.lastSnapshot) != 1 {
 		t.Errorf("a failed snapshot replaced the last one: %d secrets", len(m.lastSnapshot))
+	}
+}
+
+// TestHuffmanEntry checks the secret_map entry sync stores for the
+// HPACK-Huffman form of a placeholder (huffmanEntry).
+func TestHuffmanEntry(t *testing.T) {
+	raw := secretValue{HostLen: 11, Port: 443, Protocol: 6}
+	copy(raw.AllowedHost[:], "example.com")
+	pads := map[uint8]bool{}
+	for _, p := range hpackTailPairs {
+		if len(p.shadow) != len(p.real) || secrets.HuffmanBits(p.shadow) != secrets.HuffmanBits(p.real) {
+			t.Fatalf("%q is not a shadow of %q", p.shadow, p.real)
+		}
+		key, val, err := huffmanEntry(p.shadow, p.real, &raw)
+		if err != nil {
+			t.Fatalf("%q: %v", p.shadow, err)
+		}
+		huffShadow := hpack.AppendHuffmanString(nil, p.shadow)
+		huffReal := hpack.AppendHuffmanString(nil, p.real)
+		if !bytes.Equal(key.Prefix[:], huffShadow[:8]) {
+			t.Errorf("%q: key %x, want %x", p.shadow, key.Prefix, huffShadow[:8])
+		}
+		// Huffman(real) as hpack encodes it, with no EOS byte appended: it is
+		// as long as Huffman(shadow).
+		var wantReal [len(val.RealSecret)]byte
+		copy(wantReal[:], huffReal)
+		if int(val.Len) != len(huffShadow) || val.RealSecret != wantReal {
+			t.Errorf("%q: real %x (len %d), want %x", p.shadow, val.RealSecret, val.Len, huffReal)
+		}
+		if want := uint8((8 - secrets.HuffmanBits(p.shadow)%8) % 8); val.PadBits != want {
+			t.Errorf("%q: pad bits %d, want %d", p.shadow, val.PadBits, want)
+		}
+		pads[val.PadBits] = true
+		if val.HostLen != raw.HostLen || val.AllowedHost != raw.AllowedHost || val.IpLen != raw.IpLen ||
+			val.AllowedIp != raw.AllowedIp || val.Port != raw.Port || val.Protocol != raw.Protocol {
+			t.Errorf("%q: restrictions %+v, want the placeholder's", p.shadow, val)
+		}
+		if int(val.PrefixLen) != len(huffShadow) || !bytes.Equal(val.FullPrefix[:val.PrefixLen], huffShadow) {
+			t.Errorf("%q: prefix %x, want %x", p.shadow, val.FullPrefix[:val.PrefixLen], huffShadow)
+		}
+	}
+	if len(pads) != 8 {
+		t.Errorf("pad bits covered: %v, want 0-7", pads)
+	}
+}
+
+// TestHuffmanEntry_Refused checks the placeholders that get no Huffman
+// entry: their HTTP/2 form is sent as is.
+func TestHuffmanEntry_Refused(t *testing.T) {
+	for _, c := range []struct {
+		name, real, shadow string
+		want               error
+	}{
+		// The sync before #228 padded such a real with 0xff bytes: more
+		// than 7 bits of EOS padding, a decoding error (RFC 7541 §5.2).
+		{"shorter real", "lowercase-secret-value", "kl::ABCDEFGHJKMNPQRSTV", nil},
+		// Same byte length, but the text after it would be shifted by a bit.
+		{"one bit longer shadow", "ghp-real-token-0", "kl::0R6cc91aa2tb", nil},
+		{"longer real", "ZZZZZZZZZZZZ", "kl::abcdefgh", nil},
+		{"code shorter than a key", "real0000", "kl::0000", errHuffmanKeyTooShort},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, _, err := huffmanEntry(c.shadow, c.real, &secretValue{})
+			if err == nil || (c.want != nil && !errors.Is(err, c.want)) {
+				t.Errorf("huffmanEntry(%q, %q) = %v, want an error (%v)", c.shadow, c.real, err, c.want)
+			}
+		})
+	}
+}
+
+// TestApplySecrets_HuffmanEntry checks what applySecrets stores for a
+// secret: its placeholder's entry, with no pad bits (tc patches all of its
+// bytes, as before #228), and the Huffman form's from huffmanEntry.
+func TestApplySecrets_HuffmanEntry(t *testing.T) {
+	m := createTestSecretMap(t)
+	p := hpackTailPairs[1] // pad bits 1
+	snapshot := []secrets.Secret{{OwnerID: "ns/a", Key: "k", Real: p.real, Shadow: p.shadow, Host: "example.com", Port: 443, Protocol: 6}}
+	if _, err := applySecrets(m, snapshot, testLog()); err != nil {
+		t.Fatal(err)
+	}
+	var key secretKey
+	copy(key.Prefix[:], p.shadow)
+	var raw secretValue
+	if err := m.Lookup(&key, &raw); err != nil {
+		t.Fatalf("placeholder entry: %v", err)
+	}
+	if raw.PadBits != 0 || int(raw.Len) != len(p.real) || string(raw.RealSecret[:raw.Len]) != p.real {
+		t.Errorf("placeholder entry: len %d, pad bits %d, real %q", raw.Len, raw.PadBits, raw.RealSecret[:raw.Len])
+	}
+	hkey, want, err := huffmanEntry(p.shadow, p.real, &raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got secretValue
+	if err := m.Lookup(&hkey, &got); err != nil || got != want {
+		t.Errorf("Huffman entry: %+v, %v, want %+v", got, err, want)
+	}
+
+	// A pair the patch cannot rewrite soundly keeps only its placeholder's
+	// entry: the HTTP/2 form goes out unchanged.
+	snapshot[0].Shadow = "kl::0R6cc91aa2tb"
+	snapshot[0].Real = "ghp-real-token-0"
+	if _, err := applySecrets(m, snapshot, testLog()); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	var k secretKey
+	var v secretValue
+	for iter := m.Iterate(); iter.Next(&k, &v); {
+		n++
+	}
+	if n != 1 {
+		t.Errorf("secret_map has %d entries, want the placeholder's", n)
 	}
 }

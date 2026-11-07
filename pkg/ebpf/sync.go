@@ -4,6 +4,7 @@ package ebpf
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/cilium/ebpf"
@@ -147,69 +148,29 @@ func applySecrets(secretMap *ebpf.Map, snapshot []secrets.Secret, log *zap.Sugar
 				"hostLen", val.HostLen, "port", val.Port, "protocol", val.Protocol)
 		}
 
-		// Also store a Huffman-encoded variant for HTTP/2 HPACK interception.
-		// HPACK uses a static Huffman table (RFC 7541) so the encoding is
-		// deterministic. The eBPF scanner checks for both plaintext "kl::"
-		// and its Huffman encoding (3 stable leading bytes: 0xeb 0x45 0xcb).
-		//
-		// The rewritten Huffman data must be EXACTLY the same length as the
-		// shadow's Huffman encoding — the HPACK length prefix in the wire
-		// buffer is immutable. If the real's Huffman is longer, we skip
-		// (HTTP/1.1 path still works). If shorter, pad with EOS (0xFF).
-		huffShadow := hpack.AppendHuffmanString(nil, s.Shadow)
-		huffReal := hpack.AppendHuffmanString(nil, s.Real)
-		realHuffLen := len(huffReal)
-
-		if len(huffShadow) >= 8 && realHuffLen > 0 && realHuffLen <= len(huffShadow) {
-			// Pad real with HPACK EOS bits to match shadow's Huffman length.
-			// realHuffLen <= len(huffShadow) is required: the wire-buffer
-			// HPACK length prefix is shadow-sized and immutable, so a longer
-			// Huffman blob would overflow it. The else-if below catches the
-			// "too-long" case explicitly.
-			for len(huffReal) < len(huffShadow) {
-				huffReal = append(huffReal, 0xff)
+		// Also store the placeholder's HPACK-Huffman form, which HTTP/2
+		// clients send in header fields (huffmanEntry).
+		huffKey, huffVal, err := huffmanEntry(s.Shadow, s.Real, &val)
+		_, taken := newKeys[huffKey]
+		switch {
+		case errors.Is(err, errHuffmanKeyTooShort):
+			logging.Tracew(log, "no HTTP/2 Huffman variant: the placeholder's Huffman code is shorter than a BPF key",
+				"owner", s.OwnerID, "key", s.Key)
+		case err != nil:
+			log.Warnw("no HTTP/2 Huffman variant, the placeholder will not be rewritten in HTTP/2 headers",
+				"owner", s.OwnerID, "key", s.Key, "reason", err)
+		case taken:
+			// Another entry of this snapshot has the key: keep the first.
+		default:
+			newKeys[huffKey] = struct{}{}
+			if err := secretMap.Update(&huffKey, &huffVal, 0); err != nil {
+				log.Errorw("failed to update BPF secret_map (Huffman)", "error", err,
+					"owner", s.OwnerID, "key", s.Key)
+				errs.add(err)
+			} else {
+				logging.Tracew(log, "synced Huffman secret into eBPF map",
+					"owner", s.OwnerID, "key", s.Key, "huffLen", huffVal.Len)
 			}
-
-			var huffKey secretKey
-			copy(huffKey.Prefix[:], huffShadow[:8])
-			if _, exists := newKeys[huffKey]; !exists {
-				newKeys[huffKey] = struct{}{}
-
-				var huffVal secretValue
-				huffLen := len(huffReal)
-				if huffLen > 128 {
-					huffLen = 128
-				}
-				huffVal.Len = uint32(huffLen)
-				copy(huffVal.RealSecret[:], huffReal[:huffLen])
-				huffVal.HostLen = val.HostLen
-				huffVal.AllowedHost = val.AllowedHost
-				huffVal.IpLen = val.IpLen
-				copy(huffVal.AllowedIp[:], val.AllowedIp[:])
-				huffVal.Port = val.Port
-				huffVal.Protocol = val.Protocol
-				huffPrefixLen := len(huffShadow)
-				if huffPrefixLen > 42 {
-					huffPrefixLen = 42
-				}
-				huffVal.PrefixLen = uint32(huffPrefixLen)
-				copy(huffVal.FullPrefix[:], huffShadow[:huffPrefixLen])
-
-				if err := secretMap.Update(&huffKey, &huffVal, 0); err != nil {
-					log.Errorw("failed to update BPF secret_map (Huffman)", "error", err,
-						"owner", s.OwnerID, "key", s.Key)
-					errs.add(err)
-				} else {
-					logging.Tracew(log, "synced Huffman secret into eBPF map",
-						"owner", s.OwnerID, "key", s.Key, "huffLen", huffLen)
-				}
-			}
-		} else if len(huffShadow) >= 8 && realHuffLen > len(huffShadow) {
-			// This should not happen if the source generates shadows
-			// with sufficient Huffman length, but log it just in case.
-			logging.Tracew(log, "skipping HTTP/2 Huffman variant — shadow Huffman too short",
-				"owner", s.OwnerID, "key", s.Key,
-				"shadowHuffLen", len(huffShadow), "realHuffLen", realHuffLen)
 		}
 	}
 
@@ -240,6 +201,53 @@ func applySecrets(secretMap *ebpf.Map, snapshot []secrets.Secret, log *zap.Sugar
 		"snapshotEntries", len(snapshot), "bpfKeys", len(newKeys),
 		"pruned", len(staleKeys), "watchedHosts", len(hostNames))
 	return hostNames, errs.err("secret_map")
+}
+
+// errHuffmanKeyTooShort reports a placeholder whose HPACK-Huffman code is
+// shorter than a secret_map key, so its HTTP/2 form cannot be looked up.
+var errHuffmanKeyTooShort = errors.New("placeholder's Huffman code is shorter than a BPF key")
+
+// huffmanEntry returns the secret_map entry of the HPACK-Huffman form of a
+// placeholder, which HTTP/2 clients send in header fields: keyed by the first
+// 8 bytes of Huffman(shadow), with Huffman(real) as its real. raw is the
+// placeholder's own entry, whose host, IP and port restrictions it shares.
+//
+// The data plane patches the bytes Huffman(shadow) spans on the wire. Unless
+// the code ends on a byte boundary, the last of them also holds the first
+// bits of what follows the placeholder in the same string (the next
+// character, or the string's EOS padding): PadBits counts them, and the patch
+// leaves them unchanged (patch_delta in bpf/helpers.h). That is only sound
+// when shadow and real have the same Huffman bit length, which the shadow
+// generator guarantees: the string's length prefix on the wire is not
+// rewritten, and what follows the placeholder must stay where it is. A pair
+// that does not have it gets no entry, and its HTTP/2 form is sent as is.
+func huffmanEntry(shadow, realValue string, raw *secretValue) (secretKey, secretValue, error) {
+	var key secretKey
+	var val secretValue
+	huffShadow := hpack.AppendHuffmanString(nil, shadow)
+	bits := secrets.HuffmanBits(shadow)
+	switch {
+	case len(huffShadow) < len(key.Prefix):
+		return key, val, errHuffmanKeyTooShort
+	case bits != secrets.HuffmanBits(realValue):
+		// The bit lengths are value-derived: keep them out of the error.
+		return key, val, errors.New("shadow and real have different HPACK Huffman bit lengths")
+	case len(huffShadow) > len(val.RealSecret):
+		return key, val, fmt.Errorf("placeholder's Huffman code is longer than %d bytes", len(val.RealSecret))
+	}
+	copy(key.Prefix[:], huffShadow)
+
+	val.Len = uint32(len(huffShadow))
+	copy(val.RealSecret[:], hpack.AppendHuffmanString(nil, realValue))
+	val.PadBits = uint8(len(huffShadow)*8 - bits)
+	val.HostLen = raw.HostLen
+	val.AllowedHost = raw.AllowedHost
+	val.IpLen = raw.IpLen
+	val.AllowedIp = raw.AllowedIp
+	val.Port = raw.Port
+	val.Protocol = raw.Protocol
+	val.PrefixLen = uint32(copy(val.FullPrefix[:], huffShadow))
+	return key, val, nil
 }
 
 // syncSecretACL makes secret_acl hold exactly the entries the bindings grant
