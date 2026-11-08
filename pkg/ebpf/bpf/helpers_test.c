@@ -191,6 +191,70 @@ static void test_prefix_exact_four(void) {
 }
 
 // ============================================================================
+// is_kloak_candidate — "kl::" or its HPACK Huffman prefix (eb 45 cb).
+// ============================================================================
+
+static void test_candidate_plain(void) {
+  assert(is_kloak_candidate((const unsigned char *)"kl::abcd") == 1);
+}
+
+static void test_candidate_huffman(void) {
+  const unsigned char buf[] = {0xeb, 0x45, 0xcb, 0x12, 0x34, 0x56, 0x78, 0x9a};
+  assert(is_kloak_candidate(buf) == 1);
+}
+
+static void test_candidate_huffman_partial(void) {
+  const unsigned char buf[] = {0xeb, 0x45, 0xca, 0x12};
+  assert(is_kloak_candidate(buf) == 0);
+}
+
+static void test_candidate_neither(void) {
+  assert(is_kloak_candidate((const unsigned char *)"kl:;abcd") == 0);
+  assert(is_kloak_candidate((const unsigned char *)"Bearer x") == 0);
+}
+
+// ============================================================================
+// prescan_num_chunks / prescan_scan_len — the prescan tries every start
+// position whose key fits in the write exactly once, so a placeholder in the
+// overlap of two chunks is recorded once.
+// ============================================================================
+
+static void test_prescan_chunks_tile_positions(void) {
+  static unsigned char tried[4 * MAX_DATA_SIZE + 2 * SECRET_KEY_LEN];
+  for (__u32 total = 0; total < sizeof(tried); total++) {
+    memset(tried, 0, sizeof(tried));
+    __u32 chunks = prescan_num_chunks(total);
+    for (__u32 c = 0; c < chunks; c++) {
+      __u32 offset = c * CHUNK_STRIDE;
+      assert(offset < total); // prescan_chunk stops at offset >= total
+      __u32 read_len = total - offset;
+      if (read_len > MAX_DATA_SIZE)
+        read_len = MAX_DATA_SIZE;
+      __u32 scan = prescan_scan_len(read_len);
+      assert(scan <= CHUNK_STRIDE);
+      for (__u32 i = 0; i < scan; i++) {
+        assert(i + SECRET_KEY_LEN <= read_len); // the key lies in the chunk
+        tried[offset + i]++;
+      }
+    }
+    for (__u32 p = 0; p < total; p++)
+      assert(tried[p] == (p + SECRET_KEY_LEN <= total ? 1 : 0));
+  }
+}
+
+static void test_prescan_scan_len_bounds(void) {
+  assert(prescan_scan_len(0) == 0);
+  assert(prescan_scan_len(SECRET_KEY_LEN - 1) == 0);
+  assert(prescan_scan_len(SECRET_KEY_LEN) == 1);
+  assert(prescan_scan_len(MAX_DATA_SIZE) == CHUNK_STRIDE);
+  assert(prescan_scan_len(MAX_DATA_SIZE + 100) == CHUNK_STRIDE);
+  assert(prescan_num_chunks(0) == 0);
+  assert(prescan_num_chunks(1) == 1);
+  assert(prescan_num_chunks(CHUNK_STRIDE) == 1);
+  assert(prescan_num_chunks(CHUNK_STRIDE + 1) == 2);
+}
+
+// ============================================================================
 // patch_delta — the XOR delta bpf_xor_path stages for a placeholder
 // ============================================================================
 
@@ -1588,6 +1652,16 @@ int main(void) {
   RUN_TEST(test_prefix_uppercase);
   RUN_TEST(test_prefix_wrong_second_char);
   RUN_TEST(test_prefix_exact_four);
+
+  printf("is_kloak_candidate:\n");
+  RUN_TEST(test_candidate_plain);
+  RUN_TEST(test_candidate_huffman);
+  RUN_TEST(test_candidate_huffman_partial);
+  RUN_TEST(test_candidate_neither);
+
+  printf("prescan chunking:\n");
+  RUN_TEST(test_prescan_chunks_tile_positions);
+  RUN_TEST(test_prescan_scan_len_bounds);
 
   printf("patch_delta:\n");
   RUN_TEST(test_patch_tail_mask);
