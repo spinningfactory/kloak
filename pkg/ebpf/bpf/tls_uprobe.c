@@ -69,6 +69,7 @@ struct secret_value {
   char allowed_ip[16];                 // IPv4-mapped-IPv6 address
   __u16 port;                          // 0 = wildcard, otherwise port number (host byte order)
   __u8 protocol;                       // IPPROTO_TCP (6) = TCP, IPPROTO_UDP (17) = UDP
+  __u8 pad_bits;                       // low bits of the last byte the patch keeps (patch_tail_mask); 0 = whole byte
   __u32 prefix_len;                    // actual prefix length (8..42)
   char full_prefix[SECRET_PREFIX_MAX]; // full kl::UUID prefix for verification
 };
@@ -1714,7 +1715,8 @@ int bpf_xor_path(void *ctx) {
 
   dbg_inc(DBG_XOR_SECRET_FOUND);
 
-  // Compute XOR delta: shadow bytes ^ real bytes.
+  // Compute XOR delta: shadow bytes ^ real bytes, minus the bits after an
+  // HPACK-Huffman placeholder (patch_delta).
   __u32 delta_len = clamp_write_len(val_len);
 
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
@@ -1730,8 +1732,7 @@ int bpf_xor_path(void *ctx) {
 
   val = bpf_map_lookup_elem(&secret_map, &key);
   if (!val) goto next;
-  for (__u32 j = 0; j < SECRET_MAX_LEN && j < delta_len; j++)
-    w->ct_buf[j] ^= val->real_secret[j];
+  patch_delta(w->ct_buf, val->real_secret, delta_len, val->pad_bits);
 
   // Store patch in staged_pending.
   w = bpf_map_lookup_elem(&ghash_scratch, &zero);

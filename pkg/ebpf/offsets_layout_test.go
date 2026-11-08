@@ -38,6 +38,18 @@ func fieldNames(v any) []string {
 	return names
 }
 
+// TestSecretValueLayout pins secretValue to the generated struct
+// secret_value: a mismatch would have the data plane read sync's fields at
+// the wrong offsets.
+func TestSecretValueLayout(t *testing.T) {
+	if got, want := binary.Size(secretValue{}), binary.Size(tlsuprobeSecretValue{}); got != want {
+		t.Fatalf("secretValue is %d bytes, struct secret_value is %d", got, want)
+	}
+	if got, want := fieldNames(secretValue{}), fieldNames(tlsuprobeSecretValue{}); !slices.Equal(got, want) {
+		t.Fatalf("secretValue field order %v does not match struct secret_value %v", got, want)
+	}
+}
+
 // TestSecretACLKeyLayout pins secretACLKey to the generated struct
 // secret_acl_key; a mismatch would make every lookup miss (fail closed for
 // every pod).
