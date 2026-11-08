@@ -235,6 +235,31 @@ static void test_patch_delta_raw(void) {
   assert(memcmp(out, want, strlen(want)) == 0);
 }
 
+// The delta for every length and pad: buf ^ real over the placeholder's
+// bits, 0 over the pad bits of its last byte, and buf unchanged past it. The
+// loop covers the whole buffer (for Linux 6.1's verifier), which leaves the
+// bytes past len as they are only because real is zero there, as sync
+// writes it.
+static void test_patch_delta_every_len(void) {
+  for (__u32 len = 1; len <= SECRET_MAX_LEN; len++) {
+    for (__u8 pad = 0; pad < 8; pad++) {
+      __u8 buf[SECRET_MAX_LEN], orig[SECRET_MAX_LEN];
+      char real[SECRET_MAX_LEN] = {0};
+      for (__u32 j = 0; j < SECRET_MAX_LEN; j++)
+        orig[j] = buf[j] = (__u8)(0x5a + 37 * j);
+      for (__u32 j = 0; j < len; j++)
+        real[j] = (char)(0xc3 ^ (11 * j));
+      patch_delta(buf, real, len, pad);
+      for (__u32 j = 0; j + 1 < len; j++)
+        assert(buf[j] == (__u8)(orig[j] ^ (__u8)real[j]));
+      assert(buf[len - 1] ==
+             (__u8)((orig[len - 1] ^ (__u8)real[len - 1]) & patch_tail_mask(pad)));
+      for (__u32 j = len; j < SECRET_MAX_LEN; j++)
+        assert(buf[j] == orig[j]);
+    }
+  }
+}
+
 // spinningfactory/kloak#228 (1.7): for an HPACK-Huffman placeholder, the
 // patch must not touch the bits after the placeholder's code, which are the
 // next character's when text follows it in the same header value. Every case
@@ -1567,6 +1592,7 @@ int main(void) {
   printf("patch_delta:\n");
   RUN_TEST(test_patch_tail_mask);
   RUN_TEST(test_patch_delta_raw);
+  RUN_TEST(test_patch_delta_every_len);
   RUN_TEST(test_patch_delta_hpack_tail);
 
   printf("gf128_mul:\n");
