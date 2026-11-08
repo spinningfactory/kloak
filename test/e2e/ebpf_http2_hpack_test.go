@@ -5,9 +5,12 @@ package e2e
 import (
 	"context"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
 // TestEBPFHttp2HpackOverPadding exercises the HTTP/2 HPACK rewrite path
@@ -127,5 +130,102 @@ func TestEBPFHttp2HpackOverPadding(t *testing.T) {
 
 	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {
 		t.Errorf("blocked secret leaked despite host mismatch — host filtering regressed")
+	}
+}
+
+// TestEBPFHttp2HpackTrailingText checks that text after a placeholder in the
+// same HTTP/2 header value arrives intact (spinningfactory/kloak#228, 1.7).
+//
+// HPACK Huffman-codes the whole value, so the placeholder's code shares its
+// last byte with the first bits of the next character unless it ends on a
+// byte boundary. The patch used to make that byte Huffman(real) followed by
+// EOS 1-bits, overwriting those bits. The real is chosen so that its code
+// (and so its shadow's) is 1 bit past a byte boundary: 7 bits of the ';'
+// after it are in the placeholder's last byte, and ';' (11111011) does not
+// start with 7 1-bits, so the old patch corrupted it. demo-go sends the
+// placeholder followed by ";tail" in X-Secret-Suffixed (SECRET_ALLOWED_SUFFIX).
+func TestEBPFHttp2HpackTrailingText(t *testing.T) {
+	gcCtx, gcCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer gcCancel()
+	_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-allowed-kloak")
+	_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-blocked-kloak")
+
+	const (
+		realValue = "real-trailing-key-10"
+		suffix    = ";tail"
+	)
+	if bits := secrets.HuffmanBits(realValue); bits%8 != 1 {
+		t.Fatalf("%q is %d Huffman bits; the test needs 1 mod 8 to overwrite the next character's first 7 bits", realValue, bits)
+	}
+	allowedData := map[string][]byte{"api-key": []byte(realValue)}
+	blockedData := map[string][]byte{"api-key": []byte("REAL-BLOCKED-KEY-67890")}
+
+	echoFQDN := deployHTTPEchoServer(t)
+	createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{
+		"getkloak.io/hosts": echoFQDN,
+	})
+	createEnabledSecret(t, "secret-blocked", blockedData, nil, map[string]string{
+		"getkloak.io/hosts": "example.com",
+	})
+	assertShadowSecret(t, "secret-allowed", allowedData)
+	assertShadowSecret(t, "secret-blocked", blockedData)
+
+	demoManifest := filepath.Join(repoRoot, "examples", "demo-go", "deployment.yaml")
+	toEcho := httpEchoTargetURL(echoFQDN)
+	withSuffix := addDemoEnv("SECRET_ALLOWED_SUFFIX", suffix)
+	if err := applyManifestTransformed(t, demoManifest, func(m string) string { return withSuffix(toEcho(m)) }); err != nil {
+		t.Fatalf("failed to deploy demo-go: %v", err)
+	}
+	t.Cleanup(func() {
+		if out, err := kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found"); err != nil {
+			t.Logf("demo-go cleanup failed: %v\n%s", err, out)
+		}
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	if err := waitForDeploymentReady(ctx, testNamespace, "demo-go"); err != nil {
+		if demoDesc, descErr := kubectl("describe", "deployment", "-n", testNamespace, "demo-go"); descErr == nil {
+			t.Logf("deployment describe:\n%s", demoDesc)
+		} else {
+			t.Logf("kubectl describe failed: %v", descErr)
+		}
+		t.Fatalf("demo-go not ready: %v", err)
+	}
+
+	demoActiveCtx, demoActiveCancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer demoActiveCancel()
+	pollDemoLogs(t, demoActiveCtx, "app=demo-go", "http2-hpack-trailing",
+		"demo-go never issued a second request — image, network, or scheduling problem (not the HPACK path)",
+		func(s string) bool { return strings.Count(s, "Request #") >= 2 })
+
+	// The echo returns the headers as JSON: the suffixed one must hold the
+	// real value followed by the suffix, byte for byte.
+	want := `"X-Secret-Suffixed":"` + realValue + suffix + `"`
+	pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer pollCancel()
+	out := pollDemoLogs(t, pollCtx, "app=demo-go", "http2-hpack-trailing",
+		"timed out waiting for "+want+" in demo-go's response echo — the rewrite corrupted the text after the placeholder, or the echo's HPACK decoder rejected the header block",
+		func(s string) bool { return strings.Contains(s, want) })
+	t.Logf("=== demo-go (HTTP/2 HPACK trailing text) logs ===\n%s", out)
+
+	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {
+		t.Errorf("blocked secret leaked despite host mismatch — host filtering regressed")
+	}
+}
+
+// addDemoEnv adds name=value to a demo manifest's container env, as the
+// entry before TARGET_URL (whose indentation it copies).
+func addDemoEnv(name, value string) func(string) string {
+	return func(manifest string) string {
+		const anchor = "- name: TARGET_URL\n"
+		idx := strings.Index(manifest, anchor)
+		if idx == -1 {
+			return manifest
+		}
+		lineStart := strings.LastIndexByte(manifest[:idx], '\n') + 1
+		indent := manifest[lineStart:idx]
+		entry := indent + "- name: " + name + "\n" + indent + "  value: " + strconv.Quote(value) + "\n"
+		return manifest[:lineStart] + entry + manifest[lineStart:]
 	}
 }
