@@ -10,7 +10,11 @@ images:
 
 # VM resources
 cpus: 4
-memory: "4GiB"
+# vz never hands freed guest memory back to macOS (no free page reporting,
+# and Lima doesn't drive the balloon), so the VM costs the host up to its
+# full size, mostly in guest page cache. A smaller VM caps that, and the
+# zram swap set up below absorbs build peaks instead of OOM-killing them.
+memory: "3GiB"
 disk: "20GiB"
 
 # Mount the project directory
@@ -66,6 +70,37 @@ provision:
       go version
       clang --version | head -1
       echo "=== Provision complete ==="
+
+  # Compressed swap in RAM (zram). Runs on every boot, so a kernel upgrade
+  # gets its matching module. Pods don't swap: k3s sets failSwapOn=false and
+  # the kubelet default swap behavior is NoSwap, so only k3s, containerd,
+  # buildkit, builds and tests use it.
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      # The Ubuntu cloud kernel builds zram as a module but ships it in
+      # linux-modules-extra (~120 MB).
+      if ! modinfo zram >/dev/null 2>&1; then
+        apt-get install -y "linux-modules-extra-$(uname -r)"
+      fi
+      if ! dpkg -s systemd-zram-generator >/dev/null 2>&1; then
+        apt-get install -y systemd-zram-generator
+      fi
+
+      cat > /etc/systemd/zram-generator.conf <<'EOF'
+      [zram0]
+      zram-size = ram
+      compression-algorithm = zstd
+      EOF
+      # Swap-in from RAM is cheap: read one page at a time.
+      echo "vm.page-cluster = 0" > /etc/sysctl.d/99-zram.conf
+      sysctl -p /etc/sysctl.d/99-zram.conf
+
+      systemctl daemon-reload
+      systemctl start systemd-zram-setup@zram0.service
+      swapon --show
 
   # Install K3s (Single Node Cluster)
   - mode: system
