@@ -89,11 +89,12 @@ type TLSUprobeManager struct {
 	reader     *ringbuf.Reader
 	procReader *ringbuf.Reader
 	log        *zap.SugaredLogger
-	// linksMu guards links — AttachTLS runs concurrently from the reconciler
-	// goroutine and PollExecEvents (incl. its retry goroutine), so unsynchronized
-	// appends could lose entries, double-write the backing array, or race Close().
+	// linksMu guards links, the node-wide links (tracepoints, kprobes, the
+	// virtual IP cgroup hooks), held until Close.
 	linksMu sync.Mutex
-	links   []io.Closer // uprobe/kprobe/tracepoint/TCX links and clsact filters
+	links   []io.Closer
+	// registry holds the uprobes attached for containers (links.go).
+	registry linkRegistry
 
 	// secretSource produces snapshots of the secrets the BPF map should
 	// hold. The k8s controller wires a pkg/secrets/k8s.Source here; tests
@@ -102,6 +103,9 @@ type TLSUprobeManager struct {
 	secretSource secrets.Source
 	// cgroupRoot is the path to the cgroup v2 filesystem (e.g. /sys/fs/cgroup)
 	cgroupRoot string
+	// kubepods is the cgroup directory every container cgroup is under
+	// (setupCgroupAncestor), "" when it was not found.
+	kubepods string
 	// egressInterface selects which container-netns NIC is used to locate
 	// the tc patch attach point (the host side of its veth pair):
 	//
@@ -126,13 +130,15 @@ type TLSUprobeManager struct {
 	// cgroupPaths maps cgroup inode ID -> filesystem path.
 	// Populated by TrackCgroup.
 	cgroupPaths sync.Map // uint64 -> string
-	// tcAttached tracks network namespace inodes where tc egress is already
-	// attached. Stores an open fd to the netns — keeping it open prevents the
-	// kernel from freeing the inode, so a new pod's netns always gets a
-	// different inode. This avoids false "already attached" dedup hits from
-	// inode reuse after pod deletion. The fd is closed in UntrackCgroup.
-	tcAttached sync.Map // uint64 (netns inode) -> *tcAttachEntry
-	// cgroupToNetns maps cgroup ID → netns inode for cleanup on UntrackCgroup.
+	// tcMu guards podTC.
+	tcMu sync.Mutex
+	// podTC maps a pod network namespace's inode to the tc patch program
+	// attached for it, released (detached) with the last cgroup recorded
+	// for the netns (ReleaseCgroupNetns).
+	podTC map[uint64]*podTC
+	// tcProgID is the kernel ID of the tc patch program (tcLinkKey).
+	tcProgID ebpf.ProgramID
+	// cgroupToNetns maps cgroup ID → netns inode, for the pod's release.
 	cgroupToNetns sync.Map // uint64 (cgroup ID) -> uint64 (netns inode)
 	// retryWG tracks the deferred-attach goroutines spawned by PollExecEvents.
 	// Close() waits on it (with a bounded timeout) before tearing down BPF
@@ -165,26 +171,9 @@ type TLSUprobeManager struct {
 	// dnsRewriteFailed records the pods whose attach failure was logged.
 	dnsRewriteFailed map[string]bool
 
-	// uprobesMu guards uprobes and cgroupLinks.
-	uprobesMu sync.Mutex
-	// uprobes records the uprobes attached per container (attachUprobes).
-	uprobes map[uprobeKey]struct{}
-	// cgroupLinks holds each container's uprobe links, detached when the
-	// container is untracked or at Close.
-	cgroupLinks map[uint64][]io.Closer
-	// detachWG tracks the goroutines detaching untracked containers' links.
+	// detachWG tracks the goroutines detaching links that are no longer
+	// needed (detachAsync).
 	detachWG sync.WaitGroup
-}
-
-// uprobeKey identifies the uprobes kloak attached for a container on one
-// symbol (or file offset) of one file: for one of its processes, or for
-// every process that maps the file when pid is 0.
-type uprobeKey struct {
-	cgroupID uint64
-	pid      int
-	dev, ino uint64
-	symbol   string
-	offset   uint64
 }
 
 // bindingLogKey identifies a logged binding or SNI violation.
@@ -194,62 +183,41 @@ type bindingLogKey struct {
 	sniStatus uint8
 }
 
-// tcAttachEntry holds an open fd to a network namespace to prevent inode reuse.
-type tcAttachEntry struct {
-	netnsFd *os.File // kept open to pin the inode
+// podTC is the tc patch program attached for a pod's network namespace:
+// tc ingress on the host side of its veth pairs, or tc egress on an
+// interface without a peer. Its mutex serializes the attaches and the
+// release for the netns.
+type podTC struct {
+	mu sync.Mutex
+	// netnsFd is an open fd to the netns: it keeps the kernel from reusing
+	// the inode for another pod's netns while the entry is recorded.
+	netnsFd *os.File
+	// links are the attachments, by what they are attached to.
+	links map[tcLinkKey]io.Closer
+	// attached: the last attach completed (possibly without any link, with
+	// --egress-interface none).
+	attached bool
+	// released: ReleaseCgroupNetns detached it (the pod went).
+	released bool
 }
 
-// fileID returns the device and inode of the file at path.
-func fileID(path string) (dev, ino uint64, err error) {
-	var st syscall.Stat_t
-	if err := syscall.Stat(path, &st); err != nil {
-		return 0, 0, err
+// detachAsync closes links in the background: a uprobe detach can wait for
+// an RCU grace period, which must not hold up an attach or the
+// reconciliation. Close waits for it.
+func (m *TLSUprobeManager) detachAsync(links []io.Closer, what string, keysAndValues ...any) {
+	if len(links) == 0 {
+		return
 	}
-	return uint64(st.Dev), st.Ino, nil //nolint:unconvert // Dev is uint32 on some arches
-}
-
-// attachUprobes calls attach to attach the uprobes for key, unless they are
-// attached already, and records the links with key's container so that
-// UntrackCgroup detaches them. It reports whether attach ran.
-//
-// AttachTLS runs for every process of a container on each exec in it, and a
-// uprobe without a PID filter already fires for every process that maps the
-// file. Attaching again would run the program once more per call and keep
-// the link until shutdown, where each uprobe detach waits for an RCU Tasks
-// Trace grace period, one at a time (the kernel holds event_mutex): with
-// hundreds of links the controller took minutes to exit.
-func (m *TLSUprobeManager) attachUprobes(key uprobeKey, attach func() ([]io.Closer, error)) (bool, error) {
-	m.uprobesMu.Lock()
-	defer m.uprobesMu.Unlock()
-	if _, ok := m.uprobes[key]; ok {
-		return false, nil
-	}
-	links, err := attach()
-	if err != nil {
-		return false, err
-	}
-	if m.uprobes == nil {
-		m.uprobes = make(map[uprobeKey]struct{})
-		m.cgroupLinks = make(map[uint64][]io.Closer)
-	}
-	m.uprobes[key] = struct{}{}
-	m.cgroupLinks[key.cgroupID] = append(m.cgroupLinks[key.cgroupID], links...)
-	return true, nil
-}
-
-// takeCgroupLinks forgets the uprobes attached for a container and returns
-// their links, for the caller to close.
-func (m *TLSUprobeManager) takeCgroupLinks(cgroupID uint64) []io.Closer {
-	m.uprobesMu.Lock()
-	defer m.uprobesMu.Unlock()
-	links := m.cgroupLinks[cgroupID]
-	delete(m.cgroupLinks, cgroupID)
-	for k := range m.uprobes {
-		if k.cgroupID == cgroupID {
-			delete(m.uprobes, k)
+	m.detachWG.Add(1)
+	go func() {
+		defer m.detachWG.Done()
+		for _, l := range links {
+			if err := l.Close(); err != nil {
+				m.log.Debugw("failed to detach "+what, append([]any{"error", err}, keysAndValues...)...)
+			}
 		}
-	}
-	return links
+		logging.Tracew(m.log, "detached "+what, append([]any{"links", len(links)}, keysAndValues...)...)
+	}()
 }
 
 // setupCgroupAncestor finds the kubepods cgroup directory, stores its fd in
@@ -470,8 +438,10 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		log:              log,
 		secretSource:     secretSource,
 		cgroupRoot:       cgroupRoot,
+		kubepods:         kubepods,
 		egressInterface:  egressInterface,
 		tcMode:           newTCModeResolver(TCAttachAuto),
+		tcProgID:         programID(objs.TcEgressPatch),
 		bindings:         make(map[string]podBinding),
 		bindingLogged:    make(map[bindingLogKey]time.Time),
 		dnsRewrite:       make(map[string]*dnsRewriteAttach),
@@ -488,8 +458,8 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		"range", hostRes.VirtualIPRanges.String(), "pinPath", hostRes.pinPath(), "cgroup", kubepods)
 
 	// Attach the connect, process and socket tracepoints and the tcp_sendmsg
-	// kprobes. These are system-wide but filtered per-process via
-	// tracked_tgids map.
+	// kprobes. These are node-wide, filtered in BPF by tracked_tgids and
+	// tracked_cgroups.
 	if err := mgr.attachTracepoints(); err != nil {
 		_ = mgr.Close()
 		return nil, fmt.Errorf("attaching tracepoints: %w", err)
@@ -596,82 +566,81 @@ func (m *TLSUprobeManager) SetTCAttachMode(mode TCAttachMode) {
 // The controller enters the container's netns via /proc/<pid>/ns/net to
 // resolve the veth peer ifindex, then switches to the root netns
 // (/proc/1/ns/net — requires hostPID: true) to attach.
-func (m *TLSUprobeManager) attachTCEgress(pid int) error {
-	// Check if this network namespace already has tc attached by reading
-	// the netns inode. We keep an open fd to the netns file — this prevents
-	// the kernel from freeing the inode, so a new pod's netns always gets a
-	// different inode (no false dedup from inode reuse).
-	//
-	// To avoid a TOCTOU race between this check and the final Store (two
-	// goroutines could both miss the Load and both attach tc, doubling the
-	// patch program on each interface and corrupting GHASH), we reserve the
-	// inode atomically with LoadOrStore using a zero-value placeholder. The
-	// winner proceeds with the attach; losers bail out. On any failure the
-	// winner MUST Delete the placeholder so a future retry can succeed.
-	//
-	// Placeholder semantics on a hit:
-	//   netnsFd == nil → attach is in-flight by another goroutine. Return
-	//     an error so the caller retries; returning nil would mask an
-	//     in-flight failure (if that goroutine deletes its placeholder, the
-	//     caller who got nil won't retry and the pod stays unpatched).
-	//   netnsFd != nil → a previous attach completed successfully. Return
-	//     nil; no work to do.
+//
+// It is attached once per pod network namespace (podTC), which cgroupID's
+// container is recorded in, for the pod's release to detach it
+// (ReleaseCgroupNetns). A later call finds it attached, after checking with
+// the kernel that every attachment is still there (tcLinkLive): one whose
+// interface went (the pod's veth recreated) is attached again, on the
+// interfaces the netns has now. Attaching the program twice on one hook
+// would patch each record twice and corrupt it, so an attachment kloak has
+// is never attached again.
+func (m *TLSUprobeManager) attachTCEgress(pid int, cgroupID uint64) error {
 	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
-	var netnsIno uint64
-	var haveIno bool
-	var placeholder *tcAttachEntry
-	if fi, err := os.Stat(netnsPath); err == nil {
-		if stat, ok := fi.Sys().(*syscall.Stat_t); ok {
-			netnsIno = stat.Ino
-			haveIno = true
-			placeholder = &tcAttachEntry{} // zero value, no fd yet
-			if existing, loaded := m.tcAttached.LoadOrStore(netnsIno, placeholder); loaded {
-				placeholder = nil // we didn't reserve a slot; nothing to roll back
-				if e, ok := existing.(*tcAttachEntry); ok && e.netnsFd != nil {
-					m.log.Debugw("tc egress already attached for this netns", "pid", pid, "netns_ino", netnsIno)
-					return nil
-				}
-				return fmt.Errorf("tc egress attach in progress for pid %d netns %d; retry", pid, netnsIno)
-			}
-		}
+	podNetns, err := netnsInode(netnsPath)
+	if err != nil {
+		return fmt.Errorf("reading the netns of pid %d: %w", pid, err)
 	}
+	// Record the container's netns first: the pod's release then finds
+	// what this attaches, whatever the caller does with the result.
+	m.cgroupToNetns.Store(cgroupID, podNetns)
 
-	// rollback releases the placeholder on any error path so a later retry
-	// can re-attempt the attach. CompareAndDelete (not plain Delete) so a
-	// real entry that some pathological reorder placed into the slot can't
-	// be accidentally removed. Cleared (set nil) on success.
-	rollback := func() {
-		if haveIno && placeholder != nil {
-			m.tcAttached.CompareAndDelete(netnsIno, placeholder)
-		}
+	e := m.podTCEntry(podNetns)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.released {
+		return fmt.Errorf("tc patch program of pid %d's netns released during the attach; retry", pid)
 	}
-	defer func() {
-		if rollback != nil {
-			rollback()
-		}
-	}()
+	if e.attached && m.podTCLive(e) {
+		m.log.Debugw("tc egress already attached for this netns", "pid", pid, "netns_ino", podNetns)
+		return nil
+	}
 
 	// Open the netns fd for two purposes:
 	// 1. setns to enter the container's network namespace
-	// 2. Keep it open (stored in tcAttached) to pin the inode
+	// 2. Keep it open (in the podTC entry) to pin the inode
 	containerNS, err := os.Open(netnsPath)
 	if err != nil {
 		return fmt.Errorf("opening container netns %s: %w", netnsPath, err)
 	}
-	// NOTE: containerNS is NOT closed here on success — it's stored in
-	// tcAttachEntry to pin the netns inode. Closed in UntrackCgroup when
-	// the pod is deleted.
+	if ino, err := netnsInode(netnsPath); err != nil || ino != podNetns {
+		// The process exited and its PID was reused, between the two opens.
+		_ = containerNS.Close()
+		return fmt.Errorf("pid %d's netns changed during the attach; retry", pid)
+	}
+	keepNS := false
+	defer func() {
+		if !keepNS {
+			_ = containerNS.Close()
+		}
+	}()
 
 	// The host-side veth peer lives in the root network namespace. With
 	// hostPID: true, /proc/1/ns/net is the node init's netns (in kind/k3d,
 	// the node container's netns — which is where the CNI places pod veth
 	// peers there too).
-	rootNS, err := os.Open("/proc/1/ns/net")
+	const rootNetnsPath = "/proc/1/ns/net"
+	rootNS, err := os.Open(rootNetnsPath)
 	if err != nil {
-		_ = containerNS.Close()
-		return fmt.Errorf("opening root netns /proc/1/ns/net: %w", err)
+		return fmt.Errorf("opening root netns %s: %w", rootNetnsPath, err)
 	}
 	defer func() { _ = rootNS.Close() }()
+	rootNetns, err := netnsInode(rootNetnsPath)
+	if err != nil {
+		return fmt.Errorf("reading the root netns: %w", err)
+	}
+
+	// The attachments kloak has for the netns and that the kernel still
+	// has: those are kept, the others are attached.
+	have := make(map[tcLinkKey]io.Closer, len(e.links))
+	var dead []io.Closer
+	for k, l := range e.links {
+		if tcLinkLive(l) {
+			have[k] = l
+		} else {
+			dead = append(dead, l)
+		}
+	}
 
 	// Run the netns-entered work in a dedicated worker goroutine, NOT on
 	// the caller's goroutine. Per Go runtime contract
@@ -690,7 +659,7 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 	//
 	// Do NOT "simplify" this back to inline LockOSThread on the caller.
 	type tcResult struct {
-		links []io.Closer
+		links map[tcLinkKey]io.Closer // the netns's attachments, kept and new
 		err   error
 	}
 	resultCh := make(chan tcResult, 1)
@@ -753,10 +722,8 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 		// egress attach.
 		var legacy []*net.Interface
 
-		// Resolve and validate everything before attaching anything:
-		// TCX stacks attachments, so a retry after a partial attach would
-		// double-attach the same program and corrupt GHASH. (The clsact
-		// fallback replaces a fixed-handle filter instead, see tc_attach.go.)
+		// Resolve and validate everything before attaching anything, so
+		// that a failure leaves the netns as it was.
 		for _, ifName := range ifNames {
 			if ifName == "lo" {
 				// Loopback is deliberately not patched — see the
@@ -781,10 +748,11 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 			peers = append(peers, hostPeer{ifName: ifName, podIfidx: iface.Index, hostIfidx: peerIdx})
 		}
 
-		// Track links attached during this call locally. On a partial
-		// failure close them all and return; the caller won't splice
-		// them into m.links so a retry doesn't see a half-attached netns.
-		attachedHere := make([]io.Closer, 0, len(peers)+len(legacy))
+		// The netns's attachments after this call: those it keeps and those
+		// it attaches. On a partial failure the ones it attached are closed
+		// and the netns keeps what it had, for a retry to complete.
+		out := make(map[tcLinkKey]io.Closer, len(peers)+len(legacy))
+		var attachedHere []io.Closer
 		closeOnFail := func() {
 			for _, prior := range attachedHere {
 				if cerr := prior.Close(); cerr != nil {
@@ -792,19 +760,36 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 				}
 			}
 		}
+		// ensure attaches the program on (netns, ifindex, ingress) unless
+		// the netns has it there already.
+		ensure := func(netnsIno uint64, ifindex int, ingress bool, nsFd *os.File) (bool, error) {
+			key := tcLinkKey{netns: netnsIno, ifindex: ifindex, ingress: ingress, prog: m.tcProgID}
+			if l, ok := have[key]; ok {
+				out[key] = l
+				return false, nil
+			}
+			l, err := m.attachTCProgram(m.objs.TcEgressPatch, ifindex, ingress, nsFd)
+			if err != nil {
+				return false, err
+			}
+			attachedHere = append(attachedHere, l)
+			out[key] = l
+			return true, nil
+		}
 
 		// Legacy fallback first, while still inside the container netns.
 		for _, iface := range legacy {
-			tcLink, err := m.attachTCProgram(m.objs.TcEgressPatch, iface.Index, false, containerNS)
+			created, err := ensure(podNetns, iface.Index, false, containerNS)
 			if err != nil {
 				closeOnFail()
 				resultCh <- tcResult{err: fmt.Errorf("attaching tc egress to %s (ifindex %d) in pid %d netns: %w", iface.Name, iface.Index, pid, err)}
 				return
 			}
-			attachedHere = append(attachedHere, tcLink)
-			m.log.Warnw("interface has no veth peer — attached tc egress inside the pod netns; "+
-				"patched traffic remains capturable by in-pod AF_PACKET (drop NET_RAW)",
-				"pid", pid, "interface", iface.Name, "ifindex", iface.Index)
+			if created {
+				m.log.Warnw("interface has no veth peer — attached tc egress inside the pod netns; "+
+					"patched traffic remains capturable by in-pod AF_PACKET (drop NET_RAW)",
+					"pid", pid, "interface", iface.Name, "ifindex", iface.Index)
+			}
 		}
 
 		// Phase 2: switch to the root netns and attach tc ingress on each
@@ -834,22 +819,23 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 				}
 			}
 			for _, p := range peers {
-				tcLink, err := m.attachTCProgram(m.objs.TcEgressPatch, p.hostIfidx, true, rootNS)
+				created, err := ensure(rootNetns, p.hostIfidx, true, rootNS)
 				if err != nil {
 					closeOnFail()
 					resultCh <- tcResult{err: fmt.Errorf("attaching tc ingress to host veth ifindex %d (pod %s): %w", p.hostIfidx, p.ifName, err)}
 					return
 				}
-				attachedHere = append(attachedHere, tcLink)
-				m.log.Debugw("Attached tc patch to host-side veth", "pid", pid, "podInterface", p.ifName, "hostIfindex", p.hostIfidx)
+				if created {
+					m.log.Debugw("Attached tc patch to host-side veth", "pid", pid, "podInterface", p.ifName, "hostIfindex", p.hostIfidx)
+				}
 			}
 		}
 
-		if len(attachedHere) == 0 {
+		if len(out) == 0 {
 			optOut := strings.EqualFold(m.egressInterface, "none") || strings.EqualFold(m.egressInterface, "lo-only")
 			if optOut {
 				// Explicit opt-out: nothing to attach, report success.
-				resultCh <- tcResult{links: nil}
+				resultCh <- tcResult{links: out}
 				return
 			}
 			// No external interface resolved (e.g. no default route yet,
@@ -858,40 +844,56 @@ func (m *TLSUprobeManager) attachTCEgress(pid int) error {
 			resultCh <- tcResult{err: fmt.Errorf("no external interface resolved in pid %d netns; nothing attached", pid)}
 			return
 		}
-		resultCh <- tcResult{links: attachedHere}
+		resultCh <- tcResult{links: out}
 	}()
 
 	res := <-resultCh
 	if res.err != nil {
-		_ = containerNS.Close()
 		return res.err
 	}
 
-	m.linksMu.Lock()
-	m.links = append(m.links, res.links...)
-	m.linksMu.Unlock()
-
-	// Replace the placeholder with the real entry holding the pinned netns fd.
-	// CompareAndSwap (not Store) guards against a concurrent UntrackCgroup
-	// (pod deleted mid-attach) that already removed our placeholder —
-	// unconditional Store would re-insert the entry and leak containerNS,
-	// since UntrackCgroup is the only place that closes the pinned netns fd.
-	// On a lost CAS, close containerNS directly and let Close() take down
-	// the tc attachments via m.links at controller shutdown.
-	if haveIno {
-		finalEntry := &tcAttachEntry{netnsFd: containerNS}
-		if !m.tcAttached.CompareAndSwap(netnsIno, placeholder, finalEntry) {
-			_ = containerNS.Close()
-			m.log.Debugw("tcAttached entry removed mid-attach (pod likely deleted); not reinserting", "pid", pid, "netns_ino", netnsIno)
+	// The attachments the kernel no longer has, and those of interfaces the
+	// netns no longer routes through, are detached.
+	for k, l := range have {
+		if _, ok := res.links[k]; !ok {
+			dead = append(dead, l)
 		}
-		rollback = nil // success — don't run the rollback defer
-	} else {
-		// Defensive: we never reserved a placeholder (initial Stat failed),
-		// so there's nothing to roll back. Close the open fd to avoid a leak
-		// since it won't be tracked for cleanup.
-		_ = containerNS.Close()
+	}
+	m.detachAsync(dead, "tc patch attachments the pod's netns no longer has", "pid", pid, "netns_ino", podNetns)
+	e.links = res.links
+	e.attached = true
+	if e.netnsFd == nil {
+		e.netnsFd = containerNS
+		keepNS = true
 	}
 	return nil
+}
+
+// podTCEntry returns the podTC entry of netns netnsIno, recording a new one
+// if there is none.
+func (m *TLSUprobeManager) podTCEntry(netnsIno uint64) *podTC {
+	m.tcMu.Lock()
+	defer m.tcMu.Unlock()
+	if m.podTC == nil {
+		m.podTC = make(map[uint64]*podTC)
+	}
+	e := m.podTC[netnsIno]
+	if e == nil {
+		e = &podTC{}
+		m.podTC[netnsIno] = e
+	}
+	return e
+}
+
+// podTCLive reports whether the kernel still has every attachment of e;
+// the caller holds e.mu.
+func (m *TLSUprobeManager) podTCLive(e *podTC) bool {
+	for _, l := range e.links {
+		if !tcLinkLive(l) {
+			return false
+		}
+	}
+	return true
 }
 
 // resolveEgressInterfaces returns the ordered interface names used to locate
@@ -1075,14 +1077,11 @@ func (m *TLSUprobeManager) TrackTGID(tgid uint32) error {
 	return m.objs.TrackedTgids.Update(tgid, &val, 0)
 }
 
-// UntrackTGID removes a process TGID from the tracked_tgids map.
-// go_tls_offset_config is keyed by cgroup_id, not tgid, and is cleaned up
-// via UntrackCgroup when the container is removed.
+// UntrackTGID removes a process TGID from the tracked_tgids map. The
+// sched_process_exit tracepoint does so for every process that exits; the
+// per-binary maps (tls_strategy, the offsets) are keyed by cgroup and
+// cleaned up with it.
 func (m *TLSUprobeManager) UntrackTGID(tgid uint32) error {
-	// Best-effort: delete the strategy entry so it doesn't accumulate. Either
-	// map may legitimately have no entry (BoringSSL/static binaries never had
-	// strategy=LIBCRYPTO_HOOK), so ignore not-found errors.
-	_ = m.objs.TlsStrategy.Delete(&tgid)
 	return m.objs.TrackedTgids.Delete(tgid)
 }
 
@@ -1098,25 +1097,21 @@ func (m *TLSUprobeManager) TrackCgroup(cgroupID uint64, cgroupPath string) error
 }
 
 // RecordCgroupNetns records the cgroup → netns inode mapping for a container
-// process. This enables cleanup of the tcAttached entry (which pins the netns
-// fd) when the cgroup is untracked on pod deletion.
+// process, for the pod's release (ReleaseCgroupNetns) to detach the tc patch
+// program attached in the netns. attachTCEgress records it too.
 func (m *TLSUprobeManager) RecordCgroupNetns(cgroupID uint64, pid int) {
-	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
-	fi, err := os.Stat(netnsPath)
+	ino, err := netnsInode(fmt.Sprintf("/proc/%d/ns/net", pid))
 	if err != nil {
 		return
 	}
-	stat, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return
-	}
-	m.cgroupToNetns.Store(cgroupID, stat.Ino)
+	m.cgroupToNetns.Store(cgroupID, ino)
 }
 
 // UntrackCgroup removes a container cgroup ID from the tracked_cgroups map
 // and cleans up the associated tc attachment state. When the last cgroup
-// referencing a netns is untracked, the pinned netns fd is closed, allowing
-// the kernel to free the inode for reuse.
+// referencing a netns is untracked, the netns's tc patch program is
+// detached and its pinned fd closed, allowing the kernel to free the inode
+// for reuse.
 func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 	err := m.UntrackExitedCgroup(cgroupID)
 	m.ReleaseCgroupNetns(cgroupID)
@@ -1127,67 +1122,33 @@ func (m *TLSUprobeManager) UntrackCgroup(cgroupID uint64) error {
 // its pod lives on (an init container that completed, a container that
 // restarted in a new cgroup) as UntrackCgroup does, but keeps the pod's
 // network namespace recorded for it: while it is, the pod's tc patch
-// program stays recorded as attached, and a later container of the pod
-// finds it instead of attaching it a second time (which would patch each
-// record twice). ReleaseCgroupNetns releases it, with the pod.
+// program stays attached, and a later container of the pod finds it
+// instead of attaching it a second time. ReleaseCgroupNetns releases it,
+// with the pod.
 func (m *TLSUprobeManager) UntrackExitedCgroup(cgroupID uint64) error {
 	m.cgroupPaths.Delete(cgroupID)
 
-	// Detach the container's uprobes in the background: each detach can
-	// wait for an RCU grace period, which must not hold up reconciliation.
-	if links := m.takeCgroupLinks(cgroupID); len(links) > 0 {
-		m.detachWG.Add(1)
-		go func() {
-			defer m.detachWG.Done()
-			for _, l := range links {
-				if err := l.Close(); err != nil {
-					m.log.Debugw("failed to detach uprobe of untracked container", "cgroupID", cgroupID, "error", err)
-				}
-			}
-			logging.Tracew(m.log, "detached uprobes of untracked container", "cgroupID", cgroupID, "links", len(links))
-		}()
-	}
+	// Detach the uprobes no other container needs, in the background: each
+	// detach can wait for an RCU grace period, which must not hold up
+	// reconciliation.
+	m.detachAsync(m.registry.releaseCgroup(cgroupID), "uprobes of an untracked container", "cgroupID", cgroupID)
 
-	// Remove TLS offset entries belonging to this cgroup. Both go_tls_offset_config
-	// and tls_offset_config are keyed by (cgroup_id, exe_inode) via the shared
-	// tls_binary_key struct — iterate each and delete keys whose cgroup_id
-	// matches. Best-effort: failures here only leak map entries.
-	{
-		var k tlsuprobeTlsBinaryKey
-		var v tlsuprobeGoTlsOffsets
-		var stale []tlsuprobeTlsBinaryKey
-		iter := m.objs.GoTlsOffsetConfig.Iterate()
-		for iter.Next(&k, &v) {
-			if k.CgroupId == cgroupID {
-				stale = append(stale, k)
-			}
-		}
-		for i := range stale {
-			_ = m.objs.GoTlsOffsetConfig.Delete(&stale[i])
-		}
-	}
-	{
-		var k tlsuprobeTlsBinaryKey
-		var v tlsuprobeTlsOffsets
-		var stale []tlsuprobeTlsBinaryKey
-		iter := m.objs.TlsOffsetConfig.Iterate()
-		for iter.Next(&k, &v) {
-			if k.CgroupId == cgroupID {
-				stale = append(stale, k)
-			}
-		}
-		for i := range stale {
-			_ = m.objs.TlsOffsetConfig.Delete(&stale[i])
-		}
+	// The per-binary entries of the cgroup's processes: their offsets
+	// (tls_offset_config, go_tls_offset_config) and H-extraction strategy
+	// (tls_strategy), all keyed by (cgroup_id, exe_inode). Best-effort:
+	// failures here only leak map entries until the next sweep.
+	dead := func(id uint64) bool { return id == cgroupID }
+	for _, mp := range []*ebpf.Map{m.objs.GoTlsOffsetConfig, m.objs.TlsOffsetConfig, m.objs.TlsStrategy} {
+		_, _ = deleteBinaryKeys(mp, dead)
 	}
 
 	return m.objs.TrackedCgroups.Delete(cgroupID)
 }
 
 // ReleaseCgroupNetns forgets the network namespace recorded for a cgroup
-// (RecordCgroupNetns). Once no cgroup records it, the pinned netns fd is
-// closed so the kernel can reclaim the inode (multi-container pods share a
-// netns).
+// (RecordCgroupNetns). Once no cgroup records it, the netns's tc patch
+// program is detached and the pinned netns fd closed, so the kernel can
+// reclaim the inode (multi-container pods share a netns).
 func (m *TLSUprobeManager) ReleaseCgroupNetns(cgroupID uint64) {
 	inoVal, ok := m.cgroupToNetns.LoadAndDelete(cgroupID)
 	if !ok {
@@ -1206,17 +1167,44 @@ func (m *TLSUprobeManager) ReleaseCgroupNetns(cgroupID uint64) {
 	if otherRefs {
 		return
 	}
-	if entry, ok := m.tcAttached.LoadAndDelete(ino); ok {
-		if e, ok := entry.(*tcAttachEntry); ok && e.netnsFd != nil {
-			_ = e.netnsFd.Close()
-		}
+	m.releasePodTC(ino)
+}
+
+// releasePodTC detaches the tc patch program attached for netns netnsIno and
+// closes the netns fd, once any attach for it in flight is done.
+func (m *TLSUprobeManager) releasePodTC(netnsIno uint64) {
+	m.tcMu.Lock()
+	e := m.podTC[netnsIno]
+	delete(m.podTC, netnsIno)
+	m.tcMu.Unlock()
+	if e == nil {
+		return
 	}
+	e.mu.Lock()
+	e.released = true
+	closers := make([]io.Closer, 0, len(e.links)+1)
+	for _, l := range e.links {
+		closers = append(closers, l)
+	}
+	e.links = nil
+	if e.netnsFd != nil {
+		// After the links: a clsact filter is removed through its own
+		// duplicate of the fd.
+		closers = append(closers, e.netnsFd)
+		e.netnsFd = nil
+	}
+	e.mu.Unlock()
+	m.detachAsync(closers, "tc patch program of a released pod netns", "netns_ino", netnsIno)
 }
 
 // AttachTLS attaches system-wide eBPF uprobes to all TLS libraries in a
-// container. The uprobes fire for ALL processes in the container (same overlay
-// mount = same inode). The BPF cgroup filter restricts interception to tracked
-// containers only.
+// container. The uprobes fire for ALL processes that map the libraries
+// (every container of the image shares them, see fileIdentity). The BPF
+// cgroup filter restricts interception to tracked containers only.
+//
+// The attach discovers the uprobes the process needs and ensures them
+// through the link registry (links.go): one the registry has is not attached
+// again, and the container is recorded as needing it.
 func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 	return m.attachTLS(pid, cgroupID, true)
 }
@@ -1233,6 +1221,115 @@ func (m *TLSUprobeManager) AttachContainerTLS(pid int, cgroupID uint64) error {
 	return m.attachTLS(pid, cgroupID, false)
 }
 
+// tlsProcess is a process whose executable an attach looks at.
+type tlsProcess struct {
+	pid     int
+	start   uint64 // procStartTime
+	exePath string // /proc/<pid>/exe
+	exe     *link.Executable
+	exeFile fileKey // exeFileKey; exeFile.ino is the exe_inode of the per-binary maps
+}
+
+// discoverProcess opens process pid's executable, and reads what its
+// process-scoped uprobes are keyed by.
+func discoverProcess(pid int) (*tlsProcess, error) {
+	start, err := procStartTime(pid)
+	if err != nil {
+		return nil, fmt.Errorf("reading the start time of pid %d: %w", pid, err)
+	}
+	exePath := fmt.Sprintf("/proc/%d/exe", pid)
+	ex, err := link.OpenExecutable(exePath)
+	if err != nil {
+		return nil, fmt.Errorf("opening executable %s: %w", exePath, err)
+	}
+	file, err := exeFileKey(pid)
+	if err != nil {
+		return nil, fmt.Errorf("stat executable %s: %w", exePath, err)
+	}
+	return &tlsProcess{pid: pid, start: start, exePath: exePath, exe: ex, exeFile: file}, nil
+}
+
+// uprobeSpec is a uprobe an attach discovered: its key in the link registry,
+// and how to attach it.
+type uprobeSpec struct {
+	key    uprobeLinkKey
+	attach func() ([]io.Closer, error)
+}
+
+// exeUprobe is the uprobe running prog at symbol (or file offset addr) of
+// p's executable, for p only.
+func (m *TLSUprobeManager) exeUprobe(p *tlsProcess, symbol string, addr uint64, prog uprobeProg) uprobeSpec {
+	return uprobeSpec{
+		key: uprobeLinkKey{pid: p.pid, start: p.start, file: p.exeFile, symbol: symbol, addr: addr, prog: prog},
+		attach: func() ([]io.Closer, error) {
+			return m.attachUprobe(p.exe, symbol, prog, &link.UprobeOptions{PID: p.pid, Address: addr})
+		},
+	}
+}
+
+// libUprobe is the uprobe running prog at symbol of the library ex, file
+// file, for every process that maps it.
+func (m *TLSUprobeManager) libUprobe(ex *link.Executable, file fileKey, symbol string, prog uprobeProg) uprobeSpec {
+	return uprobeSpec{
+		key: uprobeLinkKey{file: file, symbol: symbol, prog: prog},
+		attach: func() ([]io.Closer, error) {
+			return m.attachUprobe(ex, symbol, prog, nil)
+		},
+	}
+}
+
+// ensureUprobe attaches the uprobe of spec unless the link registry has it,
+// and records container cgroupID as needing it. It reports whether it
+// attached it.
+func (m *TLSUprobeManager) ensureUprobe(spec uprobeSpec, cgroupID uint64) (bool, error) {
+	return m.registry.ensure(spec.key, cgroupID, spec.attach)
+}
+
+// attachUprobe attaches prog at symbol (or opts.Address) of ex.
+func (m *TLSUprobeManager) attachUprobe(ex *link.Executable, symbol string, prog uprobeProg, opts *link.UprobeOptions) ([]io.Closer, error) {
+	switch prog {
+	case progSSLWrite, progGoTLSWrite:
+		p := m.objs.BpfUprobeSslWrite
+		if prog == progGoTLSWrite {
+			p = m.objs.BpfUprobeGoTlsWrite
+		}
+		up, err := ex.Uprobe(symbol, p, opts)
+		if err != nil {
+			return nil, err
+		}
+		return []io.Closer{up}, nil
+	case progEVPCipherInit:
+		up, err := ex.Uprobe(symbol, m.objs.BpfUprobeEvpCipherInit, opts)
+		if err != nil {
+			return nil, err
+		}
+		ret, err := ex.Uretprobe(symbol, m.objs.BpfUretprobeEvpCipherInit, opts)
+		if err != nil {
+			_ = up.Close()
+			return nil, err
+		}
+		return []io.Closer{up, ret}, nil
+	default:
+		return nil, fmt.Errorf("unknown uprobe program %d", prog)
+	}
+}
+
+// retainProcess detaches the process-scoped uprobes recorded for process
+// pid's PID that are not for the process and executable it runs now: those
+// of the executable it ran before an exec, and those of an earlier process
+// with its PID. A process that exited is left to the sweep.
+func (m *TLSUprobeManager) retainProcess(pid int) {
+	start, err := procStartTime(pid)
+	if err != nil {
+		return
+	}
+	exe, err := exeFileKey(pid)
+	if err != nil {
+		return
+	}
+	m.detachAsync(m.registry.retainProcess(pid, start, exe), "uprobes of a process's previous executable", "pid", pid)
+}
+
 // attachTLS is AttachTLS, for the process's executable too when withExe.
 func (m *TLSUprobeManager) attachTLS(pid int, cgroupID uint64, withExe bool) error {
 	// Register the process for DNS/connect tracking.
@@ -1245,13 +1342,19 @@ func (m *TLSUprobeManager) attachTLS(pid int, cgroupID uint64, withExe bool) err
 	// H extraction now happens in the entry uprobe via 4-step pointer chain.
 	// The offsets are pushed to the BPF config map by pushTLSOffsets below.
 
-	sslSymbols := []string{"SSL_write", "SSL_write_ex"}
-	gnutlsSymbols := []string{"gnutls_record_send", "gnutls_record_send2"}
+	tlsSymbols := []string{"SSL_write", "SSL_write_ex", "gnutls_record_send", "gnutls_record_send2"}
 	attached := false
 
 	// 1-2. The TLS linked into the executable.
+	var proc *tlsProcess
 	if withExe {
-		done, exeAttached, err := m.attachExecutable(pid, cgroupID, append(sslSymbols, gnutlsSymbols...))
+		p, err := discoverProcess(pid)
+		if err != nil {
+			return err
+		}
+		proc = p
+		defer m.retainProcess(pid)
+		done, exeAttached, err := m.attachExecutable(proc, cgroupID, tlsSymbols)
 		if err != nil || done {
 			return err
 		}
@@ -1260,8 +1363,8 @@ func (m *TLSUprobeManager) attachTLS(pid int, cgroupID uint64, withExe bool) err
 
 	// 3. Scan all TLS shared libraries in the container filesystem and attach
 	// system-wide uprobes. Uses /proc/<pid>/root to access the container's
-	// overlay mount — all processes in the same container share the same
-	// overlay inode, so the uprobe fires for any of them.
+	// overlay mount: a library's uprobe fires for any process that maps it,
+	// in this container or another of the image.
 	containerLibs := findContainerTLSLibraries(pid)
 	logging.Tracew(m.log, "found container TLS libraries", "pid", pid, "count", len(containerLibs), "libs", containerLibs)
 
@@ -1271,16 +1374,12 @@ func (m *TLSUprobeManager) attachTLS(pid int, cgroupID uint64, withExe bool) err
 		if err != nil {
 			continue
 		}
-		libDev, libIno, err := fileID(hostPath)
+		file, err := fileIdentity(hostPath)
 		if err != nil {
 			continue
 		}
-		for _, sym := range append(sslSymbols, gnutlsSymbols...) {
-			key := uprobeKey{cgroupID: cgroupID, dev: libDev, ino: libIno, symbol: sym}
-			created, err := m.attachUprobes(key, func() ([]io.Closer, error) {
-				up, err := libEx.Uprobe(sym, m.objs.BpfUprobeSslWrite, nil)
-				return []io.Closer{up}, err
-			})
+		for _, sym := range tlsSymbols {
+			created, err := m.ensureUprobe(m.libUprobe(libEx, file, sym, progSSLWrite), cgroupID)
 			if err != nil {
 				continue
 			}
@@ -1300,18 +1399,18 @@ func (m *TLSUprobeManager) attachTLS(pid int, cgroupID uint64, withExe bool) err
 		// Attach the libcrypto EVP_CipherInit_ex hooks for the libcrypto-hook
 		// H-extraction strategy. If libcrypto.so is found and at least one of
 		// EVP_CipherInit_ex2 / EVP_CipherInit_ex resolves, write
-		// tls_strategy[tgid] = STRATEGY_LIBCRYPTO_HOOK so SSL_write routes
-		// through h_extract → cache lookup. Otherwise (BoringSSL, statically
-		// linked) leave strategy at 0 (default) — process stays on the legacy
-		// kprobe-walks-chain path that's been on main since launch. Without
-		// the executable (the container runtime's own, until it runs the
-		// container's command), the hooks are attached but the strategy is
-		// left to the command's exec event, which knows what the command is
-		// (a Bun binary must stay on the kprobe walk).
-		if m.attachLibcryptoCipherInit(pid, cgroupID, containerLibs, withExe) && withExe {
-			tgid := uint32(pid)
+		// tls_strategy[(cgroup, exe)] = STRATEGY_LIBCRYPTO_HOOK so SSL_write
+		// routes through h_extract → cache lookup. Otherwise (BoringSSL,
+		// statically linked) leave strategy at 0 (default) — the binary stays
+		// on the kprobe-walks-chain path. Without the executable (the
+		// container runtime's own, until it runs the container's command),
+		// the hooks are attached but the strategy is left to the command's
+		// exec event, which knows what the command is (a Bun binary must
+		// stay on the kprobe walk).
+		if m.attachLibcryptoCipherInit(pid, proc, cgroupID, containerLibs) && proc != nil {
+			key := tlsuprobeTlsBinaryKey{CgroupId: cgroupID, ExeInode: proc.exeFile.ino}
 			strategyVal := strategyLibcryptoHook
-			if err := m.objs.TlsStrategy.Update(&tgid, &strategyVal, 0); err != nil {
+			if err := m.objs.TlsStrategy.Update(&key, &strategyVal, 0); err != nil {
 				m.log.Errorw("Failed to set tls_strategy for libcrypto hook",
 					"error", err, "pid", pid)
 			} else {
@@ -1322,7 +1421,7 @@ func (m *TLSUprobeManager) attachTLS(pid int, cgroupID uint64, withExe bool) err
 
 		// Attach tc egress to the container's eth0 for kernel-only ciphertext
 		// patching. Required for secret rewriting.
-		if err := m.attachTCEgress(pid); err != nil {
+		if err := m.attachTCEgress(pid, cgroupID); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				m.log.Debugw("Process exited before tc egress could attach", "error", err, "pid", pid)
 			} else {
@@ -1341,30 +1440,16 @@ func (m *TLSUprobeManager) attachTLS(pid int, cgroupID uint64, withExe bool) err
 // that carries all of the process's TLS (Go, Bun): its offsets are pushed and
 // the pod's tc program attached, and there is nothing else to attach.
 // attached reports that symbols were attached in the executable.
-func (m *TLSUprobeManager) attachExecutable(pid int, cgroupID uint64, symbols []string) (done, attached bool, err error) {
-	exePath := fmt.Sprintf("/proc/%d/exe", pid)
-
-	// Open the executable to check for statically linked TLS
-	ex, err := link.OpenExecutable(exePath)
-	if err != nil {
-		return false, false, fmt.Errorf("opening executable %s: %w", exePath, err)
-	}
-	exeDev, exeIno, err := fileID(exePath)
-	if err != nil {
-		return false, false, fmt.Errorf("stat executable %s: %w", exePath, err)
-	}
-	exeKey := func(symbol string, offset uint64) uprobeKey {
-		return uprobeKey{cgroupID: cgroupID, pid: pid, dev: exeDev, ino: exeIno, symbol: symbol, offset: offset}
-	}
+//
+// The uprobes are process-scoped: the executable is the process's own, and
+// a uprobe on a binary in a container's overlay does not fire for the same
+// binary seen through another mount.
+func (m *TLSUprobeManager) attachExecutable(p *tlsProcess, cgroupID uint64, symbols []string) (done, attached bool, err error) {
+	pid := p.pid
 
 	// 1. Try Go crypto/tls (statically linked into the binary).
-	// Use PID-scoped attachment because Go binaries are unique per container
-	// and system-wide uprobes via overlay don't fire for the same binary.
 	goWriteSym := "crypto/tls.(*Conn).Write"
-	if created, err := m.attachUprobes(exeKey(goWriteSym, 0), func() ([]io.Closer, error) {
-		up, err := ex.Uprobe(goWriteSym, m.objs.BpfUprobeGoTlsWrite, &link.UprobeOptions{PID: pid})
-		return []io.Closer{up}, err
-	}); err == nil {
+	if created, err := m.ensureUprobe(m.exeUprobe(p, goWriteSym, 0, progGoTLSWrite), cgroupID); err == nil {
 		if created {
 			m.log.Debugw("Attached Go uprobe", "pid", pid, "symbol", goWriteSym)
 		}
@@ -1374,7 +1459,7 @@ func (m *TLSUprobeManager) attachExecutable(pid int, cgroupID uint64, symbols []
 		// Key by cgroup_id, not PID — the BPF kprobe sees root-NS PIDs and
 		// can't look up by our local-NS PID in nested deployments (kind/k3d).
 		m.pushGoTLSOffsets(pid, cgroupID)
-		if err := m.attachTCEgress(pid); err != nil {
+		if err := m.attachTCEgress(pid, cgroupID); err != nil {
 			m.log.Errorw("Failed to attach tc egress for Go TLS — secrets will not be rewritten", "error", err, "pid", pid)
 		}
 		return true, false, nil
@@ -1385,51 +1470,40 @@ func (m *TLSUprobeManager) attachExecutable(pid int, cgroupID uint64, symbols []
 	// SSL_write file offset. The binary is symbol-stripped, so the normal
 	// symbol-scan below would fail. UprobeOptions.Address bypasses symbol
 	// resolution in cilium/ebpf when non-zero (link/uprobe.go:167-169).
-	if bunOff, bunVer, ok := DetectBun(exePath); ok && bunOff.SSLWriteOffset > 0 {
-		m.log.Infow("Bun single-executable detected — attaching at SSL_write file offset",
-			"pid", pid, "version", bunVer,
-			"ssl_write_offset", fmt.Sprintf("0x%x", bunOff.SSLWriteOffset))
-		if _, err := m.attachUprobes(exeKey("", bunOff.SSLWriteOffset), func() ([]io.Closer, error) {
-			up, err := ex.Uprobe("", m.objs.BpfUprobeSslWrite, &link.UprobeOptions{
-				Address: bunOff.SSLWriteOffset,
-				PID:     pid,
-			})
-			return []io.Closer{up}, err
-		}); err == nil {
+	if bunOff, bunVer, ok := DetectBun(p.exePath); ok && bunOff.SSLWriteOffset > 0 {
+		created, err := m.ensureUprobe(m.exeUprobe(p, "", bunOff.SSLWriteOffset, progSSLWrite), cgroupID)
+		if err == nil {
+			if created {
+				m.log.Infow("Bun single-executable detected — attached at SSL_write file offset",
+					"pid", pid, "version", bunVer,
+					"ssl_write_offset", fmt.Sprintf("0x%x", bunOff.SSLWriteOffset))
+			}
 			// Push BoringSSL chain offsets — Bun statically links BoringSSL and
 			// uses the same SSL→s3→aead_write_ctx→AES_KEY walk.
-			var st syscall.Stat_t
-			if serr := syscall.Stat(exePath, &st); serr == nil {
-				val := bpfTLSOffsets{
-					SSLToVersion:     0xFFFFFFFF,
-					SSLToWBIO:        bunOff.BoringSSL.SSLToWBIO,
-					TLSLib:           bpfTLSLibBoringSSL,
-					BsslSSLToS3:      bunOff.BoringSSL.SSLToS3,
-					BsslS3ToAEAD:     bunOff.BoringSSL.S3ToAEAD,
-					BsslAEADToAESKey: bunOff.BoringSSL.AEADToAESKey,
-				}
-				m.pushOffsetVal(val, cgroupID, st.Ino)
-				m.log.Debugw("Pushed BoringSSL offsets for Bun process",
-					"pid", pid, "cgroupID", cgroupID, "offsets", fmt.Sprintf("%+v", bunOff.BoringSSL))
+			val := bpfTLSOffsets{
+				SSLToVersion:     0xFFFFFFFF,
+				SSLToWBIO:        bunOff.BoringSSL.SSLToWBIO,
+				TLSLib:           bpfTLSLibBoringSSL,
+				BsslSSLToS3:      bunOff.BoringSSL.SSLToS3,
+				BsslS3ToAEAD:     bunOff.BoringSSL.S3ToAEAD,
+				BsslAEADToAESKey: bunOff.BoringSSL.AEADToAESKey,
 			}
-			if err := m.attachTCEgress(pid); err != nil {
+			m.pushOffsetVal(val, cgroupID, p.exeFile.ino)
+			m.log.Debugw("Pushed BoringSSL offsets for Bun process",
+				"pid", pid, "cgroupID", cgroupID, "offsets", fmt.Sprintf("%+v", bunOff.BoringSSL))
+			if err := m.attachTCEgress(pid, cgroupID); err != nil {
 				m.log.Errorw("Failed to attach tc egress for Bun — secrets will not be rewritten",
 					"error", err, "pid", pid)
 			}
 			return true, false, nil
-		} else {
-			m.log.Warnw("Bun detected but SSL_write uprobe failed — falling through to symbol scan",
-				"pid", pid, "error", err)
 		}
+		m.log.Warnw("Bun detected but SSL_write uprobe failed — falling through to symbol scan",
+			"pid", pid, "version", bunVer, "error", err)
 	}
 
 	// Try main executable first (statically linked OpenSSL/BoringSSL/GnuTLS).
-	// Use PID-scoped because the main exe is unique per container.
 	for _, sym := range symbols {
-		created, err := m.attachUprobes(exeKey(sym, 0), func() ([]io.Closer, error) {
-			up, err := ex.Uprobe(sym, m.objs.BpfUprobeSslWrite, &link.UprobeOptions{PID: pid})
-			return []io.Closer{up}, err
-		})
+		created, err := m.ensureUprobe(m.exeUprobe(p, sym, 0, progSSLWrite), cgroupID)
 		if err != nil {
 			continue
 		}
@@ -1474,15 +1548,15 @@ func (m *TLSUprobeManager) processUsesBoringSSL(pid int, containerLibs []string,
 // attachLibcryptoCipherInit attaches the EVP_CipherInit_ex entry+uretprobe
 // pair so the libcrypto-hook H-extraction path activates for this process.
 // Returns true if any attach point succeeded, in which case the caller marks
-// the process as STRATEGY_LIBCRYPTO_HOOK.
+// the process's binary as STRATEGY_LIBCRYPTO_HOOK.
 //
 // Tries two attach points:
 //
-//  1. The main executable (/proc/<pid>/exe), PID-scoped, when withExe. This catches apps
-//     that statically link OpenSSL into the binary — most notably Node.js,
-//     which bundles OpenSSL 3.x inside the `node` ELF and exports
-//     EVP_CipherInit_ex / _ex2 directly. PID-scoped because the exe is
-//     unique per container and we don't want the hook firing for unrelated
+//  1. The main executable of p (when the attach looks at it), PID-scoped.
+//     This catches apps that statically link OpenSSL into the binary — most
+//     notably Node.js, which bundles OpenSSL 3.x inside the `node` ELF and
+//     exports EVP_CipherInit_ex / _ex2 directly. PID-scoped because the exe
+//     is the process's own, and we don't want the hook firing for unrelated
 //     copies on the host.
 //
 //  2. Each libcrypto.so found in containerLibs, system-wide. This catches
@@ -1497,7 +1571,7 @@ func (m *TLSUprobeManager) processUsesBoringSSL(pid int, containerLibs []string,
 // BoringSSL apps that don't expose EVP_CipherInit_ex anywhere (rare in
 // practice — Node.js publishes as OpenSSL despite the historical "uses
 // BoringSSL" reputation) stay on STRATEGY_KPROBE_WALK.
-func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, cgroupID uint64, containerLibs []string, withExe bool) bool {
+func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, p *tlsProcess, cgroupID uint64, containerLibs []string) bool {
 	// BoringSSL must stay on STRATEGY_KPROBE_WALK. Its libcrypto also exports
 	// EVP_CipherInit_ex, but BoringSSL's cipher init does NOT populate the
 	// OpenSSL evp_h_cache that h_extract reads, and the OpenSSL provider chain
@@ -1505,7 +1579,7 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, cgroupID uint64, c
 	// STRATEGY_LIBCRYPTO_HOOK and route SSL_write to h_extract, which bails on
 	// ssl_to_wrl==0 — bypassing the kprobe BoringSSL H-walk entirely (the path
 	// that recomputes H from the AES round keys). So skip the hook for BoringSSL.
-	if m.processUsesBoringSSL(pid, containerLibs, withExe) {
+	if m.processUsesBoringSSL(pid, containerLibs, p != nil) {
 		m.log.Debugw("BoringSSL process — skipping EVP_CipherInit hook, staying on kprobe-walk",
 			"pid", pid)
 		return false
@@ -1522,48 +1596,23 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, cgroupID uint64, c
 	attached := false
 
 	// 1. Main executable, PID-scoped — for statically-linked OpenSSL (Node.js).
-	if withExe {
-		exePath := fmt.Sprintf("/proc/%d/exe", pid)
-		exeEx, err := link.OpenExecutable(exePath)
-		var exeDev, exeIno uint64
-		if err == nil {
-			exeDev, exeIno, err = fileID(exePath)
+	if p != nil {
+		exeAttached := false
+		for _, sym := range cipherInitSymbols {
+			created, err := m.ensureUprobe(m.exeUprobe(p, sym, 0, progEVPCipherInit), cgroupID)
+			if err != nil {
+				continue
+			}
+			if created {
+				m.log.Debugw("Attached EVP_CipherInit hooks (main exe, PID-scoped)",
+					"pid", pid, "symbol", sym)
+			}
+			attached = true
+			exeAttached = true
 		}
-		if err == nil {
-			exeAttached := false
-			for _, sym := range cipherInitSymbols {
-				key := uprobeKey{cgroupID: cgroupID, pid: pid, dev: exeDev, ino: exeIno, symbol: sym}
-				created, err := m.attachUprobes(key, func() ([]io.Closer, error) {
-					up, errEntry := exeEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit,
-						&link.UprobeOptions{PID: pid})
-					if errEntry != nil {
-						return nil, errEntry
-					}
-					ret, errRet := exeEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit,
-						&link.UprobeOptions{PID: pid})
-					if errRet != nil {
-						_ = up.Close()
-						return nil, errRet
-					}
-					return []io.Closer{up, ret}, nil
-				})
-				if err != nil {
-					continue
-				}
-				if created {
-					m.log.Debugw("Attached EVP_CipherInit hooks (main exe, PID-scoped)",
-						"pid", pid, "symbol", sym)
-				}
-				attached = true
-				exeAttached = true
-			}
-			if !exeAttached {
-				m.log.Debugw("Main exe has no EVP_CipherInit symbols — likely dynamically links libcrypto",
-					"pid", pid)
-			}
-		} else {
-			m.log.Debugw("Failed to open main exe for cipher_init attach",
-				"pid", pid, "error", err)
+		if !exeAttached {
+			m.log.Debugw("Main exe has no EVP_CipherInit symbols — likely dynamically links libcrypto",
+				"pid", pid)
 		}
 	}
 
@@ -1577,9 +1626,9 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, cgroupID uint64, c
 		libcryptoFound = true
 		hostPath := fmt.Sprintf("/proc/%d/root%s", pid, containerPath)
 		libEx, err := link.OpenExecutable(hostPath)
-		var libDev, libIno uint64
+		var file fileKey
 		if err == nil {
-			libDev, libIno, err = fileID(hostPath)
+			file, err = fileIdentity(hostPath)
 		}
 		if err != nil {
 			m.log.Debugw("Failed to open libcrypto for cipher_init attach",
@@ -1588,24 +1637,10 @@ func (m *TLSUprobeManager) attachLibcryptoCipherInit(pid int, cgroupID uint64, c
 		}
 		libAttached := false
 		for _, sym := range cipherInitSymbols {
-			key := uprobeKey{cgroupID: cgroupID, dev: libDev, ino: libIno, symbol: sym}
-			created, err := m.attachUprobes(key, func() ([]io.Closer, error) {
-				up, errEntry := libEx.Uprobe(sym, m.objs.BpfUprobeEvpCipherInit, nil)
-				if errEntry != nil {
-					m.log.Debugw("EVP_CipherInit entry uprobe attach failed",
-						"pid", pid, "symbol", sym, "lib", containerPath, "error", errEntry)
-					return nil, errEntry
-				}
-				ret, errRet := libEx.Uretprobe(sym, m.objs.BpfUretprobeEvpCipherInit, nil)
-				if errRet != nil {
-					_ = up.Close()
-					m.log.Debugw("EVP_CipherInit uretprobe attach failed",
-						"pid", pid, "symbol", sym, "lib", containerPath, "error", errRet)
-					return nil, errRet
-				}
-				return []io.Closer{up, ret}, nil
-			})
+			created, err := m.ensureUprobe(m.libUprobe(libEx, file, sym, progEVPCipherInit), cgroupID)
 			if err != nil {
+				m.log.Debugw("EVP_CipherInit hook attach failed",
+					"pid", pid, "symbol", sym, "lib", containerPath, "error", err)
 				continue
 			}
 			if created {
@@ -1913,14 +1948,12 @@ func isTLSLibrary(name string) bool {
 // Close releases all links and the eBPF manager.
 //
 // Each link.Close on a uprobe is a kernel syscall that takes ~50-100 ms,
-// and m.links accumulates one entry per uprobe attachment over the
-// daemonset's lifetime. On a long-running cluster with churning pods this
-// reaches into the thousands; closing serially blows past kubelet's
+// and a node with many kloak pods holds hundreds of uprobes (the link
+// registry, the pods' tc programs); closing serially blows past kubelet's
 // terminationGracePeriodSeconds and the pod is SIGKILL'd before the Go
 // runtime gets to flush exit hooks (which lost us the e2e covcounters
 // flush, among other things). Close concurrently with a bounded worker
-// pool so wall time stays inside the grace period regardless of how
-// long the controller has been running.
+// pool so wall time stays inside the grace period.
 func (m *TLSUprobeManager) Close() error {
 	t0 := time.Now()
 	// Drain in-flight retry goroutines first. PollExecEvents is expected to
@@ -1939,8 +1972,8 @@ func (m *TLSUprobeManager) Close() error {
 	case <-time.After(5 * time.Second):
 		m.log.Warnw("timed out waiting for retry goroutines on shutdown; proceeding with teardown")
 	}
-	// Untracked containers' uprobes may still be detaching. Their links
-	// are no longer in cgroupLinks, so this is the only wait for them.
+	// Links no longer needed may still be detaching (detachAsync). They
+	// are no longer in the registry, so this is the only wait for them.
 	detached := make(chan struct{})
 	go func() {
 		m.detachWG.Wait()
@@ -1949,7 +1982,7 @@ func (m *TLSUprobeManager) Close() error {
 	select {
 	case <-detached:
 	case <-time.After(10 * time.Second):
-		m.log.Warnw("timed out waiting for untracked containers' uprobes to detach; proceeding with teardown")
+		m.log.Warnw("timed out waiting for released links to detach; proceeding with teardown")
 	}
 
 	// Snapshot + nil out the slice under the lock, then release before doing
@@ -1961,13 +1994,23 @@ func (m *TLSUprobeManager) Close() error {
 	links := m.links
 	m.links = nil
 	m.linksMu.Unlock()
-	m.uprobesMu.Lock()
-	for cg, cgLinks := range m.cgroupLinks {
-		links = append(links, cgLinks...)
-		delete(m.cgroupLinks, cg)
+	links = append(links, m.registry.drain()...)
+	m.tcMu.Lock()
+	for ino, e := range m.podTC {
+		e.mu.Lock()
+		e.released = true
+		for _, l := range e.links {
+			links = append(links, l)
+		}
+		e.links = nil
+		if e.netnsFd != nil {
+			links = append(links, e.netnsFd)
+			e.netnsFd = nil
+		}
+		e.mu.Unlock()
+		delete(m.podTC, ino)
 	}
-	clear(m.uprobes)
-	m.uprobesMu.Unlock()
+	m.tcMu.Unlock()
 	m.dnsRewriteMu.Lock()
 	for uid, a := range m.dnsRewrite {
 		links = append(links, a.links...)

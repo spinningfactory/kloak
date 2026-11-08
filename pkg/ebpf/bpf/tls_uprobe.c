@@ -398,26 +398,6 @@ struct {
   __type(value, struct evp_h_val);
 } evp_h_cache SEC(".maps");
 
-// Per-process H-extraction strategy. Written by the controller when the
-// libcrypto EVP_CipherInit_ex uretprobe attaches successfully for a pid.
-// Read in bpf_uprobe_ssl_write to choose between the cache-lookup path
-// (LIBCRYPTO_HOOK) and the legacy kprobe-walk path (default 0).
-//   0 = STRATEGY_KPROBE_WALK    — BoringSSL, static binaries, OpenSSL where
-//                                 the libcrypto attach failed. Pre-existing
-//                                 SSL_write→xor_path→kprobe-walks-chain flow.
-//   1 = STRATEGY_LIBCRYPTO_HOOK — OpenSSL where libcrypto.so was found and
-//                                 EVP_CipherInit_ex hooks are in place.
-//                                 SSL_write→h_extract(cache)→xor_path→kprobe
-//                                 reads H from xor_pending.
-#define STRATEGY_KPROBE_WALK    0
-#define STRATEGY_LIBCRYPTO_HOOK 1
-struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 4096);
-  __type(key, __u32);   // tgid
-  __type(value, __u8);  // strategy
-} tls_strategy SEC(".maps");
-
 // A watched hostname, zero-padded: the key of vip_host_ip.
 struct watched_host_key {
   char host[MAX_HOST_LEN];
@@ -1005,6 +985,29 @@ struct {
   __type(key, struct tls_binary_key);
   __type(value, struct tls_offsets);
 } tls_offset_config SEC(".maps");
+
+// Per-binary H-extraction strategy, keyed like the offsets (tls_binary_key):
+// by cgroup, which the controller can name whatever PID namespace it runs in,
+// and cleans up with the container, and by executable, which decides the
+// strategy with the container's libraries. Written by the controller when
+// the libcrypto EVP_CipherInit_ex uretprobe attaches for a binary. Read in
+// bpf_uprobe_ssl_write to choose between the cache-lookup path
+// (LIBCRYPTO_HOOK) and the legacy kprobe-walk path (default 0).
+//   0 = STRATEGY_KPROBE_WALK    — BoringSSL, static binaries, OpenSSL where
+//                                 the libcrypto attach failed. Pre-existing
+//                                 SSL_write→xor_path→kprobe-walks-chain flow.
+//   1 = STRATEGY_LIBCRYPTO_HOOK — OpenSSL where libcrypto.so was found and
+//                                 EVP_CipherInit_ex hooks are in place.
+//                                 SSL_write→h_extract(cache)→xor_path→kprobe
+//                                 reads H from xor_pending.
+#define STRATEGY_KPROBE_WALK    0
+#define STRATEGY_LIBCRYPTO_HOOK 1
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 4096);
+  __type(key, struct tls_binary_key);
+  __type(value, __u8);  // strategy
+} tls_strategy SEC(".maps");
 
 // Go crypto/tls struct offsets for H extraction.
 // Keyed by TGID (per-process), allowing different Go versions to coexist.
@@ -2831,14 +2834,17 @@ int bpf_uprobe_ssl_write(void *ctx) {
     bpf_loop(num_chunks, prescan_chunk, &pctx, 0);
   }
 
-  // Route by per-process H-extraction strategy. STRATEGY_LIBCRYPTO_HOOK
+  // Route by the binary's H-extraction strategy. STRATEGY_LIBCRYPTO_HOOK
   // (set by the controller when EVP_CipherInit_ex hooks attached for this
-  // pid's libcrypto.so) goes through h_extract → cache lookup → xor_path.
+  // binary's libcrypto) goes through h_extract → cache lookup → xor_path.
   // STRATEGY_KPROBE_WALK (default — BoringSSL, statically-linked, or
   // libcrypto attach failed) goes straight to xor_path; the tcp_sendmsg
-  // kprobe then walks SSL→…→H itself, exactly as on main today.
-  __u32 cur_tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-  __u8 *strat = bpf_map_lookup_elem(&tls_strategy, &cur_tgid);
+  // kprobe then walks SSL→…→H itself.
+  struct tls_binary_key sk = {};
+  sk.cgroup_id = cgroup_id;
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+  sk.exe_inode = BPF_CORE_READ(task, mm, exe_file, f_inode, i_ino);
+  __u8 *strat = bpf_map_lookup_elem(&tls_strategy, &sk);
   if (strat && *strat == STRATEGY_LIBCRYPTO_HOOK) {
     bpf_tail_call(ctx, &prog_array, 2);
   } else {

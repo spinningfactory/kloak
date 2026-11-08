@@ -115,7 +115,7 @@ func (m *TLSUprobeManager) attachVirtualIPRedirect(r VirtualIPRanges, cgroupPath
 type dnsRewriteAttach struct {
 	ino uint64
 	// netns is kept open while attached, so its inode can't be reused by
-	// another netns and wrongly look attached (see tcAttached).
+	// another netns and wrongly look attached (see podTC).
 	netns *os.File
 	links []io.Closer
 	addrs []netip.Addr // addresses of the interfaces attached to
