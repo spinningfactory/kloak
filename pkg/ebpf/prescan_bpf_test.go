@@ -301,9 +301,10 @@ func prescanWrite(t *testing.T, objs *tlsuprobeObjects, addr string, payload []b
 	}
 	conn := dialTLS(t, addr, "")
 	defer func() { _ = conn.Close() }()
-	if _, err := conn.Write(payload); err != nil {
-		t.Fatalf("TLS write: %v", err)
-	}
+	// The uprobe runs at Write's entry, on the whole buffer. The server reads
+	// one byte and closes, so a write of several records may then be reset:
+	// that does not change what was staged.
+	_, _ = conn.Write(payload)
 
 	var v tlsuprobeXorPendingVal
 	if err := objs.XorPending.Lookup(tgid, &v); errors.Is(err, ciliumebpf.ErrKeyNotExist) {
