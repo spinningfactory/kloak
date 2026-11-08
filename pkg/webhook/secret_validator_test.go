@@ -12,6 +12,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
 func TestValidateHostsLabel(t *testing.T) {
@@ -77,6 +79,14 @@ func TestValidatePortLabel(t *testing.T) {
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("expected no error, got: %v", err)
+				}
+				// The k8s Source skips a Secret whose port does not
+				// parse (spinningfactory/kloak#368), so whatever
+				// admission accepts must parse there too.
+				if tc.spec != "" {
+					if _, err := secrets.ParsePort(tc.spec); err != nil {
+						t.Fatalf("admitted %q, but secrets.ParsePort rejects it: %v", tc.spec, err)
+					}
 				}
 				return
 			}

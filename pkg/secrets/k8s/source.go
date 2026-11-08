@@ -73,8 +73,8 @@ func NewSource(reader client.Reader) *Source {
 }
 
 // WithLog attaches a logger so Snapshot can surface diagnostic output
-// (e.g. invalid port annotations falling back to wildcard). Returns the
-// receiver so call sites can chain the constructor.
+// (e.g. the Secrets it skips for an invalid destination filter). Returns
+// the receiver so call sites can chain the constructor.
 func (s *Source) WithLog(log *zap.SugaredLogger) *Source {
 	s.log = log
 	return s
@@ -85,7 +85,9 @@ func (s *Source) WithLog(log *zap.SugaredLogger) *Source {
 // the enabled Secret's annotations. Secrets without a corresponding
 // shadow, or whose shadow is shorter than secrets.ShadowPrefixLen,
 // are skipped (the same check pkg/ebpf/sync.go performs today before
-// writing to the BPF map).
+// writing to the BPF map). Secrets whose destination filter cannot be
+// honored (a filter set as a label, or a port annotation that does not
+// parse) are skipped too, so their placeholder is never rewritten.
 func (s *Source) Snapshot(ctx context.Context) ([]secrets.Secret, error) {
 	if s.reader == nil {
 		return nil, nil
@@ -133,22 +135,23 @@ func (s *Source) Snapshot(ctx context.Context) ([]secrets.Secret, error) {
 		host, ip := secrets.ParseHost(en.Annotations[AnnotationHosts])
 		var port uint16
 		var proto uint8
-		if raw, ok := en.Annotations[AnnotationPort]; ok && raw != "" {
-			if ps, err := secrets.ParsePort(raw); err == nil {
-				port = ps.Port
-				proto = ps.Protocol
-			} else if s.log != nil {
-				// Bad annotation falls back to wildcard rather than failing
-				// the whole snapshot. Surface it via the optional logger so
-				// the operator can find and fix the manifest.
-				//
-				// TODO: this fails open (any port) when the validating
-				// webhook is not installed. Skip the secret instead, like
-				// MisplacedFilterLabels does, once callers can tolerate it.
-				s.log.Warnw("invalid port annotation, treating as wildcard",
-					"namespace", en.Namespace, "secret", en.Name,
-					"annotation", AnnotationPort, "value", raw, "error", err)
+		if raw := en.Annotations[AnnotationPort]; raw != "" {
+			ps, err := secrets.ParsePort(raw)
+			if err != nil {
+				// Fail closed, as for a misplaced filter label: port 0
+				// means any port to the data plane, so syncing the secret
+				// without the port the manifest asks for would widen it.
+				// Skip only this Secret; returning an error would fail the
+				// whole snapshot and hold every other secret's sync back.
+				if s.log != nil {
+					s.log.Errorw("skipping secret: invalid port annotation",
+						"namespace", en.Namespace, "secret", en.Name,
+						"annotation", AnnotationPort, "value", raw, "error", err)
+				}
+				continue
 			}
+			port = ps.Port
+			proto = ps.Protocol
 		}
 
 		ownerID := en.Namespace + "/" + en.Name
