@@ -1258,8 +1258,8 @@ type uprobeSpec struct {
 
 // exeUprobe is the uprobe running prog at symbol (or file offset addr) of
 // p's executable, for p only.
-func (m *TLSUprobeManager) exeUprobe(p *tlsProcess, symbol string, addr uint64, prog uprobeProg) uprobeSpec {
-	return uprobeSpec{
+func (m *TLSUprobeManager) exeUprobe(p *tlsProcess, symbol string, addr uint64, prog uprobeProg) *uprobeSpec {
+	return &uprobeSpec{
 		key: uprobeLinkKey{pid: p.pid, start: p.start, file: p.exeFile, symbol: symbol, addr: addr, prog: prog},
 		attach: func() ([]io.Closer, error) {
 			return m.attachUprobe(p.exe, symbol, prog, &link.UprobeOptions{PID: p.pid, Address: addr})
@@ -1269,8 +1269,8 @@ func (m *TLSUprobeManager) exeUprobe(p *tlsProcess, symbol string, addr uint64, 
 
 // libUprobe is the uprobe running prog at symbol of the library ex, file
 // file, for every process that maps it.
-func (m *TLSUprobeManager) libUprobe(ex *link.Executable, file fileKey, symbol string, prog uprobeProg) uprobeSpec {
-	return uprobeSpec{
+func (m *TLSUprobeManager) libUprobe(ex *link.Executable, file fileKey, symbol string, prog uprobeProg) *uprobeSpec {
+	return &uprobeSpec{
 		key: uprobeLinkKey{file: file, symbol: symbol, prog: prog},
 		attach: func() ([]io.Closer, error) {
 			return m.attachUprobe(ex, symbol, prog, nil)
@@ -1281,8 +1281,8 @@ func (m *TLSUprobeManager) libUprobe(ex *link.Executable, file fileKey, symbol s
 // ensureUprobe attaches the uprobe of spec unless the link registry has it,
 // and records container cgroupID as needing it. It reports whether it
 // attached it.
-func (m *TLSUprobeManager) ensureUprobe(spec uprobeSpec, cgroupID uint64) (bool, error) {
-	return m.registry.ensure(spec.key, cgroupID, spec.attach)
+func (m *TLSUprobeManager) ensureUprobe(spec *uprobeSpec, cgroupID uint64) (bool, error) {
+	return m.registry.ensure(&spec.key, cgroupID, spec.attach)
 }
 
 // attachUprobe attaches prog at symbol (or opts.Address) of ex.
@@ -1354,9 +1354,9 @@ func (m *TLSUprobeManager) attachTLS(pid int, cgroupID uint64, withExe bool) err
 		}
 		proc = p
 		defer m.retainProcess(pid)
-		done, exeAttached, err := m.attachExecutable(proc, cgroupID, tlsSymbols)
-		if err != nil || done {
-			return err
+		done, exeAttached := m.attachExecutable(proc, cgroupID, tlsSymbols)
+		if done {
+			return nil
 		}
 		attached = exeAttached
 	}
@@ -1444,7 +1444,7 @@ func (m *TLSUprobeManager) attachTLS(pid int, cgroupID uint64, withExe bool) err
 // The uprobes are process-scoped: the executable is the process's own, and
 // a uprobe on a binary in a container's overlay does not fire for the same
 // binary seen through another mount.
-func (m *TLSUprobeManager) attachExecutable(p *tlsProcess, cgroupID uint64, symbols []string) (done, attached bool, err error) {
+func (m *TLSUprobeManager) attachExecutable(p *tlsProcess, cgroupID uint64, symbols []string) (done, attached bool) {
 	pid := p.pid
 
 	// 1. Try Go crypto/tls (statically linked into the binary).
@@ -1462,7 +1462,7 @@ func (m *TLSUprobeManager) attachExecutable(p *tlsProcess, cgroupID uint64, symb
 		if err := m.attachTCEgress(pid, cgroupID); err != nil {
 			m.log.Errorw("Failed to attach tc egress for Go TLS — secrets will not be rewritten", "error", err, "pid", pid)
 		}
-		return true, false, nil
+		return true, false
 	}
 
 	// 2. Bun single-executable (e.g. Claude Code): detect by version string
@@ -1495,7 +1495,7 @@ func (m *TLSUprobeManager) attachExecutable(p *tlsProcess, cgroupID uint64, symb
 				m.log.Errorw("Failed to attach tc egress for Bun — secrets will not be rewritten",
 					"error", err, "pid", pid)
 			}
-			return true, false, nil
+			return true, false
 		}
 		m.log.Warnw("Bun detected but SSL_write uprobe failed — falling through to symbol scan",
 			"pid", pid, "version", bunVer, "error", err)
@@ -1512,7 +1512,7 @@ func (m *TLSUprobeManager) attachExecutable(p *tlsProcess, cgroupID uint64, symb
 		}
 		attached = true
 	}
-	return false, attached, nil
+	return false, attached
 }
 
 // Strategy values must match #defines in pkg/ebpf/bpf/tls_uprobe.c.

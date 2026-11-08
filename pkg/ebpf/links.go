@@ -189,10 +189,10 @@ type linkRegistry struct {
 //
 // Attaches are serialized: two attach paths that discover the same uprobe at
 // once must not both attach it, which would run the program twice per call.
-func (r *linkRegistry) ensure(key uprobeLinkKey, cgroupID uint64, attach func() ([]io.Closer, error)) (bool, error) {
+func (r *linkRegistry) ensure(key *uprobeLinkKey, cgroupID uint64, attach func() ([]io.Closer, error)) (bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.uprobes[key]; ok {
+	if e, ok := r.uprobes[*key]; ok {
 		e.cgroups[cgroupID] = struct{}{}
 		return false, nil
 	}
@@ -203,7 +203,7 @@ func (r *linkRegistry) ensure(key uprobeLinkKey, cgroupID uint64, attach func() 
 	if r.uprobes == nil {
 		r.uprobes = make(map[uprobeLinkKey]*uprobeEntry)
 	}
-	r.uprobes[key] = &uprobeEntry{links: links, cgroups: map[uint64]struct{}{cgroupID: {}}}
+	r.uprobes[*key] = &uprobeEntry{links: links, cgroups: map[uint64]struct{}{cgroupID: {}}}
 	return true, nil
 }
 

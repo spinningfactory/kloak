@@ -66,7 +66,7 @@ func TestLinkRegistryDedup(t *testing.T) {
 	attach, attaches, _ := fakeAttach(1)
 	lib := uprobeLinkKey{file: libssl, symbol: "SSL_write", prog: progSSLWrite}
 	for range 3 {
-		if _, err := r.ensure(lib, 1, attach); err != nil {
+		if _, err := r.ensure(&lib, 1, attach); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -79,7 +79,7 @@ func TestLinkRegistryDedup(t *testing.T) {
 		{pid: 7, start: 100, file: exeA, symbol: "SSL_write", prog: progSSLWrite},
 		{pid: 7, start: 100, file: exeA, addr: 0x1234, prog: progSSLWrite},
 	} {
-		created, err := r.ensure(k, 1, attach)
+		created, err := r.ensure(&k, 1, attach)
 		if err != nil || !created {
 			t.Fatalf("%+v: created=%v err=%v", k, created, err)
 		}
@@ -90,10 +90,10 @@ func TestLinkRegistryDedup(t *testing.T) {
 
 	// A failed attach is not recorded, so a later discovery attaches it.
 	failed := uprobeLinkKey{file: libssl, symbol: "gnutls_record_send", prog: progSSLWrite}
-	if _, err := r.ensure(failed, 1, func() ([]io.Closer, error) { return nil, errors.New("no such symbol") }); err == nil {
+	if _, err := r.ensure(&failed, 1, func() ([]io.Closer, error) { return nil, errors.New("no such symbol") }); err == nil {
 		t.Fatal("attach error not returned")
 	}
-	if created, _ := r.ensure(failed, 1, attach); !created {
+	if created, _ := r.ensure(&failed, 1, attach); !created {
 		t.Fatal("failed attach was recorded")
 	}
 }
@@ -106,7 +106,7 @@ func TestLinkRegistrySharedImageLayer(t *testing.T) {
 	attach, attaches, closed := fakeAttach(2) // EVP_CipherInit: entry + return
 	evp := uprobeLinkKey{file: libcrypto, symbol: "EVP_CipherInit_ex", prog: progEVPCipherInit}
 	for _, cg := range []uint64{1, 2, 3} {
-		if _, err := r.ensure(evp, cg, attach); err != nil {
+		if _, err := r.ensure(&evp, cg, attach); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -130,7 +130,7 @@ func TestLinkRegistrySharedImageLayer(t *testing.T) {
 	if *closed != 2 {
 		t.Errorf("%d links closed, want 2", *closed)
 	}
-	if created, _ := r.ensure(evp, 4, attach); !created {
+	if created, _ := r.ensure(&evp, 4, attach); !created {
 		t.Error("probe still recorded after its last container was released")
 	}
 }
@@ -152,7 +152,7 @@ func TestLinkRegistryReleaseCgroupProcessScoped(t *testing.T) {
 
 func mustEnsure(t *testing.T, r *linkRegistry, k uprobeLinkKey, cg uint64, attach func() ([]io.Closer, error)) {
 	t.Helper()
-	if _, err := r.ensure(k, cg, attach); err != nil {
+	if _, err := r.ensure(&k, cg, attach); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -179,7 +179,7 @@ func TestLinkRegistryPIDReuse(t *testing.T) {
 		t.Fatalf("PID reuse dropped %d links, want 1", len(got))
 	}
 	reused := uprobeLinkKey{pid: 7, start: 200, file: exeA, symbol: "SSL_write", prog: progSSLWrite}
-	if created, _ := r.ensure(reused, 1, attach); !created {
+	if created, _ := r.ensure(&reused, 1, attach); !created {
 		t.Fatal("the new process with the PID found the old one's uprobe")
 	}
 	// It execs another binary.
