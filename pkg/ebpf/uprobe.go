@@ -2550,7 +2550,7 @@ func (m *TLSUprobeManager) logSNIViolation(ev *secretBindingEvent, pod, secret s
 // debugCounterNames maps index to human-readable name (must match C enum in
 // pkg/ebpf/bpf/tls_uprobe.c — DBG_* constants).
 var debugCounterNames = []string{
-	"xor_conn_check", "xor_conn_hit", "xor_prescan_match", "xor_tailcall",
+	"xor_conn_check", "xor_conn_hit", "xor_prescan_match", "xor_prescan_unconfirmed", "xor_tailcall",
 	"xor_path_entered", "xor_secret_found", "xor_delta_done",
 	"tc_entry", "tc_match", "tc_patched",
 	"kprobe_bridge", "kprobe_bridge_no_entry", "kprobe_bridge_h_fail",

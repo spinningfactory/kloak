@@ -3,19 +3,80 @@
 package ebpf
 
 import (
+	"errors"
+	"maps"
+	"os"
+	"slices"
 	"testing"
 
 	"github.com/cilium/ebpf"
 )
 
+// verifierBudget is how many instructions the verifier may walk for one
+// program: half the kernel's limit (BPF_COMPLEXITY_LIMIT_INSNS, 1M). The
+// count changes a lot between kernels for the same program (the SNI kprobe
+// took 160K on 6.8 and 859K on 7.2), so a program close to the limit on one
+// kernel is one verifier change away from being rejected on the next.
+const verifierBudget = 500_000
+
 func loadTestObjects(t *testing.T) *tlsuprobeObjects {
 	t.Helper()
 	objs := &tlsuprobeObjects{}
 	if err := loadTlsuprobeObjects(objs, nil); err != nil {
-		t.Skipf("eBPF objects not available (need Linux kernel 5.17+): %v", err)
+		skipUnlessRejected(t, err)
 	}
 	t.Cleanup(func() { _ = objs.Close() })
 	return objs
+}
+
+// skipUnlessRejected skips the test when the objects can't be loaded here (no
+// root, no BPF), but fails it when the verifier rejected a program: that is a
+// kloak bug on this kernel, and a kernel matrix must not pass by skipping.
+// KLOAK_REQUIRE_BPF=1 (CI's kernel matrix) makes every load failure fatal.
+func skipUnlessRejected(t *testing.T, err error) {
+	t.Helper()
+	var ve *ebpf.VerifierError
+	if errors.As(err, &ve) {
+		t.Fatalf("the verifier rejected a program: %-20v", ve)
+	}
+	if os.Getenv("KLOAK_REQUIRE_BPF") == "1" {
+		t.Fatalf("eBPF objects did not load: %v", err)
+	}
+	t.Skipf("eBPF objects not available (need Linux kernel 5.17+): %v", err)
+}
+
+// TestVerifierBudget loads every program on its own, so that one rejection
+// doesn't hide the others, and checks its verifier cost against
+// verifierBudget.
+func TestVerifierBudget(t *testing.T) {
+	spec, err := loadTlsuprobe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range slices.Sorted(maps.Keys(spec.Programs)) {
+		t.Run(name, func(t *testing.T) {
+			one := spec.Copy()
+			one.Programs = map[string]*ebpf.ProgramSpec{name: one.Programs[name]}
+			coll, err := ebpf.NewCollection(one)
+			if err != nil {
+				skipUnlessRejected(t, err)
+			}
+			defer coll.Close()
+
+			info, err := coll.Programs[name].Info()
+			if err != nil {
+				t.Fatal(err)
+			}
+			n, ok := info.VerifiedInstructions()
+			if !ok {
+				t.Skip("this kernel doesn't report the verifier's cost (5.16+)")
+			}
+			t.Logf("verified %d instructions (budget %d)", n, verifierBudget)
+			if n > verifierBudget {
+				t.Errorf("%d verified instructions is over the budget of %d", n, verifierBudget)
+			}
+		})
+	}
 }
 
 func TestLoadObjects(t *testing.T) {

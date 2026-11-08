@@ -191,6 +191,70 @@ static void test_prefix_exact_four(void) {
 }
 
 // ============================================================================
+// is_kloak_candidate — "kl::" or its HPACK Huffman prefix (eb 45 cb).
+// ============================================================================
+
+static void test_candidate_plain(void) {
+  assert(is_kloak_candidate((const unsigned char *)"kl::abcd") == 1);
+}
+
+static void test_candidate_huffman(void) {
+  const unsigned char buf[] = {0xeb, 0x45, 0xcb, 0x12, 0x34, 0x56, 0x78, 0x9a};
+  assert(is_kloak_candidate(buf) == 1);
+}
+
+static void test_candidate_huffman_partial(void) {
+  const unsigned char buf[] = {0xeb, 0x45, 0xca, 0x12};
+  assert(is_kloak_candidate(buf) == 0);
+}
+
+static void test_candidate_neither(void) {
+  assert(is_kloak_candidate((const unsigned char *)"kl:;abcd") == 0);
+  assert(is_kloak_candidate((const unsigned char *)"Bearer x") == 0);
+}
+
+// ============================================================================
+// prescan_num_chunks / prescan_scan_len — the prescan tries every start
+// position whose key fits in the write exactly once, so a placeholder in the
+// overlap of two chunks is recorded once.
+// ============================================================================
+
+static void test_prescan_chunks_tile_positions(void) {
+  static unsigned char tried[4 * MAX_DATA_SIZE + 2 * SECRET_KEY_LEN];
+  for (__u32 total = 0; total < sizeof(tried); total++) {
+    memset(tried, 0, sizeof(tried));
+    __u32 chunks = prescan_num_chunks(total);
+    for (__u32 c = 0; c < chunks; c++) {
+      __u32 offset = c * CHUNK_STRIDE;
+      assert(offset < total); // prescan_chunk stops at offset >= total
+      __u32 read_len = total - offset;
+      if (read_len > MAX_DATA_SIZE)
+        read_len = MAX_DATA_SIZE;
+      __u32 scan = prescan_scan_len(read_len);
+      assert(scan <= CHUNK_STRIDE);
+      for (__u32 i = 0; i < scan; i++) {
+        assert(i + SECRET_KEY_LEN <= read_len); // the key lies in the chunk
+        tried[offset + i]++;
+      }
+    }
+    for (__u32 p = 0; p < total; p++)
+      assert(tried[p] == (p + SECRET_KEY_LEN <= total ? 1 : 0));
+  }
+}
+
+static void test_prescan_scan_len_bounds(void) {
+  assert(prescan_scan_len(0) == 0);
+  assert(prescan_scan_len(SECRET_KEY_LEN - 1) == 0);
+  assert(prescan_scan_len(SECRET_KEY_LEN) == 1);
+  assert(prescan_scan_len(MAX_DATA_SIZE) == CHUNK_STRIDE);
+  assert(prescan_scan_len(MAX_DATA_SIZE + 100) == CHUNK_STRIDE);
+  assert(prescan_num_chunks(0) == 0);
+  assert(prescan_num_chunks(1) == 1);
+  assert(prescan_num_chunks(CHUNK_STRIDE) == 1);
+  assert(prescan_num_chunks(CHUNK_STRIDE + 1) == 2);
+}
+
+// ============================================================================
 // patch_delta — the XOR delta bpf_xor_path stages for a placeholder
 // ============================================================================
 
@@ -233,6 +297,31 @@ static void test_patch_delta_raw(void) {
   apply_patch((const unsigned char *)wire, strlen(wire), 7,
               (const unsigned char *)"real-value12", 12, 0, out);
   assert(memcmp(out, want, strlen(want)) == 0);
+}
+
+// The delta for every length and pad: buf ^ real over the placeholder's
+// bits, 0 over the pad bits of its last byte, and buf unchanged past it. The
+// loop covers the whole buffer (for Linux 6.1's verifier), which leaves the
+// bytes past len as they are only because real is zero there, as sync
+// writes it.
+static void test_patch_delta_every_len(void) {
+  for (__u32 len = 1; len <= SECRET_MAX_LEN; len++) {
+    for (__u8 pad = 0; pad < 8; pad++) {
+      __u8 buf[SECRET_MAX_LEN], orig[SECRET_MAX_LEN];
+      char real[SECRET_MAX_LEN] = {0};
+      for (__u32 j = 0; j < SECRET_MAX_LEN; j++)
+        orig[j] = buf[j] = (__u8)(0x5a + 37 * j);
+      for (__u32 j = 0; j < len; j++)
+        real[j] = (char)(0xc3 ^ (11 * j));
+      patch_delta(buf, real, len, pad);
+      for (__u32 j = 0; j + 1 < len; j++)
+        assert(buf[j] == (__u8)(orig[j] ^ (__u8)real[j]));
+      assert(buf[len - 1] ==
+             (__u8)((orig[len - 1] ^ (__u8)real[len - 1]) & patch_tail_mask(pad)));
+      for (__u32 j = len; j < SECRET_MAX_LEN; j++)
+        assert(buf[j] == orig[j]);
+    }
+  }
 }
 
 // spinningfactory/kloak#228 (1.7): for an HPACK-Huffman placeholder, the
@@ -1616,9 +1705,20 @@ int main(void) {
   RUN_TEST(test_prefix_wrong_second_char);
   RUN_TEST(test_prefix_exact_four);
 
+  printf("is_kloak_candidate:\n");
+  RUN_TEST(test_candidate_plain);
+  RUN_TEST(test_candidate_huffman);
+  RUN_TEST(test_candidate_huffman_partial);
+  RUN_TEST(test_candidate_neither);
+
+  printf("prescan chunking:\n");
+  RUN_TEST(test_prescan_chunks_tile_positions);
+  RUN_TEST(test_prescan_scan_len_bounds);
+
   printf("patch_delta:\n");
   RUN_TEST(test_patch_tail_mask);
   RUN_TEST(test_patch_delta_raw);
+  RUN_TEST(test_patch_delta_every_len);
   RUN_TEST(test_patch_delta_hpack_tail);
 
   printf("gf128_mul:\n");

@@ -23,6 +23,12 @@ typedef uint64_t __u64;
 #ifndef MAX_DATA_SIZE
 #define MAX_DATA_SIZE 256
 #endif
+#ifndef SECRET_KEY_LEN
+#define SECRET_KEY_LEN 8
+#endif
+#ifndef CHUNK_STRIDE
+#define CHUNK_STRIDE (MAX_DATA_SIZE - (SECRET_KEY_LEN - 1))
+#endif
 typedef uint16_t __u16;
 typedef int int32_t;
 // libbpf's, from bpf_helpers.h.
@@ -120,6 +126,39 @@ HELPER_INLINE int is_kloak_prefix_huffman(const unsigned char *buf) {
              : 0;
 }
 
+// is_kloak_candidate reports whether a placeholder may start at buf: "kl::"
+// (HTTP/1.1) or its HPACK Huffman prefix (HTTP/2). It is only a filter: the
+// prescan confirms a candidate by looking its SECRET_KEY_LEN bytes up in
+// secret_map before it takes a match slot. Caller must ensure buf has >= 4
+// bytes.
+HELPER_INLINE int is_kloak_candidate(const unsigned char *buf) {
+  return is_kloak_prefix((const char *)buf) || is_kloak_prefix_huffman(buf);
+}
+
+// Prescan chunking (prescan_chunk in tls_uprobe.c). Chunk k of a write reads
+// up to MAX_DATA_SIZE bytes at k * CHUNK_STRIDE and tries prescan_scan_len()
+// start positions in it: those whose SECRET_KEY_LEN-byte key lies inside the
+// chunk. A full chunk tries CHUNK_STRIDE positions, so the chunks tile the
+// write's start positions: each is tried exactly once, and a key straddling
+// two chunks is tried in the first, which holds all of it. The chunks overlap
+// by SECRET_KEY_LEN - 1 bytes only to hold that key's tail.
+_Static_assert(CHUNK_STRIDE == MAX_DATA_SIZE - SECRET_KEY_LEN + 1,
+               "prescan chunks must tile the start positions");
+
+// prescan_num_chunks returns the number of chunks the prescan reads for a
+// write of total_len bytes.
+HELPER_INLINE __u32 prescan_num_chunks(__u32 total_len) {
+  return (total_len + CHUNK_STRIDE - 1) / CHUNK_STRIDE;
+}
+
+// prescan_scan_len returns how many start positions the prescan tries in a
+// chunk of read_len bytes (at most CHUNK_STRIDE).
+HELPER_INLINE __u32 prescan_scan_len(__u32 read_len) {
+  if (read_len > MAX_DATA_SIZE)
+    read_len = MAX_DATA_SIZE;
+  return read_len >= SECRET_KEY_LEN ? read_len - SECRET_KEY_LEN + 1 : 0;
+}
+
 // The bits of a patch's last byte that belong to the placeholder. An
 // HPACK-Huffman-coded placeholder need not end on a byte boundary: when its
 // code is not a multiple of 8 bits long, the low pad_bits bits of its last
@@ -139,17 +178,25 @@ HELPER_INLINE __u8 patch_tail_mask(__u8 pad_bits) {
 // entry, whose real is Huffman(real value) with EOS padding, that is the
 // real value's code followed by the next character's bits, unchanged.
 //
+// real is zero past len (sync copies only the secret), so the bytes of buf
+// past the placeholder are left as they are. They are never applied anyway:
+// tc stores back only len bytes, and the GHASH delta masks the rest
+// (ghash_block_delta).
+//
 // The last byte is prepared before the loop rather than masked after it: its
 // bits after the placeholder are set to real's, which the loop's XOR then
-// clears. The verifier walks code after the loop once per loop exit (up to
-// SECRET_MAX_LEN of them) until its next prune point, which made the mask
-// after the loop double bpf_xor_path's verifier cost.
+// clears. With the loop bounded by len, the verifier walked code after it
+// once per loop exit, which made a mask after it double bpf_xor_path's
+// verifier cost. The loop covers the whole buffer, a constant bound every
+// verifier can follow: bounded by len too, clang counts the loop down on a
+// second register whose range Linux 6.1's and 6.6's verifiers lose, and they
+// reject bpf_xor_path.
 HELPER_INLINE void patch_delta(__u8 buf[SECRET_MAX_LEN],
                                const char real[SECRET_MAX_LEN], __u32 len,
                                __u8 pad_bits) {
   __u32 last = (len - 1) & (SECRET_MAX_LEN - 1);
   buf[last] ^= (buf[last] ^ (__u8)real[last]) & (__u8)~patch_tail_mask(pad_bits);
-  for (__u32 j = 0; j < SECRET_MAX_LEN && j < len; j++)
+  for (__u32 j = 0; j < SECRET_MAX_LEN; j++)
     buf[j] ^= real[j];
 }
 
