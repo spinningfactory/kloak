@@ -120,6 +120,39 @@ HELPER_INLINE int is_kloak_prefix_huffman(const unsigned char *buf) {
              : 0;
 }
 
+// The bits of a patch's last byte that belong to the placeholder. An
+// HPACK-Huffman-coded placeholder need not end on a byte boundary: when its
+// code is not a multiple of 8 bits long, the low pad_bits bits of its last
+// byte are the first bits of what follows it in the same string, or the
+// string's EOS padding (RFC 7541 §5.2) when nothing does. pad_bits is 0 for a
+// raw placeholder, and for a code that ends on a byte boundary: the whole
+// byte is the placeholder's.
+HELPER_INLINE __u8 patch_tail_mask(__u8 pad_bits) {
+  return (__u8)(0xff << (pad_bits & 7));
+}
+
+// Turn the len wire bytes of a placeholder, in buf, into the patch's XOR
+// delta: buf ^ real over the placeholder's bits, 0 over the pad_bits bits
+// after it, so that the patched bytes are real followed by the wire's own
+// bits. len is in [1, SECRET_MAX_LEN] (clamp_write_len). Applied to the wire,
+// the delta gives real over the placeholder's bytes; for an HPACK-Huffman
+// entry, whose real is Huffman(real value) with EOS padding, that is the
+// real value's code followed by the next character's bits, unchanged.
+//
+// The last byte is prepared before the loop rather than masked after it: its
+// bits after the placeholder are set to real's, which the loop's XOR then
+// clears. The verifier walks code after the loop once per loop exit (up to
+// SECRET_MAX_LEN of them) until its next prune point, which made the mask
+// after the loop double bpf_xor_path's verifier cost.
+HELPER_INLINE void patch_delta(__u8 buf[SECRET_MAX_LEN],
+                               const char real[SECRET_MAX_LEN], __u32 len,
+                               __u8 pad_bits) {
+  __u32 last = (len - 1) & (SECRET_MAX_LEN - 1);
+  buf[last] ^= (buf[last] ^ (__u8)real[last]) & (__u8)~patch_tail_mask(pad_bits);
+  for (__u32 j = 0; j < SECRET_MAX_LEN && j < len; j++)
+    buf[j] ^= real[j];
+}
+
 // ============================================================================
 // GF(2^128) arithmetic for AES-GCM GHASH tag recomputation.
 // Uses the GHASH convention: MSB-first bit ordering within bytes,

@@ -56,7 +56,7 @@ type secretValue struct {
 	AllowedIp   [16]byte // IPv4-mapped-IPv6
 	Port        uint16   // 0 = wildcard, otherwise port number (host byte order)
 	Protocol    uint8    // IPPROTO_TCP (6) = TCP, IPPROTO_UDP (17) = UDP
-	_           [1]byte  // padding to align PrefixLen (uint32)
+	PadBits     uint8    // low bits of the patch's last byte left unchanged (HPACK-Huffman entry); 0 = none
 	PrefixLen   uint32
 	FullPrefix  [42]byte // SECRET_PREFIX_MAX
 	_           [2]byte  // trailing padding to match C struct alignment

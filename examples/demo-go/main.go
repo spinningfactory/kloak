@@ -40,6 +40,10 @@ func main() {
 	// demos (demo-python, demo-js) still use the volume-mount path.
 	keyAllowed := loadSecret("SECRET_ALLOWED", "SECRET_ALLOWED_FILE", "")
 	keyBlocked := loadSecret("SECRET_BLOCKED", "SECRET_BLOCKED_FILE", "")
+	// Optional: also send the allowed secret followed by this text, in an
+	// X-Secret-Suffixed header, to show that text after a placeholder in
+	// the same header value arrives intact.
+	allowedSuffix := os.Getenv("SECRET_ALLOWED_SUFFIX")
 
 	targetURL := os.Getenv("TARGET_URL")
 	if targetURL == "" {
@@ -105,6 +109,9 @@ func main() {
 		req.Header.Set("X-Secret-Allowed", keyAllowed)
 		req.Header.Set("X-Secret-Blocked", keyBlocked)
 		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", keyAllowed))
+		if allowedSuffix != "" {
+			req.Header.Set("X-Secret-Suffixed", keyAllowed+allowedSuffix)
+		}
 
 		resp, err := client.Do(req)
 		if err != nil {
