@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	ciliumebpf "github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
@@ -63,6 +64,23 @@ func monotonicNow(t *testing.T) uint64 {
 		t.Fatal(err)
 	}
 	return uint64(ts.Nano())
+}
+
+// monotonicAgo returns the CLOCK_MONOTONIC timestamp of age nanoseconds ago,
+// for an entry that old. CLOCK_MONOTONIC starts at boot: in a VM booted for
+// the test (the Kernels workflow's), age can exceed the uptime, and now - age
+// would wrap to a timestamp after now, of an entry not yet created. So it
+// first waits for the uptime to pass age (at most age, once per boot).
+func monotonicAgo(t *testing.T, age uint64) uint64 {
+	t.Helper()
+	now := monotonicNow(t)
+	if now <= age {
+		wait := time.Duration(age-now) + 100*time.Millisecond
+		t.Logf("waiting %s for the uptime to pass %s", wait, time.Duration(age))
+		time.Sleep(wait)
+		now = monotonicNow(t)
+	}
+	return now - age
 }
 
 // tcPatchFixture is a TLS 1.3 AES-128-GCM record carrying a placeholder at
@@ -268,7 +286,7 @@ func TestTCEgressPatchExpiry(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			pv := f.pending(t, c.writeSeq)
-			pv.CreatedAt -= c.age
+			pv.CreatedAt = monotonicAgo(t, c.age)
 			if err := f.objs.TcPending.Update(&dk, &pv, ciliumebpf.UpdateAny); err != nil {
 				t.Fatal(err)
 			}
@@ -291,7 +309,7 @@ func TestTCEgressPatchExpiry(t *testing.T) {
 		{"tag split across segments", 1000 + uint32(len(f.record)) - 8, 0},
 	} {
 		t.Run("deferred tag "+c.name, func(t *testing.T) {
-			tv := tlsuprobeTcTagVal{TagTcpSeq: c.tagSeq, CreatedAt: monotonicNow(t) - c.age}
+			tv := tlsuprobeTcTagVal{TagTcpSeq: c.tagSeq, CreatedAt: monotonicAgo(t, c.age)}
 			if err := f.objs.TcTagPending.Update(&dk, &tv, ciliumebpf.UpdateAny); err != nil {
 				t.Fatal(err)
 			}
