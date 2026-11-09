@@ -75,28 +75,9 @@ func TestMain(m *testing.M) {
 	skipInstall := os.Getenv("E2E_SKIP_INSTALL") != ""
 	if skipInstall {
 		fmt.Println("Skipping Helm install (E2E_SKIP_INSTALL set, assuming kloak is already deployed)")
-	} else {
-		chartDir = filepath.Join(repoRoot, "charts", "kloak")
-		valuesFile := filepath.Join(repoRoot, "test", "e2e", "values-e2e.yaml")
-		helmArgs := []string{"install", "kloak", chartDir, "-n", kloakNamespace, "--create-namespace", "-f", valuesFile, "--wait", "--timeout", "120s"}
-		if imageRegistry != "" {
-			helmArgs = append(helmArgs,
-				"--set", "image.repository="+imageRegistry+"/kloak",
-				"--set", "image.pullPolicy=Always",
-			)
-		}
-		// E2E_HELM_SET adds comma-separated key=value overrides, e.g.
-		// "controller.ebpf.tcAttachMode=clsact" to run the suite against the
-		// clsact tc fallback on a TCX-capable kernel.
-		for _, kv := range strings.Split(os.Getenv("E2E_HELM_SET"), ",") {
-			if kv = strings.TrimSpace(kv); kv != "" {
-				helmArgs = append(helmArgs, "--set", kv)
-			}
-		}
-		if _, err := helm(helmArgs...); err != nil {
-			fmt.Fprintf(os.Stderr, "failed to deploy kloak: %v\n", err)
-			os.Exit(1)
-		}
+	} else if err := installKloak(); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to deploy kloak: %v\n", err)
+		os.Exit(1)
 	}
 
 	// Wait for controller and webhook to be ready
@@ -139,6 +120,29 @@ func TestMain(m *testing.M) {
 
 	teardown()
 	os.Exit(code)
+}
+
+// installKloak installs the kloak release the suite runs against.
+func installKloak() error {
+	chartDir = filepath.Join(repoRoot, "charts", "kloak")
+	valuesFile := filepath.Join(repoRoot, "test", "e2e", "values-e2e.yaml")
+	helmArgs := []string{"install", "kloak", chartDir, "-n", kloakNamespace, "--create-namespace", "-f", valuesFile, "--wait", "--timeout", "120s"}
+	if imageRegistry != "" {
+		helmArgs = append(helmArgs,
+			"--set", "image.repository="+imageRegistry+"/kloak",
+			"--set", "image.pullPolicy=Always",
+		)
+	}
+	// E2E_HELM_SET adds comma-separated key=value overrides, e.g.
+	// "controller.ebpf.tcAttachMode=clsact" to run the suite against the
+	// clsact tc fallback on a TCX-capable kernel.
+	for _, kv := range strings.Split(os.Getenv("E2E_HELM_SET"), ",") {
+		if kv = strings.TrimSpace(kv); kv != "" {
+			helmArgs = append(helmArgs, "--set", kv)
+		}
+	}
+	_, err := helm(helmArgs...)
+	return err
 }
 
 func teardown() {
