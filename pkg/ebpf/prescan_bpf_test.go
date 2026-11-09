@@ -79,7 +79,7 @@ func TestPrescanConfirmsSlots(t *testing.T) {
 		refs = append(refs, secrets.Ref{OwnerID: s.OwnerID})
 	}
 	bindings := map[string]podBinding{"uid": {pod: "ns/client", cgroupIDs: []uint64{cgroupID}, refs: refs}}
-	if err := syncSecretACL(objs.SecretAcl, snapshot, bindings, testLog()); err != nil {
+	if err := syncSecretACL(objs.SecretAcl, snapshot, bindings, true, testLog()); err != nil {
 		t.Fatal(err)
 	}
 

@@ -501,7 +501,7 @@ func TestSyncSecretACL_GrantsAndPrunes(t *testing.T) {
 		"b": {pod: "ns/b", cgroupIDs: []uint64{2}, refs: []secrets.Ref{{OwnerID: "ns/db"}}},
 	}
 
-	if err := syncSecretACL(m, snapshot, bindings, testLog()); err != nil {
+	if err := syncSecretACL(m, snapshot, bindings, true, testLog()); err != nil {
 		t.Fatal(err)
 	}
 	if got, want := aclEntries(t, m), secretACL(snapshot, bindings); len(got) != len(want) {
@@ -510,7 +510,7 @@ func TestSyncSecretACL_GrantsAndPrunes(t *testing.T) {
 
 	// Pod b goes away: its grants must be pruned, pod a's kept.
 	delete(bindings, "b")
-	if err := syncSecretACL(m, snapshot, bindings, testLog()); err != nil {
+	if err := syncSecretACL(m, snapshot, bindings, true, testLog()); err != nil {
 		t.Fatal(err)
 	}
 	got := aclEntries(t, m)

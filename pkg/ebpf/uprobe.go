@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -85,7 +86,10 @@ type watchedHostKey struct {
 
 // TLSUprobeManager manages the loading and attaching of eBPF uprobes for TLS interception.
 type TLSUprobeManager struct {
-	objs       *tlsuprobeObjects
+	objs *tlsuprobeObjects
+	// dispatch holds the uprobe trampolines (dispatch_v1.c): every uprobe
+	// runs one, which tail-calls the pipeline's entry program in its slot.
+	dispatch   *dispatchObjects
 	reader     *ringbuf.Reader
 	procReader *ringbuf.Reader
 	log        *zap.SugaredLogger
@@ -95,6 +99,26 @@ type TLSUprobeManager struct {
 	links   []io.Closer
 	// registry holds the uprobes attached for containers (links.go).
 	registry linkRegistry
+
+	// pins is where the BPF objects are pinned to outlive the controller
+	// (pins.go); nil when they go with it.
+	pins *pinRoot
+	// adopted: the pipeline is the one a previous controller of this build
+	// left pinned, not a new load.
+	adopted bool
+	// adoptedUprobes counts the uprobes adopted from pins at start.
+	adoptedUprobes int
+	// pruneDeferred holds back, until FinishAdopt, the syncs that prune the
+	// maps to the pods' bindings: the adopted maps hold the bindings of the
+	// pods that ran when the controller started, which the reconciliation
+	// has yet to bind again.
+	pruneDeferred atomic.Bool
+	// stopped: the data plane was torn down for an uninstall; nothing is
+	// attached or synced any more.
+	stopped atomic.Bool
+	// teardownMu serializes detachAll; detached records that it ran.
+	teardownMu sync.Mutex
+	detached   bool
 
 	// secretSource produces snapshots of the secrets the BPF map should
 	// hold. The k8s controller wires a pkg/secrets/k8s.Source here; tests
@@ -345,7 +369,14 @@ func parseBPFLogLevel(s string) ebpf.LogLevel {
 //
 // hostRes holds the virtual IP ranges; the virtual IP maps are pinned under
 // hostRes.PinPath, which must be on bpffs.
-func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterface string, hostRes *HostResolutionConfig, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
+//
+// With persist, every BPF object is pinned under hostRes.PinPath too, so
+// that the data plane outlives the controller (pins.go): a controller of the
+// same build adopts what the previous one left there instead of loading and
+// attaching it again (Adopted, FinishAdopt), and Shutdown decides what the
+// next one finds. Without it, or when the pin root is not the host's bpffs,
+// the objects go with the controller.
+func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterface string, hostRes *HostResolutionConfig, persist bool, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
 	if hostRes == nil {
 		return nil, errors.New("no host resolution config")
 	}
@@ -361,53 +392,28 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 	if err := prepareVirtualIPPins(spec, hostRes.pinPath(), log); err != nil {
 		return nil, fmt.Errorf("preparing virtual IP map pins: %w", err)
 	}
-	mapOpts := ebpf.MapOptions{PinPath: hostRes.pinPath()}
 
-	objs := &tlsuprobeObjects{}
-	// Verifier-log level for BPF program loads. Defaults to disabled (0) so the
-	// 1 MB-per-program log buffers aren't allocated proactively. cilium/ebpf
-	// still retries with LogLevelBranch automatically on verifier failure, so
-	// the diagnostic remains available on the only path that needs it.
-	// Set KLOAK_BPF_LOG_LEVEL=branch / instruction / stats to opt in.
-	progOpts := ebpf.ProgramOptions{
-		LogSizeStart: 1 << 20, // 1 MB
-		LogLevel:     parseBPFLogLevel(os.Getenv("KLOAK_BPF_LOG_LEVEL")),
-	}
-	if err := spec.LoadAndAssign(objs, &ebpf.CollectionOptions{
-		Maps:     mapOpts,
-		Programs: progOpts,
-	}); err != nil {
-		var ve *ebpf.VerifierError
-		if errors.As(err, &ve) {
-			// Print only the error summary (includes rejection reason).
-			// The full verifier log can be 100K+ lines and overflows container log buffers.
-			log.Errorw("eBPF verifier rejected program", "error", err)
-		} else {
-			log.Errorw("eBPF loading failed (not a verifier error, check dmesg)",
-				"error", err, "error_type", fmt.Sprintf("%T", err))
+	var pins *pinRoot
+	adoptable := false
+	if persist {
+		if pins, err = openPinRoot(hostRes.pinPath(), log); err != nil {
+			log.Warnw("the BPF programs can't be kept across controller restarts: they are detached with this controller", "error", err)
+			pins = nil
+		} else if adoptable, err = pins.prepare(); err != nil {
+			return nil, fmt.Errorf("preparing the pinned BPF objects: %w", err)
 		}
-		return nil, fmt.Errorf("loading eBPF objects: %w", err)
+	}
+	if pins == nil {
+		// What a previous controller kept attached would run next to this
+		// one's.
+		if err := teardownKeptPins(hostRes.pinPath(), log); err != nil {
+			return nil, fmt.Errorf("detaching the BPF objects a previous controller kept attached: %w", err)
+		}
 	}
 
-	// Wire up tail call map: index 1 -> bpf_xor_path (AES-GCM ciphertext patching)
-	xorFd := uint32(objs.BpfXorPath.FD())
-	if err := objs.ProgArray.Put(uint32(1), xorFd); err != nil {
-		_ = objs.Close()
-		return nil, fmt.Errorf("configuring tail call map index 1: %w", err)
-	}
-
-	// Wire up tail call: index 2 -> bpf_h_extract (GHASH key H extraction)
-	hExtFd := uint32(objs.BpfH_extract.FD())
-	if err := objs.ProgArray.Put(uint32(2), hExtFd); err != nil {
-		_ = objs.Close()
-		return nil, fmt.Errorf("configuring tail call map index 2: %w", err)
-	}
-
-	// Wire up tc tail call: index 0 -> tc_ghash_update
-	tcGhashFd := uint32(objs.TcGhashUpdate.FD())
-	if err := objs.TcProgArray.Put(uint32(0), tcGhashFd); err != nil {
-		_ = objs.Close()
-		return nil, fmt.Errorf("configuring tc tail call map: %w", err)
+	objs, dispatch, pins, adopted, err := openPipeline(spec, pins, adoptable, hostRes.pinPath(), log)
+	if err != nil {
+		return nil, err
 	}
 
 	// Populate the cgroup ancestor map so the exec tracepoint can catch
@@ -420,6 +426,7 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 
 	reader, err := ringbuf.NewReader(objs.SecretBindingEvents)
 	if err != nil {
+		_ = dispatch.Close()
 		_ = objs.Close()
 		return nil, fmt.Errorf("creating ringbuf reader: %w", err)
 	}
@@ -427,15 +434,19 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 	procReader, err := ringbuf.NewReader(objs.ProcEvents)
 	if err != nil {
 		_ = reader.Close()
+		_ = dispatch.Close()
 		_ = objs.Close()
 		return nil, fmt.Errorf("creating proc events ringbuf reader: %w", err)
 	}
 
 	mgr := &TLSUprobeManager{
 		objs:             objs,
+		dispatch:         dispatch,
 		reader:           reader,
 		procReader:       procReader,
 		log:              log,
+		pins:             pins,
+		adopted:          adopted,
 		secretSource:     secretSource,
 		cgroupRoot:       cgroupRoot,
 		kubepods:         kubepods,
@@ -447,12 +458,23 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		dnsRewrite:       make(map[string]*dnsRewriteAttach),
 		dnsRewriteFailed: make(map[string]bool),
 	}
+	// The adopted maps hold the bindings of the pods running now: they are
+	// pruned once the reconciliation has bound those pods again.
+	mgr.pruneDeferred.Store(adopted)
+	if pins != nil {
+		mgr.adoptedUprobes = mgr.adoptUprobes()
+	}
+	// A startup failure keeps what is pinned attached: the pods' writes are
+	// still rewritten while the controller restarts.
+	fail := func(err error) (*TLSUprobeManager, error) {
+		_ = mgr.Shutdown(ShutdownKeep)
+		return nil, err
+	}
 	mgr.virtualIPs = newVirtualIPAllocator(objs, hostRes.VirtualIPRanges, log)
 	mgr.virtualIPs.logRestored()
 	// Without the redirect, a pod handed a fake IP could not connect.
 	if err := mgr.attachVirtualIPRedirect(hostRes.VirtualIPRanges, kubepods); err != nil {
-		_ = mgr.Close()
-		return nil, fmt.Errorf("attaching the virtual IP connect redirect: %w", err)
+		return fail(fmt.Errorf("attaching the virtual IP connect redirect: %w", err))
 	}
 	log.Infow("virtual IP host resolution: kloak pods get fake IPs for watched hosts, connects to them are redirected",
 		"range", hostRes.VirtualIPRanges.String(), "pinPath", hostRes.pinPath(), "cgroup", kubepods)
@@ -461,11 +483,235 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 	// kprobes. These are node-wide, filtered in BPF by tracked_tgids and
 	// tracked_cgroups.
 	if err := mgr.attachTracepoints(); err != nil {
-		_ = mgr.Close()
-		return nil, fmt.Errorf("attaching tracepoints: %w", err)
+		return fail(fmt.Errorf("attaching tracepoints: %w", err))
 	}
 
+	if pins != nil {
+		if err := pins.writeMeta(); err != nil {
+			log.Warnw("recording the active build in the pinned meta failed", "error", err)
+		}
+		log.Infow("BPF programs are pinned, and outlive this controller",
+			"pinPath", hostRes.pinPath(), "build", pins.build, "adopted", adopted, "adoptedUprobes", mgr.adoptedUprobes)
+	}
 	return mgr, nil
+}
+
+// openPipeline returns this build's pipeline and the uprobe trampolines,
+// wired (wirePipeline): adopted from pins when adoptable (pinRoot.prepare)
+// and they check out, loaded otherwise, and pinned there. pins nil: loaded,
+// and not pinned. It returns the pin root it keeps them in: nil when
+// pinning failed (they then go with the controller).
+func openPipeline(spec *ebpf.CollectionSpec, pins *pinRoot, adoptable bool, pinPath string, log *zap.SugaredLogger) (*tlsuprobeObjects, *dispatchObjects, *pinRoot, bool, error) {
+	objs := &tlsuprobeObjects{}
+	adopted := false
+	if adoptable {
+		if err := pins.loadGeneration(spec, objs); err != nil {
+			log.Warnw("the pinned BPF objects of this build can't be adopted: loading them again", "error", err)
+			if err := teardownGen(pins.genDir(), log); err != nil {
+				return nil, nil, nil, false, fmt.Errorf("tearing down the pinned BPF objects: %w", err)
+			}
+		} else {
+			adopted = true
+		}
+	}
+	if !adopted {
+		if err := loadPipeline(spec, objs, pinPath, log); err != nil {
+			return nil, nil, nil, false, err
+		}
+		if pins != nil {
+			if err := pins.pinGeneration(objs); err != nil {
+				log.Errorw("pinning the BPF objects failed: they are detached with this controller", "error", err)
+				// Nothing pinned may run next to this controller's objects.
+				_ = teardownPins(pins.dir, false, log)
+				pins = nil
+			}
+		}
+	}
+	dispatch, _, err := openDispatch(pins)
+	if err != nil {
+		_ = objs.Close()
+		return nil, nil, nil, false, err
+	}
+	if err := wirePipeline(objs, dispatch); err != nil {
+		_ = dispatch.Close()
+		_ = objs.Close()
+		return nil, nil, nil, false, err
+	}
+	return objs, dispatch, pins, adopted, nil
+}
+
+// loadPipeline loads the BPF pipeline of spec into objs, the virtual IP maps
+// pinned under pinPath (prepareVirtualIPPins).
+func loadPipeline(spec *ebpf.CollectionSpec, objs *tlsuprobeObjects, pinPath string, log *zap.SugaredLogger) error {
+	// Verifier-log level for BPF program loads. Defaults to disabled (0) so the
+	// 1 MB-per-program log buffers aren't allocated proactively. cilium/ebpf
+	// still retries with LogLevelBranch automatically on verifier failure, so
+	// the diagnostic remains available on the only path that needs it.
+	// Set KLOAK_BPF_LOG_LEVEL=branch / instruction / stats to opt in.
+	progOpts := ebpf.ProgramOptions{
+		LogSizeStart: 1 << 20, // 1 MB
+		LogLevel:     parseBPFLogLevel(os.Getenv("KLOAK_BPF_LOG_LEVEL")),
+	}
+	if err := spec.LoadAndAssign(objs, &ebpf.CollectionOptions{
+		Maps:     ebpf.MapOptions{PinPath: pinPath},
+		Programs: progOpts,
+	}); err != nil {
+		var ve *ebpf.VerifierError
+		if errors.As(err, &ve) {
+			// Print only the error summary (includes rejection reason).
+			// The full verifier log can be 100K+ lines and overflows container log buffers.
+			log.Errorw("eBPF verifier rejected program", "error", err)
+		} else {
+			log.Errorw("eBPF loading failed (not a verifier error, check dmesg)",
+				"error", err, "error_type", fmt.Sprintf("%T", err))
+		}
+		return fmt.Errorf("loading eBPF objects: %w", err)
+	}
+	return nil
+}
+
+// wirePipeline fills the pipeline's tail-call maps, and puts its entry
+// programs in the uprobe trampolines' slots. Writing a slot again with the
+// same program changes nothing: an adopted pipeline goes through it too.
+func wirePipeline(objs *tlsuprobeObjects, dispatch *dispatchObjects) error {
+	for _, w := range []struct {
+		m    *ebpf.Map
+		slot uint32
+		prog *ebpf.Program
+		what string
+	}{
+		{objs.ProgArray, 1, objs.BpfXorPath, "bpf_xor_path"},    // AES-GCM ciphertext patching
+		{objs.ProgArray, 2, objs.BpfH_extract, "bpf_h_extract"}, // GHASH key H extraction
+		{objs.TcProgArray, 0, objs.TcGhashUpdate, "tc_ghash_update"},
+	} {
+		if err := w.m.Update(w.slot, uint32(w.prog.FD()), ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("configuring tail call %s (index %d): %w", w.what, w.slot, err)
+		}
+	}
+	return fillDispatch(dispatch, objs)
+}
+
+// Adopted reports whether the manager adopted BPF objects a previous
+// controller left pinned: the pipeline of this build, or uprobes on the
+// trampolines. FinishAdopt must then be called once the pods running at the
+// start have been reconciled.
+func (m *TLSUprobeManager) Adopted() bool {
+	return m.adopted || m.adoptedUprobes > 0
+}
+
+// adoptUprobes records in the registry the uprobes a previous controller
+// pinned, and returns how many. A pin that can't be read back, or whose link
+// does not run the trampoline its key says, is removed (which detaches it):
+// the reconciliation attaches the uprobe again.
+func (m *TLSUprobeManager) adoptUprobes() int {
+	dir := m.pins.uprobeDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			m.log.Warnw("reading the pinned uprobes", "error", err)
+		}
+		return 0
+	}
+	want := map[uprobeProg][]ebpf.ProgramID{
+		progSSLWrite:      {programID(m.dispatch.KloakSslWrite)},
+		progGoTLSWrite:    {programID(m.dispatch.KloakGoWrite)},
+		progEVPCipherInit: {programID(m.dispatch.KloakEvpInit), programID(m.dispatch.KloakEvpRet)},
+	}
+	type pinned struct {
+		links []link.Link
+		paths []string
+	}
+	found := make(map[uprobeLinkKey]*pinned)
+	drop := func(path string, l link.Link, err error) {
+		if l != nil {
+			_ = l.Close()
+		}
+		_ = os.Remove(path)
+		m.log.Debugw("detached a pinned uprobe that can't be adopted", "pin", filepath.Base(path), "error", err)
+	}
+	for _, e := range entries {
+		path := filepath.Join(dir, e.Name())
+		key, idx, err := parseUprobePinName(e.Name())
+		if err != nil {
+			drop(path, nil, err)
+			continue
+		}
+		l, err := link.LoadPinnedLink(path, nil)
+		if err != nil {
+			drop(path, nil, err)
+			continue
+		}
+		info, err := l.Info()
+		if err == nil && info.Program != want[key.prog][idx] {
+			err = fmt.Errorf("runs program %d, not the trampoline %d", info.Program, want[key.prog][idx])
+		}
+		if err != nil {
+			drop(path, l, err)
+			continue
+		}
+		p := found[key]
+		if p == nil {
+			p = &pinned{links: make([]link.Link, key.prog.links()), paths: make([]string, key.prog.links())}
+			found[key] = p
+		}
+		p.links[idx], p.paths[idx] = l, path
+	}
+	n := 0
+	for key, p := range found {
+		closers := make([]io.Closer, 0, len(p.links))
+		complete := true
+		for i, l := range p.links {
+			if l == nil {
+				complete = false
+				continue
+			}
+			closers = append(closers, &ownedLink{Link: l, pin: p.paths[i]})
+		}
+		if !complete {
+			// Half of an entry and return probe pair: attached again whole.
+			for _, c := range closers {
+				_ = c.Close()
+			}
+			continue
+		}
+		m.registry.adopt(&key, closers)
+		n++
+	}
+	return n
+}
+
+// addLink records a node-wide link, closed with the manager.
+func (m *TLSUprobeManager) addLink(l io.Closer) {
+	m.linksMu.Lock()
+	m.links = append(m.links, l)
+	m.linksMu.Unlock()
+}
+
+// ensureGlobalLink keeps the node-wide link name of prog attached: the one
+// a previous controller pinned while it still runs prog (and attached, when
+// it reports so), or a new one attach makes, pinned for the next
+// controller.
+func (m *TLSUprobeManager) ensureGlobalLink(name string, prog *ebpf.Program, attach func() (link.Link, error), attached func(*link.Info) bool) error {
+	var path string
+	if m.pins != nil {
+		path = filepath.Join(m.pins.globalLinkDir(), name)
+		if l, err := link.LoadPinnedLink(path, nil); err == nil {
+			info, err := l.Info()
+			if err == nil && info.Program == programID(prog) && (attached == nil || attached(info)) {
+				m.addLink(&ownedLink{Link: l, pin: path})
+				return nil
+			}
+			// Another program's, or detached: replaced.
+			_ = l.Close()
+			_ = os.Remove(path)
+		}
+	}
+	l, err := attach()
+	if err != nil {
+		return err
+	}
+	m.addLink(m.pins.pinLink(l, path))
+	return nil
 }
 
 // attachTracepoints attaches the syscall tracepoints and kprobes for connect tracking and the tcp_sendmsg bridge.
@@ -482,49 +728,41 @@ func (m *TLSUprobeManager) attachTracepoints() error {
 		{"syscalls", "sys_enter_close", m.objs.TpEnterClose},
 		{"sched", "sched_process_exec", m.objs.TpSchedProcessExec},
 		{"sched", "sched_process_exit", m.objs.TpSchedProcessExit},
+		// SNI check: forget a connection's ClientHello SNI when the socket
+		// reconnects or closes.
+		{"sock", "inet_sock_set_state", m.objs.TpInetSockSetState},
 	}
 
 	for _, t := range tracepoints {
-		l, err := link.Tracepoint(t.group, t.name, t.prog, nil)
+		err := m.ensureGlobalLink("tp_"+t.group+"_"+t.name, t.prog, func() (link.Link, error) {
+			return link.Tracepoint(t.group, t.name, t.prog, nil)
+		}, nil)
 		if err != nil {
 			return fmt.Errorf("attaching tracepoint %s/%s: %w", t.group, t.name, err)
 		}
-		m.linksMu.Lock()
-		m.links = append(m.links, l)
-		m.linksMu.Unlock()
 		m.log.Debugw("Attached tracepoint", "group", t.group, "name", t.name)
 	}
 
 	// Attach kprobe on tcp_sendmsg to bridge xor_pending → tc_pending.
 	// This runs after SSL_write encrypts and calls write/send, giving us
 	// access to the struct sock (source port) for per-connection keying.
-	tkp, err := link.Kprobe("tcp_sendmsg", m.objs.BpfKprobeTcpSendmsg, nil)
-	if err != nil {
-		return fmt.Errorf("attaching kprobe tcp_sendmsg: %w", err)
+	// The SNI check records each connection's ClientHello SNI with a second
+	// kprobe on tcp_sendmsg.
+	for _, kp := range []struct {
+		name string
+		prog *ebpf.Program
+	}{
+		{"kprobe_tcp_sendmsg", m.objs.BpfKprobeTcpSendmsg},
+		{"kprobe_tcp_sendmsg_sni", m.objs.BpfKprobeTcpSendmsgSni},
+	} {
+		err := m.ensureGlobalLink(kp.name, kp.prog, func() (link.Link, error) {
+			return link.Kprobe("tcp_sendmsg", kp.prog, nil)
+		}, nil)
+		if err != nil {
+			return fmt.Errorf("attaching %s: %w", kp.name, err)
+		}
 	}
-	m.linksMu.Lock()
-	m.links = append(m.links, tkp)
-	m.linksMu.Unlock()
-	m.log.Debugw("Attached kprobe", "function", "tcp_sendmsg")
-
-	// SNI check: record each connection's ClientHello SNI (a second kprobe
-	// on tcp_sendmsg) and forget it when the socket reconnects or closes.
-	skp, err := link.Kprobe("tcp_sendmsg", m.objs.BpfKprobeTcpSendmsgSni, nil)
-	if err != nil {
-		return fmt.Errorf("attaching SNI kprobe tcp_sendmsg: %w", err)
-	}
-	m.linksMu.Lock()
-	m.links = append(m.links, skp)
-	m.linksMu.Unlock()
-	stp, err := link.Tracepoint("sock", "inet_sock_set_state", m.objs.TpInetSockSetState, nil)
-	if err != nil {
-		return fmt.Errorf("attaching tracepoint sock/inet_sock_set_state: %w", err)
-	}
-	m.linksMu.Lock()
-	m.links = append(m.links, stp)
-	m.linksMu.Unlock()
-	m.log.Debugw("Attached SNI capture", "kprobe", "tcp_sendmsg", "tracepoint", "sock/inet_sock_set_state")
-
+	m.log.Debugw("Attached kprobes", "function", "tcp_sendmsg")
 	return nil
 }
 
@@ -576,6 +814,9 @@ func (m *TLSUprobeManager) SetTCAttachMode(mode TCAttachMode) {
 // would patch each record twice and corrupt it, so an attachment kloak has
 // is never attached again.
 func (m *TLSUprobeManager) attachTCEgress(pid int, cgroupID uint64) error {
+	if m.stopped.Load() {
+		return errStopped
+	}
 	netnsPath := fmt.Sprintf("/proc/%d/ns/net", pid)
 	podNetns, err := netnsInode(netnsPath)
 	if err != nil {
@@ -1197,6 +1438,10 @@ func (m *TLSUprobeManager) releasePodTC(netnsIno uint64) {
 	m.detachAsync(closers, "tc patch program of a released pod netns", "netns_ino", netnsIno)
 }
 
+// errStopped is returned by the attaches once the data plane was torn down
+// for an uninstall (Uninstall).
+var errStopped = errors.New("the eBPF data plane was torn down for an uninstall")
+
 // AttachTLS attaches system-wide eBPF uprobes to all TLS libraries in a
 // container. The uprobes fire for ALL processes that map the libraries
 // (every container of the image shares them, see fileIdentity). The BPF
@@ -1206,6 +1451,9 @@ func (m *TLSUprobeManager) releasePodTC(netnsIno uint64) {
 // through the link registry (links.go): one the registry has is not attached
 // again, and the container is recorded as needing it.
 func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
+	if m.stopped.Load() {
+		return errStopped
+	}
 	return m.attachTLS(pid, cgroupID, true)
 }
 
@@ -1218,6 +1466,9 @@ func (m *TLSUprobeManager) AttachTLS(pid int, cgroupID uint64) error {
 // executable is attached on its exec event (PollExecEvents), with what
 // depends on it: the TLS linked into it, and its H-extraction strategy.
 func (m *TLSUprobeManager) AttachContainerTLS(pid int, cgroupID uint64) error {
+	if m.stopped.Load() {
+		return errStopped
+	}
 	return m.attachTLS(pid, cgroupID, false)
 }
 
@@ -1259,59 +1510,78 @@ type uprobeSpec struct {
 // exeUprobe is the uprobe running prog at symbol (or file offset addr) of
 // p's executable, for p only.
 func (m *TLSUprobeManager) exeUprobe(p *tlsProcess, symbol string, addr uint64, prog uprobeProg) *uprobeSpec {
-	return &uprobeSpec{
-		key: uprobeLinkKey{pid: p.pid, start: p.start, file: p.exeFile, symbol: symbol, addr: addr, prog: prog},
-		attach: func() ([]io.Closer, error) {
-			return m.attachUprobe(p.exe, symbol, prog, &link.UprobeOptions{PID: p.pid, Address: addr})
-		},
+	spec := &uprobeSpec{key: uprobeLinkKey{pid: p.pid, start: p.start, file: p.exeFile, symbol: symbol, addr: addr, prog: prog}}
+	spec.attach = func() ([]io.Closer, error) {
+		return m.attachUprobe(&spec.key, p.exe, &link.UprobeOptions{PID: p.pid, Address: addr})
 	}
+	return spec
 }
 
 // libUprobe is the uprobe running prog at symbol of the library ex, file
 // file, for every process that maps it.
 func (m *TLSUprobeManager) libUprobe(ex *link.Executable, file fileKey, symbol string, prog uprobeProg) *uprobeSpec {
-	return &uprobeSpec{
-		key: uprobeLinkKey{file: file, symbol: symbol, prog: prog},
-		attach: func() ([]io.Closer, error) {
-			return m.attachUprobe(ex, symbol, prog, nil)
-		},
+	spec := &uprobeSpec{key: uprobeLinkKey{file: file, symbol: symbol, prog: prog}}
+	spec.attach = func() ([]io.Closer, error) {
+		return m.attachUprobe(&spec.key, ex, nil)
 	}
+	return spec
 }
 
 // ensureUprobe attaches the uprobe of spec unless the link registry has it,
 // and records container cgroupID as needing it. It reports whether it
 // attached it.
 func (m *TLSUprobeManager) ensureUprobe(spec *uprobeSpec, cgroupID uint64) (bool, error) {
+	if m.stopped.Load() {
+		return false, errStopped
+	}
 	return m.registry.ensure(&spec.key, cgroupID, spec.attach)
 }
 
-// attachUprobe attaches prog at symbol (or opts.Address) of ex.
-func (m *TLSUprobeManager) attachUprobe(ex *link.Executable, symbol string, prog uprobeProg, opts *link.UprobeOptions) ([]io.Closer, error) {
-	switch prog {
+// attachUprobe attaches the uprobe of key, at key.symbol (or opts.Address)
+// of ex: it runs the trampoline of key.prog (dispatch_v1.c), and is pinned
+// under its key (uprobePinName) to outlive the controller.
+func (m *TLSUprobeManager) attachUprobe(key *uprobeLinkKey, ex *link.Executable, opts *link.UprobeOptions) ([]io.Closer, error) {
+	var links []link.Link
+	switch key.prog {
 	case progSSLWrite, progGoTLSWrite:
-		p := m.objs.BpfUprobeSslWrite
-		if prog == progGoTLSWrite {
-			p = m.objs.BpfUprobeGoTlsWrite
+		p := m.dispatch.KloakSslWrite
+		if key.prog == progGoTLSWrite {
+			p = m.dispatch.KloakGoWrite
 		}
-		up, err := ex.Uprobe(symbol, p, opts)
+		up, err := ex.Uprobe(key.symbol, p, opts)
 		if err != nil {
 			return nil, err
 		}
-		return []io.Closer{up}, nil
+		links = []link.Link{up}
 	case progEVPCipherInit:
-		up, err := ex.Uprobe(symbol, m.objs.BpfUprobeEvpCipherInit, opts)
+		up, err := ex.Uprobe(key.symbol, m.dispatch.KloakEvpInit, opts)
 		if err != nil {
 			return nil, err
 		}
-		ret, err := ex.Uretprobe(symbol, m.objs.BpfUretprobeEvpCipherInit, opts)
+		ret, err := ex.Uretprobe(key.symbol, m.dispatch.KloakEvpRet, opts)
 		if err != nil {
 			_ = up.Close()
 			return nil, err
 		}
-		return []io.Closer{up, ret}, nil
+		links = []link.Link{up, ret}
 	default:
-		return nil, fmt.Errorf("unknown uprobe program %d", prog)
+		return nil, fmt.Errorf("unknown uprobe program %d", key.prog)
 	}
+	out := make([]io.Closer, len(links))
+	for i, l := range links {
+		var path string
+		if m.pins != nil {
+			if name, ok := uprobePinName(key, i); ok {
+				path = filepath.Join(m.pins.uprobeDir(), name)
+			}
+		}
+		if path == "" {
+			out[i] = &ownedLink{Link: l}
+			continue
+		}
+		out[i] = m.pins.pinLink(l, path)
+	}
+	return out, nil
 }
 
 // retainProcess detaches the process-scoped uprobes recorded for process
@@ -1945,7 +2215,15 @@ func isTLSLibrary(name string) bool {
 		strings.HasPrefix(name, "libgnutls.so")
 }
 
-// Close releases all links and the eBPF manager.
+// Close detaches everything and releases the manager:
+// Shutdown(ShutdownDetach).
+func (m *TLSUprobeManager) Close() error {
+	return m.Shutdown(ShutdownDetach)
+}
+
+// Shutdown releases the manager, leaving the data plane as mode says: kept
+// attached for the next controller (the pinned programs and links; without
+// pins, ShutdownKeep detaches), detached, or uninstalled.
 //
 // Each link.Close on a uprobe is a kernel syscall that takes ~50-100 ms,
 // and a node with many kloak pods holds hundreds of uprobes (the link
@@ -1954,7 +2232,7 @@ func isTLSLibrary(name string) bool {
 // runtime gets to flush exit hooks (which lost us the e2e covcounters
 // flush, among other things). Close concurrently with a bounded worker
 // pool so wall time stays inside the grace period.
-func (m *TLSUprobeManager) Close() error {
+func (m *TLSUprobeManager) Shutdown(mode ShutdownMode) error {
 	t0 := time.Now()
 	// Drain in-flight retry goroutines first. PollExecEvents is expected to
 	// be cancelled before Close() is called (its ctx fires the retry's
@@ -1983,6 +2261,73 @@ func (m *TLSUprobeManager) Close() error {
 	case <-detached:
 	case <-time.After(10 * time.Second):
 		m.log.Warnw("timed out waiting for released links to detach; proceeding with teardown")
+	}
+
+	linkCount, mode, err := m.detachAll(mode)
+	var errs []error
+	if err != nil {
+		errs = append(errs, err)
+	}
+	if m.reader != nil {
+		if err := m.reader.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if m.procReader != nil {
+		if err := m.procReader.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if m.dispatch != nil {
+		if err := m.dispatch.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	if m.objs != nil {
+		if err := m.objs.Close(); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	m.log.Infow("Close: done", "mode", mode.String(), "links", linkCount, "duration", time.Since(t0).String())
+	if len(errs) > 0 {
+		return fmt.Errorf("errors closing uprobe manager: %v", errs)
+	}
+	return nil
+}
+
+// Uninstall tears the data plane down while the controller runs, for an
+// uninstall: nothing is attached or synced from then on, the real secrets
+// leave the kernel's maps, every link is detached and the pin root removed.
+// The maps stay open, for what still reads them, until Shutdown.
+func (m *TLSUprobeManager) Uninstall() error {
+	m.stopped.Store(true)
+	n, _, err := m.detachAll(ShutdownUninstall)
+	m.log.Infow("eBPF data plane torn down for an uninstall", "links", n, "error", err)
+	return err
+}
+
+// detachAll lets go of every link as mode says (once: a later call does
+// nothing), and returns how many there were and the mode it applied.
+func (m *TLSUprobeManager) detachAll(mode ShutdownMode) (int, ShutdownMode, error) {
+	m.teardownMu.Lock()
+	defer m.teardownMu.Unlock()
+	if m.detached {
+		return 0, mode, nil
+	}
+	m.detached = true
+	if mode == ShutdownKeep && m.pins == nil {
+		mode = ShutdownDetach // nothing is pinned to keep
+	}
+	var errs []error
+	if mode != ShutdownKeep {
+		// Every uprobe does nothing from now on, whatever is still
+		// attached while the rest goes.
+		if m.dispatch != nil {
+			errs = append(errs, clearDispatch(m.dispatch.KloakDispatch))
+		}
+		if mode == ShutdownUninstall && m.objs != nil {
+			errs = append(errs, emptyMap(m.objs.SecretMap))
+		}
 	}
 
 	// Snapshot + nil out the slice under the lock, then release before doing
@@ -2019,8 +2364,15 @@ func (m *TLSUprobeManager) Close() error {
 	}
 	m.dnsRewriteMu.Unlock()
 
+	// Kept: the pinned links and the cls_bpf filters stay attached, only
+	// this process's handles on them go.
+	closeOne := func(c io.Closer) error {
+		if r, ok := c.(releaser); ok && mode == ShutdownKeep {
+			return r.release()
+		}
+		return c.Close()
+	}
 	linkCount := len(links)
-	var errs []error
 	var errsMu sync.Mutex
 
 	// Cap workers at the number of links — no point spinning up 64
@@ -2037,7 +2389,7 @@ func (m *TLSUprobeManager) Close() error {
 		go func() {
 			defer wg.Done()
 			for l := range jobs {
-				if err := l.Close(); err != nil {
+				if err := closeOne(l); err != nil {
 					errsMu.Lock()
 					errs = append(errs, err)
 					errsMu.Unlock()
@@ -2051,26 +2403,103 @@ func (m *TLSUprobeManager) Close() error {
 	close(jobs)
 	wg.Wait()
 
-	if m.reader != nil {
-		if err := m.reader.Close(); err != nil {
-			errs = append(errs, err)
+	if mode != ShutdownKeep && m.pins != nil {
+		errs = append(errs, teardownPins(m.pins.dir, mode == ShutdownUninstall, m.log))
+	}
+	return linkCount, mode, errors.Join(errs...)
+}
+
+// emptyMap deletes every entry of the hash map mp.
+func emptyMap(mp *ebpf.Map) error {
+	key := make([]byte, mp.KeySize())
+	for {
+		if err := mp.NextKey(nil, &key); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				return nil
+			}
+			return err
+		}
+		if err := mp.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return err
 		}
 	}
-	if m.procReader != nil {
-		if err := m.procReader.Close(); err != nil {
-			errs = append(errs, err)
+}
+
+// FinishAdopt ends the adoption of what a previous controller left pinned,
+// once the pods that ran when this one started have been reconciled: what
+// none of them claimed is detached (the uprobes, tc patch programs and DNS
+// rewrites of pods that went while no controller ran), and the syncs prune
+// the maps to the pods' bindings again.
+func (m *TLSUprobeManager) FinishAdopt() {
+	uprobes := m.registry.releaseUnclaimed()
+	m.detachAsync(uprobes, "adopted uprobes no container claimed")
+	tcx := m.releaseUnclaimedTCX()
+
+	m.pruneDeferred.Store(false)
+	m.bindMu.Lock()
+	var err error
+	if m.lastSnapshot != nil && !m.stopped.Load() {
+		err = syncSecretACL(m.objs.SecretAcl, m.lastSnapshot, m.bindings, true, m.log)
+		if m.virtualIPs != nil {
+			err = errors.Join(err, syncVipPodHost(m.objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, m.bindingMode == SecretBindingAudit), true, m.log))
 		}
 	}
-	if m.objs != nil {
-		if err := m.objs.Close(); err != nil {
-			errs = append(errs, err)
+	m.bindMu.Unlock()
+	m.log.Infow("adopted the pinned BPF objects: detached what no pod claimed",
+		"uprobeLinks", len(uprobes), "tcxLinks", tcx, "pruneError", err)
+}
+
+// releaseUnclaimedTCX removes the pins of this build's TCX links that no pod
+// netns recorded in podTC or dnsRewrite claimed (which detaches them), and
+// returns how many. The pins are listed first: an attach holds its entry's
+// lock until it is recorded, so a pin listed is either claimed by then or
+// unclaimed.
+func (m *TLSUprobeManager) releaseUnclaimedTCX() int {
+	if m.pins == nil {
+		return 0
+	}
+	entries, err := os.ReadDir(m.pins.tcxLinkDir())
+	if err != nil {
+		return 0
+	}
+	claimed := make(map[string]bool)
+	claim := func(c io.Closer) {
+		if l, ok := c.(*ownedLink); ok && l.pin != "" {
+			claimed[l.pin] = true
 		}
 	}
-	m.log.Infow("Close: done", "links", linkCount, "duration", time.Since(t0).String())
-	if len(errs) > 0 {
-		return fmt.Errorf("errors closing uprobe manager: %v", errs)
+	m.tcMu.Lock()
+	pods := make([]*podTC, 0, len(m.podTC))
+	for _, e := range m.podTC {
+		pods = append(pods, e)
 	}
-	return nil
+	m.tcMu.Unlock()
+	for _, e := range pods {
+		e.mu.Lock()
+		for _, l := range e.links {
+			claim(l)
+		}
+		e.mu.Unlock()
+	}
+	m.dnsRewriteMu.Lock()
+	for _, a := range m.dnsRewrite {
+		for _, l := range a.links {
+			claim(l)
+		}
+	}
+	m.dnsRewriteMu.Unlock()
+
+	n := 0
+	for _, e := range entries {
+		path := filepath.Join(m.pins.tcxLinkDir(), e.Name())
+		if claimed[path] {
+			continue
+		}
+		if err := os.Remove(path); err == nil {
+			n++
+		}
+	}
+	return n
 }
 
 // PollExecEvents reads process exec events from the proc_events ring buffer
@@ -2279,7 +2708,7 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 // were. A failed map operation does not stop the others; the error reports
 // it, and a retry completes the maps.
 func (m *TLSUprobeManager) SyncSecrets(ctx context.Context) error {
-	if m.secretSource == nil {
+	if m.secretSource == nil || m.stopped.Load() {
 		return nil
 	}
 	snapshot, err := m.secretSource.Snapshot(ctx)
@@ -2296,10 +2725,11 @@ func (m *TLSUprobeManager) SyncSecrets(ctx context.Context) error {
 	m.bindMu.Lock()
 	defer m.bindMu.Unlock()
 	m.lastSnapshot = snapshot
-	aclErr := syncSecretACL(m.objs.SecretAcl, snapshot, m.bindings, m.log)
+	prune := !m.pruneDeferred.Load()
+	aclErr := syncSecretACL(m.objs.SecretAcl, snapshot, m.bindings, prune, m.log)
 	var podHostErr error
 	if m.virtualIPs != nil {
-		podHostErr = syncVipPodHost(m.objs.VipPodHost, vipPodHosts(snapshot, m.bindings, m.bindingMode == SecretBindingAudit), m.log)
+		podHostErr = syncVipPodHost(m.objs.VipPodHost, vipPodHosts(snapshot, m.bindings, m.bindingMode == SecretBindingAudit), prune, m.log)
 	}
 	return errors.Join(secretsErr, vipErr, aclErr, podHostErr)
 }
@@ -2482,7 +2912,7 @@ func (m *TLSUprobeManager) UnbindPod(podUID string) {
 	if m.virtualIPs != nil && len(b.podIPs) > 0 {
 		// Failures are logged entry by entry, and the next secret sync
 		// prunes what is left.
-		_ = syncVipPodHost(m.objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, m.bindingMode == SecretBindingAudit), m.log)
+		_ = syncVipPodHost(m.objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, m.bindingMode == SecretBindingAudit), !m.pruneDeferred.Load(), m.log)
 	}
 }
 

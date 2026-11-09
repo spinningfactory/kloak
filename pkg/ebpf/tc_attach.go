@@ -58,19 +58,32 @@ func newTCModeResolver(mode TCAttachMode) *tcModeResolver {
 // nsFd must be an open handle to that same netns; the clsact path keeps a
 // duplicate of it so the filter can be removed later from any thread.
 //
+// A TCX link of prog the hook has already (one a previous controller of the
+// same build pinned) is adopted rather than attached again: the program
+// would run twice, and patch each record twice. A new TCX link is pinned
+// under the generation (pinRoot.tcxPin), to outlive the controller. A
+// cls_bpf filter outlives it anyway, and replaces the one there.
+// Whichever mode attaches, prog's attachment of the other mode on the hook
+// (after --tc-attach-mode changed) is removed, for the same reason.
+//
 // The returned io.Closer detaches the program.
 func (m *TLSUprobeManager) attachTCProgram(prog *ebpf.Program, ifindex int, ingress bool, nsFd *os.File) (io.Closer, error) {
+	attach := ebpf.AttachTCXEgress
+	if ingress {
+		attach = ebpf.AttachTCXIngress
+	}
 	if !m.tcMode.useClsact.Load() {
-		attach := ebpf.AttachTCXEgress
-		if ingress {
-			attach = ebpf.AttachTCXIngress
+		if l := m.adoptTCX(prog, ifindex, attach); l != nil {
+			deleteClsactFilter(ifindex, ingress)
+			return l, nil
 		}
 		// First on the hook: a program before it (a CNI's) could redirect
 		// the packet, and the patch would never run. Kloak's programs
 		// return TC_ACT_UNSPEC (TCX_NEXT), so the others still run.
 		l, err := attachTCX(link.TCXOptions{Interface: ifindex, Program: prog, Attach: attach, Anchor: link.Head()})
 		if err == nil {
-			return l, nil
+			deleteClsactFilter(ifindex, ingress)
+			return m.pinTCX(l), nil
 		}
 		if m.tcMode.configured != TCAttachAuto || !errors.Is(err, ebpf.ErrNotSupported) {
 			return nil, err
@@ -80,7 +93,89 @@ func (m *TLSUprobeManager) attachTCProgram(prog *ebpf.Program, ifindex int, ingr
 				"error", err)
 		}
 	}
+	if l := m.adoptTCX(prog, ifindex, attach); l != nil {
+		if err := l.Close(); err != nil {
+			return nil, fmt.Errorf("detaching the TCX link the clsact filter replaces: %w", err)
+		}
+	}
 	return attachClsact(prog, ifindex, ingress, nsFd)
+}
+
+// adoptTCX returns the TCX link that runs prog on the hook (ifindex, attach)
+// of the calling thread's netns, or nil if there is none.
+func (m *TLSUprobeManager) adoptTCX(prog *ebpf.Program, ifindex int, attach ebpf.AttachType) *ownedLink {
+	res, err := link.QueryPrograms(link.QueryOptions{Target: ifindex, Attach: attach})
+	if err != nil {
+		return nil // no TCX here
+	}
+	want := programID(prog)
+	for _, p := range res.Programs {
+		id, ok := p.LinkID()
+		if p.ID != want || !ok {
+			continue
+		}
+		l, err := link.NewFromID(id)
+		if err != nil {
+			continue
+		}
+		if m.pins == nil {
+			return &ownedLink{Link: l}
+		}
+		if path := m.pins.tcxPin(id); fileExists(path) {
+			return &ownedLink{Link: l, pin: path}
+		}
+		return m.pinTCX(l)
+	}
+	return nil
+}
+
+// pinTCX pins the TCX link l under the generation, by its ID.
+func (m *TLSUprobeManager) pinTCX(l link.Link) *ownedLink {
+	if m.pins == nil {
+		return &ownedLink{Link: l}
+	}
+	info, err := l.Info()
+	if err != nil {
+		return &ownedLink{Link: l}
+	}
+	return m.pins.pinLink(l, m.pins.tcxPin(info.ID))
+}
+
+// deleteClsactFilter removes kloak's cls_bpf filter from the hook
+// (ifindex, ingress) of the calling thread's netns, if it has one.
+func deleteClsactFilter(ifindex int, ingress bool) {
+	h, err := netlink.NewHandle(unix.NETLINK_ROUTE)
+	if err != nil {
+		return
+	}
+	defer h.Close()
+	lk, err := h.LinkByIndex(ifindex)
+	if err != nil {
+		return
+	}
+	parent := uint32(netlink.HANDLE_MIN_EGRESS)
+	if ingress {
+		parent = netlink.HANDLE_MIN_INGRESS
+	}
+	filters, err := h.FilterList(lk, parent)
+	if err != nil {
+		return
+	}
+	for _, f := range filters {
+		if bf, ok := f.(*netlink.BpfFilter); ok && isKloakFilter(bf) {
+			_ = h.FilterDel(bf)
+		}
+	}
+}
+
+// isKloakFilter reports whether f is a cls_bpf filter attachClsact made.
+func isKloakFilter(f *netlink.BpfFilter) bool {
+	return f.Handle == clsactFilterHandle && f.Priority == clsactFilterPriority && f.Name == clsactFilterName
+}
+
+func fileExists(path string) bool {
+	_, err := os.Lstat(path)
+	return err == nil
 }
 
 // clsactFilter is an attached cls_bpf filter. Close removes it.
@@ -140,6 +235,12 @@ func attachClsact(prog *ebpf.Program, ifindex int, ingress bool, nsFd *os.File) 
 		return nil, fmt.Errorf("duplicating netns fd: %w", err)
 	}
 	return &clsactFilter{nsFd: dup, filter: filter}, nil
+}
+
+// release closes the filter's netns handle and leaves the filter in place:
+// a cls_bpf filter outlives the controller, and the next one replaces it.
+func (f *clsactFilter) release() error {
+	return unix.Close(f.nsFd)
 }
 
 // Close removes the filter. It may run on any goroutine: the netlink handle

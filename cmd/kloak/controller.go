@@ -164,7 +164,7 @@ func runController(cmd *cobra.Command, args []string) {
 			_ = setupLog.Sync()
 			os.Exit(1)
 		}
-		uprobeMgr, err = ebpf.NewTLSUprobeManager(k8ssecrets.NewSource(mgr.GetClient()).WithLog(setupLog), cgroupPath, egressInterface, &hostRes, setupLog)
+		uprobeMgr, err = ebpf.NewTLSUprobeManager(k8ssecrets.NewSource(mgr.GetClient()).WithLog(setupLog), cgroupPath, egressInterface, &hostRes, false, setupLog)
 		if err != nil {
 			setupLog.Errorw("failed to initialize eBPF uprobe manager", "error", err)
 			_ = setupLog.Sync()
