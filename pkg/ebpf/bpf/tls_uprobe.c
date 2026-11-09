@@ -400,26 +400,6 @@ struct {
   __type(value, struct evp_h_val);
 } evp_h_cache SEC(".maps");
 
-// Per-process H-extraction strategy. Written by the controller when the
-// libcrypto EVP_CipherInit_ex uretprobe attaches successfully for a pid.
-// Read in bpf_uprobe_ssl_write to choose between the cache-lookup path
-// (LIBCRYPTO_HOOK) and the legacy kprobe-walk path (default 0).
-//   0 = STRATEGY_KPROBE_WALK    — BoringSSL, static binaries, OpenSSL where
-//                                 the libcrypto attach failed. Pre-existing
-//                                 SSL_write→xor_path→kprobe-walks-chain flow.
-//   1 = STRATEGY_LIBCRYPTO_HOOK — OpenSSL where libcrypto.so was found and
-//                                 EVP_CipherInit_ex hooks are in place.
-//                                 SSL_write→h_extract(cache)→xor_path→kprobe
-//                                 reads H from xor_pending.
-#define STRATEGY_KPROBE_WALK    0
-#define STRATEGY_LIBCRYPTO_HOOK 1
-struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 4096);
-  __type(key, __u32);   // tgid
-  __type(value, __u8);  // strategy
-} tls_strategy SEC(".maps");
-
 // A watched hostname, zero-padded: the key of vip_host_ip.
 struct watched_host_key {
   char host[MAX_HOST_LEN];
@@ -1008,6 +988,29 @@ struct {
   __type(value, struct tls_offsets);
 } tls_offset_config SEC(".maps");
 
+// Per-binary H-extraction strategy, keyed like the offsets (tls_binary_key):
+// by cgroup, which the controller can name whatever PID namespace it runs in,
+// and cleans up with the container, and by executable, which decides the
+// strategy with the container's libraries. Written by the controller when
+// the libcrypto EVP_CipherInit_ex uretprobe attaches for a binary. Read in
+// bpf_uprobe_ssl_write to choose between the cache-lookup path
+// (LIBCRYPTO_HOOK) and the legacy kprobe-walk path (default 0).
+//   0 = STRATEGY_KPROBE_WALK    — BoringSSL, static binaries, OpenSSL where
+//                                 the libcrypto attach failed. Pre-existing
+//                                 SSL_write→xor_path→kprobe-walks-chain flow.
+//   1 = STRATEGY_LIBCRYPTO_HOOK — OpenSSL where libcrypto.so was found and
+//                                 EVP_CipherInit_ex hooks are in place.
+//                                 SSL_write→h_extract(cache)→xor_path→kprobe
+//                                 reads H from xor_pending.
+#define STRATEGY_KPROBE_WALK    0
+#define STRATEGY_LIBCRYPTO_HOOK 1
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 4096);
+  __type(key, struct tls_binary_key);
+  __type(value, __u8);  // strategy
+} tls_strategy SEC(".maps");
+
 // Go crypto/tls struct offsets for H extraction.
 // Keyed by TGID (per-process), allowing different Go versions to coexist.
 //
@@ -1060,6 +1063,7 @@ struct tc_pending_val {
   __u8  _pad[3];
   __u32 plaintext_len;      // SSL_write data length (for TLS version detection)
   __u32 write_seq;          // TCP write_seq at time of tcp_sendmsg — identifies the exact segment
+  __u64 created_at;         // bpf_ktime_get_ns() at tcp_sendmsg: expires unused (tc_entry_expired)
 };
 
 // Holds all large structs and buffers that would otherwise exceed the 512-byte
@@ -1070,6 +1074,9 @@ struct ghash_work {
   struct tc_pending_val staged_tc;       // for tc_pending map insert
   // Ciphertext patching buffers
   __u8 ct_buf[SECRET_MAX_LEN]; // Ciphertext chunk for XOR patching
+  // The patched ciphertext of each staged patch, which tc_egress_patch reads
+  // and XORs, and tc_ghash_update writes with the recomputed tag.
+  __u8 ct_patched[XOR_MAX_PATCHES][SECRET_MAX_LEN];
   __u8 old_tag[16];            // Original auth tag from TLS record
   __u8 tag_delta[16];          // Accumulated tag correction
   __u8 new_tag[16];            // Patched auth tag
@@ -1158,6 +1165,8 @@ struct {
 struct tc_tag_val {
   __u8  tag_delta[16];    // precomputed GHASH correction: new_tag = old_tag ^ delta
   __u32 tag_tcp_seq;      // TCP seq number of the byte where the auth tag starts
+  __u32 _pad;
+  __u64 created_at;       // bpf_ktime_get_ns() when deferred: expires (tc_tag_action)
 };
 
 struct {
@@ -2307,10 +2316,10 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   }
 
   // TTL cleanup: for memory BIO apps, xor_pending persists across tcp_sendmsg
-  // calls. Delete stale entries older than 2 seconds to bound kprobe overhead.
-  // 2s is generous — the encrypt→writev gap is typically <10ms.
+  // calls. Delete stale entries (XOR_PENDING_TTL_NS) to bound kprobe overhead.
+  // The encrypt→writev gap is typically <10ms.
   if (pending->memory_bio &&
-      bpf_ktime_get_ns() - pending->created_at > 2000000000ULL) {
+      tc_entry_expired(bpf_ktime_get_ns(), pending->created_at, XOR_PENDING_TTL_NS)) {
     bpf_map_delete_elem(&xor_pending, &tgid);
     return 0;
   }
@@ -2631,6 +2640,7 @@ h_ready:;
   // Disable seq check so tc_egress matches by TLS header + record validation.
   // For socket BIO apps: write_seq is always correct (synchronous call chain).
   w->staged_tc.write_seq = is_membio ? 0 : wseq;
+  w->staged_tc.created_at = bpf_ktime_get_ns();
 
   bpf_map_update_elem(&tc_pending, &tdk, &w->staged_tc, BPF_ANY);
   dbg_inc(DBG_KPROBE_BRIDGE);
@@ -2848,14 +2858,17 @@ int bpf_uprobe_ssl_write(void *ctx) {
     bpf_loop(num_chunks, prescan_chunk, &pctx, 0);
   }
 
-  // Route by per-process H-extraction strategy. STRATEGY_LIBCRYPTO_HOOK
+  // Route by the binary's H-extraction strategy. STRATEGY_LIBCRYPTO_HOOK
   // (set by the controller when EVP_CipherInit_ex hooks attached for this
-  // pid's libcrypto.so) goes through h_extract → cache lookup → xor_path.
+  // binary's libcrypto) goes through h_extract → cache lookup → xor_path.
   // STRATEGY_KPROBE_WALK (default — BoringSSL, statically-linked, or
   // libcrypto attach failed) goes straight to xor_path; the tcp_sendmsg
-  // kprobe then walks SSL→…→H itself, exactly as on main today.
-  __u32 cur_tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-  __u8 *strat = bpf_map_lookup_elem(&tls_strategy, &cur_tgid);
+  // kprobe then walks SSL→…→H itself.
+  struct tls_binary_key sk = {};
+  sk.cgroup_id = cgroup_id;
+  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
+  sk.exe_inode = BPF_CORE_READ(task, mm, exe_file, f_inode, i_ino);
+  __u8 *strat = bpf_map_lookup_elem(&tls_strategy, &sk);
   if (strat && *strat == STRATEGY_LIBCRYPTO_HOOK) {
     bpf_tail_call(ctx, &prog_array, 2);
   } else {
@@ -3051,9 +3064,9 @@ int tc_egress_patch(struct __sk_buff *skb) {
     struct tc_tag_val *tag = bpf_map_lookup_elem(&tc_tag_pending, &key);
     if (tag) {
       __u32 tag_seq = tag->tag_tcp_seq;
-      __u32 pkt_end = pkt_seq + payload_len;
-      // Check if the tag's byte position falls within this segment.
-      if (pkt_seq <= tag_seq && tag_seq + 16 <= pkt_end) {
+      int action = tc_tag_action(pkt_seq, payload_len, tag_seq,
+                                 bpf_ktime_get_ns(), tag->created_at);
+      if (action == TC_TAG_PATCH) {
         __u32 tag_off = payload_off + (tag_seq - pkt_seq);
         __u8 old_tag[16], new_tag[16];
         if (bpf_skb_load_bytes(skb, tag_off, old_tag, 16) >= 0) {
@@ -3065,10 +3078,19 @@ int tc_egress_patch(struct __sk_buff *skb) {
 #endif
         }
         bpf_map_delete_elem(&tc_tag_pending, &key);
+        return TC_PASS;
       }
-      // Whether we patched or not, return — this segment is a continuation,
-      // not a new TLS record. Don't process it further.
-      return TC_PASS;
+      if (action == TC_TAG_WAIT)
+        // A continuation of the record, not a new one: don't process it
+        // further.
+        return TC_PASS;
+      // TC_TAG_DROP: the tag can no longer be patched. Forget it, so that
+      // the connection's next records are patched, and look at this
+      // segment as any other.
+      bpf_map_delete_elem(&tc_tag_pending, &key);
+#ifdef KLOAK_DEBUG
+      bpf_printk("kloak [5-TAG-DROPPED] seq=%u pkt=%u", tag_seq, pkt_seq);
+#endif
     }
   }
 
@@ -3113,12 +3135,22 @@ int tc_egress_patch(struct __sk_buff *skb) {
 #endif
     return TC_PASS;
   }
+  // An entry anchored to its record's TCP sequence number (socket BIO) can
+  // only match that record; one matched by framing alone (memory BIO) could
+  // match a later record of the same length, so it lives no longer than the
+  // xor_pending entry that staged it.
+  int anchored = pending->write_seq > 0;
+  if (tc_entry_expired(bpf_ktime_get_ns(), pending->created_at,
+                       anchored ? TC_PENDING_TTL_NS : XOR_PENDING_TTL_NS)) {
+    bpf_map_delete_elem(&tc_pending, &key);
+    return TC_PASS;
+  }
 
   // TCP sequence check: only patch the segment that contains the password data.
   // write_seq was captured in the kprobe at the moment the password was queued
   // into the TCP send buffer. Skip segments from earlier writes (e.g., TLS
   // Finished, StartupMessage) that share the same connection key.
-  if (pending->write_seq > 0) {
+  if (anchored) {
     __u32 pkt_end = pkt_seq + payload_len;
     // write_seq points to the START of the password TLS record in the stream.
     // The segment must contain this offset: pkt_seq <= write_seq < pkt_end.
@@ -3183,15 +3215,19 @@ int tc_egress_patch(struct __sk_buff *skb) {
       scan_off += 5 + rlen;
     }
   }
-  if (matched)
-    nonce_len = matched_nonce;
-  else if (nonce_len == TLS_NONCE_UNKNOWN)
-    // No exact fit (e.g. an SSL_write larger than one record): keep the first
-    // application_data record and assume TLS 1.2, as before.
-    // TODO: derive nonce_len for TLS libraries without an ssl_to_version
-    // offset (BoringSSL/Bun) instead of guessing, so large writes on TLS 1.3
-    // are patched with the right layout.
-    nonce_len = 8;
+  // No exact fit (e.g. an SSL_write larger than one record): a write anchored
+  // to the segment keeps the first application_data record, assuming TLS 1.2
+  // when the version is unknown; a memory-BIO write is left unpatched, the
+  // record may be another write's (tc_record_nonce).
+  // TODO: derive nonce_len for TLS libraries without an ssl_to_version
+  // offset (BoringSSL/Bun) instead of guessing, so large writes on TLS 1.3
+  // are patched with the right layout.
+  if (!tc_record_nonce(matched, matched_nonce, anchored, &nonce_len)) {
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [3-TC] NO-FIT rlen=%u pt=%u", record_len, pt_len);
+#endif
+    return TC_PASS;
+  }
 
   // Ensure record is large enough for the nonce + tag. For TLS 1.2 (nonce_len=8),
   // minimum is 24; for TLS 1.3 (nonce_len=0), minimum is 17. Without this check,
@@ -3224,9 +3260,14 @@ int tc_egress_patch(struct __sk_buff *skb) {
   w->ghash_pkt_seq = pkt_seq;
   w->ghash_record_tcp_off = payload_off - tcp_payload_start;
 
-  // Apply patches. Zero secret_len on failure so GHASH skips unapplied patches.
-  // Track whether any patch was actually applied — only deactivate tc_pending
-  // if at least one patch succeeded. For multi-segment TLS records, the first
+  // Stage the patches: read each one's ciphertext and XOR it with the delta
+  // into ct_patched, which tc_ghash_update writes together with the
+  // recomputed tag. Nothing is written here: if the tail call fails, the
+  // record leaves as the TLS library wrote it (the placeholder, under a tag
+  // that matches) instead of patched under a stale tag.
+  // Zero secret_len on failure so GHASH skips unapplied patches.
+  // Track whether any patch can be applied — only deactivate tc_pending
+  // if at least one can. For multi-segment TLS records, the first
   // segment may have a record too small for the secret; we must NOT consume
   // tc_pending so the real record's segment can match later.
   __u32 patches_applied = 0;
@@ -3244,19 +3285,17 @@ int tc_egress_patch(struct __sk_buff *skb) {
     __u32 patch_off = payload_off + 5 + nonce_len + sec_off;
     __u32 patch_len = clamp_write_len(sec_len);
 
-    if (bpf_skb_load_bytes(skb, patch_off, w->ct_buf, patch_len) < 0) {
+    if (bpf_skb_load_bytes(skb, patch_off, w->ct_patched[p & (XOR_MAX_PATCHES - 1)], patch_len) < 0) {
       w = bpf_map_lookup_elem(&ghash_scratch, &zero);
       if (w) w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len = 0;
       continue;
     }
 
-    // The whole buffer, for the verifier (see bpf_xor_path): only patch_len
-    // bytes are stored back.
+    // The whole buffer, for the verifier (see patch_delta): tc_ghash_update
+    // stores back only patch_len bytes.
     for (__u32 i = 0; i < SECRET_MAX_LEN; i++)
-      w->ct_buf[i] ^= w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].xor_delta[i];
-
-    bpf_skb_store_bytes(skb, patch_off, w->ct_buf, patch_len, 0);
-    dbg_inc(DBG_TC_PATCHED);
+      w->ct_patched[p & (XOR_MAX_PATCHES - 1)][i] ^=
+          w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].xor_delta[i];
     patches_applied++;
   }
 
@@ -3333,8 +3372,46 @@ int tc_ghash_update(struct __sk_buff *skb) {
   if (!w)
     return TC_PASS;
 
-  // Try to read the old tag from the current segment.
-  if (bpf_skb_load_bytes(skb, tag_offset, w->old_tag, 16) >= 0) {
+  // Write the ciphertext tc_egress_patch staged, and the tag when it is in
+  // this segment, all or nothing: the skb is first made writable up to the
+  // last byte written, so that no write fails after another succeeded.
+  // Otherwise the record would leave patched under a stale tag.
+  int tag_here = bpf_skb_load_bytes(skb, tag_offset, w->old_tag, 16) >= 0;
+  __u32 extent = tag_here ? tag_offset + 16 : 0;
+  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++) {
+    __u32 sec_len = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len;
+    if (sec_len == 0)
+      continue;
+    __u32 end = payload_off + 5 + nonce_len +
+                w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_offset +
+                clamp_write_len(sec_len);
+    if (end > extent)
+      extent = end;
+  }
+  if (extent == 0 || bpf_skb_pull_data(skb, extent) < 0) {
+#ifdef KLOAK_DEBUG
+    bpf_printk("kloak [5-GHASH] PULL_FAILED extent=%u", extent);
+#endif
+    return TC_PASS;
+  }
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return TC_PASS;
+  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < pc; p++) {
+    __u32 sec_len = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len;
+    if (sec_len == 0)
+      continue;
+    __u32 patch_off = payload_off + 5 + nonce_len +
+                      w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_offset;
+    bpf_skb_store_bytes(skb, patch_off, w->ct_patched[p & (XOR_MAX_PATCHES - 1)],
+                        clamp_write_len(sec_len), 0);
+    dbg_inc(DBG_TC_PATCHED);
+    w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+    if (!w)
+      return TC_PASS;
+  }
+
+  if (tag_here) {
     // Tag is in this segment — apply delta inline (common case for socket BIOs
     // and small TLS records that fit in one segment).
     for (__u32 i = 0; i < 16; i++)
@@ -3352,9 +3429,10 @@ int tc_ghash_update(struct __sk_buff *skb) {
     // tag_tcp_seq = pkt_seq + record_tcp_off + 5 + nonce_len + ct_len
     // record_tcp_off accounts for forward-scanned records that don't start
     // at byte 0 of the TCP payload (coalesced TLS records).
-    struct tc_tag_val tv;
+    struct tc_tag_val tv = {};
     __builtin_memcpy(tv.tag_delta, w->tag_delta, 16);
     tv.tag_tcp_seq = w->ghash_pkt_seq + w->ghash_record_tcp_off + 5 + nonce_len + ct_len;
+    tv.created_at = bpf_ktime_get_ns();
     bpf_map_update_elem(&tc_tag_pending, &w->ghash_conn_key, &tv, BPF_ANY);
 #ifdef KLOAK_DEBUG
     bpf_printk("kloak [5-GHASH] DEFERRED tag_seq=%u", tv.tag_tcp_seq);

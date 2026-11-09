@@ -290,6 +290,15 @@ func runController(cmd *cobra.Command, args []string) {
 			_ = setupLog.Sync()
 			os.Exit(1)
 		}
+		// Detach what processes and containers that went left attached, and
+		// prune the BPF maps keyed by cgroup.
+		if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+			return uprobeMgr.RunLifecycleSweep(ctx, ebpf.LifecycleSweepInterval)
+		})); err != nil {
+			setupLog.Errorw("unable to add eBPF lifecycle sweep runnable", "error", err)
+			_ = setupLog.Sync()
+			os.Exit(1)
+		}
 	}
 
 	setupLog.Infow("starting manager")

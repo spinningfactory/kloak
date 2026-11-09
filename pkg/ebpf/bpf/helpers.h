@@ -511,6 +511,77 @@ HELPER_INLINE int tls_appdata_reclen_match(__u32 rec_len, __u32 pt_len,
   return 0;
 }
 
+// tc_record_nonce decides whether tc_egress patches the application_data
+// record it chose for a staged SSL_write, and under which explicit nonce
+// length (written to *nonce_len, which holds the connection's known one, or
+// TLS_NONCE_UNKNOWN). matched: the record's length fits the write's
+// plaintext exactly, under matched_nonce. anchored: the staged write carries
+// the TCP sequence number its record starts at (a socket BIO write), so the
+// segment is the write's.
+//
+// A record that does not fit is patched only when anchored (an SSL_write
+// larger than one record: its first record is the one in the segment). A
+// memory-BIO write (Node.js, Bun) is matched to the record by its length
+// alone: another record of the connection, an earlier or later write, must
+// not get its deltas.
+HELPER_INLINE int tc_record_nonce(int matched, __u32 matched_nonce,
+                                  int anchored, __u32 *nonce_len) {
+  if (matched) {
+    *nonce_len = matched_nonce;
+    return 1;
+  }
+  if (!anchored)
+    return 0;
+  if (*nonce_len == TLS_NONCE_UNKNOWN)
+    *nonce_len = 8; // assume TLS 1.2, as for any record that does not fit
+  return 1;
+}
+
+// Lifetimes of staged patches that no write or record used.
+//   XOR_PENDING_TTL_NS: a memory-BIO write's xor_pending entry (the app
+//     sends the record after the SSL_write, typically within 10 ms), and the
+//     tc_pending entries matched by record framing alone that it stages.
+//   TC_PENDING_TTL_NS: a tc_pending entry anchored to its record's TCP
+//     sequence number, and a tc_tag_pending entry: kept while TCP may hold
+//     the segment back (a full send window), longer than any record takes
+//     to leave in practice.
+#define XOR_PENDING_TTL_NS 2000000000ULL
+#define TC_PENDING_TTL_NS 10000000000ULL
+
+// tc_entry_expired reports whether an entry created at created_at
+// (bpf_ktime_get_ns) is older than ttl at now.
+HELPER_INLINE int tc_entry_expired(__u64 now, __u64 created_at, __u64 ttl) {
+  return now > created_at && now - created_at > ttl;
+}
+
+// What tc_egress does with a deferred tag patch (tc_tag_pending) on a TCP
+// segment of the connection.
+#define TC_TAG_WAIT 0  // the tag comes in a later segment: let this one by
+#define TC_TAG_PATCH 1 // the tag is in this segment, (tag_seq - pkt_seq) in
+#define TC_TAG_DROP 2  // the tag can no longer be patched: forget it
+
+// tc_tag_action decides it for a segment starting at TCP sequence number
+// pkt_seq with payload_len payload bytes, for a tag starting at tag_seq,
+// deferred at created_at. The tag cannot be patched any more once it
+// expired, once a segment starts past it (it left unpatched), or when it is
+// split across segments (it is patched whole). A forgotten tag fails the
+// record's authentication: the TLS library's tag no longer matches the
+// patched ciphertext. Kept, it would hold back every later patch of the
+// connection. Sequence numbers wrap: they are compared as serial numbers.
+HELPER_INLINE int tc_tag_action(__u32 pkt_seq, __u32 payload_len,
+                                __u32 tag_seq, __u64 now, __u64 created_at) {
+  if (tc_entry_expired(now, created_at, TC_PENDING_TTL_NS))
+    return TC_TAG_DROP;
+  __u32 off = tag_seq - pkt_seq;
+  if (off >= 0x80000000U)
+    return TC_TAG_DROP; // the segment starts past the tag
+  if (off >= payload_len)
+    return TC_TAG_WAIT;
+  if (payload_len - off < 16)
+    return TC_TAG_DROP; // split across segments
+  return TC_TAG_PATCH;
+}
+
 // ============================================================================
 // TLS ClientHello SNI extraction (SNI check, spinningfactory/kloak#328)
 //

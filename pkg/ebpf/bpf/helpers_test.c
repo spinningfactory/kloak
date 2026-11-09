@@ -622,6 +622,58 @@ static void test_tls_reclen_match_zero_plaintext(void) {
   assert(n == 0xAA);
 }
 
+// tc_record_nonce: a memory-BIO write is only patched into a record that fits.
+static void test_tc_record_nonce_matched(void) {
+  __u32 n = TLS_NONCE_UNKNOWN;
+  assert(tc_record_nonce(1, 0, 0, &n) == 1 && n == 0);
+  n = TLS_NONCE_UNKNOWN;
+  assert(tc_record_nonce(1, 8, 1, &n) == 1 && n == 8);
+}
+
+static void test_tc_record_nonce_memory_bio_no_fit(void) {
+  __u32 n = 0;
+  assert(tc_record_nonce(0, 0, 0, &n) == 0);
+  n = TLS_NONCE_UNKNOWN;
+  assert(tc_record_nonce(0, 0, 0, &n) == 0);
+}
+
+static void test_tc_record_nonce_anchored_no_fit(void) {
+  __u32 n = 0;
+  assert(tc_record_nonce(0, 8, 1, &n) == 1 && n == 0); // known: kept
+  n = TLS_NONCE_UNKNOWN;
+  assert(tc_record_nonce(0, 0, 1, &n) == 1 && n == 8); // unknown: TLS 1.2
+}
+
+static void test_tc_entry_expired(void) {
+  const __u64 t0 = 5000000000000ULL;
+  assert(!tc_entry_expired(t0, t0, XOR_PENDING_TTL_NS));
+  assert(!tc_entry_expired(t0 + XOR_PENDING_TTL_NS, t0, XOR_PENDING_TTL_NS));
+  assert(tc_entry_expired(t0 + XOR_PENDING_TTL_NS + 1, t0, XOR_PENDING_TTL_NS));
+  assert(!tc_entry_expired(t0 + XOR_PENDING_TTL_NS + 1, t0, TC_PENDING_TTL_NS));
+  // An entry stamped after now (another CPU's clock read) is not expired.
+  assert(!tc_entry_expired(t0, t0 + 10, XOR_PENDING_TTL_NS));
+}
+
+static void test_tc_tag_action(void) {
+  const __u64 now = 5000000000000ULL;
+  // Tag in this segment: payload [1000, 1100), tag at [1080, 1096).
+  assert(tc_tag_action(1000, 100, 1080, now, now) == TC_TAG_PATCH);
+  assert(tc_tag_action(1000, 100, 1084, now, now) == TC_TAG_PATCH); // last 16 bytes
+  // In a later segment, or a pure ACK before it.
+  assert(tc_tag_action(1000, 100, 1100, now, now) == TC_TAG_WAIT);
+  assert(tc_tag_action(1000, 0, 1000, now, now) == TC_TAG_WAIT);
+  assert(tc_tag_action(1000, 100, 9000, now, now) == TC_TAG_WAIT);
+  // Split across this segment and the next.
+  assert(tc_tag_action(1000, 100, 1085, now, now) == TC_TAG_DROP);
+  // The segment starts past the tag: it left unpatched.
+  assert(tc_tag_action(1000, 100, 990, now, now) == TC_TAG_DROP);
+  // Expired.
+  assert(tc_tag_action(1000, 100, 1080, now, now - TC_PENDING_TTL_NS - 1) == TC_TAG_DROP);
+  // Sequence numbers wrap.
+  assert(tc_tag_action(0xFFFFFFF0U, 100, 0x00000010U, now, now) == TC_TAG_PATCH);
+  assert(tc_tag_action(0x00000010U, 100, 0xFFFFFFF0U, now, now) == TC_TAG_DROP);
+}
+
 // ============================================================================
 // AES (H recovery for BoringSSL)
 // ============================================================================
@@ -1690,6 +1742,11 @@ int main(void) {
   RUN_TEST(test_tls_reclen_match_known_nonce);
   RUN_TEST(test_tls_reclen_match_unknown_nonce);
   RUN_TEST(test_tls_reclen_match_zero_plaintext);
+  RUN_TEST(test_tc_record_nonce_matched);
+  RUN_TEST(test_tc_record_nonce_memory_bio_no_fit);
+  RUN_TEST(test_tc_record_nonce_anchored_no_fit);
+  RUN_TEST(test_tc_entry_expired);
+  RUN_TEST(test_tc_tag_action);
 
   printf("aes (BoringSSL H recovery):\n");
   RUN_TEST(test_aes128_fips197);
