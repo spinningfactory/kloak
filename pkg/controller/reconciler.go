@@ -84,6 +84,10 @@ type Reconciler struct {
 	// delete event (where we only have the namespaced name) we can look up
 	// the UID and clean up trackedPods correctly.
 	podKeyToUID map[string]string
+
+	// reconciled records the pods (UIDs) a reconcile has attached and bound
+	// once, for WaitForInitialReconcile.
+	reconciled map[string]struct{}
 }
 
 // NewReconciler creates a new pod reconciler.
@@ -102,6 +106,7 @@ func NewReconciler(c client.Client, log *zap.SugaredLogger, scheme *runtime.Sche
 		exitedCgroups:  make(map[string]map[uint64]struct{}),
 		startedCgroups: make(map[string]map[uint64]containerCgroup),
 		podKeyToUID:    make(map[string]string),
+		reconciled:     make(map[string]struct{}),
 	}
 }
 
@@ -183,6 +188,9 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	refs := k8ssecrets.PodSecretRefs(pod)
 	if pending {
 		if !dnsAttached {
+			// Tried: a pod whose sandbox is not there yet has nothing
+			// attached to claim.
+			r.markReconciled(uid)
 			poll := sandboxPoll
 			if time.Since(pod.CreationTimestamp.Time) > sandboxPollFor {
 				poll = sandboxPollSlow
@@ -197,6 +205,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 			if !pod.Spec.HostNetwork && r.virtualIP() {
 				r.UprobeManager.BindPodNetwork(uid, req.String(), addrs, refs)
 			}
+			r.markReconciled(uid)
 			return ctrl.Result{}, nil
 		}
 	}
@@ -316,6 +325,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		r.UprobeManager.RecordCgroupNetns(cgroupID, pid)
 	}
 
+	r.markReconciled(uid)
+
 	// If any cgroups still need attachment, requeue to retry later.
 	// This handles runtimes like Python where libssl loads lazily.
 	r.mu.RLock()
@@ -334,6 +345,70 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{RequeueAfter: 500 * time.Millisecond}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+// markReconciled records that a reconcile of pod uid attached what the pod
+// has running, and bound it.
+func (r *Reconciler) markReconciled(uid string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.reconciled == nil {
+		r.reconciled = make(map[string]struct{})
+	}
+	r.reconciled[uid] = struct{}{}
+}
+
+// WaitForInitialReconcile waits until every kloak pod of the node that is
+// running or pending has been reconciled once (attached and bound), or
+// timeout, and returns the pods (namespace/name) still waiting. A
+// controller that adopted a previous one's pinned eBPF objects then
+// detaches what no pod claimed (TLSUprobeManager.FinishAdopt).
+func (r *Reconciler) WaitForInitialReconcile(ctx context.Context, timeout time.Duration) []string {
+	deadline := time.Now().Add(timeout)
+	t := time.NewTicker(500 * time.Millisecond)
+	defer t.Stop()
+	for {
+		pending, err := r.unreconciled(ctx)
+		if err == nil && len(pending) == 0 {
+			return nil
+		}
+		if err != nil {
+			pending = []string{"(listing pods: " + err.Error() + ")"}
+		}
+		if time.Now().After(deadline) {
+			return pending
+		}
+		select {
+		case <-ctx.Done():
+			return pending
+		case <-t.C:
+		}
+	}
+}
+
+// unreconciled returns the kloak pods of the node, running or pending, that
+// no reconcile went through yet.
+func (r *Reconciler) unreconciled(ctx context.Context) ([]string, error) {
+	var pods corev1.PodList
+	if err := r.List(ctx, &pods); err != nil {
+		return nil, err
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	var out []string
+	for i := range pods.Items {
+		pod := &pods.Items[i]
+		if !r.isEnabled(pod) || (r.NodeName != "" && pod.Spec.NodeName != r.NodeName) || pod.DeletionTimestamp != nil {
+			continue
+		}
+		if pod.Status.Phase != corev1.PodRunning && pod.Status.Phase != corev1.PodPending {
+			continue
+		}
+		if _, ok := r.reconciled[string(pod.UID)]; !ok {
+			out = append(out, pod.Namespace+"/"+pod.Name)
+		}
+	}
+	return out, nil
 }
 
 // attachUprobesToCgroup attaches the TLS uprobes for the processes of a
@@ -671,6 +746,7 @@ func (r *Reconciler) handleDelete(uid, namespacedName string) (ctrl.Result, erro
 	delete(r.exitedCgroups, uid)
 	delete(r.startedCgroups, uid)
 	delete(r.podKeyToUID, namespacedName)
+	delete(r.reconciled, uid)
 	r.mu.Unlock()
 	r.Log.Infow("stopped tracking pod", "pod", namespacedName, "uid", uid, "cgroupCount", len(cgroupIDs)+len(exited))
 
