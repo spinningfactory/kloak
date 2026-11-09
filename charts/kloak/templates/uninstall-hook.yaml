@@ -1,0 +1,106 @@
+{{- if and .Values.controller.ebpf.enabled .Values.controller.ebpf.persist .Values.uninstall.hook.enabled }}
+# Before the release is deleted, every controller tears down the eBPF data
+# plane it kept attached on its node (kloak uninstall-hook). Helm waits for
+# the Job; it never fails, so the uninstall goes on.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kloak-uninstall-hook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-delete
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: kloak-uninstall-hook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-delete
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+rules:
+  - apiGroups: ["apps"]
+    resources: ["daemonsets"]
+    resourceNames: ["kloak-controller"]
+    verbs: ["get", "patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: kloak-uninstall-hook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+  annotations:
+    helm.sh/hook: pre-delete
+    helm.sh/hook-weight: "-10"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: kloak-uninstall-hook
+subjects:
+  - kind: ServiceAccount
+    name: kloak-uninstall-hook
+    namespace: {{ .Release.Namespace }}
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: kloak-uninstall-hook
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kloak.labels" . | nindent 4 }}
+    app.kubernetes.io/component: uninstall-hook
+  annotations:
+    helm.sh/hook: pre-delete
+    helm.sh/hook-weight: "0"
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  backoffLimit: 0
+  # The hook waits for the controllers up to its timeout, then reports.
+  activeDeadlineSeconds: {{ add (int .Values.uninstall.hook.timeoutSeconds) 60 }}
+  template:
+    metadata:
+      labels:
+        {{- include "kloak.selectorLabels" . | nindent 8 }}
+        app.kubernetes.io/component: uninstall-hook
+    spec:
+      serviceAccountName: kloak-uninstall-hook
+      restartPolicy: Never
+      containers:
+        - name: uninstall-hook
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/kloak", "uninstall-hook"]
+          args:
+            - --daemonset=kloak-controller
+            - --namespace={{ .Release.Namespace }}
+            - --timeout={{ int .Values.uninstall.hook.timeoutSeconds }}s
+          env:
+            - name: KLOAK_LOG_LEVEL
+              value: {{ .Values.log.level | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+{{- end }}
