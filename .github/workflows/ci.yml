@@ -213,7 +213,7 @@ jobs:
           # Build the combined profile. Each profile starts with a `mode:` line
           # plus per-line records. We pick whichever inputs exist.
           # Drop the generated eBPF bindings (tlsuprobe_bpfel.go /
-          # tlsuprobe_bpfeb.go) from BOTH halves — they're only on disk on
+          # tlsuprobe_bpfeb.go, dispatch_bpfel.go / dispatch_bpfeb.go) from BOTH halves — they're only on disk on
           # nodes that ran `go generate`, and downstream jobs that read the
           # profile (Coverage Badge runs `go tool cover -func` against the
           # whole file) will fail otherwise. Apply the filter to the unit
@@ -223,7 +223,7 @@ jobs:
           OUT=/tmp/combined-coverage.out
 
           # head -1 keeps the `mode:` line; the filter trims subsequent lines.
-          strip_generated() { grep -v 'tlsuprobe_bpf'; }
+          strip_generated() { grep -v -e 'tlsuprobe_bpf' -e 'dispatch_bpf'; }
 
           if [ -f "$UNIT" ] && [ -f "$E2E" ]; then
             # `go tool cover` only merges records whose block ranges match

@@ -39,9 +39,17 @@ var ErrNotSupported = errors.New("kloak: eBPF uprobes are only supported on Linu
 // ErrNotSupported (or is a no-op for the void methods).
 type TLSUprobeManager struct{}
 
-func NewTLSUprobeManager(_ secrets.Source, _, _ string, _ *HostResolutionConfig, _ *zap.SugaredLogger) (*TLSUprobeManager, error) {
+func NewTLSUprobeManager(_ secrets.Source, _, _ string, _ *HostResolutionConfig, _ bool, _ *zap.SugaredLogger) (*TLSUprobeManager, error) {
 	return nil, ErrNotSupported
 }
+
+// CleanupPins is a no-op error off Linux: there is no bpffs.
+func CleanupPins(string, *zap.SugaredLogger) error { return ErrNotSupported }
+
+func (m *TLSUprobeManager) Shutdown(ShutdownMode) error { return ErrNotSupported }
+func (m *TLSUprobeManager) Uninstall() error            { return ErrNotSupported }
+func (m *TLSUprobeManager) Adopted() bool               { return false }
+func (m *TLSUprobeManager) FinishAdopt()                {}
 
 func (m *TLSUprobeManager) TrackTGID(uint32) error               { return ErrNotSupported }
 func (m *TLSUprobeManager) UntrackTGID(uint32) error             { return ErrNotSupported }

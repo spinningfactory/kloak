@@ -33,7 +33,7 @@ EBPF_PKG=pkg/ebpf
 # Source files
 GO_SOURCES=$(shell find . -name '*.go' -not -path './vendor/*')
 BPF_SOURCES=$(wildcard $(BPF_DIR)/*.c $(BPF_DIR)/*.h)
-EBPF_GENERATED=$(EBPF_PKG)/tlsuprobe_bpfel.go $(EBPF_PKG)/tlsuprobe_bpfeb.go
+EBPF_GENERATED=$(EBPF_PKG)/tlsuprobe_bpfel.go $(EBPF_PKG)/tlsuprobe_bpfeb.go $(EBPF_PKG)/dispatch_bpfel.go $(EBPF_PKG)/dispatch_bpfeb.go
 
 # Docker
 DOCKER_IMAGE=kloak
@@ -248,8 +248,8 @@ e2e-k3s-cleanup:
 clean:
 	$(GOCLEAN)
 	rm -rf $(BUILD_DIR)
-	rm -f $(EBPF_PKG)/tlsuprobe_bpfel.go $(EBPF_PKG)/tlsuprobe_bpfeb.go
-	rm -f $(EBPF_PKG)/tlsuprobe_bpfel.o $(EBPF_PKG)/tlsuprobe_bpfeb.o
+	rm -f $(EBPF_PKG)/tlsuprobe_bpfel.go $(EBPF_PKG)/tlsuprobe_bpfeb.go $(EBPF_PKG)/dispatch_bpfel.go $(EBPF_PKG)/dispatch_bpfeb.go
+	rm -f $(EBPF_PKG)/tlsuprobe_bpfel.o $(EBPF_PKG)/tlsuprobe_bpfeb.o $(EBPF_PKG)/dispatch_bpfel.o $(EBPF_PKG)/dispatch_bpfeb.o
 
 deps:
 	$(GOMOD) download

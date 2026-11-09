@@ -37,9 +37,19 @@ fi
 
 # -tags linux constrains the generated _bpfel.go / _bpfeb.go to linux builds
 # so macOS unit tests still compile (cilium/ebpf is Linux-only). See PR #217.
-exec go run github.com/cilium/ebpf/cmd/bpf2go \
+CFLAGS="-O2 -g -Wall -Werror -D__TARGET_ARCH_${ARCH} ${DEBUG_DEFINE}"
+go run github.com/cilium/ebpf/cmd/bpf2go \
     -cc clang \
-    -cflags "-O2 -g -Wall -Werror -D__TARGET_ARCH_${ARCH} ${DEBUG_DEFINE}" \
+    -cflags "$CFLAGS" \
     -tags linux \
     tlsuprobe \
     bpf/tls_uprobe.c -- -I../ebpf
+# The uprobe trampolines (bpf/dispatch_v1.c, spinningfactory/kloak#107): a
+# separate object, so that its programs stay the same whatever the pipeline's
+# build.
+exec go run github.com/cilium/ebpf/cmd/bpf2go \
+    -cc clang \
+    -cflags "$CFLAGS" \
+    -tags linux \
+    dispatch \
+    bpf/dispatch_v1.c -- -I../ebpf

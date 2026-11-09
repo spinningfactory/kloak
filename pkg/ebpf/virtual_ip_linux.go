@@ -91,22 +91,30 @@ func (m *TLSUprobeManager) attachVirtualIPRedirect(r VirtualIPRanges, cgroupPath
 	if err := m.objs.VipConfig.Update(uint32(0), &cfg, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("writing vip_config: %w", err)
 	}
+	cgroupID, err := netnsInode(cgroupPath) // a cgroup's ID is its directory's inode
+	if err != nil {
+		return fmt.Errorf("reading the cgroup ID of %s: %w", cgroupPath, err)
+	}
 	for _, p := range []struct {
+		name   string
 		prog   *ebpf.Program
 		attach ebpf.AttachType
 	}{
-		{m.objs.VipConnect4, ebpf.AttachCGroupInet4Connect},
-		{m.objs.VipConnect6, ebpf.AttachCGroupInet6Connect},
-		{m.objs.VipGetpeername4, ebpf.AttachCgroupInet4GetPeername},
-		{m.objs.VipGetpeername6, ebpf.AttachCgroupInet6GetPeername},
+		{"vip_connect4", m.objs.VipConnect4, ebpf.AttachCGroupInet4Connect},
+		{"vip_connect6", m.objs.VipConnect6, ebpf.AttachCGroupInet6Connect},
+		{"vip_getpeername4", m.objs.VipGetpeername4, ebpf.AttachCgroupInet4GetPeername},
+		{"vip_getpeername6", m.objs.VipGetpeername6, ebpf.AttachCgroupInet6GetPeername},
 	} {
-		l, err := link.AttachCgroup(link.CgroupOptions{Path: cgroupPath, Attach: p.attach, Program: p.prog})
+		err := m.ensureGlobalLink(p.name, p.prog, func() (link.Link, error) {
+			return link.AttachCgroup(link.CgroupOptions{Path: cgroupPath, Attach: p.attach, Program: p.prog})
+		}, func(info *link.Info) bool {
+			// Still on this kubepods cgroup.
+			cg := info.Cgroup()
+			return cg != nil && cg.CgroupId == cgroupID
+		})
 		if err != nil {
 			return fmt.Errorf("attaching %s to %s: %w", p.attach, cgroupPath, err)
 		}
-		m.linksMu.Lock()
-		m.links = append(m.links, l)
-		m.linksMu.Unlock()
 	}
 	return nil
 }
@@ -168,6 +176,10 @@ func (m *TLSUprobeManager) AttachPodDNSRewriteNetns(podUID, pod, path string) ([
 // then on (kept open while attached, closed otherwise); where names the
 // netns in logs.
 func (m *TLSUprobeManager) attachPodDNSRewrite(podUID, pod string, podNS *os.File, where string) ([]netip.Addr, error) {
+	if m.stopped.Load() {
+		_ = podNS.Close()
+		return nil, errStopped
+	}
 	rootIno, err := netnsInode("/proc/1/ns/net")
 	if err != nil {
 		_ = podNS.Close()
@@ -272,11 +284,11 @@ func (m *TLSUprobeManager) DetachPodDNSRewrite(podUID string) {
 }
 
 // syncVipPodHost makes vip_pod_host hold exactly desired (vipPodHosts):
-// pruning is what stops the rewrite for a pod that went away, or whose
-// secrets no longer name a host. Stale entries go first, making room. Like
-// syncSecretACL, it reports failed map operations once it has done the
-// others.
-func syncVipPodHost(m *ebpf.Map, desired map[vipPodHostKey]struct{}, log *zap.SugaredLogger) error {
+// pruning (unless not prune, as for syncSecretACL) is what stops the
+// rewrite for a pod that went away, or whose secrets no longer name a host.
+// Stale entries go first, making room. Like syncSecretACL, it reports failed
+// map operations once it has done the others.
+func syncVipPodHost(m *ebpf.Map, desired map[vipPodHostKey]struct{}, prune bool, log *zap.SugaredLogger) error {
 	var errs mapErrors
 	var stale []vipPodHostKey
 	present := make(map[vipPodHostKey]struct{}, len(desired))
@@ -286,7 +298,7 @@ func syncVipPodHost(m *ebpf.Map, desired map[vipPodHostKey]struct{}, log *zap.Su
 	for iter.Next(&k, &v) {
 		if _, ok := desired[k]; ok {
 			present[k] = struct{}{}
-		} else {
+		} else if prune {
 			stale = append(stale, k)
 		}
 	}

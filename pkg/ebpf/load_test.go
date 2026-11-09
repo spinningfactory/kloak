@@ -104,6 +104,18 @@ func TestLoadObjects(t *testing.T) {
 	if objs.TpEnterClose == nil {
 		t.Error("TpEnterClose program not loaded")
 	}
+
+	// The uprobe trampolines (dispatch_v1.c), and the entry programs in
+	// their slots: the kernel takes a program into a prog array only if it
+	// is compatible with the programs that tail-call through it.
+	dispatch := &dispatchObjects{}
+	if err := loadDispatchObjects(dispatch, nil); err != nil {
+		skipUnlessRejected(t, err)
+	}
+	t.Cleanup(func() { _ = dispatch.Close() })
+	if err := fillDispatch(dispatch, objs); err != nil {
+		t.Errorf("the trampolines don't take the entry programs: %v", err)
+	}
 }
 
 func TestTailCallWiring(t *testing.T) {

@@ -27,6 +27,15 @@ log:
 controller:
   ebpf:
     enabled: true
+    # Keep the node's eBPF data plane attached across controller restarts,
+    # rollouts and upgrades: the programs and maps stay pinned under
+    # /sys/fs/bpf/kloak, and the next controller adopts them, so the pods'
+    # secrets are rewritten all along (with a BPF build that differs, the
+    # next controller loads its own, and until it has attached them a pod's
+    # TLS writes carry their placeholders). On shutdown a controller keeps
+    # them only while its DaemonSet stays; uninstall.hook tears them down
+    # on every node. false: they are detached on every shutdown.
+    persist: true
     # Container interface whose host-side veth peer gets the tc patch
     # program (tc ingress on the host veth — keeps rewritten ciphertext
     # out of reach of in-pod packet capture). "auto" (default) reads the
@@ -68,8 +77,8 @@ controller:
     # connects to a hardcoded address, or resolves outside the pod's DNS,
     # gets none). While the controller is not running, connects to fake IPs
     # fail. The fake IPs and their addresses are kept in BPF maps pinned
-    # under /sys/fs/bpf/kloak so restarts keep them; the pins stay on the
-    # node after an uninstall until it reboots.
+    # under /sys/fs/bpf/kloak so restarts keep them; an uninstall removes
+    # them.
     #
     # virtualIPRange is an IPv4 range (/19 or larger) and optionally an IPv6
     # one (/115 or larger), comma-separated (escape the comma as "\," with
@@ -110,6 +119,19 @@ controller:
     limits:
       cpu: 500m
       memory: 512Mi
+
+# Deleting the release tears down the eBPF data plane every controller kept
+# attached (controller.ebpf.persist).
+uninstall:
+  hook:
+    # A pre-delete hook Job (`kloak uninstall-hook`) asks every controller to
+    # detach its node's programs and remove their pins, and waits for them,
+    # up to timeoutSeconds. It then lists the nodes it could not confirm: a
+    # controller still tears down when the release's deletion stops it, and
+    # a node whose controller wasn't running is cleaned by a reboot or
+    # `kloak cleanup`. The Job never fails the uninstall.
+    enabled: true
+    timeoutSeconds: 120
 
 webhook:
   replicas: 1

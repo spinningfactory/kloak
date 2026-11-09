@@ -4,11 +4,13 @@ import (
 	"context"
 	"net"
 	"os"
+	goruntime "runtime"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
 	"go.uber.org/zap"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -59,7 +61,14 @@ var (
 	sniCheck            string
 	virtualIPRange      string
 	nriSocket           string
+	daemonSetName       string
+	nodeLockPath        string
 )
+
+// adoptReconcileTimeout bounds how long a controller that adopted the
+// pinned eBPF objects waits for the pods running at its start to be
+// reconciled before it detaches what none of them claimed.
+const adoptReconcileTimeout = 60 * time.Second
 
 func init() {
 	controllerCmd.Flags().StringVar(&controllerProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -83,6 +92,12 @@ func init() {
 	controllerCmd.Flags().StringVar(&nriSocket, "nri-socket", controller.DefaultNRISocket,
 		`NRI socket of the container runtime (containerd 2.0+, CRI-O 1.30+): the runtime then waits for kloak to attach the DNS rewrite while it creates each pod sandbox, before the pod's containers start, and a container's TLS uprobes before it starts. `+
 			`Without NRI (unreachable socket, or "" to disable), the rewrite is attached by polling pending pods, and a container's uprobes once the pod's status reports it running, which leaves a short window at pod start in which a lookup gets the real addresses and a connection made with them no host-restricted secret, and a TLS write sends the placeholder unchanged.`)
+	controllerCmd.Flags().StringVar(&daemonSetName, "daemonset", "",
+		`The controller's DaemonSet, in the namespace POD_NAMESPACE names. When set, the eBPF data plane outlives the controller: its programs and maps stay pinned under `+ebpf.DefaultBPFPinPath+` and attached across restarts, rollouts and upgrades, and the next controller adopts them, so the pods' secrets are rewritten all along. `+
+			`On shutdown it is kept only while the DaemonSet stays and its pod template is annotated `+controller.PinFormatAnnotation+` (its controllers adopt the pins; the Helm chart sets it); it is torn down when the DaemonSet is being deleted, annotated `+controller.UninstallAnnotation+` (the Helm chart's pre-delete hook), or kloak's RBAC is gone, and detached otherwise. `+
+			`Empty: the data plane is detached on every shutdown, and what a previous controller kept is detached at startup.`)
+	controllerCmd.Flags().StringVar(&nodeLockPath, "node-lock", DefaultNodeLock,
+		`File the controller locks (flock) while it runs, on a host directory: a controller waits for the previous one on the node to exit before it touches the node's eBPF objects. "" disables it.`)
 	controllerCmd.Flags().StringVar(&virtualIPRange, "virtual-ip-range", ebpf.DefaultVirtualIPRange,
 		`Ranges fake IPs come from. Every host a secret is restricted to (getkloak.io/hosts) gets a stable fake IP, and fake IPv6, kept in maps pinned under `+ebpf.DefaultBPFPinPath+`. `+
 			`A kloak pod with a secret for the host gets the fake IP in DNS answers and its connects to it are redirected to the host's addresses; a host-restricted secret is only rewritten on a connection made to its host's fake IP. `+
@@ -94,7 +109,14 @@ func init() {
 func runController(cmd *cobra.Command, args []string) {
 	setupLog := logging.Setup().Named("setup")
 
-	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface, "tcAttachMode", tcAttachMode, "secretBinding", secretBinding, "sniCheck", sniCheck, "virtualIPRange", virtualIPRange, "nriSocket", nriSocket)
+	setupLog.Infow("Starting Kloak controller", "ebpf", enableEBPF, "cgroupPath", cgroupPath, "egressInterface", egressInterface, "tcAttachMode", tcAttachMode, "secretBinding", secretBinding, "sniCheck", sniCheck, "virtualIPRange", virtualIPRange, "nriSocket", nriSocket, "daemonset", daemonSetName)
+	signalCtx := ctrl.SetupSignalHandler()
+	namespace := os.Getenv("POD_NAMESPACE")
+	persist := enableEBPF && daemonSetName != ""
+	if persist && namespace == "" {
+		setupLog.Warnw("--daemonset without POD_NAMESPACE: the eBPF data plane is detached on every shutdown")
+		persist = false
+	}
 
 	tcMode, err := ebpf.ParseTCAttachMode(tcAttachMode)
 	if err != nil {
@@ -128,20 +150,27 @@ func runController(cmd *cobra.Command, args []string) {
 	// to 30 s anyway, but pinning it documents the budget and makes it
 	// obvious where to tune if shutdown ever pushes past the grace period.
 	gracefulShutdown := 30 * time.Second
+	// The trusted DNS reconciler only needs kube-dns: cache that, not
+	// every Service and EndpointSlice of the cluster.
+	byObject := map[client.Object]cache.ByObject{
+		&corev1.Service{}: {Namespaces: map[string]cache.Config{controller.KubeDNSNamespace: {
+			FieldSelector: fields.OneTermEqualSelector("metadata.name", controller.KubeDNSName),
+		}}},
+		&discoveryv1.EndpointSlice{}: {Namespaces: map[string]cache.Config{controller.KubeDNSNamespace: {
+			LabelSelector: labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: controller.KubeDNSName}),
+		}}},
+	}
+	if persist {
+		// The uninstall watcher only needs the controller's own DaemonSet.
+		byObject[&appsv1.DaemonSet{}] = cache.ByObject{Namespaces: map[string]cache.Config{namespace: {
+			FieldSelector: fields.OneTermEqualSelector("metadata.name", daemonSetName),
+		}}}
+	}
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                  scheme,
 		HealthProbeBindAddress:  controllerProbeAddr,
 		GracefulShutdownTimeout: &gracefulShutdown,
-		// The trusted DNS reconciler only needs kube-dns: cache that, not
-		// every Service and EndpointSlice of the cluster.
-		Cache: cache.Options{ByObject: map[client.Object]cache.ByObject{
-			&corev1.Service{}: {Namespaces: map[string]cache.Config{controller.KubeDNSNamespace: {
-				FieldSelector: fields.OneTermEqualSelector("metadata.name", controller.KubeDNSName),
-			}}},
-			&discoveryv1.EndpointSlice{}: {Namespaces: map[string]cache.Config{controller.KubeDNSNamespace: {
-				LabelSelector: labels.SelectorFromSet(labels.Set{discoveryv1.LabelServiceName: controller.KubeDNSName}),
-			}}},
-		}},
+		Cache:                   cache.Options{ByObject: byObject},
 	})
 	if err != nil {
 		setupLog.Errorw("unable to start manager", "error", err)
@@ -151,6 +180,8 @@ func runController(cmd *cobra.Command, args []string) {
 
 	// Create uprobe manager instances
 	var uprobeMgr *ebpf.TLSUprobeManager
+	// nodeLock holds the node lock until the eBPF data plane is shut down.
+	var nodeLock *os.File
 
 	if enableEBPF {
 		// The controller runs with hostPID: /proc/1 is in the host network
@@ -164,7 +195,18 @@ func runController(cmd *cobra.Command, args []string) {
 			_ = setupLog.Sync()
 			os.Exit(1)
 		}
-		uprobeMgr, err = ebpf.NewTLSUprobeManager(k8ssecrets.NewSource(mgr.GetClient()).WithLog(setupLog), cgroupPath, egressInterface, &hostRes, setupLog)
+		// One controller at a time on the node's eBPF objects: a new one
+		// waits for the previous one to exit (it may still be keeping or
+		// tearing them down).
+		if nodeLockPath != "" {
+			nodeLock, err = lockNode(signalCtx, nodeLockPath, setupLog)
+			if err != nil {
+				setupLog.Errorw("failed to take the node lock", "error", err)
+				_ = setupLog.Sync()
+				os.Exit(1)
+			}
+		}
+		uprobeMgr, err = ebpf.NewTLSUprobeManager(k8ssecrets.NewSource(mgr.GetClient()).WithLog(setupLog), cgroupPath, egressInterface, &hostRes, persist, setupLog)
 		if err != nil {
 			setupLog.Errorw("failed to initialize eBPF uprobe manager", "error", err)
 			_ = setupLog.Sync()
@@ -232,12 +274,32 @@ func runController(cmd *cobra.Command, args []string) {
 		os.Exit(1)
 	}
 
+	// Tear the node's data plane down when the uninstall hook asks for it.
+	var uninstall *controller.UninstallWatcher
+	readyCheck := healthz.Ping
+	if persist && uprobeMgr != nil {
+		uninstall = &controller.UninstallWatcher{
+			Client:    mgr.GetClient(),
+			Namespace: namespace,
+			Name:      daemonSetName,
+			PodName:   os.Getenv("POD_NAME"),
+			Uninstall: uprobeMgr.Uninstall,
+			Log:       setupLog.Named("controller").Named("Uninstall"),
+		}
+		if err := uninstall.SetupWithManager(mgr); err != nil {
+			setupLog.Errorw("unable to create controller", "error", err, "controller", "Uninstall")
+			_ = setupLog.Sync()
+			os.Exit(1)
+		}
+		readyCheck = uninstall.ReadyCheck
+	}
+
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
 		setupLog.Errorw("unable to set up health check", "error", err)
 		_ = setupLog.Sync()
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", readyCheck); err != nil {
 		setupLog.Errorw("unable to set up ready check", "error", err)
 		_ = setupLog.Sync()
 		os.Exit(1)
@@ -299,10 +361,29 @@ func runController(cmd *cobra.Command, args []string) {
 			_ = setupLog.Sync()
 			os.Exit(1)
 		}
+		// A controller that adopted the previous one's pinned objects
+		// detaches what no pod claimed once the pods are reconciled.
+		if uprobeMgr.Adopted() {
+			if err := mgr.Add(manager.RunnableFunc(func(ctx context.Context) error {
+				pending := reconciler.WaitForInitialReconcile(ctx, adoptReconcileTimeout)
+				if ctx.Err() != nil {
+					return nil
+				}
+				if len(pending) > 0 {
+					setupLog.Warnw("pods not reconciled yet: what they had attached may be detached, and attached again once they are",
+						"pods", pending, "timeout", adoptReconcileTimeout.String())
+				}
+				uprobeMgr.FinishAdopt()
+				return nil
+			})); err != nil {
+				setupLog.Errorw("unable to add the eBPF adoption runnable", "error", err)
+				_ = setupLog.Sync()
+				os.Exit(1)
+			}
+		}
 	}
 
 	setupLog.Infow("starting manager")
-	signalCtx := ctrl.SetupSignalHandler()
 	startErr := mgr.Start(signalCtx)
 	// Past mgr.Start: signalCtx is done, manager has already given runnables
 	// up to GracefulShutdownTimeout to return. Log the trigger so the cause
@@ -321,10 +402,16 @@ func runController(cmd *cobra.Command, args []string) {
 	flushCoverage()
 
 	if uprobeMgr != nil {
-		if err := uprobeMgr.Close(); err != nil {
+		mode, why := ebpf.ShutdownDetach, "the data plane is not kept across restarts (no --daemonset)"
+		if persist {
+			mode, why = shutdownMode(context.Background(), mgr.GetAPIReader(), namespace, daemonSetName, uninstall.Uninstalled())
+		}
+		setupLog.Infow("shutting down the eBPF data plane", "mode", mode.String(), "reason", why)
+		if err := uprobeMgr.Shutdown(mode); err != nil {
 			setupLog.Errorw("failed to close uprobe manager", "error", err)
 		}
 	}
+	goruntime.KeepAlive(nodeLock) // an unreachable *os.File is closed by the GC, which would release the lock
 	setupLog.Infow("controller exited cleanly")
 	_ = setupLog.Sync()
 }

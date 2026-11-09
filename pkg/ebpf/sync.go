@@ -251,11 +251,13 @@ func huffmanEntry(shadow, realValue string, raw *secretValue) (secretKey, secret
 }
 
 // syncSecretACL makes secret_acl hold exactly the entries the bindings grant
-// over the snapshot: missing entries are added, the rest pruned. Pruning is
-// what revokes a binding when a pod goes away, a container restarts with a
-// new cgroup, or a secret's placeholder changes. Like applySecrets, it
-// reports failed map operations once it has done the others.
-func syncSecretACL(aclMap *ebpf.Map, snapshot []secrets.Secret, bindings map[string]podBinding, log *zap.SugaredLogger) error {
+// over the snapshot: missing entries are added, the rest pruned (unless not
+// prune: while adopting a previous controller's maps, whose entries are for
+// pods not bound again yet). Pruning is what revokes a binding when a pod
+// goes away, a container restarts with a new cgroup, or a secret's
+// placeholder changes. Like applySecrets, it reports failed map operations
+// once it has done the others.
+func syncSecretACL(aclMap *ebpf.Map, snapshot []secrets.Secret, bindings map[string]podBinding, prune bool, log *zap.SugaredLogger) error {
 	desired := secretACL(snapshot, bindings)
 	var errs mapErrors
 
@@ -267,7 +269,7 @@ func syncSecretACL(aclMap *ebpf.Map, snapshot []secrets.Secret, bindings map[str
 	for iter.Next(&k, &v) {
 		if _, ok := desired[k]; ok {
 			present[k] = struct{}{}
-		} else {
+		} else if prune {
 			stale = append(stale, k)
 		}
 	}

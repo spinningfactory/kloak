@@ -348,14 +348,14 @@ func TestVipPodHostBindings(t *testing.T) {
 	check("old pod unbound", "10.42.0.7 db.example.com", "fd42::7 db.example.com")
 
 	putPodHost(t, objs, netip.MustParseAddr("10.42.0.99"), "api.example.com")
-	if err := syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), m.log); err != nil {
+	if err := syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), true, m.log); err != nil {
 		t.Fatal(err)
 	}
 	check("synced", "10.42.0.7 db.example.com", "fd42::7 db.example.com")
 
 	m.SetSecretBindingMode(SecretBindingAudit)
 	m.BindPodSecrets("uid-new", "ns/new", addr, nil, []secrets.Ref{{OwnerID: "ns/db"}})
-	if err := syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, true), m.log); err != nil {
+	if err := syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, true), true, m.log); err != nil {
 		t.Fatal(err)
 	}
 	check("audit", "10.42.0.7 ", "fd42::7 ")
@@ -405,13 +405,13 @@ func TestBindPodNetworkKeepsCgroups(t *testing.T) {
 	if b := m.bindings["uid"]; !slices.Equal(b.cgroupIDs, []uint64{41, 42}) || b.podIPs[0] != netip.MustParseAddr("10.42.0.8") {
 		t.Fatalf("binding after BindPodNetwork: %+v", b)
 	}
-	if err := syncSecretACL(objs.SecretAcl, m.lastSnapshot, m.bindings, m.log); err != nil {
+	if err := syncSecretACL(objs.SecretAcl, m.lastSnapshot, m.bindings, true, m.log); err != nil {
 		t.Fatal(err)
 	}
 	if got := aclCgroups(); !slices.Equal(got, []uint64{41, 42}) {
 		t.Errorf("secret_acl cgroups after a sync: %v, want [41 42]", got)
 	}
-	if err := syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), m.log); err != nil {
+	if err := syncVipPodHost(objs.VipPodHost, vipPodHosts(m.lastSnapshot, m.bindings, false), true, m.log); err != nil {
 		t.Fatal(err)
 	}
 	var k vipPodHostKey

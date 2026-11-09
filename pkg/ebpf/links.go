@@ -25,10 +25,17 @@ package ebpf
 // The tc patch programs are recorded per pod network namespace (podTC in
 // uprobe.go), under tcLinkKey, and checked against the kernel (tcLinkLive)
 // before kloak relies on one.
+//
+// Every uprobe is pinned under its key (uprobePinName, Phase 1), so that it
+// stays attached across controller restarts: the next controller adopts the
+// pins (adopt), its reconciliation claims the uprobes the containers still
+// need, and the others are detached (releaseUnclaimed).
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -66,8 +73,8 @@ const (
 // Otherwise dev and ino are the file's.
 type fileKey struct {
 	dev, ino uint64
-	ctime    int64 // ns; overlay files only
-	handle   string
+	ctime    int64  // ns; overlay files only
+	handle   string // hex of the first 16 bytes of the handle's SHA-256; overlay files only
 }
 
 // atHandleFID is AT_HANDLE_FID (Linux 6.5): name_to_handle_at returns a
@@ -97,7 +104,10 @@ func fileIdentity(path string) (fileKey, error) {
 			var b bytes.Buffer
 			_ = binary.Write(&b, binary.LittleEndian, h.Type())
 			b.Write(h.Bytes())
-			return fileKey{ino: st.Ino, ctime: st.Ctim.Nano(), handle: b.String()}, nil
+			// A digest: the key goes into the uprobe's pin name, and a
+			// handle can be up to 128 bytes.
+			sum := sha256.Sum256(b.Bytes())
+			return fileKey{ino: st.Ino, ctime: st.Ctim.Nano(), handle: hex.EncodeToString(sum[:16])}, nil
 		}
 	}
 	return fileKey{dev: uint64(st.Dev), ino: st.Ino}, nil //nolint:unconvert // Dev is uint32 on some arches
@@ -171,6 +181,8 @@ type uprobeLinkKey struct {
 
 // uprobeEntry is an attached uprobe: its links (an entry and a return
 // probe for progEVPCipherInit) and the containers (cgroup IDs) that need it.
+// An adopted uprobe (one a previous controller pinned) has none until an
+// attach claims it.
 type uprobeEntry struct {
 	links   []io.Closer
 	cgroups map[uint64]struct{}
@@ -205,6 +217,34 @@ func (r *linkRegistry) ensure(key *uprobeLinkKey, cgroupID uint64, attach func()
 	}
 	r.uprobes[*key] = &uprobeEntry{links: links, cgroups: map[uint64]struct{}{cgroupID: {}}}
 	return true, nil
+}
+
+// adopt records the uprobe of key, with its links, as a previous controller
+// pinned it: no container needs it until an attach claims it (ensure), and
+// releaseUnclaimed drops it otherwise.
+func (r *linkRegistry) adopt(key *uprobeLinkKey, links []io.Closer) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.uprobes == nil {
+		r.uprobes = make(map[uprobeLinkKey]*uprobeEntry)
+	}
+	r.uprobes[*key] = &uprobeEntry{links: links, cgroups: map[uint64]struct{}{}}
+}
+
+// releaseUnclaimed drops the adopted uprobes no attach claimed (those of the
+// containers that went while no controller ran), and returns their links,
+// for the caller to close.
+func (r *linkRegistry) releaseUnclaimed() []io.Closer {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []io.Closer
+	for k, e := range r.uprobes {
+		if len(e.cgroups) == 0 {
+			out = append(out, e.links...)
+			delete(r.uprobes, k)
+		}
+	}
+	return out
 }
 
 // releaseCgroup records that container cgroupID needs none of its uprobes

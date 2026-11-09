@@ -41,7 +41,11 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
     clang -O2 -g -Wall -Werror -D${ARCH_DEFINE} ${DEBUG_DEFINE} \
       -target bpfel -c bpf/tls_uprobe.c -o tlsuprobe_bpfel.o && \
     clang -O2 -g -Wall -Werror -D${ARCH_DEFINE} ${DEBUG_DEFINE} \
-      -target bpfeb -c bpf/tls_uprobe.c -o tlsuprobe_bpfeb.o
+      -target bpfeb -c bpf/tls_uprobe.c -o tlsuprobe_bpfeb.o && \
+    clang -O2 -g -Wall -Werror -D${ARCH_DEFINE} ${DEBUG_DEFINE} \
+      -target bpfel -c bpf/dispatch_v1.c -o dispatch_bpfel.o && \
+    clang -O2 -g -Wall -Werror -D${ARCH_DEFINE} ${DEBUG_DEFINE} \
+      -target bpfeb -c bpf/dispatch_v1.c -o dispatch_bpfeb.o
 
 # Cross-compile Go binary for the target platform (no CGO, pure Go).
 # When COVER=1, build with `-cover` for integration test coverage and

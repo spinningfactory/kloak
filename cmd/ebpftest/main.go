@@ -30,7 +30,7 @@ func main() {
 	hostRes := &ebpfpkg.HostResolutionConfig{VirtualIPRanges: ranges, PinPath: pinPath}
 	// The connect redirect attaches to the kubepods cgroup: on a host
 	// without one, the objects load but the manager fails after.
-	mgr, err := ebpfpkg.NewTLSUprobeManager(nil, "/sys/fs/cgroup", "auto", hostRes, zap.NewNop().Sugar())
+	mgr, err := ebpfpkg.NewTLSUprobeManager(nil, "/sys/fs/cgroup", "auto", hostRes, false, zap.NewNop().Sugar())
 	if err != nil {
 		_ = os.RemoveAll(pinPath)
 		var ve *ebpf.VerifierError
