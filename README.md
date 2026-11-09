@@ -55,6 +55,22 @@ helm install kloak kloak/kloak -n kloak-system --create-namespace
 kubectl get pods -n kloak-system
 ```
 
+### Restarts, upgrades and uninstalling
+
+A controller that stops for a restart, a rollout or an upgrade leaves its node's eBPF programs attached (`controller.ebpf.persist`, on by default). They stay pinned under `/sys/fs/bpf/kloak`, the next controller adopts them, and the pods' secrets are rewritten all along. When an upgrade changes the eBPF programs themselves, the new controller loads its own instead, and until it has attached them, the pods' TLS writes carry their placeholders: they fail closed. So do the first upgrade from a version without this, a rollback to one, and turning `controller.ebpf.persist` off: the stopping controller then detaches the programs, as the next one would not adopt them.
+
+`helm uninstall` tears the programs down on every node. A pre-delete hook has each controller detach them and remove their pins, then lists the nodes it could not confirm (`uninstall.hook`). A controller also tears them down when it stops and finds its DaemonSet gone, as with `helm uninstall --no-hooks` or a deleted namespace.
+
+A node whose controller was not running then, or that left the DaemonSet's scope (its node selector or tolerations changed), keeps them until it reboots. To remove them without a reboot, run `kloak cleanup` as root on the node, for example:
+
+```bash
+kubectl debug node/<node> -it --profile=sysadmin --image=ghcr.io/spinningfactory/kloak:<version> \
+  --custom=<(echo '{"securityContext":{"runAsUser":0}}') -- \
+  /kloak cleanup --pin-path /host/sys/fs/bpf/kloak --node-lock /host/run/kloak/lock
+```
+
+The pinned maps hold the real secrets. As with a running controller's maps, only the node's root can read them.
+
 ### Upgrading from v0.2.x and earlier
 
 Host-restricted secrets now use virtual IPs (see [Host Verification](#host-verification)) instead of reading the DNS answers pods receive:
