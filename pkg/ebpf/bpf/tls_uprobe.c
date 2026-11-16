@@ -41,6 +41,10 @@
 #define MAX_DATA_SIZE 256
 // Fixed secret rewrite size
 #define SECRET_MAX_LEN 128
+// Bytes of a placeholder one secret_chunks entry holds (see struct
+// secret_chunk). A power of two, so that a byte offset splits into a chunk
+// index and an in-chunk offset with a shift and a mask, and a multiple of 8.
+#define SECRET_CHUNK_LEN 256
 // BPF map key length — short key for lookup (kl:: + 4 UUID chars)
 #define SECRET_KEY_LEN 8
 // Max prefix bytes stored in secret_value (for future verification use)
@@ -61,7 +65,8 @@ struct secret_key {
 };
 
 struct secret_value {
-  __u32 len;
+  __u32 len;                           // placeholder bytes on the wire (raw, or its HPACK-Huffman code)
+  __u32 gen;                           // generation of the entry's secret_chunks; never 0 for an entry sync wrote
   char real_secret[SECRET_MAX_LEN];
   __u32 host_len;                      // 0 = wildcard (allow all hosts)
   char allowed_host[MAX_HOST_LEN];     // e.g. "httpbin.org"
@@ -81,6 +86,76 @@ struct {
   __type(key, struct secret_key);
   __type(value, struct secret_value);
 } secret_map SEC(".maps");
+
+_Static_assert(offsetof(struct secret_value, gen) == 4 &&
+                   offsetof(struct secret_value, real_secret) == 8,
+               "secret_value: len and gen first, real_secret 8-byte aligned");
+
+// The secret store (spinningfactory/kloak#383): a secret_map entry's
+// placeholder and patch, of any length, in SECRET_CHUNK_LEN-byte chunks.
+// secret_map keeps an entry's metadata (length, host, IP and port
+// restrictions) and names its generation; chunk idx of generation gen holds
+// bytes [idx * SECRET_CHUNK_LEN, idx * SECRET_CHUNK_LEN + SECRET_CHUNK_LEN)
+// of the entry, for idx in 0 .. ceil(len / SECRET_CHUNK_LEN) - 1. Written by
+// pkg/ebpf/sync.go (secretStore), read-only to programs.
+//
+// A change of an entry's placeholder or real value is a new generation:
+// sync writes every chunk of gen+1, then points the secret_map entry at it,
+// and deletes the previous generation's chunks only after a grace period
+// longer than anything in flight may still refer to them (a staged patch
+// lives TC_PENDING_TTL_NS). A reader that holds (key, gen) from an earlier
+// lookup therefore finds that generation's chunks whole, or, past the grace
+// period, none: a missing chunk means the patch is refused, never that
+// another generation's bytes are used. An unchanged entry keeps its
+// generation (host, IP or port changes are made in place).
+//
+// TODO(kloak#383): the data plane still patches from
+// secret_value.real_secret; the phase-1 switchover reads the chunks instead,
+// and drops real_secret.
+struct secret_chunk_key {
+  struct secret_key key; // the secret_map key: raw placeholder, or its HPACK-Huffman entry
+  __u32 gen;             // secret_value.gen of the entry these chunks belong to
+  __u32 idx;             // chunk index
+};
+
+struct secret_chunk {
+  // The placeholder's bytes as on the wire: the shadow, or Huffman(shadow)
+  // for an HPACK-Huffman entry, whose last byte then ends with the code's EOS
+  // padding (1s) in its pad_bits low bits: compare it under patch_tail_mask.
+  __u8 shadow[SECRET_CHUNK_LEN];
+  // shadow XOR the real value as on the wire (Huffman(real) for an HPACK
+  // entry), 0 in the pad_bits low bits of the placeholder's last byte: those
+  // bits belong to what follows the placeholder, and the patch leaves them
+  // (patch_tail_mask). XORed onto the ciphertext, it turns the placeholder
+  // into the real value.
+  __u8 delta[SECRET_CHUNK_LEN];
+  // Both arrays are 0 past the entry's len.
+};
+
+_Static_assert((SECRET_CHUNK_LEN & (SECRET_CHUNK_LEN - 1)) == 0 && SECRET_CHUNK_LEN % 8 == 0,
+               "SECRET_CHUNK_LEN must be a power of two and a multiple of 8");
+_Static_assert(sizeof(struct secret_chunk_key) == SECRET_KEY_LEN + 8 &&
+                   offsetof(struct secret_chunk_key, gen) == SECRET_KEY_LEN &&
+                   offsetof(struct secret_chunk_key, idx) == SECRET_KEY_LEN + 4,
+               "secret_chunk_key must have no holes");
+_Static_assert(sizeof(struct secret_chunk) == 2 * SECRET_CHUNK_LEN &&
+                   offsetof(struct secret_chunk, delta) == SECRET_CHUNK_LEN &&
+                   SECRET_CHUNK_LEN % 8 == 0,
+               "secret_chunk: shadow and delta back to back, both 8-byte aligned");
+
+// max_entries is set at load from the controller's byte budget
+// (--secret-store-bytes, secretStoreEntries in pkg/ebpf/secret_store.go); a
+// preallocated hash map, so the budget is reserved kernel memory. This value
+// is for loaders that don't size it: one chunk for every secret_map entry,
+// twice (a rotation keeps two generations for the grace period). No program
+// refers to it yet; it is still created and pinned with the others.
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 8192);
+  __uint(map_flags, BPF_F_RDONLY_PROG);
+  __type(key, struct secret_chunk_key);
+  __type(value, struct secret_chunk);
+} secret_chunks SEC(".maps");
 
 // Per-pod secret binding: a placeholder is redeemed only by processes whose
 // cgroup belongs to a pod that references the owning secret in its spec

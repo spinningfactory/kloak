@@ -8,6 +8,9 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	ciliumebpf "github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 )
 
 // TestBPFTLSOffsetsLayout pins the hand-written bpfTLSOffsets mirror to the
@@ -47,6 +50,36 @@ func TestSecretValueLayout(t *testing.T) {
 	}
 	if got, want := fieldNames(secretValue{}), fieldNames(tlsuprobeSecretValue{}); !slices.Equal(got, want) {
 		t.Fatalf("secretValue field order %v does not match struct secret_value %v", got, want)
+	}
+}
+
+// TestSecretChunkLayout pins the secret store's mirrors to the generated
+// struct secret_chunk_key and struct secret_chunk: a mismatch would have
+// every chunk lookup of the data plane miss, or read the wrong bytes.
+func TestSecretChunkLayout(t *testing.T) {
+	for _, c := range []struct {
+		name      string
+		got, want any
+	}{
+		{"secret_chunk_key", secretChunkKey{}, tlsuprobeSecretChunkKey{}},
+		{"secret_chunk", secretChunk{}, tlsuprobeSecretChunk{}},
+	} {
+		if got, want := binary.Size(c.got), binary.Size(c.want); got != want {
+			t.Errorf("%T is %d bytes, struct %s is %d", c.got, got, c.name, want)
+		}
+		if got, want := fieldNames(c.got), fieldNames(c.want); !slices.Equal(got, want) {
+			t.Errorf("%T field order %v does not match struct %s %v", c.got, got, c.name, want)
+		}
+	}
+	if got := len(tlsuprobeSecretChunk{}.Shadow); got != secretChunkLen {
+		t.Errorf("SECRET_CHUNK_LEN is %d, secretChunkLen %d", got, secretChunkLen)
+	}
+	spec := loadSpec(t).Maps["secret_chunks"]
+	if spec == nil {
+		t.Fatal("secret_chunks is not in the BPF object")
+	}
+	if spec.Type != ciliumebpf.Hash || spec.Flags&unix.BPF_F_RDONLY_PROG == 0 {
+		t.Errorf("secret_chunks is %v with flags %#x, want a hash map read-only to programs", spec.Type, spec.Flags)
 	}
 }
 

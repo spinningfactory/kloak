@@ -50,6 +50,7 @@ type secretKey struct {
 // secretValue matches C struct secret_value
 type secretValue struct {
 	Len         uint32
+	Gen         uint32 // generation of the entry's secret_chunks (secret_store.go)
 	RealSecret  [128]byte
 	HostLen     uint32
 	AllowedHost [64]byte
