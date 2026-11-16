@@ -6,6 +6,7 @@ import (
 	"errors"
 	"maps"
 	"os"
+	"regexp"
 	"slices"
 	"testing"
 
@@ -45,9 +46,17 @@ func skipUnlessRejected(t *testing.T, err error) {
 	t.Skipf("eBPF objects not available (need Linux kernel 5.17+): %v", err)
 }
 
+// stackDepth finds the verifier's stats line on the stack: the stack size
+// of each subprogram, the program first, then the functions it calls and
+// its bpf_loop callbacks ("stack depth 312+0+48"). The kernel caps a call
+// chain's frames at 512 bytes together.
+var stackDepth = regexp.MustCompile(`(?m)^stack depth (\S+)`)
+
 // TestVerifierBudget loads every program on its own, so that one rejection
 // doesn't hide the others, and checks its verifier cost against
-// verifierBudget.
+// verifierBudget. It also logs the stack depth the verifier computed: the
+// stats-only log (LogLevelStats) is a few lines, and costs nothing next to
+// the verification.
 func TestVerifierBudget(t *testing.T) {
 	spec, err := loadTlsuprobe()
 	if err != nil {
@@ -57,8 +66,19 @@ func TestVerifierBudget(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			one := spec.Copy()
 			one.Programs = map[string]*ebpf.ProgramSpec{name: one.Programs[name]}
-			coll, err := ebpf.NewCollection(one)
+			coll, err := ebpf.NewCollectionWithOptions(one, ebpf.CollectionOptions{
+				Programs: ebpf.ProgramOptions{LogLevel: ebpf.LogLevelStats},
+			})
 			if err != nil {
+				// With a log level set, a rejection's error only
+				// carries the stats log: load again with the
+				// defaults, whose error carries the verifier's
+				// instruction trace.
+				if c, again := ebpf.NewCollection(one); again != nil {
+					err = again
+				} else {
+					c.Close()
+				}
 				skipUnlessRejected(t, err)
 			}
 			defer coll.Close()
@@ -71,7 +91,11 @@ func TestVerifierBudget(t *testing.T) {
 			if !ok {
 				t.Skip("this kernel doesn't report the verifier's cost (5.16+)")
 			}
-			t.Logf("verified %d instructions (budget %d)", n, verifierBudget)
+			depth := "unknown"
+			if m := stackDepth.FindStringSubmatch(coll.Programs[name].VerifierLog); m != nil {
+				depth = m[1]
+			}
+			t.Logf("verified %d instructions (budget %d), stack depth %s", n, verifierBudget, depth)
 			if n > verifierBudget {
 				t.Errorf("%d verified instructions is over the budget of %d", n, verifierBudget)
 			}
