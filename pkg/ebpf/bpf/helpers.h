@@ -382,6 +382,140 @@ HELPER_INLINE void gf128_halve_to_h(__u64 lo, __u64 hi, __u8 out[16]) {
   }
 }
 
+// ============================================================================
+// GHASH engine: 4-bit table multiplication and per-span tag deltas
+// (tc_ghash_update).
+//
+// An element is two 64-bit words: hi is bytes 0..7 of its 16-byte GHASH
+// string read big-endian, lo bytes 8..15. The x^0 coefficient is hi's MSB and
+// x^127 lo's LSB, so multiplying by x is a 128-bit right shift. BPF does
+// 64-bit arithmetic natively, and a word holds 16 of the 32 nibbles a table
+// multiply reads.
+// ============================================================================
+
+struct gf128 {
+  __u64 hi;
+  __u64 lo;
+};
+
+// x^128 = 1 + x + x^2 + x^7 (mod P), as a hi word: what a bit shifted out
+// past x^127 comes back as.
+#define GF128_R 0xE100000000000000ULL
+
+HELPER_INLINE __u64 gf128_load64(const __u8 p[8]) {
+  __u64 v = 0;
+  for (int i = 0; i < 8; i++)
+    v = (v << 8) | p[i];
+  return v;
+}
+
+HELPER_INLINE void gf128_store64(__u8 p[8], __u64 v) {
+  for (int i = 0; i < 8; i++)
+    p[i] = (__u8)(v >> (56 - 8 * i));
+}
+
+HELPER_INLINE void gf128_load(const __u8 b[16], struct gf128 *v) {
+  v->hi = gf128_load64(b);
+  v->lo = gf128_load64(b + 8);
+}
+
+HELPER_INLINE void gf128_store(__u8 b[16], const struct gf128 *v) {
+  gf128_store64(b, v->hi);
+  gf128_store64(b + 8, v->lo);
+}
+
+// v = v * x.
+HELPER_INLINE void gf128_mulx(struct gf128 *v) {
+  __u64 r = -(v->lo & 1) & GF128_R;
+  v->lo = (v->lo >> 1) | (v->hi << 63);
+  v->hi = (v->hi >> 1) ^ r;
+}
+
+// Shoup's 4-bit table of an element H: m[n] = n * H for every 4-bit n, read
+// MSB-first like the GHASH strings (n's bit 3, 8, is x^0, its bit 0, 1, is
+// x^3). 16 elements, 256 bytes.
+struct gf128_table {
+  struct gf128 m[16];
+};
+
+HELPER_INLINE void gf128_table_init(struct gf128_table *t, const struct gf128 *h) {
+  struct gf128 v = *h;
+  t->m[0].hi = 0;
+  t->m[0].lo = 0;
+  t->m[8] = v;
+  gf128_mulx(&v);
+  t->m[4] = v;
+  gf128_mulx(&v);
+  t->m[2] = v;
+  gf128_mulx(&v);
+  t->m[1] = v;
+  // Every other n is the sum of its top bit's entry and the rest's.
+#pragma GCC unroll 16
+  for (int n = 3; n < 16; n++) {
+    int top = n >= 8 ? 8 : n >= 4 ? 4 : 2;
+    if (n == top)
+      continue;
+    t->m[n].hi = t->m[top].hi ^ t->m[n - top].hi;
+    t->m[n].lo = t->m[top].lo ^ t->m[n - top].lo;
+  }
+}
+
+// The reduction table of gf128_table_mul: r[n] is what the 4 bits n that a
+// multiplication by x^4 (a 4-bit right shift) pushes out of lo come back as,
+// as a hi word. Bit k of n, x^(127-k), becomes x^(131-k) = x^(3-k) * x^128 =
+// x^(3-k) * (1 + x + x^2 + x^7): GF128_R shifted right by 3-k.
+HELPER_INLINE void gf128_rem4_init(__u64 r[16]) {
+#pragma GCC unroll 16
+  for (int n = 0; n < 16; n++) {
+    __u64 v = 0;
+    for (int k = 0; k < 4; k++)
+      if ((n >> k) & 1)
+        v ^= GF128_R >> (3 - k);
+    r[n] = v;
+  }
+}
+
+// gf128_table_mul sets x = x * H, t being H's table (gf128_table_init) and r
+// the reduction table (gf128_rem4_init).
+//
+// Shoup's method: x is 32 nibbles x^4 apart, n_0 (hi's top nibble) to n_31
+// (lo's bottom one), x = sum of n_i * x^(4i), so x * H = sum of m[n_i] *
+// x^(4i), which Horner's rule computes from n_31 down: z = z * x^4 + m[n_i].
+// z * x^4 is a 4-bit right shift whose 4 bits pushed out of lo come back
+// reduced from r. 32 table steps instead of the 128 conditional XORs and
+// shifts of a bit-serial multiply.
+//
+// Unrolled, as gf128_mul_step was, for the same reasons: every shift of x is
+// a constant, and the verifier walks the 32 steps as straight-line code,
+// with no loop state to track. The table indexes are 4-bit masks, which keep
+// the reads of t and r in bounds for the verifier.
+HELPER_INLINE void gf128_table_mul(struct gf128 *x, const struct gf128_table *t,
+                                   const __u64 r[16]) {
+  __u64 xhi = x->hi, xlo = x->lo;
+  __u64 zhi = 0, zlo = 0;
+#pragma GCC unroll 32
+  for (int i = 31; i >= 0; i--) {
+    __u64 w = i < 16 ? xhi : xlo;
+    __u32 n = (w >> (60 - 4 * (i & 15))) & 0xF;
+    __u32 rem = zlo & 0xF;
+    zlo = (zlo >> 4) | (zhi << 60);
+    zhi = (zhi >> 4) ^ r[rem];
+    zhi ^= t->m[n].hi;
+    zlo ^= t->m[n].lo;
+  }
+  x->hi = zhi;
+  x->lo = zlo;
+}
+
+// gf128_mul_by sets x = x * y for a y without a table: it builds y's in t
+// (scratch space) first. Building is cheap next to the multiplication
+// itself: three shifts and eleven XORs of 128 bits.
+HELPER_INLINE void gf128_mul_by(struct gf128 *x, const struct gf128 *y,
+                                struct gf128_table *t, const __u64 r[16]) {
+  gf128_table_init(t, y);
+  gf128_table_mul(x, t, r);
+}
+
 // ghash_block_delta writes the XOR delta of GHASH block `block` (bytes
 // block * 16 .. block * 16 + 15 of the ciphertext; block is masked to 10
 // bits) to out:
@@ -412,6 +546,110 @@ HELPER_INLINE void ghash_block_delta(const __u8 xor_delta[SECRET_MAX_LEN],
   }
 }
 
+// ----------------------------------------------------------------------------
+// Tag delta of a patch: Horner's rule over its span, then one power of H.
+//
+// The record's GHASH input is its AAD blocks, its n ciphertext blocks and the
+// length block, each XORed into the accumulator, which is then multiplied by
+// H. Ciphertext block b (0-based) is therefore multiplied by H once for
+// itself and once for each block after it: n - 1 - b ciphertext blocks and
+// the length block, H^(n + 1 - b) in all. Changing the ciphertext by D_b in
+// block b changes the tag by D_b * H^(n + 1 - b): the tag mask E(K, J0), the
+// AAD and the length block cancel, and the sum is linear in the D_b.
+//
+// A patch changes the contiguous blocks first..last. Horner's rule over them,
+// acc = (acc ^ D_b) * H from b = first to b = last, leaves
+// acc = sum of D_b * H^(last + 1 - b), one table multiply per block; times
+// H^(n - last) that is the patch's tag delta. ghash_span_plan computes
+// first, the block count and exp = n - last, which is at least 1 (the length
+// block) and below 2^GHASH_POW_BITS; ghash_pow_step multiplies by H^exp one
+// set bit at a time, from the cached H^(2^i).
+//
+// Patches add up: the record's tag delta is the XOR of its patches' (two
+// patches in one block each contribute their own bytes of it).
+// ----------------------------------------------------------------------------
+
+// ghash_pow_step's H^(2^i) cover i < GHASH_POW_BITS, so a span's exponent,
+// at most the record's ciphertext block count, must stay below
+// 2^GHASH_POW_BITS (asserted against TLS_MAX_RECORD_LEN below).
+#define GHASH_POW_BITS 11
+#define GHASH_MAX_CT_BLOCKS ((1u << GHASH_POW_BITS) - 1)
+
+struct ghash_span {
+  __u32 first; // first ciphertext block the patch changes
+  __u32 count; // blocks it changes: Horner steps
+  __u32 exp;   // the power of H that the Horner sum is multiplied by
+};
+
+// ghash_span_plan fills s for a patch of len bytes at byte sec_off of a
+// record's ct_len ciphertext bytes (TLS 1.2's explicit nonce and the tag
+// excluded). It returns 0, and the record must not be patched, when the
+// patch can't be hashed: empty, not inside the ciphertext, or the record
+// longer than any TLS record.
+HELPER_INLINE int ghash_span_plan(__u32 sec_off, __u32 len, __u32 ct_len,
+                                  struct ghash_span *s) {
+  if (len == 0 || ct_len > GHASH_MAX_CT_BLOCKS * 16 || sec_off >= ct_len ||
+      len > ct_len - sec_off)
+    return 0;
+  __u32 last = (sec_off + len - 1) / 16;
+  s->first = sec_off / 16;
+  s->count = last - s->first + 1;
+  s->exp = (ct_len + 15) / 16 - last;
+  return 1;
+}
+
+// ghash_block_delta64 returns in out what ciphertext block `block` (masked to
+// GHASH_POW_BITS bits) changes by under a patch of len bytes at sec_off:
+// byte i is the delta byte of position pos = block * 16 + i when pos is in
+// the patch, 0 elsewhere. It is ghash_block_delta's arithmetic (which see),
+// assembled into the engine's words.
+//
+// The delta bytes come from win, a window of win_mask + 1 bytes (a power of
+// two, a constant): patch byte d (pos - sec_off) is win[d & win_mask]. The
+// patch's inline xor_delta is such a window of SECRET_MAX_LEN bytes, which
+// holds all of it; a ring of chunks, chunk c at (c * chunk length) &
+// win_mask, is another that does not need to.
+HELPER_INLINE void ghash_block_delta64(const __u8 *win, __u32 win_mask,
+                                       __u32 block, __u32 sec_off, __u32 len,
+                                       struct gf128 *out) {
+  __u64 start = (__u64)(block & GHASH_MAX_CT_BLOCKS) * 16 - sec_off;
+  __u64 hi = 0, lo = 0;
+#pragma GCC unroll 16
+  for (int i = 0; i < 16; i++) {
+    __u64 d = start + i;
+    barrier_var(d);
+    __u64 in = (~d & (d - len)) >> 63;
+    __u64 byte = win[d & win_mask] & -in;
+    if (i < 8)
+      hi |= byte << (56 - 8 * i);
+    else
+      lo |= byte << (56 - 8 * (i - 8));
+  }
+  out->hi = hi;
+  out->lo = lo;
+}
+
+// One Horner step of a span: acc = (acc ^ d) * H, ht being H's table.
+HELPER_INLINE void ghash_horner_step(struct gf128 *acc, const struct gf128 *d,
+                                     const struct gf128_table *ht,
+                                     const __u64 r[16]) {
+  acc->hi ^= d->hi;
+  acc->lo ^= d->lo;
+  gf128_table_mul(acc, ht, r);
+}
+
+// Bit `bit` of a span's exponent: acc = acc * H^(2^bit) when it is set, hp
+// being H^(2^bit) and t scratch space for its table. Returns whether it
+// multiplied.
+HELPER_INLINE int ghash_pow_step(struct gf128 *acc, __u32 exp, __u32 bit,
+                                 const struct gf128 *hp, struct gf128_table *t,
+                                 const __u64 r[16]) {
+  if (!((exp >> bit) & 1))
+    return 0;
+  gf128_mul_by(acc, hp, t, r);
+  return 1;
+}
+
 // Kloak internal cipher type enum (not TLS cipher suite IDs).
 // The cipher type is determined implicitly: successful H extraction = AES-GCM.
 #define KLOAK_CIPHER_UNKNOWN 0
@@ -434,6 +672,11 @@ HELPER_INLINE int is_aes_gcm(__u32 cipher_type) {
 // Largest legal TLSCiphertext.length (RFC 5246 §6.2.3: 2^14 + 2048). Anything
 // larger cannot be a record boundary.
 #define TLS_MAX_RECORD_LEN (16384 + 2048)
+
+// Every ciphertext block of a record, and so every span's exponent, stays
+// within the H^(2^i) that the GHASH engine keeps (ghash_span_plan).
+_Static_assert((TLS_MAX_RECORD_LEN + 15) / 16 <= GHASH_MAX_CT_BLOCKS,
+               "a TLS record has more blocks than GHASH_POW_BITS cover");
 
 // Smallest application_data record: TLS 1.3 with 0 plaintext bytes =
 // 1 (inner content type) + 16 (AEAD tag).

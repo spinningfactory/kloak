@@ -921,6 +921,536 @@ static void test_ghash_block_delta(void) {
 }
 
 // ============================================================================
+// GHASH engine: table multiply, span tag deltas
+// ============================================================================
+
+// xorshift64*: a fixed sequence, so a failure reproduces.
+static __u64 rng_state = 0x9E3779B97F4A7C15ULL;
+static __u64 rng64(void) {
+  rng_state ^= rng_state >> 12;
+  rng_state ^= rng_state << 25;
+  rng_state ^= rng_state >> 27;
+  return rng_state * 0x2545F4914F6CDD1DULL;
+}
+
+static void rng_bytes(__u8 *p, __u32 n) {
+  for (__u32 i = 0; i < n; i++)
+    p[i] = (__u8)(rng64() >> 56);
+}
+
+static struct gf128 rng_gf128(void) {
+  struct gf128 v = {rng64(), rng64()};
+  return v;
+}
+
+static int gf_eq(const struct gf128 *a, const struct gf128 *b) {
+  return a->hi == b->hi && a->lo == b->lo;
+}
+
+static void gf_xor(struct gf128 *a, const struct gf128 *b) {
+  a->hi ^= b->hi;
+  a->lo ^= b->lo;
+}
+
+static void print_gf(const char *label, const struct gf128 *v) {
+  printf("\n    %s: %016llx%016llx", label, (unsigned long long)v->hi,
+         (unsigned long long)v->lo);
+}
+
+// The bit-serial multiply (gf128_mul, checked against the GCM spec's vectors
+// above), on the engine's words.
+static struct gf128 ref_mul(const struct gf128 *a, const struct gf128 *b) {
+  __u8 ab[16], bb[16], rb[16];
+  struct gf128 r;
+  gf128_store(ab, a);
+  gf128_store(bb, b);
+  gf128_mul(ab, bb, rb);
+  gf128_load(rb, &r);
+  return r;
+}
+
+static __u64 rem4[16];
+
+static struct gf128 table_mul(const struct gf128 *x, const struct gf128 *h) {
+  struct gf128_table t;
+  struct gf128 r = *x;
+  gf128_table_init(&t, h);
+  gf128_table_mul(&r, &t, rem4);
+  return r;
+}
+
+static void test_gf128_words(void) {
+  __u8 b[16], back[16];
+  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", b, 16);
+  struct gf128 v;
+  gf128_load(b, &v);
+  assert(v.hi == 0x66e94bd4ef8a2c3bULL && v.lo == 0x884cfa59ca342b2eULL);
+  gf128_store(back, &v);
+  assert(bytes_equal(b, back, 16));
+
+  // x * x^127 = x^128 = 1 + x + x^2 + x^7; x^0 * x = x.
+  struct gf128 top = {0, 1}, one = {1ULL << 63, 0};
+  gf128_mulx(&top);
+  assert(top.hi == GF128_R && top.lo == 0);
+  gf128_mulx(&one);
+  assert(one.hi == 1ULL << 62 && one.lo == 0);
+}
+
+static void test_gf128_rem4(void) {
+  // The reduction constants of the 4-bit method (Shoup; McGrew & Viega).
+  static const __u64 want[16] = {0x0000, 0x1C20, 0x3840, 0x2460,
+                                 0x7080, 0x6CA0, 0x48C0, 0x54E0,
+                                 0xE100, 0xFD20, 0xD940, 0xC560,
+                                 0x9180, 0x8DA0, 0xA9C0, 0xB5E0};
+  for (int n = 0; n < 16; n++)
+    assert(rem4[n] == want[n] << 48);
+}
+
+static void test_gf128_table_entries(void) {
+  // m[n] = n * H, n read MSB-first: the bit-serial product of H and the
+  // element whose first four coefficients are n's bits.
+  struct gf128 h = rng_gf128();
+  struct gf128_table t;
+  gf128_table_init(&t, &h);
+  for (__u64 n = 0; n < 16; n++) {
+    struct gf128 e = {n << 60, 0};
+    struct gf128 want = ref_mul(&e, &h);
+    assert(gf_eq(&t.m[n], &want));
+  }
+}
+
+static void check_table_mul(const struct gf128 *x, const struct gf128 *h) {
+  struct gf128 want = ref_mul(x, h), got = table_mul(x, h);
+  if (!gf_eq(&want, &got)) {
+    print_gf("x   ", x);
+    print_gf("h   ", h);
+    print_gf("want", &want);
+    print_gf("got ", &got);
+  }
+  assert(gf_eq(&want, &got));
+}
+
+static void test_gf128_table_mul(void) {
+  // Edge elements: 0, 1, all ones, every single coefficient x^0 .. x^127,
+  // and the GCM spec's H values; each against all of them.
+  struct gf128 edge[136];
+  int n = 0;
+  edge[n++] = (struct gf128){0, 0};
+  edge[n++] = (struct gf128){~0ULL, ~0ULL};
+  for (int i = 0; i < 64; i++) {
+    edge[n++] = (struct gf128){1ULL << (63 - i), 0};
+    edge[n++] = (struct gf128){0, 1ULL << (63 - i)};
+  }
+  edge[n++] = (struct gf128){0x66e94bd4ef8a2c3bULL, 0x884cfa59ca342b2eULL};
+  edge[n++] = (struct gf128){0xb83b533708bf535dULL, 0x0aa6e52980d53b78ULL};
+  for (int i = 0; i < n; i++)
+    for (int j = 0; j < n; j++)
+      check_table_mul(&edge[i], &edge[j]);
+
+  // Random elements, against the edges and against each other.
+  for (int i = 0; i < 20000; i++) {
+    struct gf128 x = rng_gf128(), h = rng_gf128();
+    check_table_mul(&x, &h);
+    check_table_mul(&x, &edge[i % n]);
+    check_table_mul(&edge[i % n], &h);
+  }
+
+  // GCM spec test case 2: C * H = X1.
+  struct gf128 h = {0x66e94bd4ef8a2c3bULL, 0x884cfa59ca342b2eULL};
+  struct gf128 c = {0x0388dace60b6a392ULL, 0xf328c2b971b2fe78ULL};
+  struct gf128 x1 = table_mul(&c, &h);
+  assert(x1.hi == 0x5e2ec74691706288ULL && x1.lo == 0x2c85b0685353deb7ULL);
+}
+
+static void test_gf128_mul_by(void) {
+  // gf128_mul_by builds y's table in the scratch table it is given, over
+  // whatever was there.
+  struct gf128_table scratch;
+  memset(&scratch, 0x5A, sizeof(scratch));
+  for (int i = 0; i < 2000; i++) {
+    struct gf128 x = rng_gf128(), y = rng_gf128();
+    struct gf128 want = ref_mul(&x, &y), got = x;
+    gf128_mul_by(&got, &y, &scratch, rem4);
+    assert(gf_eq(&want, &got));
+    // Squaring, which builds the H^(2^i) powers: x and y the same element.
+    want = ref_mul(&x, &x);
+    got = x;
+    gf128_mul_by(&got, &x, &scratch, rem4);
+    assert(gf_eq(&want, &got));
+  }
+}
+
+static void test_ghash_span_plan(void) {
+  struct ghash_span s;
+  // A 24-byte placeholder at offset 2 of a 26-byte ciphertext: blocks 0..1
+  // of 2; the length block follows the last one.
+  assert(ghash_span_plan(2, 24, 26, &s));
+  assert(s.first == 0 && s.count == 2 && s.exp == 1);
+  // One byte at the end of block 3 of 10 blocks: 6 blocks and the length
+  // block after it.
+  assert(ghash_span_plan(63, 1, 160, &s));
+  assert(s.first == 3 && s.count == 1 && s.exp == 7);
+  // A whole block, then the same byte count one byte later (two blocks).
+  assert(ghash_span_plan(16, 16, 33, &s) && s.first == 1 && s.count == 1 && s.exp == 2);
+  assert(ghash_span_plan(17, 16, 33, &s) && s.first == 1 && s.count == 2 && s.exp == 1);
+  // The largest TLS 1.2 record (no AEAD record is longer): 1151 blocks, the
+  // exponent of block 0 at most 1151, 11 bits.
+  __u32 ct12 = TLS_MAX_RECORD_LEN - 8 - 16;
+  assert(ghash_span_plan(0, 1, ct12, &s) && s.exp == (ct12 + 15) / 16);
+  assert(s.exp < (1u << GHASH_POW_BITS));
+  assert(ghash_span_plan(0, ct12, ct12, &s) && s.count == (ct12 + 15) / 16 && s.exp == 1);
+  assert(ghash_span_plan(0, 1, GHASH_MAX_CT_BLOCKS * 16, &s) &&
+         s.exp == GHASH_MAX_CT_BLOCKS);
+
+  // Not hashable: empty, past the ciphertext (at its end, running over it,
+  // offsets so large that sec_off + len wraps), too long a record.
+  assert(!ghash_span_plan(2, 0, 26, &s));
+  assert(!ghash_span_plan(26, 1, 26, &s));
+  assert(!ghash_span_plan(3, 24, 26, &s));
+  assert(!ghash_span_plan(0, 27, 26, &s));
+  assert(!ghash_span_plan(0xFFFFFFF0u, 0x20, 26, &s));
+  assert(!ghash_span_plan(2, 0xFFFFFFFFu, 26, &s));
+  assert(!ghash_span_plan(0, 1, GHASH_MAX_CT_BLOCKS * 16 + 1, &s));
+}
+
+// The bytes of block b under a patch of len bytes at sec_off whose delta
+// byte d is delta[d] (the engine's words).
+static struct gf128 block_delta_ref(const __u8 *delta, __u32 b, __u32 sec_off,
+                                    __u32 len) {
+  __u8 out[16] = {0};
+  for (__u32 i = 0; i < 16; i++) {
+    __u64 pos = (__u64)(b & GHASH_MAX_CT_BLOCKS) * 16 + i;
+    if (pos >= sec_off && pos < (__u64)sec_off + len)
+      out[i] = delta[pos - sec_off];
+  }
+  struct gf128 v;
+  gf128_load(out, &v);
+  return v;
+}
+
+static void test_ghash_block_delta64(void) {
+  __u8 xor_delta[SECRET_MAX_LEN];
+  for (int i = 0; i < SECRET_MAX_LEN; i++)
+    xor_delta[i] = (__u8)(i * 37 + 1); // no zero bytes, so a miss shows
+
+  // The inline xor_delta window: every patch at every offset in the first
+  // 400 bytes, against every block it can touch and its neighbours, and
+  // blocks past 1023 (ghash_block_delta's old 10-bit mask) up to the last
+  // one an 11-bit exponent covers.
+  for (__u32 len = 1; len <= SECRET_MAX_LEN; len++) {
+    for (__u32 sec_off = 0; sec_off < 400; sec_off++)
+      for (__u32 b = 0; b < 35; b++) {
+        struct gf128 want = block_delta_ref(xor_delta, b, sec_off, len), got;
+        ghash_block_delta64(xor_delta, SECRET_MAX_LEN - 1, b, sec_off, len, &got);
+        assert(gf_eq(&want, &got));
+      }
+    static const __u32 offs[] = {16352, 16367, 16368, 16383, 16384, 18400,
+                                 32750, 0xFFFFFFF0u, 0xFFFFFFFFu};
+    static const __u32 blocks[] = {0, 1, 1022, 1023, 1024, 1025, 1150,
+                                   2046, 2047};
+    for (unsigned o = 0; o < sizeof(offs) / sizeof(offs[0]); o++)
+      for (unsigned k = 0; k < sizeof(blocks) / sizeof(blocks[0]); k++) {
+        struct gf128 want = block_delta_ref(xor_delta, blocks[k], offs[o], len), got;
+        ghash_block_delta64(xor_delta, SECRET_MAX_LEN - 1, blocks[k], offs[o], len, &got);
+        assert(gf_eq(&want, &got));
+      }
+  }
+
+  // A ring of two 256-byte chunks (a delta longer than any window): chunk c
+  // of the patch's delta at (c * 256) & 511. The ring holds the chunk of a
+  // block's first delta byte and the next, which is all of the block's.
+  static __u8 delta[8192];
+  rng_bytes(delta, sizeof(delta));
+  for (int t = 0; t < 4000; t++) {
+    __u32 len = 1 + rng64() % 8000;
+    __u32 sec_off = rng64() % 20000;
+    __u32 first = sec_off / 16, last = (sec_off + len - 1) / 16;
+    __u32 b = first + rng64() % (last - first + 1);
+    __u8 ring[512];
+    memset(ring, 0xEE, sizeof(ring));
+    int64_t d0 = (int64_t)b * 16 - sec_off; // the block's first delta byte
+    __u32 c = d0 < 0 ? 0 : (__u32)d0 / 256;
+    for (__u32 cc = c; cc <= c + 1 && cc * 256 < len; cc++)
+      memcpy(ring + (cc * 256) % 512, delta + cc * 256,
+             len - cc * 256 < 256 ? len - cc * 256 : 256);
+    struct gf128 want = block_delta_ref(delta, b, sec_off, len), got;
+    ghash_block_delta64(ring, 511, b, sec_off, len, &got);
+    assert(gf_eq(&want, &got));
+  }
+}
+
+// The engine's H state, as tc's per-connection cache keeps it: H's table and
+// H^(2^i) for i < GHASH_POW_BITS (squared with gf128_mul_by, as tc builds
+// them).
+struct engine_key {
+  struct gf128_table ht;
+  struct gf128 pow[GHASH_POW_BITS];
+};
+
+static void engine_key_init(struct engine_key *k, const struct gf128 *h) {
+  struct gf128_table scratch;
+  gf128_table_init(&k->ht, h);
+  k->pow[0] = *h;
+  for (int i = 1; i < GHASH_POW_BITS; i++) {
+    k->pow[i] = k->pow[i - 1];
+    gf128_mul_by(&k->pow[i], &k->pow[i - 1], &scratch, rem4);
+  }
+}
+
+// The tag delta of a patch, step by step as tc_ghash_update's callbacks run
+// it: one ghash_horner_step per block of the span, one ghash_pow_step per
+// exponent bit. delta is a window of win_mask + 1 bytes (see
+// ghash_block_delta64). Returns 0 when ghash_span_plan refuses the patch.
+static int engine_span_delta(const struct engine_key *k, const __u8 *delta,
+                             __u32 win_mask, __u32 sec_off, __u32 len,
+                             __u32 ct_len, struct gf128 *out) {
+  struct ghash_span s;
+  if (!ghash_span_plan(sec_off, len, ct_len, &s))
+    return 0;
+  struct gf128 acc = {0, 0};
+  for (__u32 i = 0; i < s.count; i++) {
+    struct gf128 d;
+    ghash_block_delta64(delta, win_mask, s.first + i, sec_off, len, &d);
+    ghash_horner_step(&acc, &d, &k->ht, rem4);
+  }
+  struct gf128_table scratch;
+  for (__u32 bit = 0; bit < GHASH_POW_BITS; bit++)
+    ghash_pow_step(&acc, s.exp, bit, &k->pow[bit], &scratch, rem4);
+  *out = acc;
+  return 1;
+}
+
+// H^1 .. H^GHASH_MAX_CT_BLOCKS+1 by repeated bit-serial multiplication.
+static struct gf128 ref_pow[GHASH_MAX_CT_BLOCKS + 2];
+
+static void ref_pow_init(const struct gf128 *h) {
+  ref_pow[0] = (struct gf128){1ULL << 63, 0};
+  for (__u32 i = 1; i < GHASH_MAX_CT_BLOCKS + 2; i++)
+    ref_pow[i] = ref_mul(&ref_pow[i - 1], h);
+}
+
+// The tag delta as the old tc code computed it: every block the patch
+// touches times H^(n + 1 - b), each its own power.
+static struct gf128 naive_span_delta(const __u8 *delta, __u32 sec_off,
+                                     __u32 len, __u32 ct_len) {
+  __u32 n = (ct_len + 15) / 16;
+  struct gf128 sum = {0, 0};
+  for (__u32 b = sec_off / 16; b <= (sec_off + len - 1) / 16; b++) {
+    struct gf128 d = block_delta_ref(delta, b, sec_off, len);
+    struct gf128 c = ref_mul(&d, &ref_pow[n + 1 - b]);
+    gf_xor(&sum, &c);
+  }
+  return sum;
+}
+
+static __u8 span_delta_buf[32768];
+
+static void check_span(const struct engine_key *k, __u32 sec_off, __u32 len,
+                       __u32 ct_len) {
+  struct gf128 want = naive_span_delta(span_delta_buf, sec_off, len, ct_len), got;
+  assert(engine_span_delta(k, span_delta_buf, sizeof(span_delta_buf) - 1,
+                           sec_off, len, ct_len, &got));
+  if (!gf_eq(&want, &got)) {
+    printf("\n    sec_off=%u len=%u ct_len=%u", sec_off, len, ct_len);
+    print_gf("want", &want);
+    print_gf("got ", &got);
+  }
+  assert(gf_eq(&want, &got));
+}
+
+static void test_ghash_span_vs_naive(void) {
+  struct gf128 h = rng_gf128();
+  struct engine_key k;
+  engine_key_init(&k, &h);
+  ref_pow_init(&h);
+  for (int i = 1; i < GHASH_POW_BITS; i++)
+    assert(gf_eq(&k.pow[i], &ref_pow[1u << i]));
+  rng_bytes(span_delta_buf, sizeof(span_delta_buf));
+
+  const __u32 ct13 = 16384 + 256;                 // largest TLS 1.3 ciphertext
+  const __u32 ct12 = TLS_MAX_RECORD_LEN - 8 - 16; // largest TLS 1.2 one
+
+  // Short patches: every alignment, every length up to 4 blocks, records
+  // ending with the patch or later.
+  for (__u32 a = 0; a < 16; a++)
+    for (__u32 len = 1; len <= 64; len++)
+      for (__u32 base = 0; base <= 48; base += 48) {
+        __u32 off = base + a;
+        static const __u32 extra[] = {0, 1, 17, 1000};
+        for (unsigned e = 0; e < 4; e++)
+          check_span(&k, off, len, off + len + extra[e]);
+        check_span(&k, off, len, ct13);
+      }
+
+  // Long patches, up to a whole record, at every alignment.
+  static const __u32 lens[] = {127,  128,  129,  255,  256,  257,   1000,
+                               1024, 4095, 4096, 4097, 8191, 16383, 16384};
+  for (unsigned l = 0; l < sizeof(lens) / sizeof(lens[0]); l++)
+    for (__u32 a = 0; a < 16; a++) {
+      __u32 len = lens[l], off = a;
+      check_span(&k, off, len, off + len);
+      check_span(&k, off, len, off + len + 15);
+      check_span(&k, off, len, ct12);
+      if (off + len <= ct13)
+        check_span(&k, off, len, ct13);
+      check_span(&k, ct12 - len - a, len, ct12); // ending a's bytes from the end
+    }
+  check_span(&k, 0, ct12, ct12);
+  check_span(&k, 0, ct13, ct13);
+
+  // Random patches in random records.
+  for (int t = 0; t < 500; t++) {
+    __u32 ct_len = 1 + rng64() % ct12;
+    __u32 sec_off = rng64() % ct_len;
+    __u32 len = 1 + rng64() % (ct_len - sec_off);
+    if (t % 2)
+      len = 1 + len % 300; // placeholder-sized, more often
+    check_span(&k, sec_off, len, ct_len);
+  }
+}
+
+// GHASH(H, A, C) by the definition (NIST SP 800-38D §6.4), bit-serial.
+static struct gf128 ref_ghash(const struct gf128 *h, const __u8 *a, __u32 alen,
+                              const __u8 *c, __u32 clen) {
+  struct gf128 x = {0, 0};
+  const __u8 *parts[2] = {a, c};
+  __u32 lens[2] = {alen, clen};
+  for (int p = 0; p < 2; p++)
+    for (__u32 i = 0; i < lens[p]; i += 16) {
+      __u8 blk[16] = {0};
+      memcpy(blk, parts[p] + i, lens[p] - i < 16 ? lens[p] - i : 16);
+      struct gf128 v;
+      gf128_load(blk, &v);
+      gf_xor(&x, &v);
+      x = ref_mul(&x, h);
+    }
+  struct gf128 l = {(__u64)alen * 8, (__u64)clen * 8};
+  gf_xor(&x, &l);
+  return ref_mul(&x, h);
+}
+
+static void test_ghash_span_vs_definition(void) {
+  // The GCM spec's test cases 3 and 4: H, ciphertext, AAD and GHASH. The
+  // engine computes GHASH itself as the tag delta of "patching" an all-zero
+  // ciphertext into C (whose GHASH is the length block's L * H).
+  __u8 hb[16], c[64], a[20], g3[16], g4[16];
+  hex_to_bytes("b83b533708bf535d0aa6e52980d53b78", hb, 16);
+  hex_to_bytes("42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e"
+               "21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f5985",
+               c, 64);
+  hex_to_bytes("feedfacedeadbeeffeedfacedeadbeefabaddad2", a, 20);
+  hex_to_bytes("7f1b32b81b820d02614f8895ac1d4eac", g3, 16);
+  hex_to_bytes("698e57f70e6ecc7fd9463b7260a9ae5f", g4, 16);
+  struct gf128 h, want3, want4;
+  gf128_load(hb, &h);
+  gf128_load(g3, &want3);
+  gf128_load(g4, &want4);
+  struct gf128 r3 = ref_ghash(&h, NULL, 0, c, 64), r4 = ref_ghash(&h, a, 20, c, 60);
+  assert(gf_eq(&r3, &want3) && gf_eq(&r4, &want4));
+
+  struct engine_key k;
+  engine_key_init(&k, &h);
+  struct gf128 got3, got4;
+  static __u8 win[SECRET_MAX_LEN];
+  memset(win, 0, sizeof(win));
+  memcpy(win, c, 64);
+  assert(engine_span_delta(&k, win, SECRET_MAX_LEN - 1, 0, 64, 64, &got3));
+  struct gf128 z3 = ref_ghash(&h, NULL, 0, (const __u8[64]){0}, 64);
+  gf_xor(&got3, &z3);
+  assert(gf_eq(&got3, &want3));
+  assert(engine_span_delta(&k, win, SECRET_MAX_LEN - 1, 0, 60, 60, &got4));
+  struct gf128 z4 = ref_ghash(&h, a, 20, (const __u8[60]){0}, 60);
+  gf_xor(&got4, &z4);
+  assert(gf_eq(&got4, &want4));
+
+  // Random records with a TLS 1.2 AAD (13 bytes): the tag delta of
+  // patching C into C' is GHASH(A, C') ^ GHASH(A, C), up to the largest
+  // record, one to four patches each (two of them may share a block).
+  static __u8 ct[TLS_MAX_RECORD_LEN], patched[TLS_MAX_RECORD_LEN];
+  static const __u32 sizes[] = {17, 100, 1500, 4096, 16384 + 256,
+                                TLS_MAX_RECORD_LEN - 8 - 16};
+  for (unsigned s = 0; s < sizeof(sizes) / sizeof(sizes[0]); s++)
+    for (int t = 0; t < 4; t++) {
+      __u32 ct_len = sizes[s];
+      struct gf128 hk = rng_gf128();
+      engine_key_init(&k, &hk);
+      __u8 aad[13];
+      rng_bytes(aad, 13);
+      rng_bytes(ct, ct_len);
+      memcpy(patched, ct, ct_len);
+      struct gf128 sum = {0, 0};
+      __u32 npatch = 1 + t, at = rng64() % 40;
+      for (__u32 p = 0; p < npatch && at < ct_len; p++) {
+        __u32 len = 1 + rng64() % SECRET_MAX_LEN;
+        if (len > ct_len - at)
+          len = ct_len - at;
+        __u8 d[SECRET_MAX_LEN] = {0};
+        rng_bytes(d, len);
+        for (__u32 i = 0; i < len; i++)
+          patched[at + i] ^= d[i];
+        struct gf128 one;
+        assert(engine_span_delta(&k, d, SECRET_MAX_LEN - 1, at, len, ct_len, &one));
+        gf_xor(&sum, &one);
+        at += len + rng64() % (ct_len / 4 + 1); // 0: the next patch shares a block
+      }
+      struct gf128 before = ref_ghash(&hk, aad, 13, ct, ct_len);
+      struct gf128 after = ref_ghash(&hk, aad, 13, patched, ct_len);
+      gf_xor(&after, &before);
+      assert(gf_eq(&sum, &after));
+    }
+}
+
+static void test_ghash_span_vs_go_gcm(void) {
+  // Tag deltas from Go's crypto/cipher GCM (AES-128 and AES-256, a random
+  // 13-byte AAD): Seal(P) ^ Seal(P ^ delta at off), the tags only. Cases:
+  // the tc fixture's shape, the largest TLS 1.3 ciphertext with a
+  // placeholder at its start and a full-size one at its end, the largest
+  // TLS 1.2 one, a patch across blocks 1023/1024, a mid-size record.
+  static const struct {
+    const char *h;
+    __u32 ct_len, off;
+    const char *delta, *want;
+  } v[] = {
+      {"25d5215d0dea6f003ad099040ce385eb", 26, 2, "6f140d24abc4c0b707c2057d6f8f32951ec04a6cf5ddc3b1",
+       "7b17ad5063eeaaf9ca0b5f0bcece510c"},
+      {"a27112340e58c1019a2a68230abab4fc", 16640, 3, "67b679734830791249e89293a065311132c0972ea1183e7d",
+       "07002daf6e6db7566eb4e76c21e70db0"},
+      {"89ff96f22532ac84f2d632e291075d9d", 16640, 16512,
+       "6d13ed76b635bd10719db7178ff5ed13f391f7a4dd73f75b478d1e8256fb401c4fbc33bcf8810c5d4736dc9e1234f50c"
+       "02cd5efc796179aee16ec80e63206c4e628d5f510f0dec4814f938e098245108117a64cb46d2aee0dd6525cdcbd530bf"
+       "c9147b96225b4db88b76bdf43c68b3ab8ba1143a2d4685ccc0c0c5ebc64a9109",
+       "784d0d8ecda2c178ff15f596c4f12505"},
+      {"63d839b1721b2c13d9eb659955f3c50c", 18408, 1029,
+       "ef6b04b80c787983bb7162bb2a3db7ee85d9aa62e47b11166d99f15af206e0a2f6716ac2e68bc5edfc22f20b68f0fa91"
+       "c8763bf2690d9fdcfe6e3a79dd09c61a0c1f4a1c6215e56b4a48d77106",
+       "5c77a53fa6952561005de00924ba8baf"},
+      {"20920db436d539e7e65de4f45a78ac94", 18408, 16371,
+       "c144a79cb46299cbbc5c725e37807c883e69cd5bcd1606f72e650226037ca538dd08db61d1251ac7",
+       "807b465d4cdf4c2e169873c04411f668"},
+      {"cb317e55fd37b4a6131af74e408f05b0", 4096, 17,
+       "681b8dfc4593e37edb931d870715518506dcdd2dc298da2c40e0b48bb6e75a84abed74c15047a8046d2cae29659146c9"
+       "7b7f6b5be32a27267f439ad9169541ef2e819f3aa2881c364c38bf387b2f1d23d97bb4c4791d892d7ce3c0f6f4b94918"
+       "6c24676b496c3bbf995d71a9c4c72366bdbdc268c6047ee35d5d975ccd0c87a1",
+       "d3b0fe8a774f303e43e6bf600e9c1944"},
+  };
+  for (unsigned i = 0; i < sizeof(v) / sizeof(v[0]); i++) {
+    __u8 hb[16], wb[16], d[SECRET_MAX_LEN] = {0};
+    __u32 len = strlen(v[i].delta) / 2;
+    assert(len <= SECRET_MAX_LEN);
+    hex_to_bytes(v[i].h, hb, 16);
+    hex_to_bytes(v[i].want, wb, 16);
+    hex_to_bytes(v[i].delta, d, len);
+    struct gf128 h, want, got;
+    gf128_load(hb, &h);
+    gf128_load(wb, &want);
+    struct engine_key k;
+    engine_key_init(&k, &h);
+    assert(engine_span_delta(&k, d, SECRET_MAX_LEN - 1, v[i].off, len, v[i].ct_len, &got));
+    assert(gf_eq(&got, &want));
+  }
+}
+
+// ============================================================================
 // main
 // ============================================================================
 
@@ -1789,6 +2319,19 @@ int main(void) {
 
   printf("ghash_block_delta:\n");
   RUN_TEST(test_ghash_block_delta);
+
+  printf("ghash engine (table multiply, span tag deltas):\n");
+  gf128_rem4_init(rem4);
+  RUN_TEST(test_gf128_words);
+  RUN_TEST(test_gf128_rem4);
+  RUN_TEST(test_gf128_table_entries);
+  RUN_TEST(test_gf128_table_mul);
+  RUN_TEST(test_gf128_mul_by);
+  RUN_TEST(test_ghash_span_plan);
+  RUN_TEST(test_ghash_block_delta64);
+  RUN_TEST(test_ghash_span_vs_naive);
+  RUN_TEST(test_ghash_span_vs_definition);
+  RUN_TEST(test_ghash_span_vs_go_gcm);
 
   printf("tls_parse_sni (SNI check):\n");
   RUN_TEST(test_sni_go);

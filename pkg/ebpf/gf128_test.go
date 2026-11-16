@@ -1,7 +1,10 @@
 package ebpf
 
 import (
+	"crypto/aes"
+	"crypto/cipher"
 	"encoding/hex"
+	"math/rand/v2"
 	"testing"
 )
 
@@ -239,5 +242,94 @@ func BenchmarkGF128Mul(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		GF128Mul(a, x)
+	}
+}
+
+// TestGHASHSpanDeltaMatchesGCM checks the GHASH engine's exponents against
+// crypto/cipher: XORing a delta into a record's plaintext XORs it into the
+// ciphertext, and changes the tag by GHASHSpanDelta, for patches at every
+// alignment, up to a whole record, in records up to the largest TLS 1.3 and
+// TLS 1.2 ones.
+func TestGHASHSpanDeltaMatchesGCM(t *testing.T) {
+	rng := rand.New(rand.NewPCG(383, 1))
+	key := make([]byte, 16)
+	for i := range key {
+		key[i] = byte(rng.Uint32())
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var h [16]byte
+	block.Encrypt(h[:], make([]byte, 16))
+
+	const ct13, ct12 = 16384 + 256, 16384 + 2048 - 8 - 16
+	random := func(n int) []byte {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = byte(rng.Uint32())
+		}
+		return b
+	}
+	check := func(ctLen, secOff, n int) {
+		t.Helper()
+		pt, aad, nonce, delta := random(ctLen), random(13), random(12), random(n)
+		sealed := aead.Seal(nil, nonce, pt, aad)
+		for i, d := range delta {
+			pt[secOff+i] ^= d
+		}
+		resealed := aead.Seal(nil, nonce, pt, aad)
+		var want [16]byte
+		for i := range want {
+			want[i] = sealed[ctLen+i] ^ resealed[ctLen+i]
+		}
+		if got := GHASHSpanDelta(h, ctLen, secOff, delta); got != want {
+			t.Fatalf("ct %d, patch %d at %d: tag delta %x, want %x", ctLen, n, secOff, got, want)
+		}
+	}
+	for _, n := range []int{1, 15, 16, 17, 24, 128, 129, 256, 1000, 4096, 16384} {
+		for a := range 16 {
+			for _, ctLen := range []int{a + n, a + n + 1, a + n + 16, ct13, ct12} {
+				if a+n <= ctLen {
+					check(ctLen, a, n)
+				}
+			}
+			check(ct12, ct12-n-a, n)
+		}
+	}
+	for range 200 {
+		ctLen := 1 + rng.IntN(ct12)
+		secOff := rng.IntN(ctLen)
+		check(ctLen, secOff, 1+rng.IntN(min(ctLen-secOff, 300)))
+	}
+}
+
+// TestGHASHSpanDeltaMatchesPerBlock checks GHASHSpanDelta against
+// GHASHIncrementalDelta, the per-block powers the old tc code computed.
+func TestGHASHSpanDeltaMatchesPerBlock(t *testing.T) {
+	h := hexBytes(t, "66e94bd4ef8a2c3b884cfa59ca342b2e")
+	delta := make([]byte, 128)
+	for i := range delta {
+		delta[i] = byte(i*37 + 1)
+	}
+	for _, ctLen := range []int{130, 1000, 16640} {
+		for secOff := 0; secOff+len(delta) <= ctLen && secOff < 40; secOff++ {
+			for _, n := range []int{1, 8, 24, 128} {
+				blocks := map[int][16]byte{}
+				for i, d := range delta[:n] {
+					b := blocks[(secOff+i)/16]
+					b[(secOff+i)%16] = d
+					blocks[(secOff+i)/16] = b
+				}
+				want := GHASHIncrementalDelta(h, blocks, (ctLen+15)/16)
+				if got := GHASHSpanDelta(h, ctLen, secOff, delta[:n]); got != want {
+					t.Errorf("ct %d, patch %d at %d: %x, want %x", ctLen, n, secOff, got, want)
+				}
+			}
+		}
 	}
 }
