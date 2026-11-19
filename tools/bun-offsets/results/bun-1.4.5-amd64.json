@@ -1,0 +1,12 @@
+{
+  "version": "1.4.5",
+  "arch": "amd64",
+  "chain": "bun",
+  "ssl_write_offset": 37776432,
+  "boringssl": {
+    "SSLToS3": 48,
+    "S3ToAEAD": 272,
+    "AEADToAESKey": 288,
+    "SSLToWBIO": 32
+  }
+}
