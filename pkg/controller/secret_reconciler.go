@@ -1,16 +1,21 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"go.uber.org/zap"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -37,6 +42,26 @@ type SecretReconciler struct {
 	client.Client
 	Log    *zap.SugaredLogger
 	Scheme *runtime.Scheme
+	// MaxSecretLen is the longest value shadowed: the policy maximum
+	// (--max-secret-length) clamped to what the data plane rewrites
+	// (secrets.EffectiveMaxLen); 0 means secrets.EffectiveMaxLen of the
+	// default. A longer value is left out of the shadow, as the data plane
+	// would not rewrite its placeholder.
+	MaxSecretLen int
+	// Recorder reports, on the Secret, the keys left out of its shadow
+	// (nil: logged only).
+	Recorder events.EventRecorder
+}
+
+// EventReasonKeysNotShadowed is the reason of the Warning event a Secret
+// gets when some of its keys are left out of its shadow.
+const EventReasonKeysNotShadowed = "KeysNotShadowed"
+
+func (r *SecretReconciler) maxSecretLen() int {
+	if r.MaxSecretLen > 0 {
+		return r.MaxSecretLen
+	}
+	return secrets.EffectiveMaxLen(secrets.DefaultMaxLen)
 }
 
 // Reconcile handles Secret events.
@@ -116,17 +141,22 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// a real value it no longer matches. The validating webhook rejects
 	// such values at admission; this covers clusters where it is missing
 	// or bypassed.
-	skipped := 0
+	//
+	// Keys are taken in order, so that the shadows minted (and the
+	// reasons reported) don't depend on map iteration.
+	var skipped []string
+	maxLen := r.maxSecretLen()
 
-	for key, originalBytes := range secret.Data {
+	for _, key := range slices.Sorted(maps.Keys(secret.Data)) {
+		originalBytes := secret.Data[key]
 		originalValue := string(originalBytes)
 		originalLen := len(originalBytes)
 		var shadowValue string
 
-		if err := canShadowValue(originalValue); err != nil {
+		if err := canShadowValue(originalValue, maxLen); err != nil {
 			log.Warnw("Not shadowing key: its value can't be rewritten by the data plane",
 				"key", key, "length", originalLen, "error", err)
-			skipped++
+			skipped = append(skipped, fmt.Sprintf("%s (%v)", key, err))
 			continue
 		}
 
@@ -182,8 +212,9 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	// No key can be shadowed: don't create a shadow, so the webhook keeps
 	// refusing pods that reference this secret. An existing shadow is
 	// still updated below, so it drops the keys it can no longer hold.
-	if len(newData) == 0 && skipped > 0 && !shadowExists {
-		log.Warnw("Not creating shadow secret: no key can be shadowed", "skipped", skipped)
+	if len(newData) == 0 && len(skipped) > 0 && !shadowExists {
+		log.Warnw("Not creating shadow secret: no key can be shadowed", "skipped", len(skipped))
+		r.reportSkipped(&secret, skipped, "no shadow secret is created, pods that reference the secret are refused")
 		return ctrl.Result{}, nil
 	}
 
@@ -212,6 +243,12 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	}
 
 	if shadowExists {
+		// Every node's controller reconciles the Secret: only one that
+		// changes the shadow writes it (and reports its skipped keys).
+		if shadowUpToDate(&existingShadow, shadowSecret) {
+			log.Debugw("Shadow secret up to date", "name", shadowName)
+			return ctrl.Result{}, nil
+		}
 		existingShadow.Data = newData
 		// Ensure ownership is set (in case it was created manually or missing)
 		existingShadow.OwnerReferences = shadowSecret.OwnerReferences
@@ -226,17 +263,46 @@ func (r *SecretReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 		}
 		log.Infow("Created shadow secret", "name", shadowName)
 	}
+	if len(skipped) > 0 {
+		r.reportSkipped(&secret, skipped, "pods that reference the secret get no value for them")
+	}
 
 	return ctrl.Result{}, nil
 }
 
+// reportSkipped reports the keys left out of secret's shadow, with why
+// (never their values), as a Warning event on the Secret.
+func (r *SecretReconciler) reportSkipped(secret *corev1.Secret, skipped []string, consequence string) {
+	if r.Recorder == nil {
+		return
+	}
+	r.Recorder.Eventf(secret, nil, corev1.EventTypeWarning, EventReasonKeysNotShadowed, "Shadow",
+		"kloak left %d key(s) out of the shadow secret, %s: %s", len(skipped), consequence, strings.Join(skipped, "; "))
+}
+
+// shadowUpToDate reports whether the existing shadow already holds what
+// want would write: the data, the labels kloak sets and the owner.
+func shadowUpToDate(existing, want *corev1.Secret) bool {
+	for k, v := range want.Labels {
+		if existing.Labels[k] != v {
+			return false
+		}
+	}
+	return maps.EqualFunc(existing.Data, want.Data, bytes.Equal) &&
+		equality.Semantic.DeepEqual(existing.OwnerReferences, want.OwnerReferences)
+}
+
 // canShadowValue returns why value can't be shadowed, or nil. The BPF
-// lookup keys on the first secrets.ShadowPrefixLen bytes of the shadow, and
-// the shadow must match the value's HPACK Huffman bit length
+// lookup keys on the first secrets.ShadowPrefixLen bytes of the shadow, a
+// value longer than maxLen is not rewritten by the data plane, and the
+// shadow must match the value's HPACK Huffman bit length
 // (secrets.CanShadow). The error never includes the value.
-func canShadowValue(value string) error {
+func canShadowValue(value string, maxLen int) error {
 	if len(value) < secrets.ShadowPrefixLen {
 		return fmt.Errorf("value is %d bytes, minimum %d required (BPF key lookup)", len(value), secrets.ShadowPrefixLen)
+	}
+	if len(value) > maxLen {
+		return fmt.Errorf("value is %d bytes, maximum %d (--max-secret-length, and what the data plane rewrites)", len(value), maxLen)
 	}
 	return secrets.CanShadow(len(value), secrets.HuffmanBits(value))
 }

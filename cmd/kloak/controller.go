@@ -28,6 +28,7 @@ import (
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/ebpf"
 	"github.com/spinningfactory/kloak/pkg/logging"
+	"github.com/spinningfactory/kloak/pkg/secrets"
 	k8ssecrets "github.com/spinningfactory/kloak/pkg/secrets/k8s"
 )
 
@@ -291,9 +292,11 @@ func runController(cmd *cobra.Command, args []string) {
 
 	// Create secret reconciler
 	secretReconciler := &controller.SecretReconciler{
-		Client: mgr.GetClient(),
-		Log:    setupLog.Named("controller").Named("Secret"),
-		Scheme: mgr.GetScheme(),
+		Client:       mgr.GetClient(),
+		Log:          setupLog.Named("controller").Named("Secret"),
+		Scheme:       mgr.GetScheme(),
+		MaxSecretLen: secrets.EffectiveMaxLen(maxSecretLen),
+		Recorder:     mgr.GetEventRecorder("kloak-controller"),
 	}
 
 	if err := secretReconciler.SetupWithManager(mgr); err != nil {
