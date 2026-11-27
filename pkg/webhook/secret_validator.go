@@ -33,13 +33,7 @@ const (
 	// ShadowPrefixLen in pkg/controller/secret_reconciler.go. The BPF
 	// program looks up the first 8 bytes; shorter secrets cannot be keyed
 	// and the reconciler refuses to generate a shadow.
-	minDataLen = 8
-
-	// maxDataLen mirrors SECRET_MAX_LEN in pkg/ebpf/bpf/tls_uprobe.c.
-	// sync.go silently truncates values longer than this when populating
-	// the BPF map, producing wrong rewrites on the wire. We reject here
-	// so the user sees the problem at apply time.
-	maxDataLen = 128
+	minDataLen = secrets.ShadowPrefixLen
 )
 
 // SecretValidator is a ValidatingAdmissionWebhook for kloak-enabled Secrets.
@@ -48,14 +42,23 @@ const (
 type SecretValidator struct {
 	decoder admission.Decoder
 	log     *zap.SugaredLogger
+	// maxDataLen is the longest value accepted: the cluster's policy
+	// (--max-secret-length), clamped to what the data plane rewrites
+	// (secrets.EffectiveMaxLen). The controller's sync leaves a longer
+	// value out of the data plane (its placeholder goes out unchanged):
+	// rejecting it here shows the problem at apply time.
+	maxDataLen int
 }
 
-func NewSecretValidator(log *zap.SugaredLogger) *SecretValidator {
+// NewSecretValidator returns the validator for a policy maximum value length
+// (secrets.DefaultMaxLen unless configured).
+func NewSecretValidator(log *zap.SugaredLogger, maxSecretLen int) *SecretValidator {
 	scheme := runtime.NewScheme()
 	_ = corev1.AddToScheme(scheme)
 	return &SecretValidator{
-		decoder: admission.NewDecoder(scheme),
-		log:     log,
+		decoder:    admission.NewDecoder(scheme),
+		log:        log,
+		maxDataLen: secrets.EffectiveMaxLen(maxSecretLen),
 	}
 }
 
@@ -92,7 +95,7 @@ func (v *SecretValidator) Handle(ctx context.Context, req admission.Request) adm
 		return admission.Denied(fmt.Sprintf("kloak: invalid %s annotation: %v", AnnotationPort, err))
 	}
 
-	if err := validateSecretData(secret.Data, secret.StringData); err != nil {
+	if err := validateSecretData(secret.Data, secret.StringData, v.maxDataLen); err != nil {
 		v.log.Warnw("rejecting secret: invalid data",
 			"namespace", secret.Namespace, "name", secret.Name, "error", err)
 		return admission.Denied(fmt.Sprintf("kloak: %v", err))
@@ -105,13 +108,13 @@ func (v *SecretValidator) Handle(ctx context.Context, req admission.Request) adm
 // imposes on secret values. The reconciler leaves entries shorter than
 // minDataLen out of the shadow (so pods silently get no value for them, and
 // a secret with no other entry gets no shadow at all, which the mutating
-// webhook reports as a confusing "shadow not found" error). sync.go
-// silently truncates entries longer than maxDataLen, producing incorrect
-// rewrites on the wire. Surface both at admission time.
+// webhook reports as a confusing "shadow not found" error). The sync leaves
+// entries longer than maxDataLen out of the data plane, so their
+// placeholders go out unchanged. Surface both at admission time.
 //
 // stringData is merged into data by the apiserver; we check both to cover
 // the case where the webhook sees the pre-merged object.
-func validateSecretData(data map[string][]byte, stringData map[string]string) error {
+func validateSecretData(data map[string][]byte, stringData map[string]string, maxDataLen int) error {
 	if len(data) == 0 && len(stringData) == 0 {
 		return fmt.Errorf("secret has no data entries — nothing for kloak to rewrite")
 	}
@@ -142,7 +145,7 @@ func validateSecretData(data map[string][]byte, stringData map[string]string) er
 			return fmt.Errorf("data[%q] is %d bytes, minimum %d required (BPF key lookup)", k, n, minDataLen)
 		}
 		if n > maxDataLen {
-			return fmt.Errorf("data[%q] is %d bytes, maximum %d allowed (BPF rewrite would truncate)", k, n, maxDataLen)
+			return fmt.Errorf("data[%q] is %d bytes, maximum %d allowed (kloak would not rewrite it)", k, n, maxDataLen)
 		}
 		// Huffman feasibility — fails-closed when the value's bit
 		// density would force HPACK over-padding on HTTP/2 rewrite.

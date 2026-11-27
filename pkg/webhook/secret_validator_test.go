@@ -134,7 +134,7 @@ func TestValidateSecretData(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := validateSecretData(tc.data, tc.stringData)
+			err := validateSecretData(tc.data, tc.stringData, secrets.EffectiveMaxLen(secrets.DefaultMaxLen))
 			if tc.wantErr == "" {
 				if err != nil {
 					t.Fatalf("expected no error, got: %v", err)
@@ -148,9 +148,53 @@ func TestValidateSecretData(t *testing.T) {
 	}
 }
 
+// TestValidateSecretData_MaxLen checks the policy maximum: a lower one is
+// what the webhook enforces, a higher one is clamped to what the data plane
+// rewrites.
+func TestValidateSecretData_MaxLen(t *testing.T) {
+	value := func(n int) map[string][]byte {
+		return map[string][]byte{"k": []byte(strings.Repeat("Test1234", n/8+1)[:n])}
+	}
+	for _, c := range []struct {
+		policy, len int
+		wantErr     string
+	}{
+		{64, 64, ""},
+		{64, 65, "maximum 64"},
+		{secrets.DefaultMaxLen, secrets.DataPlaneMaxLen, ""},
+		{secrets.DefaultMaxLen, secrets.DataPlaneMaxLen + 1, "maximum 128"},
+		{secrets.MaxLenLimit, secrets.DataPlaneMaxLen + 1, "maximum 128"},
+		{secrets.MaxLenLimit, 4096, "maximum 128"},
+	} {
+		err := validateSecretData(value(c.len), nil, secrets.EffectiveMaxLen(c.policy))
+		if c.wantErr == "" && err != nil {
+			t.Errorf("policy %d, %d bytes: %v", c.policy, c.len, err)
+		}
+		if c.wantErr != "" && (err == nil || !strings.Contains(err.Error(), c.wantErr)) {
+			t.Errorf("policy %d, %d bytes: %v, want an error containing %q", c.policy, c.len, err, c.wantErr)
+		}
+	}
+
+	// The validator applies its policy.
+	v := NewSecretValidator(zap.NewNop().Sugar(), 64)
+	s := &corev1.Secret{
+		TypeMeta:   metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{Name: "s", Namespace: "default", Labels: map[string]string{LabelEnabled: "true"}},
+		Data:       value(65),
+	}
+	raw, err := json.Marshal(s)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := v.Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{Object: runtime.RawExtension{Raw: raw}}})
+	if resp.Allowed || !strings.Contains(resp.Result.Message, "maximum 64") {
+		t.Errorf("policy 64, 65 bytes: allowed %v (%q), want denied", resp.Allowed, resp.Result.Message)
+	}
+}
+
 func TestSecretValidator_Handle(t *testing.T) {
 	logger := zap.NewNop().Sugar()
-	v := NewSecretValidator(logger)
+	v := NewSecretValidator(logger, secrets.DefaultMaxLen)
 
 	build := func(labels map[string]string, annotations map[string]string, data map[string][]byte) admission.Request {
 		s := &corev1.Secret{

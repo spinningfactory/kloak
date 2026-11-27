@@ -2,6 +2,7 @@ package yaml
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -178,7 +179,7 @@ func TestTranslate_ValidationRules(t *testing.T) {
 				Name: "x", Value: strings.Repeat("x", maxRealLen+1),
 				Inject: injectSpec{Env: "X"},
 			}}},
-			wantSub: "max is 128",
+			wantSub: fmt.Sprintf("max is %d", secrets.DataPlaneMaxLen),
 		},
 	}
 	for _, tc := range cases {

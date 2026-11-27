@@ -8,12 +8,10 @@ import (
 	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
-// maxRealLen mirrors the BPF wire-format secretValue.RealSecret cap in
-// pkg/ebpf/uprobe.go. Keeping this constant local (rather than reaching
-// across packages) avoids dragging the Linux-only ebpf package into the
-// portable secrets/yaml build; the value is part of kloak's on-disk
-// contract, not a Linux-runtime detail.
-const maxRealLen = 128
+// maxRealLen is the longest real value a secrets file may hold: the default
+// policy maximum, clamped to what the data plane rewrites (the limit the
+// webhook and the controller's sync apply to Kubernetes Secrets).
+var maxRealLen = secrets.EffectiveMaxLen(secrets.DefaultMaxLen)
 
 // translate converts a parsed fileSpec into the canonical
 // []secrets.Secret slice. Pure function (apart from os.Getenv used to
