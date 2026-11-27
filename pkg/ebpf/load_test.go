@@ -73,13 +73,14 @@ func TestVerifierBudget(t *testing.T) {
 				// With a log level set, a rejection's error only
 				// carries the stats log: load again with the
 				// defaults, whose error carries the verifier's
-				// instruction trace.
-				if c, again := ebpf.NewCollection(one); again != nil {
-					err = again
-				} else {
-					c.Close()
+				// instruction trace. A program that loads that way
+				// is measured without its stack depth.
+				c, again := ebpf.NewCollection(one)
+				if again != nil {
+					skipUnlessRejected(t, again)
 				}
-				skipUnlessRejected(t, err)
+				t.Logf("loading with the verifier's stats log failed, measured without it: %v", err)
+				coll = c
 			}
 			defer coll.Close()
 
