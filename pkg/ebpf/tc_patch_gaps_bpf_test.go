@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -13,6 +14,7 @@ import (
 
 	ciliumebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"golang.org/x/net/http2/hpack"
 
 	"github.com/spinningfactory/kloak/pkg/secrets"
 )
@@ -366,6 +368,39 @@ func TestTCPatchGapSecondWrite(t *testing.T) {
 // app's memory. tc then applies it past the record (see
 // TestTCPatchGapTruncatedPlaceholder).
 func TestXorPathTruncatedPlaceholder(t *testing.T) {
+	long := "REAL-TRUNCATED-" + strings.Repeat("0123456789", maxPatchLen/10)
+	objs, snapshot, addr := xorPathSetup(t, "REAL-TRUNCATED-VALUE-024", long[:maxPatchLen])
+
+	for _, s := range snapshot {
+		for _, in := range []int{secrets.ShadowPrefixLen, len(s.Shadow) / 2, len(s.Shadow) - 1} {
+			t.Run(fmt.Sprintf("%d of %d bytes", in, len(s.Shadow)), func(t *testing.T) {
+				payload := []byte("GET / HTTP/1.1\r\nX-Secret: " + s.Shadow[:in])
+				got := prescanWrite(t, objs, addr, payload)
+				var v tlsuprobeXorPendingVal
+				if err := objs.XorPending.Lookup(uint32(os.Getpid()), &v); errors.Is(err, ciliumebpf.ErrKeyNotExist) || len(got) == 0 {
+					t.Logf("refused: nothing staged")
+					return
+				} else if err != nil {
+					t.Fatal(err)
+				}
+				off, n := v.Patches[0].SecretOffset, v.Patches[0].SecretLen
+				if int(off+n) <= len(payload) {
+					t.Fatalf("staged %d bytes at %d, in a %d-byte write: the placeholder is cut there", n, off, len(payload))
+				}
+				t.Skipf("kloak#383 phase 0 (refuse) / phase 3 (continuation across writes): staged %d bytes at offset %d of a %d-byte write, %d past its end",
+					n, off, len(payload), int(off+n)-len(payload))
+			})
+		}
+	}
+}
+
+// xorPathSetup loads the objects, stores secrets with the given real values
+// in secret_map (each with its HPACK Huffman entry) bound to this process's
+// cgroup, attaches the Go crypto/tls Write uprobe to this process, and
+// starts a TLS server: prescanWrite then sends a write to it and returns
+// what bpf_xor_path staged for it in xor_pending.
+func xorPathSetup(t *testing.T, reals ...string) (*tlsuprobeObjects, []secrets.Secret, string) {
+	t.Helper()
 	objs := loadTestObjects(t)
 	cgroupID := selfCgroupID(t)
 	if err := objs.ProgArray.Put(uint32(1), uint32(objs.BpfXorPath.FD())); err != nil {
@@ -374,9 +409,8 @@ func TestXorPathTruncatedPlaceholder(t *testing.T) {
 	gen := secrets.NewShadowGenerator(nil, testLog())
 	var snapshot []secrets.Secret
 	var refs []secrets.Ref
-	long := "REAL-TRUNCATED-" + strings.Repeat("0123456789", maxPatchLen/10)
-	for _, real := range []string{"REAL-TRUNCATED-VALUE-024", long[:maxPatchLen]} {
-		owner := fmt.Sprintf("ns/truncated-%d", len(real))
+	for i, real := range reals {
+		owner := fmt.Sprintf("ns/xor-path-%d", i)
 		shadow, err := gen.Generate(len(real), secrets.HuffmanBits(real), owner, 20)
 		if err != nil {
 			t.Fatal(err)
@@ -402,28 +436,60 @@ func TestXorPathTruncatedPlaceholder(t *testing.T) {
 	if err != nil {
 		t.Skipf("cannot attach the Go TLS uprobe: %v", err)
 	}
-	defer func() { _ = up.Close() }()
-	addr := startTLSServer(t)
+	t.Cleanup(func() { _ = up.Close() })
+	return objs, snapshot, startTLSServer(t)
+}
 
-	for _, s := range snapshot {
-		for _, in := range []int{secrets.ShadowPrefixLen, len(s.Shadow) / 2, len(s.Shadow) - 1} {
-			t.Run(fmt.Sprintf("%d of %d bytes", in, len(s.Shadow)), func(t *testing.T) {
-				payload := []byte("GET / HTTP/1.1\r\nX-Secret: " + s.Shadow[:in])
-				got := prescanWrite(t, objs, addr, payload)
-				var v tlsuprobeXorPendingVal
-				if err := objs.XorPending.Lookup(uint32(os.Getpid()), &v); errors.Is(err, ciliumebpf.ErrKeyNotExist) || len(got) == 0 {
-					t.Logf("refused: nothing staged")
-					return
-				} else if err != nil {
-					t.Fatal(err)
-				}
-				off, n := v.Patches[0].SecretOffset, v.Patches[0].SecretLen
-				if int(off+n) <= len(payload) {
-					t.Fatalf("staged %d bytes at %d, in a %d-byte write: the placeholder is cut there", n, off, len(payload))
-				}
-				t.Skipf("kloak#383 phase 0 (refuse) / phase 3 (continuation across writes): staged %d bytes at offset %d of a %d-byte write, %d past its end",
-					n, off, len(payload), int(off+n)-len(payload))
-			})
-		}
+// TestXorPathPlaceholderAcrossFrames: framing bytes inside a placeholder,
+// in one write. Go's HTTP/2 framer cuts a header block larger than a frame
+// (16 KiB) into HEADERS and CONTINUATION frames, which puts a 9-byte frame
+// header between two parts of a header value's HPACK bytes; HTTP/1.1
+// chunked encoding puts a chunk-size line between two parts of a body.
+// kloak does not rewrite such a placeholder (a documented limit: see
+// TODO(kloak#383) at e2eHTTP2SecretLengths), so it must go out as the app
+// wrote it: nothing staged. Today bpf_xor_path confirms only the
+// placeholder's 8-byte key and stages its whole length, with the delta of
+// the bytes it read, framing included: tc would write the real value's
+// bytes over the frame header or chunk line, under a valid tag.
+func TestXorPathPlaceholderAcrossFrames(t *testing.T) {
+	objs, snapshot, addr := xorPathSetup(t, "REAL-ACROSS-FRAMES-SECRET-VALUE")
+	s := snapshot[0]
+	huffman := hpack.AppendHuffmanString(nil, s.Shadow)
+	// A CONTINUATION frame header (RFC 9113 §6.10): length, type 0x9,
+	// END_HEADERS, stream 1.
+	continuation := []byte{0, 0, byte(len(huffman)), 0x9, 0x4, 0, 0, 0, 1}
+	const cut = secrets.ShadowPrefixLen + 4 // the key, and a little more, before the framing
+	for _, tc := range []struct {
+		name    string
+		head    []byte // the write up to the placeholder
+		value   []byte // the placeholder as it would be on the wire unsplit
+		framing []byte
+	}{
+		// A HEADERS frame header, then a literal field: the name, the
+		// Huffman-coded value's length.
+		{"HTTP/2 CONTINUATION frame header in an HPACK-Huffman placeholder",
+			append([]byte("\x00\x00\x30\x01\x00\x00\x00\x00\x01\x40\x08x-secret"), 0x80|byte(len(huffman))), huffman, continuation},
+		{"HTTP/1.1 chunk-size line in a placeholder",
+			[]byte("POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n20\r\nkey="), []byte(s.Shadow), []byte("\r\n1a\r\n")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := append(append(append(bytes.Clone(tc.head), tc.value[:cut]...), tc.framing...), tc.value[cut:]...)
+			got := prescanWrite(t, objs, addr, payload)
+			if len(got) == 0 {
+				t.Log("refused: nothing staged, the placeholder goes out as written")
+				return
+			}
+			var v tlsuprobeXorPendingVal
+			if err := objs.XorPending.Lookup(uint32(os.Getpid()), &v); err != nil {
+				t.Fatal(err)
+			}
+			off, n := int(v.Patches[0].SecretOffset), int(v.Patches[0].SecretLen)
+			framingAt := len(tc.head) + cut
+			if off != len(tc.head) || off+n <= framingAt {
+				t.Fatalf("staged %d bytes at %d: not the placeholder at %d", n, off, len(tc.head))
+			}
+			t.Skipf("kloak#383 phase 1 (verify the whole placeholder against the store): staged %d bytes at offset %d, over the %d framing bytes at %d",
+				n, off, len(tc.framing), framingAt)
+		})
 	}
 }

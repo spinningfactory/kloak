@@ -139,8 +139,11 @@ func TestEBPFHttp2HpackOverPadding(t *testing.T) {
 // blocked one once, and past ~6 KiB their HPACK encodings no longer fit one
 // 16 KiB HEADERS frame. Go's framer cuts the header block into CONTINUATION
 // frames, so a 9-byte frame header can land inside a placeholder's bytes.
-// TODO(kloak#383): placeholders across HTTP/2 frames; until then such a
-// placeholder must go out unpatched, not corrupted.
+// TODO(kloak#383): frame-aware matching, which skips the 9-byte frame
+// header between a HEADERS frame and its CONTINUATION frames when it
+// compares and patches a placeholder. Until then this is a documented
+// limit: such a placeholder must go out unpatched, not corrupted
+// (TestXorPathPlaceholderAcrossFrames in pkg/ebpf).
 var e2eHTTP2SecretLengths = []int{8, 64, 127, 128, 129, 1024, 4096}
 
 // TestEBPFSecretLengthsHTTP2 is TestEBPFSecretLengths over HTTP/2: demo-go
