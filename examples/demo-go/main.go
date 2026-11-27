@@ -121,11 +121,9 @@ func main() {
 			fmt.Println("Response headers echoed back by httpbin:")
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
-			if len(body) > 800 {
-				fmt.Println(string(body[:800]))
-			} else {
-				fmt.Println(string(body))
-			}
+			// The whole echo: the e2e length cases look for the whole
+			// value of secrets of up to 64 KiB in it.
+			fmt.Println(string(body))
 		}
 
 		fmt.Printf("\nWaiting %v before next request...\n", interval)

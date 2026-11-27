@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -606,26 +607,74 @@ func runEBPFRewriteTest(t *testing.T, tc ebpfRewriteTest) {
 	_, _ = kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found")
 }
 
-// TestEBPFSecretLengths verifies that secrets of different lengths (8 to 100 bytes)
-// are correctly rewritten. Runs last to avoid secret name collisions.
+// defaultE2EMaxSecretLen is the longest secret the length cases expect
+// kloak to rewrite: SECRET_MAX_LEN in pkg/ebpf/bpf/tls_uprobe.c, and the
+// validating webhook's limit. kloak#383 lifts it; E2E_MAX_SECRET_LEN runs the
+// longer cases against a build that takes them (with the chart's per-secret
+// limit raised to match through E2E_HELM_SET).
+const defaultE2EMaxSecretLen = 128
+
+// e2eSecretLengths are the secret lengths the length cases try: the short
+// ones, the boundary of today's limit, and the sizes where a secret no
+// longer fits one segment (~1.4 KB), Go's first records (~1.2-2.4 KB), one
+// TLS record (16 KiB of plaintext), and up to the default per-secret
+// maximum of kloak#383 (64 KiB).
+var e2eSecretLengths = []int{8, 16, 21, 42, 100, 127, 128, 129, 1024, 4096, 16383, 16384, 16385, 65536}
+
+// e2eMaxSecretLen returns E2E_MAX_SECRET_LEN, or defaultE2EMaxSecretLen.
+func e2eMaxSecretLen(t *testing.T) int {
+	t.Helper()
+	v := os.Getenv("E2E_MAX_SECRET_LEN")
+	if v == "" {
+		return defaultE2EMaxSecretLen
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil || n < 8 {
+		t.Fatalf("E2E_MAX_SECRET_LEN=%q: want a length of 8 bytes or more", v)
+	}
+	return n
+}
+
+// skipLongerThanSupported skips a case whose secret is longer than the
+// data plane under test takes.
+func skipLongerThanSupported(t *testing.T, n int) {
+	t.Helper()
+	if max := e2eMaxSecretLen(t); n > max {
+		t.Skipf("kloak#383: a %d-byte secret; this build takes up to %d (E2E_MAX_SECRET_LEN)", n, max)
+	}
+}
+
+// secretOfLen returns a secret value of exactly n bytes: the prefix, the
+// length, then letters ("SECRET-42B-ABCDEFGHIJ..."), so that a value cut
+// short or patched in part is told apart from the whole one.
+func secretOfLen(prefix string, n int) string {
+	head := fmt.Sprintf("%s-%dB-", prefix, n)
+	fill := strings.Repeat("ABCDEFGHIJKLMNOPQRSTUVWXYZ", n/26+1)
+	return (head + fill)[:n]
+}
+
+// clipLog keeps the end of a log for the test's output: with 64 KiB
+// secrets, every echo is 128 KiB.
+func clipLog(s string) string {
+	const max = 8192
+	if len(s) <= max {
+		return s
+	}
+	return fmt.Sprintf("[... %d bytes ...]\n%s", len(s)-max, s[len(s)-max:])
+}
+
+// TestEBPFSecretLengths verifies that secrets of each length in
+// e2eSecretLengths are rewritten in full over raw TLS (demo-python-raw-tls:
+// OpenSSL, a socket BIO), and that a secret restricted to another host is
+// not. Cases longer than this build takes skip (e2eMaxSecretLen). Runs last
+// to avoid secret name collisions.
 func TestEBPFSecretLengths(t *testing.T) {
 	echoHostFQDN := "tls." + testNamespace + ".svc.cluster.local"
 
-	type lengthCase struct {
-		name    string
-		allowed string
-		blocked string
-	}
-	cases := []lengthCase{
-		{"8bytes", "SECRET-8", "BLOCKED8"},
-		{"16bytes", "SECRET-16B-ABCDE", "BLOCKE-16B-FGHIJ"},
-		{"21bytes", "SECRET-21B-ABCDEFGHIJ", "BLOCKE-21B-KLMNOPQRST"},
-		{"42bytes", "SECRET-42B-ABCDEFGHIJKLMNOPQRSTUVWXYZABCDE", "BLOCKE-42B-FGHIJKLMNOPQRSTUVWXYZABCDEFGHIJ"},
-		{"100bytes", "SECRET-100B-ABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJ", "BLOCKE-100B-KLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGHIJKLMNOPQRST"},
-	}
-
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+	for _, n := range e2eSecretLengths {
+		allowed, blocked := secretOfLen("SECRET", n), secretOfLen("BLOCKE", n)
+		t.Run(fmt.Sprintf("%dbytes", n), func(t *testing.T) {
+			skipLongerThanSupported(t, n)
 			// Wait for stale secrets and shadows from previous tests to be cleaned up
 			gcCtx, gcCancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer gcCancel()
@@ -634,8 +683,8 @@ func TestEBPFSecretLengths(t *testing.T) {
 			_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-allowed-kloak")
 			_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-blocked-kloak")
 
-			allowedData := map[string][]byte{"api-key": []byte(tc.allowed)}
-			blockedData := map[string][]byte{"api-key": []byte(tc.blocked)}
+			allowedData := map[string][]byte{"api-key": []byte(allowed)}
+			blockedData := map[string][]byte{"api-key": []byte(blocked)}
 
 			createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{
 				"getkloak.io/hosts": echoHostFQDN,
@@ -661,38 +710,37 @@ func TestEBPFSecretLengths(t *testing.T) {
 				t.Fatalf("deployment not ready: %v", err)
 			}
 
-			// Check prefix to poll for (use first 20 chars for long secrets)
-			allowedCheck := tc.allowed
-			if len(allowedCheck) > 20 {
-				allowedCheck = allowedCheck[:20]
-			}
-			blockedCheck := tc.blocked
-			if len(blockedCheck) > 20 {
-				blockedCheck = blockedCheck[:20]
-			}
+			// The whole value, as its line of the echo: a prefix would
+			// pass a patch that stops part way (at a segment, a record or
+			// a write).
+			wantAllowed := "ALLOWED=" + allowed + "\n"
+			// Any part of the blocked value is a leak: its prefix is
+			// unique to the case.
+			blockedCheck := blocked[:min(len(blocked), 20)]
 
-			// Poll app logs for the allowed secret prefix
+			// Poll app logs for the allowed secret. Each request logs four
+			// lines; 40 keep the last ten.
 			pollCtx, pollCancel := context.WithTimeout(context.Background(), 90*time.Second)
 			defer pollCancel()
 			var out string
 			for {
 				select {
 				case <-pollCtx.Done():
-					t.Logf("=== python-raw-tls-%s final logs ===\n%s", tc.name, out)
+					t.Logf("=== python-raw-tls-%dbytes final logs ===\n%s", n, clipLog(out))
 					t.Logf("=== Controller logs ===\n%s", controllerLogs())
-					t.Fatalf("allowed secret (%d bytes) not rewritten — prefix %q not found", len(tc.allowed), allowedCheck)
+					t.Fatalf("allowed secret (%d bytes) not rewritten in full: %q... not echoed", n, wantAllowed[:min(len(wantAllowed), 40)])
 				default:
 				}
-				out, _ = kubectl("logs", "-n", testNamespace, "-l", "app=demo-python-raw-tls", "--tail=200")
-				if strings.Contains(out, allowedCheck) {
+				out, _ = kubectl("logs", "-n", testNamespace, "-l", "app=demo-python-raw-tls", "--tail=40")
+				if strings.Contains(out, wantAllowed) {
 					break
 				}
 				time.Sleep(pollInterval)
 			}
-			t.Logf("=== python-raw-tls-%s logs ===\n%s", tc.name, out)
+			t.Logf("=== python-raw-tls-%dbytes logs ===\n%s", n, clipLog(out))
 
 			if strings.Contains(out, blockedCheck) {
-				t.Errorf("blocked secret (%d bytes) should NOT be rewritten — prefix %q found in logs", len(tc.blocked), blockedCheck)
+				t.Errorf("blocked secret (%d bytes) should NOT be rewritten — prefix %q found in logs", n, blockedCheck)
 			}
 		})
 	}
