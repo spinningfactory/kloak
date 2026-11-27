@@ -2,6 +2,7 @@ package ebpf
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/spinningfactory/kloak/pkg/secrets"
 )
@@ -33,6 +34,36 @@ const (
 	MinSecretStoreBytes     = 1 << 20
 	MaxSecretStoreBytes     = 1 << 30
 )
+
+// secretStoreGrace is how long the secret store keeps a generation whole
+// after secret_map stops pointing at it (its entry changed or deleted),
+// before it deletes its chunks. A reference the data plane took to the
+// generation (its key and gen, looked up in secret_map before the change) is
+// used until it expires, and must find every chunk until then: a missing
+// chunk is refused, never read from another generation.
+//
+// So it must exceed the longest any data-plane reader holds a reference,
+// counted from its secret_map lookup, plus secretStoreGraceMargin:
+//   - today, a staged patch: XOR_PENDING_TTL_NS (2 s, the uprobe's entry
+//     until the kprobe takes it) then TC_PENDING_TTL_NS (10 s, from the
+//     kprobe), in bpf/helpers.h;
+//   - with the tc ledger (kloak#383 phase 2), a decided record re-applies
+//     its references' deltas to retransmissions until the lookup time
+//     (ledger_slot.created_at) plus LEDGER_REC_TTL_NS (25 s), and a
+//     published slot lives LEDGER_SLOT_TTL_NS, in bpf/ledger_types.h.
+//
+// TestSecretStoreGraceCoversReaders reads those constants from the headers
+// and checks this one against them: raising a reader's TTL means raising
+// this too.
+const secretStoreGrace = 30 * time.Second
+
+// secretStoreGraceMargin is what secretStoreGrace keeps above the longest
+// reference lifetime: slack for a reference's lookup timestamp being taken
+// just before the lookup itself, and for the sweep that deletes due
+// generations (it runs every LifecycleSweepInterval, so it only ever deletes
+// later). The grace period itself starts once the sync has changed the
+// generation's secret_map entry, not at the sync's start.
+const secretStoreGraceMargin = 5 * time.Second
 
 // secretChunkLen is SECRET_CHUNK_LEN in bpf/tls_uprobe.c: the bytes of a
 // placeholder one secret_chunks entry holds.

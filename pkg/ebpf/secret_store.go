@@ -52,11 +52,6 @@ import (
 	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
-// secretStoreGrace is how long a generation no secret_map entry points at
-// any more is kept: three times TC_PENDING_TTL_NS (10 s), the longest a
-// staged patch lives in the data plane.
-const secretStoreGrace = 30 * time.Second
-
 // secretChunkKey matches C struct secret_chunk_key.
 type secretChunkKey struct {
 	Key secretKey // the secret_map key
@@ -308,6 +303,13 @@ func (s *secretStore) apply(snapshot []secrets.Secret, now time.Time) (map[strin
 	var errs mapErrors
 	s.collectLocked(now, &errs)
 
+	// A generation is retired when its secret_map entry has been changed or
+	// deleted: the grace period runs from then, which is now plus the time
+	// this sync has taken (writing a large store's chunks takes a while),
+	// not from the sync's start.
+	start := time.Now()
+	due := func() time.Time { return now.Add(time.Since(start) + secretStoreGrace) }
+
 	want, hosts, tooLong := s.desired(snapshot)
 	full := 0
 	written := 0
@@ -334,7 +336,7 @@ func (s *secretStore) apply(snapshot []secrets.Secret, now time.Time) (map[strin
 				"owner", e.owner, "key", e.name, "changed", ok, "chunks", n,
 				"usedChunks", s.used, "capacityChunks", s.capacity)
 			if ok {
-				s.withdraw(key, cur, now, &errs)
+				s.withdraw(key, cur, due(), &errs)
 			}
 			continue
 		}
@@ -344,7 +346,7 @@ func (s *secretStore) apply(snapshot []secrets.Secret, now time.Time) (map[strin
 				"error", err, "owner", e.owner, "key", e.name, "changed", ok)
 			errs.add(err)
 			if ok {
-				s.withdraw(key, cur, now, &errs)
+				s.withdraw(key, cur, due(), &errs)
 			}
 			continue
 		}
@@ -356,12 +358,12 @@ func (s *secretStore) apply(snapshot []secrets.Secret, now time.Time) (map[strin
 			// Nothing refers to the new generation.
 			s.retire(key, gen, n, now)
 			if ok {
-				s.withdraw(key, cur, now, &errs)
+				s.withdraw(key, cur, due(), &errs)
 			}
 			continue
 		}
 		if ok {
-			s.retire(key, cur.gen, cur.chunks, now.Add(secretStoreGrace))
+			s.retire(key, cur.gen, cur.chunks, due())
 		}
 		s.entries[key] = storedEntry{gen: gen, chunks: n, sum: e.sum, valid: true}
 		written++
@@ -399,13 +401,13 @@ func (s *secretStore) apply(snapshot []secrets.Secret, now time.Time) (map[strin
 		}
 		if e, ok := s.entries[stale[i]]; ok {
 			delete(s.entries, stale[i])
-			s.retire(stale[i], e.gen, e.chunks, now.Add(secretStoreGrace))
+			s.retire(stale[i], e.gen, e.chunks, due())
 		} else if gen := staleVals[i].Gen; gen != 0 {
 			// Not one this store wrote or found at start: its chunks are
 			// counted from now.
 			n := chunkCount(int(staleVals[i].Len))
 			s.used += n
-			s.retire(stale[i], gen, n, now.Add(secretStoreGrace))
+			s.retire(stale[i], gen, n, due())
 		}
 		logging.Tracew(s.log, "pruned stale entry from eBPF map")
 	}
@@ -542,16 +544,16 @@ func rawEntry(sec *secrets.Secret) storeEntry {
 }
 
 // withdraw deletes key's secret_map entry, whose generation cur no longer
-// holds the Secret's value, and retires that generation. A failure leaves
-// the entry in place: the sync reports it, and its retry withdraws it.
-func (s *secretStore) withdraw(key secretKey, cur storedEntry, now time.Time, errs *mapErrors) {
+// holds the Secret's value, and retires that generation until due. A failure
+// leaves the entry in place: the sync reports it, and its retry withdraws it.
+func (s *secretStore) withdraw(key secretKey, cur storedEntry, due time.Time, errs *mapErrors) {
 	if err := s.secrets.Delete(&key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 		s.log.Errorw("failed to withdraw a changed secret from BPF secret_map: its previous value is still rewritten", "error", err)
 		errs.add(err)
 		return
 	}
 	delete(s.entries, key)
-	s.retire(key, cur.gen, cur.chunks, now.Add(secretStoreGrace))
+	s.retire(key, cur.gen, cur.chunks, due)
 }
 
 // writeChunks writes chunks as a new generation of key, and returns it.

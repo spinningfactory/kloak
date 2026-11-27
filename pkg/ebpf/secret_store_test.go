@@ -243,7 +243,7 @@ func TestStoreApply_Generations(t *testing.T) {
 	if err := st.chunks.Lookup(&oldChunk, &secretChunk{}); err != nil {
 		t.Errorf("the previous generation went within the grace period: %v", err)
 	}
-	if freed, _, err := st.collect(changedAt.Add(secretStoreGrace)); err != nil || freed != 1 {
+	if freed, _, err := st.collect(changedAt.Add(secretStoreGrace + time.Second)); err != nil || freed != 1 {
 		t.Errorf("collect after the grace period freed %d, %v; want the previous generation's chunk", freed, err)
 	}
 	if err := st.chunks.Lookup(&oldChunk, &secretChunk{}); !errors.Is(err, ciliumebpf.ErrKeyNotExist) {
@@ -276,7 +276,7 @@ func TestStoreApply_Prune(t *testing.T) {
 	if n := mapLen(t, st.chunks); n != chunks {
 		t.Errorf("secret_chunks has %d entries right after the secret went, want its %d until the grace period", n, chunks)
 	}
-	if _, err := st.apply(nil, now.Add(time.Second+secretStoreGrace)); err != nil {
+	if _, err := st.apply(nil, now.Add(2*time.Second+secretStoreGrace)); err != nil {
 		t.Fatal(err)
 	}
 	if n := mapLen(t, st.chunks); n != 0 || st.used != 0 {
@@ -344,11 +344,11 @@ func TestStoreApply_Full(t *testing.T) {
 		t.Errorf("collect within the grace period: freed %d, refused %v, %v", freed, refused, err)
 	}
 	// Then the retired generation frees room, and the retry writes it.
-	freed, refused, err := st.collect(rotatedAt.Add(secretStoreGrace))
+	freed, refused, err := st.collect(rotatedAt.Add(secretStoreGrace + time.Second))
 	if err != nil || freed != 1 || !refused {
 		t.Fatalf("collect after the grace period: freed %d, refused %v, %v; want 1, true", freed, refused, err)
 	}
-	if _, err := st.apply([]secrets.Secret{a2, b}, rotatedAt.Add(secretStoreGrace)); err != nil {
+	if _, err := st.apply([]secrets.Secret{a2, b}, rotatedAt.Add(secretStoreGrace+time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	val, chunks := storedChunks(t, st, *key(a2))
@@ -461,7 +461,7 @@ func TestStoreRebuild(t *testing.T) {
 
 	// The generations nothing points at go after a grace period from the
 	// restart: b's previous one and c's.
-	if _, _, err := st.collect(restart.Add(secretStoreGrace)); err != nil {
+	if _, _, err := st.collect(restart.Add(secretStoreGrace + time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	if st.used != mapLen(t, st.chunks) || len(st.retired) != 0 {
