@@ -1192,7 +1192,9 @@ struct {
 // the connection's current one (a TLS 1.3 KeyUpdate, an ssl_ptr reused by a
 // new connection) is rebuilt. LRU like tls_conn_state, with as many entries:
 // 4096 of 464 bytes (key and value), about 2 MB preallocated; a miss only
-// costs the rebuild. tc only.
+// costs the rebuild. Entries outlive their process until evicted, as
+// tls_conn_state's do: should the lifecycle sweep ever prune tls_conn_state
+// by tgid, it should prune this map with it. tc only.
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
   __uint(max_entries, 4096);
@@ -1923,9 +1925,8 @@ static __always_inline void ghash_span_block(const struct ghash_work *w,
 // of word i (lo, then hi) of mul_x (gf128_table_mul). Two iterations of 16
 // unrolled steps rather than one of 32: the verifier walks the callback once
 // per call site, and half the code per multiply halved tc_ghash_update's
-// verifier cost on Linux 7.2 (29807 -> 14847 instructions), for about 4% and
-// 10% more on 6.1 and 6.6 (7760 -> 8055, 7154 -> 7877) and 5-12% more run
-// time.
+// verifier cost on Linux 7.2 (29807 -> 15027 instructions), for 15% and 10%
+// more on 6.1 and 6.6 (7760 -> 8907, 7154 -> 7869) and 5-12% more run time.
 static int ghash_mul_iter(__u32 i, void *_unused) {
   __u32 zero = 0;
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
@@ -3432,7 +3433,7 @@ int tc_ghash_update(struct __sk_buff *skb) {
   ck.tgid = w->ghash_tgid;
   ck.ssl_ptr = w->ghash_ssl_ptr;
   struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &ck);
-  if (!conn)
+  if (!conn || !is_aes_gcm(conn->cipher_type))
     return TC_PASS;
   struct gf128 h;
   gf128_load(conn->ghash_h, &h);
@@ -3445,7 +3446,9 @@ int tc_ghash_update(struct __sk_buff *skb) {
     // H is checked again after the copy, which catches a recycle that wrote
     // the element's H before then. One that races the copy byte for byte is
     // not excluded; its torn table gives a wrong tag, which the peer
-    // rejects: the connection fails, it does not carry wrong data.
+    // rejects: the connection fails, it does not carry wrong data. The
+    // compiler barrier keeps the re-check a reload after the copy.
+    asm volatile("" ::: "memory");
     cached = ks->h.hi == h.hi && ks->h.lo == h.lo;
   }
   if (!cached) {

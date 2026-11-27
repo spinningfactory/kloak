@@ -339,6 +339,8 @@ HELPER_INLINE void gf128_table_init(struct gf128_table *t, const struct gf128 *h
 // as a hi word. Bit k of n, x^(127-k), becomes x^(131-k) = x^(3-k) * x^128 =
 // x^(3-k) * (1 + x + x^2 + x^7): GF128_R shifted right by 3-k.
 HELPER_INLINE void gf128_rem4_init(__u64 r[16]) {
+  // Unrolled into 16 constant stores (load-bearing: the BPF caller runs it
+  // for every record).
 #pragma GCC unroll 16
   for (int n = 0; n < 16; n++) {
     __u64 v = 0;
@@ -360,6 +362,8 @@ HELPER_INLINE void gf128_table_mul_word(struct gf128 *z, __u64 w,
                                         const struct gf128_table *t,
                                         const __u64 r[16]) {
   __u64 zhi = z->hi, zlo = z->lo;
+  // Load-bearing: rolled, the shifts of w are no longer constants, and the
+  // verifier walks the loop iteration by iteration.
 #pragma GCC unroll 16
   for (int i = 15; i >= 0; i--) {
     __u32 n = (w >> (60 - 4 * i)) & 0xF;
