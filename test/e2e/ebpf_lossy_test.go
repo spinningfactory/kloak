@@ -83,6 +83,13 @@ func TestEBPFLossyNetwork(t *testing.T) {
 		// One ~4.1 KiB record, the secret at its end: ~5 segments.
 		{name: "4 KiB record, 1000-byte MTU", secret: "lossy-100", mtu: 1000, oneRecord: true, before: 4000, requests: 100},
 		{name: "4 KiB record, 1000-byte MTU, 5% loss", secret: "lossy-100", mtu: 1000, oneRecord: true, before: 4000, loss: "5%", requests: 200},
+		// The secret at the start: patched in the first segment, the tag
+		// deferred to the last. The record's size varies over an MSS (948
+		// bytes at this MTU), so that ~16 in 948 records have their tag
+		// split across two segments; with loss, the patched first segment
+		// is retransmitted unpatched.
+		{name: "4 KiB record, secret at its start, 1000-byte MTU", secret: "lossy-100", mtu: 1000, oneRecord: true, after: 4000, spread: 948, requests: 400},
+		{name: "4 KiB record, secret at its start, 1000-byte MTU, 5% loss", secret: "lossy-100", mtu: 1000, oneRecord: true, after: 4000, spread: 948, loss: "5%", requests: 400},
 		// A new connection's first record holds ~1.2 KB (Go's dynamic
 		// record sizing): the secret is in its second record.
 		{name: "new Go connections, 1.3 KiB before the secret", secret: "lossy-100", fresh: true, before: 1300, requests: 100},
@@ -136,6 +143,8 @@ type lossyScenario struct {
 	oneRecord bool   // dynamic record sizing off: each message is one record
 	fresh     bool   // a new connection for each request
 	before    int    // filler bytes before the secret
+	after     int    // filler bytes after the secrets
+	spread    int    // vary after over this many bytes, request to request
 	requests  int
 	control   bool // a clean network: every request must be rewritten
 }
@@ -327,6 +336,8 @@ func runLossyClient(t *testing.T, shell nodeShell, node string, echo lossyEcho, 
 		"BLOCKED_REAL_SHA256": sum(reals["lossy-blocked"]),
 		"REQUESTS":            strconv.Itoa(sc.requests),
 		"FILLER_BEFORE":       strconv.Itoa(sc.before),
+		"FILLER_AFTER":        strconv.Itoa(sc.after),
+		"AFTER_SPREAD":        strconv.Itoa(sc.spread),
 	}
 	if sc.fresh {
 		envs["FRESH_CONN"] = "1"

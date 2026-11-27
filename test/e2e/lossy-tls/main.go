@@ -12,6 +12,9 @@
 // blocked placeholder, a newline, FILLER_AFTER filler bytes: the filler
 // before a placeholder pushes it into a TLS record's later segments, or
 // into Go's second record on a new connection (dynamic record sizing).
+// AFTER_SPREAD varies the filler after it from request to request over that
+// many bytes, so that the record's end, and its tag, fall at every offset
+// of a segment.
 //
 // The client only ever holds the placeholders (kloak's shadow secrets). It
 // tells the outcome of each request from SHA-256 digests of the real
@@ -179,6 +182,7 @@ type tlsClient struct {
 	allowed, blocked    []byte
 	realSum, blockedSum string
 	before, after       int
+	spread              int
 	cfg                 *tls.Config
 	timeout             time.Duration
 	conn                net.Conn
@@ -215,6 +219,7 @@ func runClient() {
 		blockedSum: env("BLOCKED_REAL_SHA256", ""),
 		before:     envInt("FILLER_BEFORE", 0),
 		after:      envInt("FILLER_AFTER", 0),
+		spread:     envInt("AFTER_SPREAD", 0),
 		timeout:    time.Duration(envInt("TIMEOUT_MS", 3000)) * time.Millisecond,
 	}
 	c.cfg = &tls.Config{
@@ -245,7 +250,11 @@ func runClient() {
 	res := Result{Requests: requests, Counts: map[string]int{}, WarmupMillis: time.Since(start).Milliseconds()}
 	seen := map[string]bool{}
 	for i := 0; i < requests; i++ {
-		out, err := c.request(fresh, c.before, c.after)
+		after := c.after
+		if c.spread > 0 {
+			after += i * 7919 % c.spread // a stride prime to any MSS
+		}
+		out, err := c.request(fresh, c.before, after)
 		res.Counts[out]++
 		if err != nil && !seen[err.Error()] && len(res.Errors) < 5 {
 			seen[err.Error()] = true
