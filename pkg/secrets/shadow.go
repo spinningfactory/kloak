@@ -4,7 +4,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
-	"math/big"
+	"io"
 
 	"go.uber.org/zap"
 )
@@ -89,8 +89,8 @@ func (g *ShadowGenerator) Generate(originalLen, realHuffmanBits int, ownerID str
 		if err != nil {
 			// ErrHuffmanInvariantUnsatisfiable is deterministic for
 			// (originalLen, realHuffmanBits) — the feasibility check is
-			// pure arithmetic, so retrying won't help. rand.Int failures
-			// are also retry-pointless.
+			// pure arithmetic, so retrying won't help. A failed read of
+			// crypto/rand is also retry-pointless.
 			return "", err
 		}
 		// Empty ownerID → strict global check: any occupant collides.
@@ -144,7 +144,7 @@ func (g *ShadowGenerator) collides(shadow, ownerID string) bool {
 // generateShadowValue constructs a shadow whose plaintext length is
 // exactly originalLen AND whose HPACK Huffman bit length is exactly
 // realHuffmanBits. Both invariants hold by construction, not by
-// random-then-tune retry — see the algorithm comment below.
+// random-then-tune retry — see the algorithm comment in buildShadow.
 //
 // Why bit-EXACT, not byte-AT-LEAST: the BPF map sync in pkg/ebpf/sync.go
 // rewrites the shadow's encoded slot on the wire with the real's
@@ -165,14 +165,43 @@ func (g *ShadowGenerator) collides(shadow, ownerID string) bool {
 // the time spent on the error path is independent of realHuffmanBits's
 // magnitude, removing a timing oracle on the real's encoded length.
 func generateShadowValue(originalLen, realHuffmanBits int) (string, error) {
+	return generateShadow(rand.Reader, originalLen, realHuffmanBits)
+}
+
+// maxShadowAttempts bounds the shadows buildShadow starts over: it only
+// does when no byte fits a position (shadowCode.nested), which takes 23
+// bits of the code to match a candidate's first 23 and a position whose
+// window leaves no other byte: it has never been seen.
+const maxShadowAttempts = 8
+
+// generateShadow is generateShadowValue drawing its randomness from r
+// (crypto/rand.Reader; tests pass a seeded stream).
+func generateShadow(r io.Reader, originalLen, realHuffmanBits int) (string, error) {
 	// Feasibility runs first; on failure no randomness is consumed and
 	// the error path is constant-time w.r.t. realHuffmanBits's magnitude
 	// (no timing oracle).
 	if err := CanShadow(originalLen, realHuffmanBits); err != nil {
 		return "", err
 	}
-	tailLen := originalLen - len(ValuePrefix)
-	tailBits := realHuffmanBits - prefixHuffmanBits
+	rs := newRandStream(r)
+	for attempt := 0; attempt < maxShadowAttempts; attempt++ {
+		shadow, ok, err := buildShadow(rs, originalLen, realHuffmanBits)
+		if err != nil {
+			return "", fmt.Errorf("reading random bytes: %w", err)
+		}
+		if ok {
+			return shadow, nil
+		}
+	}
+	return "", fmt.Errorf("no shadow of %d bytes without a nested placeholder candidate after %d attempts", originalLen, maxShadowAttempts)
+}
+
+// buildShadow draws one shadow (see generateShadowValue), whose feasibility
+// CanShadow checked. ok is false at a dead end (pickTailByte): the caller
+// starts over.
+func buildShadow(rs *randStream, originalLen, realHuffmanBits int) (shadow string, ok bool, err error) {
+	tailLen := int64(originalLen - len(ValuePrefix))
+	tailBits := int64(realHuffmanBits - prefixHuffmanBits)
 
 	// Byte-by-byte construction. The loop invariant: at the start of
 	// iteration i, `remaining` is the bit budget the suffix
@@ -186,53 +215,179 @@ func generateShadowValue(originalLen, realHuffmanBits int) (string, error) {
 	// induction — entering iter i with remaining ∈ [left+1)*MinBits,
 	// (left+1)*MaxBits] yields lo ≤ hi, and the chosen k preserves
 	// remaining ∈ [left*MinBits, left*MaxBits] for the next iter).
-	tail := make([]byte, tailLen)
+	//
+	// The arithmetic is int64: left*MaxBits overflows a 32-bit int past
+	// 256 MiB.
+	buf := make([]byte, len(ValuePrefix), originalLen)
+	copy(buf, ValuePrefix)
+	code := newShadowCode()
 	remaining := tailBits
-	for i := 0; i < tailLen; i++ {
+	for i := int64(0); i < tailLen; i++ {
 		left := tailLen - i - 1
-		lo := MinBits
-		if v := remaining - left*MaxBits; v > lo {
-			lo = v
+		lo := max(int64(MinBits), remaining-left*MaxBits)
+		hi := min(int64(MaxBits), remaining-left*MinBits)
+		b, ok, err := pickTailByte(rs, &code, int(lo), int(hi))
+		if err != nil || !ok {
+			return "", false, err
 		}
-		hi := MaxBits
-		if v := remaining - left*MinBits; v < hi {
-			hi = v
-		}
-
-		// Pick a code length k ∈ [lo, hi] uniformly at random, then
-		// pick a byte uniformly from the bucket of that code length.
-		// Two CSPRNG draws per byte, control flow independent of
-		// realHuffmanBits — see function-level comment on timing.
-		k, err := randIntInclusive(lo, hi)
-		if err != nil {
-			return "", fmt.Errorf("rand.Int for code length: %w", err)
-		}
-		bucket := huffmanBuckets[k]
-		idx, err := rand.Int(rand.Reader, big.NewInt(int64(len(bucket))))
-		if err != nil {
-			return "", fmt.Errorf("rand.Int for bucket pick: %w", err)
-		}
-		tail[i] = bucket[idx.Int64()]
-		remaining -= k
+		buf = append(buf, b)
+		code.add(b)
+		remaining -= int64(huffmanBitsTable[b])
 	}
-
-	return ValuePrefix + string(tail), nil
+	return string(buf), true, nil
 }
 
-// randIntInclusive returns a uniform random int in [lo, hi] (both ends
-// inclusive) drawn from crypto/rand. Returns lo immediately when the
-// range is a single value so we don't pay for a CSPRNG draw on the
-// trivial case (tail positions near the end of a tight-feasibility run
-// frequently hit this branch).
-func randIntInclusive(lo, hi int) (int, error) {
-	if hi <= lo {
-		return lo, nil
+// pickTailByte draws a tail byte whose code is lo to hi bits long: the
+// length uniformly in [lo, hi], then a byte uniformly from its bucket, one
+// draw each, as uniform as the stream (randStream.intn). A byte whose code
+// would make a placeholder candidate start inside the shadow's code
+// (shadowCode.nested) is drawn again: the pick is then uniform over the
+// others, with the same weights. ok is false when every byte of [lo, hi]
+// would (a dead end).
+func pickTailByte(rs *randStream, code *shadowCode, lo, hi int) (b byte, ok bool, err error) {
+	for first := true; ; first = false {
+		k, err := rs.intn(hi - lo + 1)
+		if err != nil {
+			return 0, false, err
+		}
+		bucket := huffmanBuckets[lo+k]
+		j, err := rs.intn(len(bucket))
+		if err != nil {
+			return 0, false, err
+		}
+		if b = bucket[j]; !code.nested(b) {
+			return b, true, nil
+		}
+		// Rare (see maxShadowAttempts): check once that another byte
+		// fits before drawing again, so that the loop ends.
+		if first && !code.anyFits(lo, hi) {
+			return 0, false, nil
+		}
 	}
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(hi-lo+1)))
-	if err != nil {
-		return 0, err
+}
+
+// The prescan's candidate filters (is_kloak_prefix and
+// is_kloak_prefix_huffman in pkg/ebpf/bpf/helpers.h): the bytes "kl::",
+// and the first three bytes of Huffman("kl::"), which start every
+// placeholder's code.
+const (
+	candidateRaw     = 0x6b6c3a3a // "kl::", 32 bits
+	candidateHuffman = 0xeb45cb   // 24 bits
+)
+
+// shadowCode follows a shadow's HPACK Huffman code as buildShadow builds
+// it, so that no placeholder candidate starts inside it.
+//
+// A raw shadow holds none: its tail alphabet has no ':' and no byte of
+// 0x80 and above. Its Huffman code could: the prescan finds a placeholder
+// in an HTTP/2 header by the candidates at a byte boundary of the header
+// value's code, where the shadow's code can start at any bit offset (after
+// the bits of what precedes it in the value), and the codes of tail bytes
+// can line up into either candidate across their boundaries
+// (TestNestedCandidatesArePossible). A candidate the prescan finds inside a
+// placeholder takes a match slot if its 8 bytes are a key of secret_map,
+// and is looked up otherwise: buildShadow leaves out every byte that would
+// make one start at any bit offset inside the code, other than its first
+// (the placeholder's own). One that starts in the code and ends after it,
+// in what follows the placeholder, depends on that text.
+//
+// TODO(kloak#383): once the data plane verifies whole placeholders (phase
+// 1), its prescan should also skip candidates inside a verified span: that
+// covers those, and placeholders minted before this check.
+type shadowCode struct {
+	reg uint64 // the code's last bits, the latest lowest
+	n   int    // the code's bits so far
+}
+
+func newShadowCode() shadowCode {
+	var c shadowCode
+	for _, b := range []byte(ValuePrefix) {
+		c.add(b)
 	}
-	return lo + int(n.Int64()), nil
+	return c
+}
+
+func (c *shadowCode) add(b byte) {
+	c.reg = c.reg<<huffmanBitsTable[b] | uint64(huffmanCodes[b])
+	c.n += huffmanBitsTable[b]
+}
+
+// nested reports whether b's code, appended, ends a candidate that starts
+// after the code's first bit.
+func (c *shadowCode) nested(b byte) bool {
+	k := huffmanBitsTable[b]
+	reg := c.reg<<k | uint64(huffmanCodes[b])
+	for end := c.n + 1; end <= c.n+k; end++ { // a window ending with bit end-1
+		w := reg >> (c.n + k - end)
+		if end-24 >= 1 && w&0xffffff == candidateHuffman {
+			return true
+		}
+		if end-32 >= 1 && w&0xffffffff == candidateRaw {
+			return true
+		}
+	}
+	return false
+}
+
+// anyFits reports whether a byte of code length lo to hi is not nested.
+func (c *shadowCode) anyFits(lo, hi int) bool {
+	for k := lo; k <= hi; k++ {
+		for _, b := range huffmanBuckets[k] {
+			if !c.nested(b) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// randStream hands out uniform random integers drawn from a buffered
+// stream of random bytes (crypto/rand.Reader): one read per
+// len(randStream.buf) bytes, where two big.Int draws per shadow byte cost an
+// allocation and a read each.
+type randStream struct {
+	r   io.Reader
+	buf [512]byte
+	off int // the next unread byte of buf
+}
+
+func newRandStream(r io.Reader) *randStream {
+	s := &randStream{r: r}
+	s.off = len(s.buf)
+	return s
+}
+
+// intn returns a uniform random int in [0, n), 1 <= n <= 256, by rejection
+// sampling of a byte (intnFromByte). n == 1 draws nothing.
+func (s *randStream) intn(n int) (int, error) {
+	if n <= 1 {
+		return 0, nil
+	}
+	for {
+		if s.off == len(s.buf) {
+			if _, err := io.ReadFull(s.r, s.buf[:]); err != nil {
+				return 0, err
+			}
+			s.off = 0
+		}
+		b := s.buf[s.off]
+		s.off++
+		if v, ok := intnFromByte(b, n); ok {
+			return v, nil
+		}
+	}
+}
+
+// intnFromByte maps a uniform random byte to a uniform int in [0, n), 2 <=
+// n <= 256: b is accepted when it is below the largest multiple of n that
+// fits in a byte, and v is b mod n, so that every v has exactly 256/n
+// (rounded down) bytes; the others (256 mod n of them) are rejected, and
+// the caller draws again.
+func intnFromByte(b byte, n int) (v int, ok bool) {
+	if int(b) >= 256-256%n {
+		return 0, false
+	}
+	return int(b) % n, true
 }
 
 // ErrHuffmanInvariantUnsatisfiable is returned by generateShadowValue
@@ -279,8 +434,11 @@ func CanShadow(originalLen, realHuffmanBits int) error {
 		return fmt.Errorf("%w: originalLen=%d < %d (ValuePrefix length)",
 			ErrHuffmanInvariantUnsatisfiable, originalLen, len(ValuePrefix))
 	}
-	tailLen := originalLen - len(ValuePrefix)
-	tailBits := realHuffmanBits - prefixHuffmanBits
+	// int64: tailLen*MaxBits overflows a 32-bit int past 256 MiB.
+	tailLen := int64(originalLen) - int64(len(ValuePrefix))
+	tailBits := int64(realHuffmanBits) - int64(prefixHuffmanBits)
+	lo := int64(prefixHuffmanBits) + tailLen*MinBits
+	hi := int64(prefixHuffmanBits) + tailLen*MaxBits
 	// Special case tailLen == 0: the shadow IS the prefix; only
 	// tailBits == 0 (realHuffmanBits == prefixHuffmanBits) is
 	// satisfiable. The same bounds check handles this naturally
@@ -294,18 +452,12 @@ func CanShadow(originalLen, realHuffmanBits int) error {
 		// of admission-denial messages and audit logs.
 		return fmt.Errorf(
 			"%w: value's HPACK Huffman density is too low at length %d (achievable range %d–%d bits; use a different value or a longer secret)",
-			ErrHuffmanInvariantUnsatisfiable, originalLen,
-			prefixHuffmanBits+tailLen*MinBits,
-			prefixHuffmanBits+tailLen*MaxBits,
-		)
+			ErrHuffmanInvariantUnsatisfiable, originalLen, lo, hi)
 	}
 	if tailBits > tailLen*MaxBits {
 		return fmt.Errorf(
 			"%w: value's HPACK Huffman density is too high at length %d (achievable range %d–%d bits; use a different value or a longer secret)",
-			ErrHuffmanInvariantUnsatisfiable, originalLen,
-			prefixHuffmanBits+tailLen*MinBits,
-			prefixHuffmanBits+tailLen*MaxBits,
-		)
+			ErrHuffmanInvariantUnsatisfiable, originalLen, lo, hi)
 	}
 	return nil
 }
