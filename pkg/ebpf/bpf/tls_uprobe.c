@@ -257,6 +257,9 @@ enum {
   DBG_VIP_DNS_UNBOUND,       // a watched host's answer left unchanged: the pod has no secret for the host
   DBG_VIP_SOCK_HOST_DENY,    // patch refused at tcp_sendmsg: the socket did not connect to the secret host's fake IP
   DBG_VIP_SOCK_ADDR_DENY,    // patch refused at tcp_sendmsg: the socket's real address or port is not the secret's
+  DBG_XOR_SHADOW_READ_FAIL,  // bpf_xor_path could not read a placeholder's bytes: skipped
+  DBG_XOR_PLACEHOLDER_CUT,   // a placeholder runs past the end of its write: skipped
+  DBG_TC_PATCH_OUT_OF_RECORD, // tc refused a patch not inside its record's application data
   DBG_MAX,
 };
 
@@ -705,6 +708,37 @@ struct {
   __type(value, struct xor_pending_val);
 } xor_pending SEC(".maps");
 
+// Per-CPU scratch of the uprobe tail-call chain (bpf_xor_path): the write's
+// patches as they accumulate, one match per tail call, until they are
+// committed to xor_pending, and the placeholder being turned into its delta.
+//
+// Each context has its own scratch: this one for the uprobes, kprobe_stage
+// for the tcp_sendmsg kprobe, ghash_scratch for tc. tc runs in softirq,
+// which can interrupt a uprobe or kprobe program on the same CPU (on the
+// return from a hardware interrupt), and on a preemptible kernel the uprobe
+// chain can be preempted (uprobe programs run with migration disabled, not
+// preemption: bpf_prog_run_array_uprobe) by a task whose tcp_sendmsg kprobe
+// then runs on the same CPU. A scratch shared with either would have its
+// staged patches overwritten between two tail calls, or between the delta's
+// read and its store, and commit another connection's patches as this
+// write's.
+//
+// TODO(kloak#383): a preempted uprobe chain can still be overwritten by
+// another task's uprobe chain on the same CPU (here and in scratch). Keep the
+// chain's state per thread instead of per CPU (phase 1, once it is a few
+// fixed-size references).
+struct uprobe_stage_buf {
+  struct xor_pending_val pending;
+  __u8 delta[SECRET_MAX_LEN]; // the placeholder's wire bytes, then their XOR delta
+};
+
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct uprobe_stage_buf);
+} uprobe_stage SEC(".maps");
+
 // Userspace-configured struct offsets for extracting TLS key material.
 // Populated once per library at uprobe attach time after the controller
 // detects the OpenSSL version. Supports a 4-level pointer chain:
@@ -1045,7 +1079,6 @@ struct {
   __type(value, struct go_tls_offsets);
 } go_tls_offset_config SEC(".maps");
 
-// Per-CPU scratch space for XOR-path programs (bpf_xor_path + tcp_sendmsg kprobe).
 // tc egress struct definitions (needed by ghash_work below and tc maps further down).
 struct tc_dest_key {
   __u8  dst_ip[16]; // IPv4-mapped-IPv6 or native IPv6
@@ -1066,14 +1099,25 @@ struct tc_pending_val {
   __u64 created_at;         // bpf_ktime_get_ns() at tcp_sendmsg: expires unused (tc_entry_expired)
 };
 
-// Holds all large structs and buffers that would otherwise exceed the 512-byte
-// BPF stack limit, including staging areas for map updates and GF(2^128) state.
+// Per-CPU scratch of the tcp_sendmsg kprobe (bpf_kprobe_tcp_sendmsg and
+// socket_filter_patches): the tc_pending entry it builds from xor_pending
+// before storing it. Its own, not ghash_work: tc can interrupt the kprobe on
+// the same CPU (see uprobe_stage).
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, __u32);
+  __type(value, struct tc_pending_val);
+} kprobe_stage SEC(".maps");
+
+// tc's per-CPU scratch (tc_egress_patch, tc_ghash_update and their bpf_loop
+// callbacks): the large structs and buffers that would otherwise exceed the
+// 512-byte BPF stack limit, and the GF(2^128) state. tc only: see
+// uprobe_stage.
 struct ghash_work {
-  // Staging for map updates (avoids large structs on BPF stack)
-  struct xor_pending_val staged_pending; // staging area for patch accumulation
-  struct tc_pending_val staged_tc;       // for tc_pending map insert
-  // Ciphertext patching buffers
-  __u8 ct_buf[SECRET_MAX_LEN]; // Ciphertext chunk for XOR patching
+  // The matched tc_pending entry's patches (only patch_count and patches
+  // are used).
+  struct xor_pending_val staged_pending;
   // The patched ciphertext of each staged patch, which tc_egress_patch reads
   // and XORs, and tc_ghash_update writes with the recomputed tag.
   __u8 ct_patched[XOR_MAX_PATCHES][SECRET_MAX_LEN];
@@ -1671,20 +1715,20 @@ int bpf_xor_path(void *ctx) {
 
   __u32 mi = sd->xor_current_match;
   if (mi >= sd->xor_match_count || mi >= XOR_MAX_MATCHES)
-    return 0; // No matches to process — bail without touching stale staged_pending.
+    return 0; // No matches to process — bail without touching a stale staged entry.
 
-  // Initialize staged_pending on first invocation.
+  // Initialize the staged xor_pending entry on first invocation.
   if (mi == 0) {
-    struct ghash_work *wi = bpf_map_lookup_elem(&ghash_scratch, &zero);
-    if (!wi) return 0;
-    __builtin_memset(&wi->staged_pending, 0, sizeof(wi->staged_pending));
-    wi->staged_pending.ssl_ptr = sd->ssl_ptr;
-    wi->staged_pending.tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
-    wi->staged_pending.active = 1;
-    wi->staged_pending.chain_type = sd->chain_type;
-    wi->staged_pending.plaintext_len = sd->total_data_len;
-    wi->staged_pending.memory_bio = sd->memory_bio;
-    wi->staged_pending.created_at = bpf_ktime_get_ns();
+    struct uprobe_stage_buf *si = bpf_map_lookup_elem(&uprobe_stage, &zero);
+    if (!si) return 0;
+    __builtin_memset(&si->pending, 0, sizeof(si->pending));
+    si->pending.ssl_ptr = sd->ssl_ptr;
+    si->pending.tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+    si->pending.active = 1;
+    si->pending.chain_type = sd->chain_type;
+    si->pending.plaintext_len = sd->total_data_len;
+    si->pending.memory_bio = sd->memory_bio;
+    si->pending.created_at = bpf_ktime_get_ns();
 
     // For OpenSSL/BoringSSL, if h_extract just populated tls_conn_state
     // (libcrypto-hook path), carry H through xor_pending so the kprobe
@@ -1695,14 +1739,14 @@ int bpf_xor_path(void *ctx) {
     // and stays in the kprobe.
     if (sd->chain_type != CHAIN_GO_TLS && sd->h_fresh) {
       struct tls_conn_key ck = {};
-      ck.tgid = wi->staged_pending.tgid;
+      ck.tgid = si->pending.tgid;
       ck.ssl_ptr = sd->ssl_ptr;
       struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &ck);
       if (conn && conn->cipher_type == KLOAK_CIPHER_AES_GCM) {
-        __builtin_memcpy(wi->staged_pending.ghash_h, conn->ghash_h, 16);
-        wi->staged_pending.cipher_type = conn->cipher_type;
-        wi->staged_pending.nonce_len = conn->nonce_len;
-        wi->staged_pending.h_valid = 1;
+        __builtin_memcpy(si->pending.ghash_h, conn->ghash_h, 16);
+        si->pending.cipher_type = conn->cipher_type;
+        si->pending.nonce_len = conn->nonce_len;
+        si->pending.h_valid = 1;
       }
     }
   }
@@ -1723,8 +1767,18 @@ int bpf_xor_path(void *ctx) {
 
   __u32 val_len = val->len;
 
+  // The placeholder must lie in the write. One cut off at its end (the
+  // prescan found its key, the rest is in the app's next write) would be
+  // patched past the write's plaintext: over its record's inner content type
+  // and tag, or into another write's record. It goes out as it is.
+  // TODO(kloak#383): continuation across writes (phase 3).
+  if ((__u64)local_i + val_len > sd->total_data_len) {
+    dbg_inc(DBG_XOR_PLACEHOLDER_CUT);
+    goto next;
+  }
+
   // Pod binding last, so a violation is reported only when it is the sole
-  // reason this placeholder is not rewritten. sd, w and val are re-looked-up
+  // reason this placeholder is not rewritten. sd, st and val are re-looked-up
   // below, so the helper's map accesses don't matter here.
   if (!secret_binding_allows(&key))
     goto next;
@@ -1735,34 +1789,51 @@ int bpf_xor_path(void *ctx) {
   // HPACK-Huffman placeholder (patch_delta).
   __u32 delta_len = clamp_write_len(val_len);
 
-  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w) return 0;
+  struct uprobe_stage_buf *st = bpf_map_lookup_elem(&uprobe_stage, &zero);
+  if (!st) return 0;
   sd = bpf_map_lookup_elem(&scratch, &zero);
   if (!sd) return 0;
 
-  // Read shadow bytes directly from user memory. This avoids depending on
-  // the prescan buffer size — secrets that start near the end of the buffer
-  // won't wrap around and read garbage from position 0.
-  bpf_probe_read_user(w->ct_buf, SECRET_MAX_LEN,
-                      (void *)(sd->user_data_ptr + local_i));
+  // Read the placeholder's delta_len wire bytes directly from user memory:
+  // the prescan's chunk may hold only its start. Nothing past them: they
+  // need not be the write's, nor mapped.
+  //
+  // The rest of the buffer is zeroed first, and real is zero past its length
+  // (sync copies only the secret), so the delta is zero past the placeholder.
+  // Those bytes are never applied (tc stores back only the patch's length,
+  // and the GHASH delta masks the rest: ghash_block_delta), but they would
+  // otherwise carry the previous placeholder's delta, or the app's bytes
+  // after this one, into xor_pending and tc_pending.
+  //
+  // A read can fail though the prescan read the placeholder's start: its
+  // end may be on a page that is not present, which this program cannot
+  // fault in. On failure the helper zeroes the buffer, and the delta would
+  // be real itself: the peer would get shadow XOR real in its place. The
+  // placeholder is skipped instead, and goes out as it is.
+  __builtin_memset(st->delta, 0, SECRET_MAX_LEN);
+  if (bpf_probe_read_user(st->delta, delta_len,
+                          (void *)(sd->user_data_ptr + local_i)) < 0) {
+    dbg_inc(DBG_XOR_SHADOW_READ_FAIL);
+    goto next;
+  }
 
   val = bpf_map_lookup_elem(&secret_map, &key);
   if (!val) goto next;
-  patch_delta(w->ct_buf, val->real_secret, delta_len, val->pad_bits);
+  patch_delta(st->delta, val->real_secret, delta_len, val->pad_bits);
 
-  // Store patch in staged_pending.
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w) return 0;
+  // Store the patch in the staged xor_pending entry.
+  st = bpf_map_lookup_elem(&uprobe_stage, &zero);
+  if (!st) return 0;
 
-  __u32 pi = w->staged_pending.patch_count;
+  __u32 pi = st->pending.patch_count;
   if (pi < XOR_MAX_PATCHES) {
-    w->staged_pending.patches[pi & (XOR_MAX_PATCHES - 1)].secret_offset = local_i;
-    w->staged_pending.patches[pi & (XOR_MAX_PATCHES - 1)].secret_len = val_len;
-    __builtin_memcpy(w->staged_pending.patches[pi & (XOR_MAX_PATCHES - 1)].xor_delta,
-                     w->ct_buf, SECRET_MAX_LEN);
-    __builtin_memcpy(&w->staged_pending.patches[pi & (XOR_MAX_PATCHES - 1)].key,
+    st->pending.patches[pi & (XOR_MAX_PATCHES - 1)].secret_offset = local_i;
+    st->pending.patches[pi & (XOR_MAX_PATCHES - 1)].secret_len = val_len;
+    __builtin_memcpy(st->pending.patches[pi & (XOR_MAX_PATCHES - 1)].xor_delta,
+                     st->delta, SECRET_MAX_LEN);
+    __builtin_memcpy(&st->pending.patches[pi & (XOR_MAX_PATCHES - 1)].key,
                      &key, sizeof(key));
-    w->staged_pending.patch_count = pi + 1;
+    st->pending.patch_count = pi + 1;
   }
 
 next:
@@ -1779,13 +1850,13 @@ next:
   // the socket write happens on a different thread (e.g., Node.js/libuv).
   __u32 store_tgid = (__u32)(bpf_get_current_pid_tgid() >> 32);
 
-  struct ghash_work *wf = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!wf || wf->staged_pending.patch_count == 0)
+  struct uprobe_stage_buf *sf = bpf_map_lookup_elem(&uprobe_stage, &zero);
+  if (!sf || sf->pending.patch_count == 0)
     return 0;
 
   // ssl_ptr, tgid, active already set during mi=0 initialization.
-  bpf_map_update_elem(&xor_pending, &store_tgid, &wf->staged_pending, BPF_ANY);
-  // bpf_printk("kloak [1-UPROBE] pid=%u patches=%u", (__u32)pid_tgid, wf->staged_pending.patch_count);
+  bpf_map_update_elem(&xor_pending, &store_tgid, &sf->pending, BPF_ANY);
+  // bpf_printk("kloak [1-UPROBE] pid=%u patches=%u", (__u32)pid_tgid, sf->pending.patch_count);
 
   dbg_inc(DBG_XOR_DELTA_DONE);
   return 0;
@@ -1945,6 +2016,11 @@ static int ghash_block_iter(__u32 block_idx, void *_unused) {
   return 0;
 }
 
+// An upper bound on the GHASH blocks a patch spans: SECRET_MAX_LEN bytes
+// starting at the last byte of a block end (SECRET_MAX_LEN + 14) / 16 blocks
+// past it, at most (SECRET_MAX_LEN + 15) / 16.
+#define GHASH_PATCH_MAX_BLOCKS ((SECRET_MAX_LEN + 15) / 16 + 1)
+
 // bpf_loop callback: process one patch for GHASH tag recomputation.
 // Replaces the unrolled for-loop over patches in tc_ghash_update to keep
 // verifier complexity O(1) per patch instead of O(XOR_MAX_PATCHES).
@@ -1968,7 +2044,7 @@ static int ghash_patch_iter(__u32 p, void *_unused) {
   w->ghash_first_block = sec_off / 16;
 
   __u32 num_blocks = (sec_off + sec_len - 1) / 16 - w->ghash_first_block + 1;
-  if (num_blocks > 9) num_blocks = 9;
+  if (num_blocks > GHASH_PATCH_MAX_BLOCKS) num_blocks = GHASH_PATCH_MAX_BLOCKS;
 
   bpf_loop(num_blocks, ghash_block_iter, NULL, 0);
   return 0;
@@ -2194,7 +2270,7 @@ static __always_inline void sock_dst_addr(struct sock *sk, __u8 *out) {
   ipv4_to_mapped(out, (const __u8 *)&daddr);
 }
 
-// socket_filter_patches drops, from ghash_scratch.staged_tc, the patches
+// socket_filter_patches drops, from kprobe_stage, the patches
 // whose secret may not leave on `sk`, the socket the patched record will
 // leave on:
 //   - a secret restricted to a hostname that is not the socket's SNI;
@@ -2203,8 +2279,10 @@ static __always_inline void sock_dst_addr(struct sock *sk, __u8 *out) {
 //     address and port it connected to (vip_sock_dst, else its own
 //     destination, sock_dst_addr). bpf_xor_path leaves these restrictions
 //     to this check.
-// Refused patches are removed, not zeroed: tc treats secret_len 0 as a full
-// SECRET_MAX_LEN patch (clamp_write_len). Returns the number of patches kept.
+// Refused patches are removed, not zeroed: patch_count stays exact, and tc
+// would refuse a secret_len 0 patch itself (tc_patch_fits) and count it as
+// out of its record (tc_patch_out_of_record), a refusal that is not one.
+// Returns the number of patches kept.
 //
 // Deliberately __noinline: its own stack frame, away from the bridge
 // kprobe's, which is close to the 512-byte limit.
@@ -2226,10 +2304,10 @@ static __attribute__((noinline)) __u32 socket_filter_patches(__u64 sk_key,
     dport = dst->port;
   }
 
-  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
+  struct tc_pending_val *st = bpf_map_lookup_elem(&kprobe_stage, &zero);
+  if (!st)
     return 0;
-  __u32 pc = w->staged_tc.patch_count;
+  __u32 pc = st->patch_count;
   if (pc > XOR_MAX_PATCHES)
     pc = XOR_MAX_PATCHES;
 
@@ -2237,11 +2315,11 @@ static __attribute__((noinline)) __u32 socket_filter_patches(__u64 sk_key,
   for (__u32 p = 0; p < XOR_MAX_PATCHES; p++) {
     if (p >= pc)
       break;
-    w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-    if (!w)
+    st = bpf_map_lookup_elem(&kprobe_stage, &zero);
+    if (!st)
       return 0;
     struct secret_key key;
-    __builtin_memcpy(&key, &w->staged_tc.patches[p & (XOR_MAX_PATCHES - 1)].key,
+    __builtin_memcpy(&key, &st->patches[p & (XOR_MAX_PATCHES - 1)].key,
                      sizeof(key));
 
     int keep = 1;
@@ -2276,19 +2354,19 @@ static __attribute__((noinline)) __u32 socket_filter_patches(__u64 sk_key,
     if (!keep)
       continue;
 
-    w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-    if (!w)
+    st = bpf_map_lookup_elem(&kprobe_stage, &zero);
+    if (!st)
       return 0;
     if (kept != p)
-      w->staged_tc.patches[kept & (XOR_MAX_PATCHES - 1)] =
-          w->staged_tc.patches[p & (XOR_MAX_PATCHES - 1)];
+      st->patches[kept & (XOR_MAX_PATCHES - 1)] =
+          st->patches[p & (XOR_MAX_PATCHES - 1)];
     kept++;
   }
 
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
+  st = bpf_map_lookup_elem(&kprobe_stage, &zero);
+  if (!st)
     return 0;
-  w->staged_tc.patch_count = kept;
+  st->patch_count = kept;
   return kept;
 }
 
@@ -2369,8 +2447,8 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
   // this socket must not reach the H extraction below, which stores the
   // connection's H in tls_conn_state for the next writes with this ssl_ptr
   // (an SSL object reused by a later connection would inherit it).
-  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w) return 0;
+  struct tc_pending_val *st = bpf_map_lookup_elem(&kprobe_stage, &zero);
+  if (!st) return 0;
 
   pending = bpf_map_lookup_elem(&xor_pending, &tgid);
   if (!pending) return 0;
@@ -2384,16 +2462,16 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
 
   __u8 is_membio = pending->memory_bio;
 
-  __builtin_memset(&w->staged_tc, 0, sizeof(w->staged_tc));
-  w->staged_tc.tgid = tgid;
-  w->staged_tc.ssl_ptr = ssl_ptr;
-  w->staged_tc.active = 1;
-  w->staged_tc.plaintext_len = plaintext_len;
-  w->staged_tc.patch_count = pending->patch_count;
-  if (w->staged_tc.patch_count > XOR_MAX_PATCHES)
-    w->staged_tc.patch_count = XOR_MAX_PATCHES;
-  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < w->staged_tc.patch_count; p++)
-    w->staged_tc.patches[p] = pending->patches[p];
+  __builtin_memset(st, 0, sizeof(*st));
+  st->tgid = tgid;
+  st->ssl_ptr = ssl_ptr;
+  st->active = 1;
+  st->plaintext_len = plaintext_len;
+  st->patch_count = pending->patch_count;
+  if (st->patch_count > XOR_MAX_PATCHES)
+    st->patch_count = XOR_MAX_PATCHES;
+  for (__u32 p = 0; p < XOR_MAX_PATCHES && p < st->patch_count; p++)
+    st->patches[p] = pending->patches[p];
 
   // SNI and host / IP / port check: keep only patches
   // whose secret may leave on this socket. xor_pending itself is untouched,
@@ -2404,8 +2482,8 @@ int bpf_kprobe_tcp_sendmsg(void *ctx) {
       bpf_map_delete_elem(&xor_pending, &tgid);
     return 0;
   }
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w) return 0;
+  st = bpf_map_lookup_elem(&kprobe_stage, &zero);
+  if (!st) return 0;
 
   pending = bpf_map_lookup_elem(&xor_pending, &tgid);
   if (!pending) return 0;
@@ -2632,17 +2710,17 @@ h_ready:;
   }
 
   // Now safe to create tc_pending — tc_egress can always find H.
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w) return 0;
+  st = bpf_map_lookup_elem(&kprobe_stage, &zero);
+  if (!st) return 0;
 
   // For memory BIO apps: write_seq from this tcp_sendmsg may not match the
   // segment that carries the TLS data (SSL_write and writev are decoupled).
   // Disable seq check so tc_egress matches by TLS header + record validation.
   // For socket BIO apps: write_seq is always correct (synchronous call chain).
-  w->staged_tc.write_seq = is_membio ? 0 : wseq;
-  w->staged_tc.created_at = bpf_ktime_get_ns();
+  st->write_seq = is_membio ? 0 : wseq;
+  st->created_at = bpf_ktime_get_ns();
 
-  bpf_map_update_elem(&tc_pending, &tdk, &w->staged_tc, BPF_ANY);
+  bpf_map_update_elem(&tc_pending, &tdk, st, BPF_ANY);
   dbg_inc(DBG_KPROBE_BRIDGE);
 #ifdef KLOAK_DEBUG
   bpf_printk("kloak [2-KPROBE] sport=%u cg=%x membio=%u", src_port_h, (__u32)tdk.cgroup_id, is_membio);
@@ -3277,8 +3355,15 @@ int tc_egress_patch(struct __sk_buff *skb) {
 
     __u32 sec_off = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_offset;
     __u32 sec_len = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len;
-    if (record_len < 16 + nonce_len + sec_len) {
+    // The whole patch must lie in the record's application data
+    // (tc_patch_fits): one past its first record (a write larger than one
+    // record), or cut off at the end of its write, would be XORed into the
+    // inner content type, the tag or the next record. Its length is the
+    // length tc writes (clamp_write_len): at most SECRET_MAX_LEN.
+    if (sec_len > SECRET_MAX_LEN ||
+        !tc_patch_fits(sec_off, sec_len, ct_len, nonce_len)) {
       w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len = 0;
+      dbg_inc(DBG_TC_PATCH_OUT_OF_RECORD);
       continue;
     }
 

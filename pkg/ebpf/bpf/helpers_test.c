@@ -644,6 +644,33 @@ static void test_tc_record_nonce_anchored_no_fit(void) {
   assert(tc_record_nonce(0, 0, 1, &n) == 1 && n == 8); // unknown: TLS 1.2
 }
 
+static void test_tc_patch_fits_tls12(void) {
+  // 100 bytes of application data, all of the encrypted part.
+  assert(tc_patch_fits(0, 100, 100, 8));
+  assert(tc_patch_fits(60, 40, 100, 8)); // ends on the last byte
+  assert(!tc_patch_fits(61, 40, 100, 8)); // one byte into the tag
+  assert(!tc_patch_fits(0, 101, 100, 8));
+  assert(!tc_patch_fits(100, 1, 100, 8));
+}
+
+static void test_tc_patch_fits_tls13(void) {
+  // 100 encrypted bytes: 99 of data, then the inner content type.
+  assert(tc_patch_fits(59, 40, 100, 0)); // ends on the last data byte
+  assert(!tc_patch_fits(60, 40, 100, 0)); // over the content type
+  assert(!tc_patch_fits(0, 100, 100, 0));
+  assert(tc_patch_fits(0, 1, 2, 0));
+  assert(!tc_patch_fits(0, 1, 1, 0)); // no data at all
+  assert(!tc_patch_fits(0, 1, 0, 0));
+}
+
+static void test_tc_patch_fits_edges(void) {
+  assert(!tc_patch_fits(0, 0, 100, 8)); // an empty patch
+  // off + len wraps 32 bits: still refused.
+  assert(!tc_patch_fits(0xFFFFFFF0u, 32, 100, 8));
+  assert(!tc_patch_fits(0xFFFFFFF0u, 32, 0xFFFFFFFFu, 8));
+  assert(!tc_patch_fits(16, 0xFFFFFFF8u, 0xFFFFFFFFu, 8));
+}
+
 static void test_tc_entry_expired(void) {
   const __u64 t0 = 5000000000000ULL;
   assert(!tc_entry_expired(t0, t0, XOR_PENDING_TTL_NS));
@@ -1745,6 +1772,9 @@ int main(void) {
   RUN_TEST(test_tc_record_nonce_matched);
   RUN_TEST(test_tc_record_nonce_memory_bio_no_fit);
   RUN_TEST(test_tc_record_nonce_anchored_no_fit);
+  RUN_TEST(test_tc_patch_fits_tls12);
+  RUN_TEST(test_tc_patch_fits_tls13);
+  RUN_TEST(test_tc_patch_fits_edges);
   RUN_TEST(test_tc_entry_expired);
   RUN_TEST(test_tc_tag_action);
 
