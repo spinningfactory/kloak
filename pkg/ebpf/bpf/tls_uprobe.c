@@ -2016,8 +2016,9 @@ static int ghash_block_iter(__u32 block_idx, void *_unused) {
   return 0;
 }
 
-// The most GHASH blocks a patch spans: SECRET_MAX_LEN bytes starting at the
-// last byte of a block reach (SECRET_MAX_LEN + 15) / 16 blocks past it.
+// An upper bound on the GHASH blocks a patch spans: SECRET_MAX_LEN bytes
+// starting at the last byte of a block end (SECRET_MAX_LEN + 14) / 16 blocks
+// past it, at most (SECRET_MAX_LEN + 15) / 16.
 #define GHASH_PATCH_MAX_BLOCKS ((SECRET_MAX_LEN + 15) / 16 + 1)
 
 // bpf_loop callback: process one patch for GHASH tag recomputation.
@@ -2278,8 +2279,10 @@ static __always_inline void sock_dst_addr(struct sock *sk, __u8 *out) {
 //     address and port it connected to (vip_sock_dst, else its own
 //     destination, sock_dst_addr). bpf_xor_path leaves these restrictions
 //     to this check.
-// Refused patches are removed, not zeroed: tc treats secret_len 0 as a full
-// SECRET_MAX_LEN patch (clamp_write_len). Returns the number of patches kept.
+// Refused patches are removed, not zeroed: patch_count stays exact, and tc
+// would refuse a secret_len 0 patch itself (tc_patch_fits) and count it as
+// out of its record (tc_patch_out_of_record), a refusal that is not one.
+// Returns the number of patches kept.
 //
 // Deliberately __noinline: its own stack frame, away from the bridge
 // kprobe's, which is close to the 512-byte limit.
