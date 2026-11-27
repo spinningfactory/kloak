@@ -13,6 +13,7 @@
 typedef uint8_t __u8;
 typedef uint32_t __u32;
 typedef uint64_t __u64;
+typedef int64_t __s64;
 #define HELPER_INLINE static inline
 #ifndef MAX_HOST_LEN
 #define MAX_HOST_LEN 64
@@ -535,6 +536,40 @@ HELPER_INLINE int tc_record_nonce(int matched, __u32 matched_nonce,
   if (*nonce_len == TLS_NONCE_UNKNOWN)
     *nonce_len = 8; // assume TLS 1.2, as for any record that does not fit
   return 1;
+}
+
+// tc_patch_fits reports whether a patch of len bytes at offset off of a
+// write's plaintext lies inside the application data of the AES-GCM record
+// tc_egress chose for the write, whose encrypted part (between the explicit
+// nonce and the tag) is ct_len bytes long. In TLS 1.2 (nonce_len 8) all of
+// it is application data. In TLS 1.3 (nonce_len 0) it is TLSInnerPlaintext:
+// the data, the inner content type byte, then zero padding (RFC 8446 §5.2),
+// so the data is at most ct_len - 1 bytes.
+//
+// A patch past the data would XOR its delta into the content type, the tag
+// or the next record: a placeholder cut off at the end of the write, or past
+// the first record of a write larger than one record. It is refused.
+//
+// The padding's length is not known before decryption: this assumes none,
+// as the TLS stacks kloak supports send by default. A record that fits the
+// write's plaintext exactly (tls_appdata_reclen_match) has none; the first
+// record of an anchored write larger than one record (tc_record_nonce) could,
+// and a patch there could then still land on its content type or padding,
+// which the peer rejects.
+//
+// The content type is taken off without a branch on nonce_len: tc_egress
+// checks each of a write's patches in turn, and a branch there splits the
+// verifier's walk into a TLS 1.2 and a TLS 1.3 path that never merge again
+// (nonce_len stays live), which more than doubled tc_egress_patch's verifier
+// cost. barrier_var keeps clang from turning the arithmetic back into a
+// comparison (see ghash_block_delta). The sums are 64-bit: off + len cannot
+// wrap, and data_len is -1 for a TLS 1.3 record with no encrypted byte.
+HELPER_INLINE int tc_patch_fits(__u32 off, __u32 len, __u32 ct_len,
+                                __u32 nonce_len) {
+  __u64 nonzero = nonce_len | -nonce_len; // top bit set iff nonce_len != 0
+  barrier_var(nonzero);
+  __s64 data_len = (__s64)ct_len - (__s64)(((nonzero >> 31) & 1) ^ 1);
+  return len > 0 && (__s64)((__u64)off + len) <= data_len;
 }
 
 // Lifetimes of staged patches that no write or record used.

@@ -258,6 +258,8 @@ enum {
   DBG_VIP_SOCK_HOST_DENY,    // patch refused at tcp_sendmsg: the socket did not connect to the secret host's fake IP
   DBG_VIP_SOCK_ADDR_DENY,    // patch refused at tcp_sendmsg: the socket's real address or port is not the secret's
   DBG_XOR_SHADOW_READ_FAIL,  // bpf_xor_path could not read a placeholder's bytes: skipped
+  DBG_XOR_PLACEHOLDER_CUT,   // a placeholder runs past the end of its write: skipped
+  DBG_TC_PATCH_OUT_OF_RECORD, // tc refused a patch not inside its record's application data
   DBG_MAX,
 };
 
@@ -1764,6 +1766,16 @@ int bpf_xor_path(void *ctx) {
     goto next; // Skip this match.
 
   __u32 val_len = val->len;
+
+  // The placeholder must lie in the write. One cut off at its end (the
+  // prescan found its key, the rest is in the app's next write) would be
+  // patched past the write's plaintext: over its record's inner content type
+  // and tag, or into another write's record. It goes out as it is.
+  // TODO(kloak#383): continuation across writes (phase 3).
+  if ((__u64)local_i + val_len > sd->total_data_len) {
+    dbg_inc(DBG_XOR_PLACEHOLDER_CUT);
+    goto next;
+  }
 
   // Pod binding last, so a violation is reported only when it is the sole
   // reason this placeholder is not rewritten. sd, st and val are re-looked-up
@@ -3336,8 +3348,15 @@ int tc_egress_patch(struct __sk_buff *skb) {
 
     __u32 sec_off = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_offset;
     __u32 sec_len = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len;
-    if (record_len < 16 + nonce_len + sec_len) {
+    // The whole patch must lie in the record's application data
+    // (tc_patch_fits): one past its first record (a write larger than one
+    // record), or cut off at the end of its write, would be XORed into the
+    // inner content type, the tag or the next record. Its length is the
+    // length tc writes (clamp_write_len): at most SECRET_MAX_LEN.
+    if (sec_len > SECRET_MAX_LEN ||
+        !tc_patch_fits(sec_off, sec_len, ct_len, nonce_len)) {
       w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len = 0;
+      dbg_inc(DBG_TC_PATCH_OUT_OF_RECORD);
       continue;
     }
 
