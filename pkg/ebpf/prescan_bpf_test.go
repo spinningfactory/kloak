@@ -71,7 +71,7 @@ func TestPrescanConfirmsSlots(t *testing.T) {
 	for _, real := range []string{"REAL-PRESCAN-UNBOUND-0", "REAL-PRESCAN-UNBOUND-1", "REAL-PRESCAN-UNBOUND-2", "REAL-PRESCAN-UNBOUND-3"} {
 		unbound = append(unbound, add("ns/other-"+real[len(real)-1:], real))
 	}
-	if _, err := applySecrets(objs.SecretMap, snapshot, testLog()); err != nil {
+	if _, err := newSecretStore(objs.SecretMap, objs.SecretChunks, SecretStoreConfig{}.maxLen(), testLog()).apply(snapshot, time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	var refs []secrets.Ref

@@ -15,6 +15,8 @@ import (
 	ciliumebpf "github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
 	"github.com/vishvananda/netlink"
+
+	"github.com/spinningfactory/kloak/pkg/secrets"
 )
 
 func TestUprobePinNameRoundTrip(t *testing.T) {
@@ -151,7 +153,14 @@ func testPinRoot(t *testing.T) *pinRoot {
 // openTestPipeline opens the pipeline in r as a controller starting does.
 func openTestPipeline(t *testing.T, r *pinRoot) (*tlsuprobeObjects, *dispatchObjects, bool) {
 	t.Helper()
+	return openTestPipelineStore(t, r, SecretStoreConfig{})
+}
+
+// openTestPipelineStore is openTestPipeline with a secret store budget.
+func openTestPipelineStore(t *testing.T, r *pinRoot, store SecretStoreConfig) (*tlsuprobeObjects, *dispatchObjects, bool) {
+	t.Helper()
 	spec := loadSpec(t)
+	spec.Maps[secretChunksMap].MaxEntries = store.chunkEntries()
 	if err := prepareVirtualIPPins(spec, r.dir, testLog()); err != nil {
 		t.Fatal(err)
 	}
@@ -226,6 +235,64 @@ func TestPinnedPipelineAdopted(t *testing.T) {
 	}
 }
 
+// TestPinnedSecretStore checks that the secret store is adopted with the
+// pipeline, its state rebuilt and its secrets kept, and that a controller
+// with another budget loads the pipeline again instead of adopting a map of
+// another size.
+func TestPinnedSecretStore(t *testing.T) {
+	r := testPinRoot(t)
+	small := SecretStoreConfig{Bytes: MinSecretStoreBytes}
+	objs, dispatch, _ := openTestPipelineStore(t, r, small)
+	if got, want := objs.SecretChunks.MaxEntries(), small.chunkEntries(); got != want {
+		t.Fatalf("secret_chunks has %d entries, want the budget's %d", got, want)
+	}
+	if err := r.writeMeta(); err != nil {
+		t.Fatal(err)
+	}
+	st := newSecretStore(objs.SecretMap, objs.SecretChunks, small.maxLen(), testLog())
+	p := hpackTailPairs[0]
+	snapshot := []secrets.Secret{{OwnerID: "ns/a", Key: "k", Real: p.real, Shadow: p.shadow}}
+	if _, err := st.apply(snapshot, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	want := st.entries
+	_ = dispatch.Close()
+	_ = objs.Close()
+
+	// The same budget: adopted, with the secrets.
+	objs, dispatch, adopted := openTestPipelineStore(t, r, small)
+	if !adopted {
+		t.Fatal("the pinned pipeline was not adopted")
+	}
+	st = newSecretStore(objs.SecretMap, objs.SecretChunks, small.maxLen(), testLog())
+	if err := st.rebuild(time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if len(st.entries) != len(want) {
+		t.Fatalf("rebuilt %d entries, want %d", len(st.entries), len(want))
+	}
+	for k, e := range want {
+		if st.entries[k] != e {
+			t.Errorf("entry %q rebuilt as %+v, want %+v", k.Prefix[:], st.entries[k], e)
+		}
+	}
+	_ = dispatch.Close()
+	_ = objs.Close()
+
+	// Another budget: loaded again, with a map of its size.
+	objs, dispatch, adopted = openTestPipelineStore(t, r, SecretStoreConfig{})
+	t.Cleanup(func() { _ = dispatch.Close(); _ = objs.Close() })
+	if adopted {
+		t.Error("a pipeline pinned with another secret store budget was adopted")
+	}
+	if got, want := objs.SecretChunks.MaxEntries(), (SecretStoreConfig{}).chunkEntries(); got != want {
+		t.Errorf("secret_chunks has %d entries, want the budget's %d", got, want)
+	}
+	if n := mapLen(t, objs.SecretMap); n != 0 {
+		t.Errorf("the reloaded secret_map holds %d entries", n)
+	}
+}
+
 func TestPinnedPipelineOfAnotherBuild(t *testing.T) {
 	r := testPinRoot(t)
 	other := &pinRoot{dir: r.dir, build: strings.Repeat("ab", 32), log: testLog()}
@@ -273,7 +340,10 @@ func TestTeardownPins(t *testing.T) {
 	}
 	var k secretKey
 	copy(k.Prefix[:], "kl::test")
-	if err := objs.SecretMap.Update(&k, &secretValue{Len: 4}, ciliumebpf.UpdateAny); err != nil {
+	if err := objs.SecretMap.Update(&k, &secretValue{Len: 4, Gen: 1}, ciliumebpf.UpdateAny); err != nil {
+		t.Fatal(err)
+	}
+	if err := objs.SecretChunks.Update(&secretChunkKey{Key: k, Gen: 1}, &secretChunk{}, ciliumebpf.UpdateAny); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = dispatch.Close(); _ = objs.Close() })
@@ -294,6 +364,9 @@ func TestTeardownPins(t *testing.T) {
 	// What is left of the pipeline has nothing to rewrite with, or to.
 	if err := objs.SecretMap.Lookup(&k, &secretValue{}); !errors.Is(err, ciliumebpf.ErrKeyNotExist) {
 		t.Errorf("secret_map still holds a secret after the teardown: %v", err)
+	}
+	if n := mapLen(t, objs.SecretChunks); n != 0 {
+		t.Errorf("secret_chunks still holds %d chunks after the teardown", n)
 	}
 	var id uint32
 	if err := dispatch.KloakDispatch.Lookup(uint32(dispatchSlotSSLWrite), &id); err == nil {

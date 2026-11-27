@@ -107,7 +107,9 @@ _Static_assert(offsetof(struct secret_value, gen) == 4 &&
 // lookup therefore finds that generation's chunks whole, or, past the grace
 // period, none: a missing chunk means the patch is refused, never that
 // another generation's bytes are used. An unchanged entry keeps its
-// generation (host, IP or port changes are made in place).
+// generation (host, IP or port changes are made in place). A changed entry
+// whose new generation can't be written is removed from secret_map, never
+// left on its previous one.
 //
 // TODO(kloak#383): the data plane still patches from
 // secret_value.real_secret; the phase-1 switchover reads the chunks instead,

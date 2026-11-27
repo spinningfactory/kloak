@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	goruntime "runtime"
@@ -63,6 +64,8 @@ var (
 	nriSocket           string
 	daemonSetName       string
 	nodeLockPath        string
+	secretStoreBytes    string
+	maxSecretLength     *string
 )
 
 // adoptReconcileTimeout bounds how long a controller that adopted the
@@ -104,6 +107,12 @@ func init() {
 			`An IPv4 range (/19 or larger) and, optionally, an IPv6 one (/115 or larger), comma-separated. `+
 			`Without an IPv6 range, AAAA answers are left unchanged. `+
 			`The controller refuses to start if a range overlaps a node address, pod CIDR, service CIDR or route of the node.`)
+	controllerCmd.Flags().StringVar(&secretStoreBytes, "secret-store-bytes", fmt.Sprint(ebpf.DefaultSecretStoreBytes),
+		fmt.Sprintf(`Kernel memory the node's secret store reserves for the secrets' placeholders and patches (a Kubernetes quantity: 16Mi), from %d to %d bytes. `, ebpf.MinSecretStoreBytes, ebpf.MaxSecretStoreBytes)+
+			`Each secret takes about 1.2 KB per 256 bytes of its value (its placeholder's and its HTTP/2 form's chunks); a changed secret holds two generations for 30 s. `+
+			`A secret that does not fit is not rewritten until there is room (a changed one stops being rewritten with its previous value), and is logged and counted in kloak_secret_store_refused_entries. `+
+			`It is charged to the controller's memory cgroup. A change loads the node's data plane again at the next start, instead of adopting the pinned one.`)
+	maxSecretLength = maxSecretLengthFlag(controllerCmd)
 }
 
 func runController(cmd *cobra.Command, args []string) {
@@ -133,6 +142,24 @@ func runController(cmd *cobra.Command, args []string) {
 	sniMode, err := ebpf.ParseSNICheckMode(sniCheck)
 	if err != nil {
 		setupLog.Errorw("invalid --sni-check", "error", err)
+		_ = setupLog.Sync()
+		os.Exit(1)
+	}
+	storeBytes, err := parseByteQuantity(secretStoreBytes)
+	if err != nil {
+		setupLog.Errorw("invalid --secret-store-bytes", "error", err)
+		_ = setupLog.Sync()
+		os.Exit(1)
+	}
+	maxSecretLen, err := parseMaxSecretLength(*maxSecretLength)
+	if err != nil {
+		setupLog.Errorw("invalid --max-secret-length", "error", err)
+		_ = setupLog.Sync()
+		os.Exit(1)
+	}
+	storeCfg := ebpf.SecretStoreConfig{Bytes: storeBytes, MaxSecretLen: maxSecretLen}
+	if err := storeCfg.Validate(); err != nil {
+		setupLog.Errorw("invalid --secret-store-bytes or --max-secret-length", "error", err)
 		_ = setupLog.Sync()
 		os.Exit(1)
 	}
@@ -206,7 +233,7 @@ func runController(cmd *cobra.Command, args []string) {
 				os.Exit(1)
 			}
 		}
-		uprobeMgr, err = ebpf.NewTLSUprobeManager(k8ssecrets.NewSource(mgr.GetClient()).WithLog(setupLog), cgroupPath, egressInterface, &hostRes, persist, setupLog)
+		uprobeMgr, err = ebpf.NewTLSUprobeManager(k8ssecrets.NewSource(mgr.GetClient()).WithLog(setupLog), cgroupPath, egressInterface, &hostRes, storeCfg, persist, setupLog)
 		if err != nil {
 			setupLog.Errorw("failed to initialize eBPF uprobe manager", "error", err)
 			_ = setupLog.Sync()
