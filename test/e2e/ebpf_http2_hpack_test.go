@@ -144,12 +144,15 @@ func TestEBPFHttp2HpackOverPadding(t *testing.T) {
 // compares and patches a placeholder. Until then this is a documented
 // limit: such a placeholder must go out unpatched, not corrupted
 // (TestXorPathPlaceholderAcrossFrames in pkg/ebpf).
-var e2eHTTP2SecretLengths = []int{8, 64, 127, 128, 129, 1024, 4096}
+var e2eHTTP2SecretLengths = []int{8, 12, 64, 127, 128, 129, 1024, 4096}
 
 // TestEBPFSecretLengthsHTTP2 is TestEBPFSecretLengths over HTTP/2: demo-go
 // (Go crypto/tls) sends the secrets as headers to the in-cluster echo, so
 // the placeholders on the wire are HPACK-Huffman-coded. Each allowed value
-// must come back whole; cases longer than this build takes skip.
+// must come back whole; cases longer than this build takes skip. A
+// placeholder whose Huffman code is shorter than a BPF key (8 bytes: an
+// 8-byte value) has no HTTP/2 entry in secret_map (huffmanEntry in
+// pkg/ebpf/sync.go), a documented limit: it must come back as the shadow.
 func TestEBPFSecretLengthsHTTP2(t *testing.T) {
 	for _, n := range e2eHTTP2SecretLengths {
 		allowed, blocked := secretOfLen("SECRET", n), secretOfLen("BLOCKE", n)
@@ -169,7 +172,7 @@ func TestEBPFSecretLengthsHTTP2(t *testing.T) {
 			createEnabledSecret(t, "secret-blocked", blockedData, nil, map[string]string{
 				"getkloak.io/hosts": "example.com",
 			})
-			assertShadowSecret(t, "secret-allowed", allowedData)
+			shadow := string(assertShadowSecret(t, "secret-allowed", allowedData)["api-key"])
 			assertShadowSecret(t, "secret-blocked", blockedData)
 
 			demoManifest := filepath.Join(repoRoot, "examples", "demo-go", "deployment.yaml")
@@ -188,14 +191,22 @@ func TestEBPFSecretLengthsHTTP2(t *testing.T) {
 			}
 
 			// The echo is the request's headers as JSON: the whole value,
-			// as the header's JSON member.
+			// as the header's JSON member. The shadow has the real value's
+			// Huffman bit length.
 			want := `"X-Secret-Allowed":"` + allowed + `"`
+			tooShort := (secrets.HuffmanBits(allowed)+7)/8 < secrets.ShadowPrefixLen
+			if tooShort {
+				want = `"X-Secret-Allowed":"` + shadow + `"`
+			}
 			pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
 			defer pollCancel()
 			out := pollDemoLogs(t, pollCtx, "app=demo-go", fmt.Sprintf("http2-length-%d", n),
-				fmt.Sprintf("the %d-byte allowed secret never came back whole in demo-go's echo", n),
+				fmt.Sprintf("demo-go's echo never carried the %d-byte case's %s", n, want[:min(len(want), 60)]),
 				func(s string) bool { return strings.Contains(s, want) })
 			t.Logf("=== demo-go (HTTP/2, %d bytes) logs ===\n%s", n, clipLog(out))
+			if tooShort && strings.Contains(out, allowed) {
+				t.Errorf("the %d-byte secret's Huffman code is shorter than a BPF key, yet it was rewritten", n)
+			}
 			if blockedCheck := blocked[:min(len(blocked), 20)]; strings.Contains(out, blockedCheck) {
 				t.Errorf("blocked secret (%d bytes) leaked despite the host mismatch: %q found", n, blockedCheck)
 			}
