@@ -93,8 +93,8 @@ HELPER_INLINE int hosts_match(const char *a, const char *b) {
 }
 
 // SECRET_MAX_LEN bounds every patch, and the code masks offsets into a
-// patch with SECRET_MAX_LEN - 1 (clamp_write_len, patch_delta,
-// ghash_block_delta), which only bounds them for a power of two. A multiple
+// patch with SECRET_MAX_LEN - 1 (clamp_write_len, patch_delta, the inline
+// window of ghash_block_delta64), which only bounds them for a power of two. A multiple
 // of 8 keeps the arrays sized by it 8-byte aligned in the structs they sit in.
 _Static_assert(SECRET_MAX_LEN > 0 && (SECRET_MAX_LEN & (SECRET_MAX_LEN - 1)) == 0,
                "SECRET_MAX_LEN must be a power of two");
@@ -190,7 +190,7 @@ HELPER_INLINE __u8 patch_tail_mask(__u8 pad_bits) {
 // real is zero past len (sync copies only the secret), so the bytes of buf
 // past the placeholder are left as they are. They are never applied anyway:
 // tc stores back only len bytes, and the GHASH delta masks the rest
-// (ghash_block_delta).
+// (ghash_block_delta64).
 //
 // The last byte is prepared before the loop rather than masked after it: its
 // bits after the placeholder are set to real's, which the loop's XOR then
@@ -215,145 +215,6 @@ HELPER_INLINE void patch_delta(__u8 buf[SECRET_MAX_LEN],
 // irreducible polynomial x^128 + x^7 + x^2 + x + 1 (R = 0xe1000...0).
 // Reference: NIST SP 800-38D Section 6.3.
 // ============================================================================
-
-// One of the 128 steps of a GF(2^128) multiply, for bit i of a (MSB-first:
-// bit 0 is the MSB of byte 0): z ^= v if the bit is set, then v = v * x, a
-// 1-bit right shift that folds the bit shifted out of v[15] back in as R.
-// Start with z = 0 and v = b; after steps 0..127, z = a * b.
-//
-// The loop is fully unrolled, so every index is a constant: left as a loop,
-// clang walks v with a pointer offset by a negative constant, which the
-// verifier rejects as an unbounded access since Linux 7.2 (it now keeps a
-// pointer's constant offset in its variable bounds). It is one pass with no
-// branch on the bit: with the branch, clang loads all of v ahead of it and
-// spills it, which takes the BPF callback's stack frame from 8 bytes to 144.
-// The reduction stays a branch, where the verifier can prune the callback's
-// repeated visits once i is dead: made branch-free too, it cost Linux 7.2's
-// verifier 60K more instructions in tc_ghash_update.
-HELPER_INLINE void gf128_mul_step(const __u8 a[16], __u8 v[16], __u8 z[16],
-                                  __u32 i) {
-  // The masks keep the index bounded for the verifier (i < 128 anyway).
-  __u8 mask = -(__u8)((a[(i >> 3) & 0xF] >> (7 - (i & 7))) & 1);
-  __u8 prev = 0;
-#pragma GCC unroll 16
-  for (int j = 0; j < 16; j++) {
-    __u8 cur = v[j];
-    z[j] ^= cur & mask;
-    v[j] = (cur >> 1) | (__u8)(prev << 7);
-    prev = cur;
-  }
-  if (prev & 1)
-    v[0] ^= 0xe1;
-}
-
-// Multiply two 128-bit elements in GF(2^128) using the GHASH bit convention.
-// result = a * b in GF(2^128) with reduction polynomial x^128 + x^7 + x^2 + x + 1.
-HELPER_INLINE void gf128_mul(const __u8 a[16], const __u8 b[16], __u8 result[16]) {
-  __u8 v[16], z[16];
-
-  __builtin_memset(z, 0, 16);
-  __builtin_memcpy(v, b, 16);
-
-  for (__u32 i = 0; i < 128; i++)
-    gf128_mul_step(a, v, z, i);
-  __builtin_memcpy(result, z, 16);
-}
-
-// Compute H^power in GF(2^128) via square-and-multiply from base H.
-// power must be >= 1. Result is written to result[16].
-HELPER_INLINE void gf128_h_power(const __u8 h[16], __u32 power, __u8 result[16]) {
-  __u8 base[16], tmp[16];
-  int i;
-
-  // Multiplicative identity in GHASH convention (NIST SP 800-38D):
-  // polynomial 1 = bit 0 set = MSB of byte 0 = 0x80.
-  __builtin_memset(result, 0, 16);
-  result[0] = 0x80;
-
-  __builtin_memcpy(base, h, 16);
-  for (i = 0; i < 11 && power > 0; i++) {
-    if (power & 1) {
-      gf128_mul(result, base, tmp);
-      __builtin_memcpy(result, tmp, 16);
-    }
-    gf128_mul(base, base, tmp);
-    __builtin_memcpy(base, tmp, 16);
-    power >>= 1;
-  }
-}
-
-// Compute H^power using a precomputed table of H^(2^i) for i=0..10.
-// Faster than gf128_h_power when the table is available.
-HELPER_INLINE void gf128_h_power_table(const __u8 h_powers[11][16],
-                                        __u32 power,
-                                        __u8 result[16]) {
-  __u8 tmp[16];
-  int i;
-
-  __builtin_memset(result, 0, 16);
-  result[0] = 0x80;
-
-  for (i = 0; i < 11 && power > 0; i++) {
-    if (power & (1u << i)) {
-      gf128_mul(result, h_powers[i], tmp);
-      __builtin_memcpy(result, tmp, 16);
-    }
-  }
-}
-
-// Variant of gf128_mul that uses caller-provided workspace buffers instead of
-// stack-allocated arrays. This avoids blowing the 512-byte BPF stack limit
-// when the function is inlined multiple times in a single BPF program.
-// ws_v and ws_z must each be 16-byte buffers (e.g., fields in a per-CPU map).
-HELPER_INLINE void gf128_mul_ws(const __u8 a[16], const __u8 b[16], __u8 result[16],
-                                 __u8 ws_v[16], __u8 ws_z[16]) {
-  __builtin_memset(ws_z, 0, 16);
-  __builtin_memcpy(ws_v, b, 16);
-
-  for (__u32 i = 0; i < 128; i++)
-    gf128_mul_step(a, ws_v, ws_z, i);
-  __builtin_memcpy(result, ws_z, 16);
-}
-
-// Variant of gf128_h_power that uses caller-provided workspace buffers.
-// ws_base and ws_tmp must each be 16-byte buffers, ws_v and ws_z for mul.
-HELPER_INLINE void gf128_h_power_ws(const __u8 h[16], __u32 power, __u8 result[16],
-                                     __u8 ws_base[16], __u8 ws_tmp[16],
-                                     __u8 ws_v[16], __u8 ws_z[16]) {
-  int i;
-
-  __builtin_memset(result, 0, 16);
-  result[0] = 0x80;
-
-  __builtin_memcpy(ws_base, h, 16);
-  for (i = 0; i < 11 && power > 0; i++) {
-    if (power & 1) {
-      gf128_mul_ws(result, ws_base, ws_tmp, ws_v, ws_z);
-      __builtin_memcpy(result, ws_tmp, 16);
-    }
-    gf128_mul_ws(ws_base, ws_base, ws_tmp, ws_v, ws_z);
-    __builtin_memcpy(ws_base, ws_tmp, 16);
-    power >>= 1;
-  }
-}
-
-// Variant of gf128_h_power_table that uses caller-provided workspace.
-HELPER_INLINE void gf128_h_power_table_ws(const __u8 h_powers[11][16],
-                                            __u32 power, __u8 result[16],
-                                            __u8 ws_v[16], __u8 ws_z[16]) {
-  __u8 tmp[16]; // 16 bytes on stack is acceptable here
-  int i;
-
-  __builtin_memset(result, 0, 16);
-  result[0] = 0x80;
-
-  for (i = 0; i < 11 && power > 0; i++) {
-    if (power & (1u << i)) {
-      gf128_mul_ws(result, h_powers[i], tmp, ws_v, ws_z);
-      __builtin_memcpy(result, tmp, 16);
-    }
-  }
-}
 
 // gf128_halve_to_h recovers the GHASH subkey H from the doubled value that
 // carry-less-multiply GHASH implementations precompute at key setup:
@@ -438,6 +299,16 @@ struct gf128_table {
   struct gf128 m[16];
 };
 
+// m[a ^ b] for a and b with no bit in common.
+HELPER_INLINE void gf128_table_sum(struct gf128_table *t, int a, int b) {
+  t->m[a ^ b].hi = t->m[a].hi ^ t->m[b].hi;
+  t->m[a ^ b].lo = t->m[a].lo ^ t->m[b].lo;
+}
+
+// Written out entry by entry: as a loop, clang kept it rolled in BPF and
+// addressed m[n - top] through a pointer offset by a negative constant,
+// which the verifier rejects as an unbounded access since Linux 7.2 (it now
+// keeps a pointer's constant offset in its variable bounds).
 HELPER_INLINE void gf128_table_init(struct gf128_table *t, const struct gf128 *h) {
   struct gf128 v = *h;
   t->m[0].hi = 0;
@@ -450,14 +321,17 @@ HELPER_INLINE void gf128_table_init(struct gf128_table *t, const struct gf128 *h
   gf128_mulx(&v);
   t->m[1] = v;
   // Every other n is the sum of its top bit's entry and the rest's.
-#pragma GCC unroll 16
-  for (int n = 3; n < 16; n++) {
-    int top = n >= 8 ? 8 : n >= 4 ? 4 : 2;
-    if (n == top)
-      continue;
-    t->m[n].hi = t->m[top].hi ^ t->m[n - top].hi;
-    t->m[n].lo = t->m[top].lo ^ t->m[n - top].lo;
-  }
+  gf128_table_sum(t, 2, 1);
+  gf128_table_sum(t, 4, 1);
+  gf128_table_sum(t, 4, 2);
+  gf128_table_sum(t, 4, 3);
+  gf128_table_sum(t, 8, 1);
+  gf128_table_sum(t, 8, 2);
+  gf128_table_sum(t, 8, 3);
+  gf128_table_sum(t, 8, 4);
+  gf128_table_sum(t, 8, 5);
+  gf128_table_sum(t, 8, 6);
+  gf128_table_sum(t, 8, 7);
 }
 
 // The reduction table of gf128_table_mul: r[n] is what the 4 bits n that a
@@ -485,10 +359,11 @@ HELPER_INLINE void gf128_rem4_init(__u64 r[16]) {
 // reduced from r. 32 table steps instead of the 128 conditional XORs and
 // shifts of a bit-serial multiply.
 //
-// Unrolled, as gf128_mul_step was, for the same reasons: every shift of x is
-// a constant, and the verifier walks the 32 steps as straight-line code,
-// with no loop state to track. The table indexes are 4-bit masks, which keep
-// the reads of t and r in bounds for the verifier.
+// Unrolled: every shift of x is a constant, and the verifier walks the 32
+// steps as straight-line code, with no loop state to track (a loop would
+// also invite the negative constant pointer offsets Linux 7.2 rejects, see
+// gf128_table_init). The table indexes are 4-bit masks, which keep the reads
+// of t and r in bounds for the verifier.
 HELPER_INLINE void gf128_table_mul(struct gf128 *x, const struct gf128_table *t,
                                    const __u64 r[16]) {
   __u64 xhi = x->hi, xlo = x->lo;
@@ -514,36 +389,6 @@ HELPER_INLINE void gf128_mul_by(struct gf128 *x, const struct gf128 *y,
                                 struct gf128_table *t, const __u64 r[16]) {
   gf128_table_init(t, y);
   gf128_table_mul(x, t, r);
-}
-
-// ghash_block_delta writes the XOR delta of GHASH block `block` (bytes
-// block * 16 .. block * 16 + 15 of the ciphertext; block is masked to 10
-// bits) to out:
-// byte i is xor_delta[pos - sec_off] when pos = block * 16 + i falls in the
-// patch [sec_off, sec_off + len), and 0 elsewhere. len is at most
-// SECRET_MAX_LEN.
-//
-// The range check is arithmetic, not a comparison: BPF has no conditional
-// set, so a comparison is a branch, and 16 of them against bounds the
-// verifier doesn't know made Linux 7.2's verifier walk ~320K instructions of
-// tc_ghash_update here. d is pos - sec_off in 64 bits, negative (top bit
-// set) when pos is before the patch; the byte is in the patch when d's top
-// bit is clear and d - len's is set. The loop is unrolled so every out index
-// is a constant (see gf128_mul_step), and barrier_var keeps each byte's
-// arithmetic in its own iteration: without it clang computes all 16 up
-// front and spills them, taking the callback's stack frame from 32 bytes to
-// 248.
-HELPER_INLINE void ghash_block_delta(const __u8 xor_delta[SECRET_MAX_LEN],
-                                     __u32 block, __u32 sec_off, __u32 len,
-                                     __u8 out[16]) {
-  __u64 start = (__u64)(block & 0x3FF) * 16 - sec_off;
-#pragma GCC unroll 16
-  for (int i = 0; i < 16; i++) {
-    __u64 d = start + i;
-    barrier_var(d);
-    __u8 in = (__u8)((~d & (d - len)) >> 63);
-    out[i] = xor_delta[d & (SECRET_MAX_LEN - 1)] & -in;
-  }
 }
 
 // ----------------------------------------------------------------------------
@@ -601,8 +446,18 @@ HELPER_INLINE int ghash_span_plan(__u32 sec_off, __u32 len, __u32 ct_len,
 // ghash_block_delta64 returns in out what ciphertext block `block` (masked to
 // GHASH_POW_BITS bits) changes by under a patch of len bytes at sec_off:
 // byte i is the delta byte of position pos = block * 16 + i when pos is in
-// the patch, 0 elsewhere. It is ghash_block_delta's arithmetic (which see),
-// assembled into the engine's words.
+// the patch, 0 elsewhere.
+//
+// The range check is arithmetic, not a comparison: BPF has no conditional
+// set, so a comparison is a branch, and 16 of them against bounds the
+// verifier doesn't know made Linux 7.2's verifier walk ~320K instructions of
+// tc_ghash_update. d is pos - sec_off in 64 bits, negative (top bit set)
+// when pos is before the patch; the byte is in the patch when d's top bit is
+// clear and d - len's is set. The loop is unrolled so every shift is a
+// constant, and barrier_var keeps each byte's arithmetic in its own
+// iteration: without it clang computes all 16 up front and spills them,
+// which took the old byte-wise version's callback stack frame from 32 bytes
+// to 248.
 //
 // The delta bytes come from win, a window of win_mask + 1 bytes (a power of
 // two, a constant): patch byte d (pos - sec_off) is win[d & win_mask]. The

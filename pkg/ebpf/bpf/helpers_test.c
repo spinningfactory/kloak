@@ -399,6 +399,34 @@ static void print_hex(const char *label, const __u8 *data, int len) {
     printf("%02x", data[i]);
 }
 
+// The bit-serial GF(2^128) multiply (NIST SP 800-38D §6.3, Algorithm 1):
+// the reference the GHASH engine's table multiply is checked against. Step i,
+// for bit i of a (MSB-first: bit 0 is the MSB of byte 0): z ^= v if the bit
+// is set, then v = v * x, a 1-bit right shift that folds the bit shifted out
+// of v[15] back in as R = 0xe1 || 0^120. Start with z = 0 and v = b; after
+// steps 0..127, z = a * b.
+static void gf128_mul_step(const __u8 a[16], __u8 v[16], __u8 z[16], __u32 i) {
+  __u8 mask = -(__u8)((a[i >> 3] >> (7 - (i & 7))) & 1);
+  __u8 prev = 0;
+  for (int j = 0; j < 16; j++) {
+    __u8 cur = v[j];
+    z[j] ^= cur & mask;
+    v[j] = (cur >> 1) | (__u8)(prev << 7);
+    prev = cur;
+  }
+  if (prev & 1)
+    v[0] ^= 0xe1;
+}
+
+static void gf128_mul(const __u8 a[16], const __u8 b[16], __u8 result[16]) {
+  __u8 v[16], z[16];
+  memset(z, 0, 16);
+  memcpy(v, b, 16);
+  for (__u32 i = 0; i < 128; i++)
+    gf128_mul_step(a, v, z, i);
+  memcpy(result, z, 16);
+}
+
 static void test_gf128_mul_identity(void) {
   // Multiplying by the identity element (0x80, 0, ..., 0) should return
   // the other operand unchanged.
@@ -461,10 +489,8 @@ static void test_gf128_mul_gcm_vector(void) {
 
   gf128_mul(c, h, result);
   assert(bytes_equal(result, x1, 16));
-  gf128_mul_ws(c, h, result, ws_v, ws_z);
-  assert(bytes_equal(result, x1, 16));
 
-  // The steps one by one, as the BPF gf128_mul_iter callback runs them.
+  // The steps one by one.
   __builtin_memset(ws_z, 0, 16);
   __builtin_memcpy(ws_v, h, 16);
   __u8 a[16];
@@ -483,63 +509,6 @@ static void test_gf128_mul_commutativity(void) {
   gf128_mul(a, b, ab);
   gf128_mul(b, a, ba);
   assert(bytes_equal(ab, ba, 16));
-}
-
-static void test_gf128_h_power_1(void) {
-  // H^1 should equal H.
-  __u8 h[16], result[16];
-  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", h, 16);
-
-  gf128_h_power(h, 1, result);
-  assert(bytes_equal(result, h, 16));
-}
-
-static void test_gf128_h_power_2(void) {
-  // H^2 should equal H * H.
-  __u8 h[16], expected[16], result[16];
-  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", h, 16);
-
-  gf128_mul(h, h, expected);
-  gf128_h_power(h, 2, result);
-  assert(bytes_equal(result, expected, 16));
-}
-
-static void test_gf128_h_power_3(void) {
-  // H^3 = H^2 * H
-  __u8 h[16], h2[16], expected[16], result[16];
-  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", h, 16);
-
-  gf128_mul(h, h, h2);
-  gf128_mul(h2, h, expected);
-  gf128_h_power(h, 3, result);
-  assert(bytes_equal(result, expected, 16));
-}
-
-static void test_gf128_h_power_table(void) {
-  // Precomputed table should give same results as slow path.
-  __u8 h[16], result_slow[16], result_fast[16], tmp[16];
-  hex_to_bytes("66e94bd4ef8a2c3b884cfa59ca342b2e", h, 16);
-
-  // Build power table: table[i] = H^(2^i)
-  __u8 table[11][16];
-  memcpy(table[0], h, 16);
-  for (int i = 1; i < 11; i++) {
-    gf128_mul(table[i - 1], table[i - 1], tmp);
-    memcpy(table[i], tmp, 16);
-  }
-
-  // Test various powers
-  __u32 test_powers[] = {1, 2, 3, 5, 7, 10, 100, 1024};
-  for (int t = 0; t < 8; t++) {
-    gf128_h_power(h, test_powers[t], result_slow);
-    gf128_h_power_table(table, test_powers[t], result_fast);
-    if (!bytes_equal(result_slow, result_fast, 16)) {
-      print_hex("slow", result_slow, 16);
-      print_hex("fast", result_fast, 16);
-      printf("\n    power=%u\n", test_powers[t]);
-    }
-    assert(bytes_equal(result_slow, result_fast, 16));
-  }
 }
 
 static void test_is_aes_gcm(void) {
@@ -867,60 +836,6 @@ static void test_gf128_halve_to_h_edges(void) {
 }
 
 // ============================================================================
-// ghash_block_delta
-// ============================================================================
-
-// The block delta as ghash_block_iter built it with a branch per byte.
-static void block_delta_branchy(const __u8 *xor_delta, __u32 b, __u32 sec_off,
-                                __u32 len, __u8 out[16]) {
-  memset(out, 0, 16);
-  __u32 sec_end = sec_off + len;
-  for (__u32 i = 0; i < 16; i++) {
-    __u32 pos = (b & 0x3FF) * 16 + i;
-    if (pos >= sec_off && pos < sec_end)
-      out[i] = xor_delta[(pos - sec_off) & (SECRET_MAX_LEN - 1)];
-  }
-}
-
-static void check_block_delta(const __u8 *xor_delta, __u32 b, __u32 sec_off,
-                              __u32 len) {
-  __u8 want[16], got[16];
-  block_delta_branchy(xor_delta, b, sec_off, len, want);
-  memset(got, 0xAA, 16);
-  ghash_block_delta(xor_delta, b, sec_off, len, got);
-  if (memcmp(want, got, 16) != 0) {
-    printf("\n    block=%u sec_off=%u len=%u", b, sec_off, len);
-    print_hex("want", want, 16);
-    print_hex("got ", got, 16);
-  }
-  assert(memcmp(want, got, 16) == 0);
-}
-
-static void test_ghash_block_delta(void) {
-  __u8 xor_delta[SECRET_MAX_LEN];
-  for (int i = 0; i < SECRET_MAX_LEN; i++)
-    xor_delta[i] = (__u8)(i * 37 + 1); // no zero bytes, so a miss shows
-
-  // Every patch (len 1..SECRET_MAX_LEN) at every offset in the first 400
-  // bytes, against every block it can touch and its neighbours.
-  for (__u32 len = 1; len <= SECRET_MAX_LEN; len++)
-    for (__u32 sec_off = 0; sec_off < 400; sec_off++)
-      for (__u32 b = 0; b < 35; b++)
-        check_block_delta(xor_delta, b, sec_off, len);
-
-  // The last blocks, a block number past the 0x3FF mask, and offsets so
-  // large that the old u32 sec_end wrapped.
-  static const __u32 offs[] = {16352, 16367, 16368, 16383, 16384,
-                               0xFFFFFFFFu - SECRET_MAX_LEN, 0xFFFFFFF0u,
-                               0xFFFFFFFFu};
-  static const __u32 blocks[] = {0, 1, 1021, 1022, 1023, 1024, 1025, 0xFFFFFFFFu};
-  for (unsigned o = 0; o < sizeof(offs) / sizeof(offs[0]); o++)
-    for (unsigned k = 0; k < sizeof(blocks) / sizeof(blocks[0]); k++)
-      for (__u32 len = 1; len <= SECRET_MAX_LEN; len++)
-        check_block_delta(xor_delta, blocks[k], offs[o], len);
-}
-
-// ============================================================================
 // GHASH engine: table multiply, span tag deltas
 // ============================================================================
 
@@ -1135,8 +1050,8 @@ static void test_ghash_block_delta64(void) {
 
   // The inline xor_delta window: every patch at every offset in the first
   // 400 bytes, against every block it can touch and its neighbours, and
-  // blocks past 1023 (ghash_block_delta's old 10-bit mask) up to the last
-  // one an 11-bit exponent covers.
+  // blocks past 1023 (the old byte-wise gather's 10-bit mask) up to the
+  // last one an 11-bit exponent covers, and past it (masked).
   for (__u32 len = 1; len <= SECRET_MAX_LEN; len++) {
     for (__u32 sec_off = 0; sec_off < 400; sec_off++)
       for (__u32 b = 0; b < 35; b++) {
@@ -1144,10 +1059,12 @@ static void test_ghash_block_delta64(void) {
         ghash_block_delta64(xor_delta, SECRET_MAX_LEN - 1, b, sec_off, len, &got);
         assert(gf_eq(&want, &got));
       }
-    static const __u32 offs[] = {16352, 16367, 16368, 16383, 16384, 18400,
-                                 32750, 0xFFFFFFF0u, 0xFFFFFFFFu};
-    static const __u32 blocks[] = {0, 1, 1022, 1023, 1024, 1025, 1150,
-                                   2046, 2047};
+    // And offsets so large that a 32-bit sec_off + len wraps.
+    static const __u32 offs[] = {16352, 16367, 16368, 16383, 16384, 18400, 32750,
+                                 0xFFFFFFFFu - SECRET_MAX_LEN, 0xFFFFFFF0u,
+                                 0xFFFFFFFFu};
+    static const __u32 blocks[] = {0,    1,    1022, 1023, 1024,       1025,
+                                   1150, 2046, 2047, 2048, 0xFFFFFFFFu};
     for (unsigned o = 0; o < sizeof(offs) / sizeof(offs[0]); o++)
       for (unsigned k = 0; k < sizeof(blocks) / sizeof(blocks[0]); k++) {
         struct gf128 want = block_delta_ref(xor_delta, blocks[k], offs[o], len), got;
@@ -2284,10 +2201,6 @@ int main(void) {
   RUN_TEST(test_gf128_mul_known_vector);
   RUN_TEST(test_gf128_mul_gcm_vector);
   RUN_TEST(test_gf128_mul_commutativity);
-  RUN_TEST(test_gf128_h_power_1);
-  RUN_TEST(test_gf128_h_power_2);
-  RUN_TEST(test_gf128_h_power_3);
-  RUN_TEST(test_gf128_h_power_table);
   RUN_TEST(test_is_aes_gcm);
 
   printf("tls record framing (tc_egress):\n");
@@ -2316,9 +2229,6 @@ int main(void) {
   printf("gf128_halve_to_h (OpenSSL AVX-512 / Go H recovery):\n");
   RUN_TEST(test_gf128_halve_to_h_aes_keys);
   RUN_TEST(test_gf128_halve_to_h_edges);
-
-  printf("ghash_block_delta:\n");
-  RUN_TEST(test_ghash_block_delta);
 
   printf("ghash engine (table multiply, span tag deltas):\n");
   gf128_rem4_init(rem4);

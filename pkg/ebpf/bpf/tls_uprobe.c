@@ -645,8 +645,8 @@ struct kloak_proc_event {
 
 // Per-connection TLS state: GHASH key H and cipher suite.
 // Written by bpf_h_extract (libcrypto-hook path) and by the tcp_sendmsg
-// kprobe once it has H; read by bpf_xor_path and by tc, which derives the
-// H powers itself (copy_h_power_step).
+// kprobe once it has H; read by bpf_xor_path and by tc, which derives H's
+// table and powers itself (ghash_key_cache).
 struct tls_conn_key {
   __u32 tgid;
   __u32 _pad;
@@ -1110,9 +1110,32 @@ struct {
   __type(value, struct tc_pending_val);
 } kprobe_stage SEC(".maps");
 
+// The GHASH engine's state for one H (helpers.h, "GHASH engine"): H's 4-bit
+// table and its powers H^(2^i), built once per H and cached per connection
+// in ghash_key_cache. 448 bytes.
+struct ghash_key_state {
+  struct gf128 h;                   // the H it was built for
+  struct gf128_table ht;            // H's 4-bit table
+  struct gf128 pow[GHASH_POW_BITS]; // pow[i] = H^(2^i)
+};
+
+// tc_ghash_update's GHASH engine: what its bpf_loop callbacks work on.
+struct ghash_engine {
+  struct ghash_key_state key;   // the record's connection's H state
+  struct gf128_table pow_table; // the table of a power of H (ghash_pow_iter)
+  __u64 rem[16];                // the reduction table (gf128_rem4_init)
+  struct gf128 acc;             // the patch being hashed: Horner's accumulator
+  struct gf128 tag_delta;       // the record's: the XOR of its patches'
+  struct ghash_span span;       // the patch's blocks and exponent
+  __u32 sec_off;                // the patch's offset in the ciphertext
+  __u32 len;                    // and its length
+  __u32 patches;                // patches hashed into tag_delta
+  __u8 delta[SECRET_MAX_LEN];   // the patch's delta (ghash_span_source)
+};
+
 // tc's per-CPU scratch (tc_egress_patch, tc_ghash_update and their bpf_loop
 // callbacks): the large structs and buffers that would otherwise exceed the
-// 512-byte BPF stack limit, and the GF(2^128) state. tc only: see
+// 512-byte BPF stack limit, and the GHASH engine's state. tc only: see
 // uprobe_stage.
 struct ghash_work {
   // The matched tc_pending entry's patches (only patch_count and patches
@@ -1124,29 +1147,15 @@ struct ghash_work {
   __u8 old_tag[16];            // Original auth tag from TLS record
   __u8 tag_delta[16];          // Accumulated tag correction
   __u8 new_tag[16];            // Patched auth tag
-  __u8 block_delta[16];        // Per-block XOR delta
-  __u8 h_pow[16];              // H^power for current block
-  __u8 contrib[16];            // block_delta * H^power result
-  __u8 mul_a[16];              // gf128_mul input: operand a
-  __u8 mul_v[16];              // gf128_mul internal: shifting register
-  __u8 mul_z[16];              // gf128_mul internal: accumulator
-  __u8 hp_base[16];            // gf128_h_power internal: base
-  __u8 hp_tmp[16];             // gf128_h_power internal: temporary
   // Metadata for GHASH tag recomputation (tc egress path):
   __u32 ghash_ct_len;          // ciphertext length (excluding tag)
   __u32 ghash_tgid;            // tgid for tls_conn_state lookup
   __u64 ghash_ssl_ptr;         // ssl_ptr for tls_conn_state lookup
-  __u32 ghash_secret_offset;   // byte offset of secret in plaintext
-  __u32 ghash_patch_len;       // length of patched region
   __u32 ghash_nonce_len;       // TLS explicit nonce length (8 for TLS 1.2, 0 for TLS 1.3)
   __u32 ghash_payload_off;     // TCP payload offset within skb
-  __u8  ghash_xor_delta[SECRET_MAX_LEN]; // copy of xor_delta for block computation
   __u8  ghash_active;          // 1 = GHASH update needed
   __u8  _ghash_pad[3];
-  __u32 ghash_first_block;     // first changed block index
-  __u32 ghash_ct_blocks;       // total ciphertext blocks
-  // h_powers_cache moved to separate h_power_entries per-CPU array map
-  __u32 ghash_h_power_val;      // power value for h_power_step callback
+  struct ghash_engine engine;  // tc_ghash_update's tag delta computation
   // Connection key + record position for deferred tag patching (multi-segment records).
   struct tc_dest_key ghash_conn_key;
   __u32 ghash_pkt_seq;           // TCP seq of this segment
@@ -1171,19 +1180,20 @@ struct {
   __type(value, struct tls_conn_state);
 } conn_state_scratch SEC(".maps");
 
-// Per-CPU array of H^(2^i) power entries (16 bytes each).
-// Separate map so callbacks can look up individual entries without
-// array indexing into ghash_work (which the verifier can't bound).
-struct h_power_entry {
-  __u8 val[16];
-};
-
+// Per-connection GHASH key state, keyed like tls_conn_state: tc_ghash_update
+// builds a connection's H table and powers the first time it patches one of
+// its records (a table and ten squarings, about as much work as hashing a
+// 128-byte patch), and copies them from here after. An entry whose H is not
+// the connection's current one (a TLS 1.3 KeyUpdate, an ssl_ptr reused by a
+// new connection) is rebuilt. LRU like tls_conn_state, with as many entries:
+// 4096 of 464 bytes (key and value), about 2 MB preallocated; a miss only
+// costs the rebuild. tc only.
 struct {
-  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
-  __uint(max_entries, 16);
-  __type(key, __u32);
-  __type(value, struct h_power_entry);
-} h_power_entries SEC(".maps");
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 4096);
+  __type(key, struct tls_conn_key);
+  __type(value, struct ghash_key_state);
+} ghash_key_cache SEC(".maps");
 
 // =============================================================================
 // tc egress: pending XOR patch map keyed by TCP 4-tuple.
@@ -1863,190 +1873,128 @@ next:
 }
 
 // =============================================================================
-// GHASH shared callbacks — used by tc_ghash_update for tag recomputation.
+// GHASH engine: tc_ghash_update's tag delta (helpers.h, "GHASH engine").
+//
+// A record's tag delta is the XOR of its patches'. Per patch, a bpf_loop over
+// the blocks it changes (ghash_horner_iter: one table multiply each), then
+// one over the bits of the exponent of H that the blocks after it add
+// (ghash_pow_iter: one multiply per set bit). The verifier walks each
+// callback once whatever the patch length, so its cost does not grow with
+// it; the runtime is one multiply per block plus at most GHASH_POW_BITS per
+// patch. tc_ghash_update takes the connection's H table and powers from
+// ghash_key_cache, or builds them once per H (ghash_square_iter).
+//
+// The state is in ghash_scratch (struct ghash_engine), looked up again in
+// every callback.
 // =============================================================================
 
-// bpf_loop callback: one iteration of GF(2^128) multiplication.
-// State lives in the ghash_scratch per-CPU map (mul_a, mul_v, mul_z).
-// The verifier only needs to verify one iteration, not 128.
-static int gf128_mul_iter(__u32 i, void *_unused) {
-  __u32 zero = 0;
-  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 1; // stop
-
-  gf128_mul_step(w->mul_a, w->mul_v, w->mul_z, i);
-  return 0;
+// The delta source: where the engine reads what a patch changes the
+// ciphertext by. ghash_span_source loads patch p's delta into the engine (its
+// inline xor_delta, which holds all of it), and ghash_span_block reads block
+// b's bytes from there. The engine reads deltas only through these two.
+// TODO(kloak#383): phase 1 references the secret store instead of carrying
+// the delta: ghash_span_source records the patch's (key, gen, delta offset),
+// and ghash_span_block reads secret_chunks through a ring of two chunks in
+// the engine (ghash_block_delta64 with win_mask 511), loading the next chunk
+// when a block reaches it.
+static __always_inline void ghash_span_source(struct ghash_work *w, __u32 p) {
+  __builtin_memcpy(w->engine.delta,
+                   w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].xor_delta,
+                   SECRET_MAX_LEN);
 }
 
-// bpf_loop callback: copy one H^(2^i) entry from tls_conn_state to ghash_work.
-// Alternates map lookups to avoid holding both pointers simultaneously.
-static int copy_h_power_step(__u32 i, void *_unused) {
-  if (i >= 11)
-    return 1;
-
-  __u32 zero = 0;
-  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 1;
-
-  struct tls_conn_key ck;
-  __builtin_memset(&ck, 0, sizeof(ck));
-  ck.tgid = w->ghash_tgid;
-  ck.ssl_ptr = w->ghash_ssl_ptr;
-  struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &ck);
-  if (!conn)
-    return 1;
-
-  struct h_power_entry entry;
-
-  if (i == 0) {
-    // H^1 = H (copy directly from tls_conn_state.ghash_h)
-    __builtin_memcpy(entry.val, conn->ghash_h, 16);
-  } else {
-    // H^(2^i) = (H^(2^(i-1)))^2 — read previous entry and square it.
-    __u32 prev = i - 1;
-    struct h_power_entry *prev_entry = bpf_map_lookup_elem(&h_power_entries, &prev);
-    if (!prev_entry)
-      return 1;
-    __u8 prev_val[16];
-    __builtin_memcpy(prev_val, prev_entry->val, 16);
-
-    // Square via bpf_loop. Re-lookup w after each step.
-    w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-    if (!w)
-      return 1;
-    __builtin_memcpy(w->mul_a, prev_val, 16);
-    __builtin_memset(w->mul_z, 0, 16);
-    __builtin_memcpy(w->mul_v, prev_val, 16);
-
-    bpf_loop(128, gf128_mul_iter, NULL, 0);
-
-    w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-    if (!w)
-      return 1;
-    __builtin_memcpy(entry.val, w->mul_z, 16);
-  }
-
-  bpf_map_update_elem(&h_power_entries, &i, &entry, BPF_ANY);
-  return 0;
+static __always_inline void ghash_span_block(const struct ghash_work *w,
+                                             __u32 b, struct gf128 *out) {
+  ghash_block_delta64(w->engine.delta, SECRET_MAX_LEN - 1, b,
+                      w->engine.sec_off, w->engine.len, out);
 }
 
-// bpf_loop callback: one step of square-and-multiply for H^power.
-// Uses nested bpf_loop(128, gf128_mul_iter) for each multiply.
-// Re-lookups w after every bpf_loop to satisfy the verifier.
-static int h_power_step(__u32 bit, void *_unused) {
-  __u32 zero = 0;
-  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w || bit >= 11)
+// bpf_loop callback: pow[i + 1] = pow[i]^2, for the H state being built.
+//
+// The index is widened to 64 bits once (barrier_var), and that register is
+// both checked and used: from the 32-bit argument, clang checks one
+// zero-extension of it and indexes with another, whose bounds the verifier
+// does not have.
+static int ghash_square_iter(__u32 idx, void *_unused) {
+  __u64 i = idx;
+  barrier_var(i);
+  if (i >= GHASH_POW_BITS - 1)
     return 1;
-
-  if (!(w->ghash_h_power_val & (1u << bit)))
-    return 0; // Bit not set — skip this multiply.
-
-  // Look up H^(2^bit) from separate map and copy to stack.
-  struct h_power_entry *hp = bpf_map_lookup_elem(&h_power_entries, &bit);
-  if (!hp)
-    return 1;
-  __u8 hp_val[16];
-  __builtin_memcpy(hp_val, hp->val, 16);
-
-  // Re-lookup w (invalidated by h_power_entries lookup).
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 1;
-
-  // h_pow = h_pow * H^(2^bit)
-  __builtin_memcpy(w->mul_a, w->h_pow, 16);
-  __builtin_memset(w->mul_z, 0, 16);
-  __builtin_memcpy(w->mul_v, hp_val, 16);
-
-  bpf_loop(128, gf128_mul_iter, NULL, 0);
-
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 1;
-  __builtin_memcpy(w->h_pow, w->mul_z, 16);
-  return 0;
-}
-
-// bpf_loop callback: process one 16-byte block for GHASH tag delta.
-static int ghash_block_iter(__u32 block_idx, void *_unused) {
   __u32 zero = 0;
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w)
     return 1;
-
-  __u32 b = w->ghash_first_block + block_idx;
-  if (b >= w->ghash_ct_blocks)
-    return 1;
-
-  // Build 16-byte block delta.
-  ghash_block_delta(w->ghash_xor_delta, b, w->ghash_secret_offset,
-                    w->ghash_patch_len, w->block_delta);
-
-  // Compute H^power via bpf_loop (no inline functions — avoids stale w).
-  __u32 power = w->ghash_ct_blocks - b + 1;
-  w->ghash_h_power_val = power;
-  __builtin_memset(w->h_pow, 0, 16);
-  w->h_pow[0] = 0x80; // GF(2^128) identity
-
-  bpf_loop(11, h_power_step, NULL, 0);
-
-  // Re-lookup w. h_pow now contains H^power.
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 1;
-
-  // contribution = block_delta * H^power (flat bpf_loop, no inline).
-  __builtin_memcpy(w->mul_a, w->block_delta, 16);
-  __builtin_memset(w->mul_z, 0, 16);
-  __builtin_memcpy(w->mul_v, w->h_pow, 16);
-
-  bpf_loop(128, gf128_mul_iter, NULL, 0);
-
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
-    return 1;
-
-  // Accumulate: tag_delta ^= contribution (mul_z)
-  for (__u32 i = 0; i < 16; i++)
-    w->tag_delta[i] ^= w->mul_z[i];
-
+  struct gf128 v = w->engine.key.pow[i];
+  gf128_mul_by(&v, &w->engine.key.pow[i], &w->engine.pow_table, w->engine.rem);
+  w->engine.key.pow[i + 1] = v;
   return 0;
 }
 
-// An upper bound on the GHASH blocks a patch spans: SECRET_MAX_LEN bytes
-// starting at the last byte of a block end (SECRET_MAX_LEN + 14) / 16 blocks
-// past it, at most (SECRET_MAX_LEN + 15) / 16.
-#define GHASH_PATCH_MAX_BLOCKS ((SECRET_MAX_LEN + 15) / 16 + 1)
+// bpf_loop callback: block span.first + i of the patch being hashed.
+static int ghash_horner_iter(__u32 i, void *_unused) {
+  __u32 zero = 0;
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 1;
+  struct gf128 d;
+  ghash_span_block(w, w->engine.span.first + i, &d);
+  ghash_horner_step(&w->engine.acc, &d, &w->engine.key.ht, w->engine.rem);
+  return 0;
+}
 
-// bpf_loop callback: process one patch for GHASH tag recomputation.
-// Replaces the unrolled for-loop over patches in tc_ghash_update to keep
-// verifier complexity O(1) per patch instead of O(XOR_MAX_PATCHES).
+// bpf_loop callback: bit `bit` of the patch's exponent. Stops after its top
+// bit. Its index is widened as in ghash_square_iter.
+static int ghash_pow_iter(__u32 idx, void *_unused) {
+  __u64 bit = idx;
+  barrier_var(bit);
+  if (bit >= GHASH_POW_BITS)
+    return 1;
+  __u32 zero = 0;
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 1;
+  __u32 exp = w->engine.span.exp;
+  ghash_pow_step(&w->engine.acc, exp, bit, &w->engine.key.pow[bit],
+                 &w->engine.pow_table, w->engine.rem);
+  return (exp >> bit) <= 1;
+}
+
+// bpf_loop callback: patch p's tag delta, XORed into the record's.
 static int ghash_patch_iter(__u32 p, void *_unused) {
   __u32 zero = 0;
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w) return 1;
+  if (!w)
+    return 1;
 
-  // Skip patches that tc_egress_patch failed to apply (secret_len zeroed).
+  // Skip patches that tc_egress_patch could not stage (secret_len zeroed).
   __u32 raw_len = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len;
-  if (raw_len == 0) return 0;
-
+  if (raw_len == 0)
+    return 0;
   __u32 sec_off = w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_offset;
+  // TODO(kloak#383): the clamp goes with the inline delta (phase 1): the
+  // engine itself takes any span inside the record.
   __u32 sec_len = clamp_write_len(raw_len);
+  if (!ghash_span_plan(sec_off, sec_len, w->ghash_ct_len, &w->engine.span)) {
+    // Not inside the record's ciphertext: its tag delta can't be computed,
+    // so it is not written either (tc_ghash_update skips zeroed patches).
+    w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].secret_len = 0;
+    return 0;
+  }
+  w->engine.sec_off = sec_off;
+  w->engine.len = sec_len;
+  ghash_span_source(w, p);
+  w->engine.acc.hi = 0;
+  w->engine.acc.lo = 0;
 
-  w->ghash_secret_offset = sec_off;
-  w->ghash_patch_len = sec_len;
-  __builtin_memcpy(w->ghash_xor_delta,
-      w->staged_pending.patches[p & (XOR_MAX_PATCHES - 1)].xor_delta,
-      SECRET_MAX_LEN);
-  w->ghash_first_block = sec_off / 16;
+  bpf_loop(w->engine.span.count, ghash_horner_iter, NULL, 0);
+  bpf_loop(GHASH_POW_BITS, ghash_pow_iter, NULL, 0);
 
-  __u32 num_blocks = (sec_off + sec_len - 1) / 16 - w->ghash_first_block + 1;
-  if (num_blocks > GHASH_PATCH_MAX_BLOCKS) num_blocks = GHASH_PATCH_MAX_BLOCKS;
-
-  bpf_loop(num_blocks, ghash_block_iter, NULL, 0);
+  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 1;
+  w->engine.tag_delta.hi ^= w->engine.acc.hi;
+  w->engine.tag_delta.lo ^= w->engine.acc.lo;
+  w->engine.patches++;
   return 0;
 }
 
@@ -3408,9 +3356,8 @@ int tc_egress_patch(struct __sk_buff *skb) {
 }
 
 // =============================================================================
-// tc GHASH: tag recomputation in kernel skb memory.
-// Uses shared GF multiply callbacks (gf128_mul_iter, h_power_step,
-// ghash_block_iter, copy_h_power_step) that operate on BPF maps.
+// tc GHASH: tag recomputation in kernel skb memory, with the GHASH engine
+// (ghash_patch_iter and the callbacks above it).
 // =============================================================================
 
 SEC("tc")
@@ -3421,41 +3368,66 @@ int tc_ghash_update(struct __sk_buff *skb) {
     return TC_PASS;
   w->ghash_active = 0;
 
-  // Copy H power table from tls_conn_state.
-  bpf_loop(11, copy_h_power_step, NULL, 0);
-
-  w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
+  // The connection's H state: from ghash_key_cache when it was built for the
+  // connection's current H, else built here and cached.
+  struct tls_conn_key ck = {};
+  ck.tgid = w->ghash_tgid;
+  ck.ssl_ptr = w->ghash_ssl_ptr;
+  struct tls_conn_state *conn = bpf_map_lookup_elem(&tls_conn_state, &ck);
+  if (!conn)
     return TC_PASS;
+  struct gf128 h;
+  gf128_load(conn->ghash_h, &h);
+  gf128_rem4_init(w->engine.rem);
+  int cached = 0;
+  struct ghash_key_state *ks = bpf_map_lookup_elem(&ghash_key_cache, &ck);
+  if (ks && ks->h.hi == h.hi && ks->h.lo == h.lo) {
+    __builtin_memcpy(&w->engine.key, ks, sizeof(w->engine.key));
+    // Another CPU adding a key may recycle this LRU element meanwhile: the
+    // H is checked again after the copy, which catches a recycle that wrote
+    // the element's H before then. One that races the copy byte for byte is
+    // not excluded; its torn table gives a wrong tag, which the peer
+    // rejects: the connection fails, it does not carry wrong data.
+    cached = ks->h.hi == h.hi && ks->h.lo == h.lo;
+  }
+  if (!cached) {
+    w->engine.key.h = h;
+    gf128_table_init(&w->engine.key.ht, &h);
+    w->engine.key.pow[0] = h;
+    bpf_loop(GHASH_POW_BITS - 1, ghash_square_iter, NULL, 0);
+    w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+    if (!w)
+      return TC_PASS;
+    bpf_map_update_elem(&ghash_key_cache, &ck, &w->engine.key, BPF_ANY);
+  }
 
   __u32 ct_len = w->ghash_ct_len;
   __u32 nonce_len = w->ghash_nonce_len;
   __u32 payload_off = w->ghash_payload_off;
-  __u32 ct_blocks = (ct_len + 15) / 16;
 
   // Tag offset within the skb (if the tag is in this segment).
   __u32 tag_offset = payload_off + 5 + nonce_len + ct_len;
 
-  __builtin_memset(w->tag_delta, 0, 16);
-
-  // Iterate ALL patches — the GHASH formula is additive:
-  // tag_delta = Σ Σ (delta_block * H^power) for each patch, each block.
-  // tag_delta accumulates across all ghash_block_iter calls.
-  //
-  // Uses bpf_loop instead of a for-loop to avoid compiler unrolling
-  // XOR_MAX_PATCHES iterations. Each unrolled iteration contains nested
-  // bpf_loop calls (ghash_block_iter → h_power_step → gf128_mul_iter),
-  // causing the verifier to re-analyze the full callback tree per iteration
-  // and exceed the 1M instruction limit on newer kernels.
+  // The record's tag delta: the XOR of its patches' (ghash_patch_iter). A
+  // bpf_loop, not an unrolled loop over XOR_MAX_PATCHES, so that the
+  // verifier walks the patch callback, and the callbacks it runs, once.
+  // TODO(kloak#383): phase 2 runs this per record, not per segment: the tc
+  // ledger, at the record's header, hashes the references that overlap the
+  // record (ghash_span_plan of each one's range in it) and keeps the tag
+  // delta with the record's ciphertext and tag ranges, for every segment
+  // (and retransmit) that carries part of them.
+  w->engine.tag_delta.hi = 0;
+  w->engine.tag_delta.lo = 0;
+  w->engine.patches = 0;
   __u32 pc = w->staged_pending.patch_count;
   if (pc > XOR_MAX_PATCHES) pc = XOR_MAX_PATCHES;
-  w->ghash_ct_blocks = ct_blocks;
 
   bpf_loop(pc, ghash_patch_iter, NULL, 0);
 
   w = bpf_map_lookup_elem(&ghash_scratch, &zero);
-  if (!w)
+  if (!w || w->engine.patches == 0)
     return TC_PASS;
+  gf128_store(w->tag_delta, &w->engine.tag_delta);
 
   // Write the ciphertext tc_egress_patch staged, and the tag when it is in
   // this segment, all or nothing: the skb is first made writable up to the
