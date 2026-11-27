@@ -55,3 +55,12 @@ kloak-webhook-certs
 {{- end -}}
 {{- end -}}
 
+
+{{/*
+A byte length or size value as a flag argument: a quantity string ("64Ki")
+as is, a number as an integer (Helm holds a number from a values file as a
+float64, which it would print in scientific notation).
+*/}}
+{{- define "kloak.bytes" -}}
+{{- if kindIs "float64" . -}}{{ printf "%.0f" . }}{{- else -}}{{ . }}{{- end -}}
+{{- end -}}

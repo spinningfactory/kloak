@@ -41,6 +41,7 @@ spec:
           command: ["/kloak", "webhook"]
           args:
             - --cert-dir=/certs
+            - --max-secret-length={{ include "kloak.bytes" (.Values.secrets.maxLength | default "64Ki") }}
           env:
             - name: KLOAK_LOG_LEVEL
               value: {{ .Values.log.level | quote }}

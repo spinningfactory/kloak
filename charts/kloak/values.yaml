@@ -24,6 +24,14 @@ log:
   # for offline complexity analysis; not recommended in production.
   ebpfLevel: ""
 
+secrets:
+  # Longest kloak secret value accepted, in bytes (a Kubernetes quantity),
+  # up to 1Mi (Kubernetes' limit on a Secret). The webhook rejects a Secret
+  # with a longer value, and the controller does not rewrite one admitted
+  # before. The data plane takes values of at most 128 bytes today, so a
+  # larger setting is clamped to that until it takes longer ones.
+  maxLength: 64Ki
+
 controller:
   ebpf:
     enabled: true
@@ -88,6 +96,19 @@ controller:
     # routed. The controller refuses to start if a range overlaps a node
     # address, a pod or service CIDR, or a route of the node.
     virtualIPRange: 198.18.0.0/15,2001:2::/48
+    # Kernel memory each node's secret store reserves for the secrets'
+    # placeholders and patches (a Kubernetes quantity), from 1Mi to 1Gi. A
+    # secret takes about 1.2 KB per 256 bytes of its value (its placeholder
+    # and its HTTP/2 form), and a changed secret holds both values for 30 s.
+    # The default holds every secret the node can sync (4096 placeholders)
+    # while values are at most 128 bytes, with room to spare. A secret that
+    # does not fit is not rewritten until there is room (its placeholder
+    # goes out unchanged), and is logged and counted in the controller's
+    # kloak_secret_store_refused_entries metric. The memory is charged to
+    # the controller (resources.limits.memory). Changing it loads the
+    # node's data plane again when the controller restarts, instead of
+    # adopting the one it left (see persist).
+    secretStoreBytes: 16Mi
   cgroupPath: /host/sys/fs/cgroup
   # NRI (Node Resource Interface) hook into the container runtime:
   # containerd 2.0+ and CRI-O 1.30+ serve it by default.

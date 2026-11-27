@@ -88,6 +88,8 @@ spec:
             - --daemonset=kloak-controller
             {{- end }}
             - --node-lock=/run/kloak/lock
+            - --secret-store-bytes={{ include "kloak.bytes" (.Values.controller.ebpf.secretStoreBytes | default "16Mi") }}
+            - --max-secret-length={{ include "kloak.bytes" (.Values.secrets.maxLength | default "64Ki") }}
           env:
             - name: POD_NAME
               valueFrom:
