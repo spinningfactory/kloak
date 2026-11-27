@@ -109,6 +109,12 @@ controller:
     # node's data plane again when the controller restarts, instead of
     # adopting the one it left (see persist).
     secretStoreBytes: 16Mi
+  # Prometheus metrics on each controller pod, at /metrics on the "metrics"
+  # port: the node's data-plane events (kloak_dataplane_events_total, with
+  # the classes to alert on) and its secret store (README: Metrics). 0
+  # disables the endpoint.
+  metrics:
+    port: 8080
   cgroupPath: /host/sys/fs/cgroup
   # NRI (Node Resource Interface) hook into the container runtime:
   # containerd 2.0+ and CRI-O 1.30+ serve it by default.

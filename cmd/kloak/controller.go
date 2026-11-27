@@ -24,6 +24,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
+	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/spinningfactory/kloak/pkg/controller"
 	"github.com/spinningfactory/kloak/pkg/ebpf"
@@ -54,6 +55,7 @@ The controller is responsible for:
 
 var (
 	controllerProbeAddr string
+	metricsAddr         string
 	enableEBPF          bool
 	cgroupPath          string
 	trustedDNSServers   string
@@ -76,6 +78,8 @@ const adoptReconcileTimeout = 60 * time.Second
 
 func init() {
 	controllerCmd.Flags().StringVar(&controllerProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	controllerCmd.Flags().StringVar(&metricsAddr, "metrics-bind-address", metricsserver.DefaultBindAddress,
+		`The address the Prometheus metrics endpoint (/metrics) binds to: the data plane's events (kloak_dataplane_events_total) and the secret store's state, with controller-runtime's own metrics. "0" disables it.`)
 	controllerCmd.Flags().BoolVar(&enableEBPF, "enable-ebpf", false, "Enable eBPF traffic redirection (requires Linux + CAP_BPF).")
 	controllerCmd.Flags().StringVar(&cgroupPath, "cgroup-path", "/sys/fs/cgroup", "Path to cgroup v2 filesystem.")
 	controllerCmd.Flags().StringVar(&trustedDNSServers, "trusted-dns-servers", "", "Comma-separated DNS server IPs trusted in addition to kube-dns's ClusterIPs and endpoint addresses, which are discovered: only their answers are rewritten for host-restricted secrets.")
@@ -197,6 +201,7 @@ func runController(cmd *cobra.Command, args []string) {
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                  scheme,
 		HealthProbeBindAddress:  controllerProbeAddr,
+		Metrics:                 metricsserver.Options{BindAddress: metricsAddr},
 		GracefulShutdownTimeout: &gracefulShutdown,
 		Cache:                   cache.Options{ByObject: byObject},
 	})

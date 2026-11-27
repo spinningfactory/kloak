@@ -176,6 +176,9 @@ type TLSUprobeManager struct {
 	// syncMu serializes SyncSecrets: each takes its snapshot and applies it
 	// whole, so an older snapshot can't be applied after a newer one.
 	syncMu sync.Mutex
+	// counters is debug_counters, which the metrics endpoint reads
+	// (dataplaneMetrics).
+	counters counterSource
 
 	// bindMu guards bindings, bindingMode and lastSnapshot, and serializes
 	// every secret_acl and vip_pod_host write, so a secret sync can't
@@ -475,6 +478,8 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		dnsRewriteFailed: make(map[string]bool),
 	}
 	mgr.store = newSecretStore(objs.SecretMap, objs.SecretChunks, store.maxLen(), log)
+	mgr.counters = debugCounterMap{objs.DebugCounters}
+	dataplaneMetrics.setSource(mgr.counters)
 	if adopted {
 		// The adopted maps hold the secrets of the previous controller,
 		// which the pods' writes are rewritten with until the first sync.
@@ -2311,6 +2316,9 @@ func (m *TLSUprobeManager) Shutdown(mode ShutdownMode) error {
 		}
 	}
 	if m.objs != nil {
+		// The metrics endpoint stops reading the counters before their map
+		// is closed.
+		dataplaneMetrics.clearSource(m.counters)
 		if err := m.objs.Close(); err != nil {
 			errs = append(errs, err)
 		}
@@ -3010,42 +3018,19 @@ func (m *TLSUprobeManager) logSNIViolation(ev *secretBindingEvent, pod, secret s
 	m.log.Warnw("SNI check violation (rewrite refused): connection's TLS SNI is not the secret's host", fields...)
 }
 
-// debugCounterNames maps index to human-readable name (must match C enum in
-// pkg/ebpf/bpf/tls_uprobe.c — DBG_* constants).
-var debugCounterNames = []string{
-	"xor_conn_check", "xor_conn_hit", "xor_prescan_match", "xor_prescan_unconfirmed", "xor_tailcall",
-	"xor_path_entered", "xor_secret_found", "xor_delta_done",
-	"tc_entry", "tc_match", "tc_patched",
-	"kprobe_bridge", "kprobe_bridge_no_entry", "kprobe_bridge_h_fail",
-	"evp_init_entry", "evp_init_h_ok", "evp_init_h_zero", "evp_init_chain_fail",
-	"h_extract_cache_hit", "h_extract_cache_miss",
-	"kprobe_bridge_from_pending", "kprobe_walk_legacy",
-	"h_extract_live_walk",
-	"bssl_reached", "bssl_h_ok",
-	"bssl_s3_null", "bssl_aead_null", "bssl_rdkey_fail", "bssl_rounds_bad", "bssl_hzero",
-	"openssl_gcm_gate_fail", "openssl_h_from_hkey1",
-	"secret_binding_deny", "secret_binding_audit",
-	"sni_captured", "sni_deny", "sni_audit",
-	"vip_dns_rewritten", "vip_dns_unchanged", "vip_connect_redirect", "vip_connect_refused",
-	"vip_dns_unbound", "vip_sock_host_deny", "vip_sock_addr_deny",
-}
-
-// DumpDebugCounters reads and logs all debug counters from the BPF map.
+// DumpDebugCounters logs the data plane's event counters that are not 0
+// (at trace level; they are also metrics: dataplane_metrics.go).
 func (m *TLSUprobeManager) DumpDebugCounters() {
 	if m.objs.DebugCounters == nil {
 		return
 	}
-	for i, name := range debugCounterNames {
-		var vals []uint64
-		key := uint32(i)
-		if err := m.objs.DebugCounters.Lookup(key, &vals); err != nil {
-			continue
-		}
-		var total uint64
-		for _, v := range vals {
-			total += v
-		}
-		if total > 0 {
+	totals, err := dataplaneTotals(debugCounterMap{m.objs.DebugCounters})
+	if err != nil {
+		logging.Tracew(m.log, "reading the eBPF debug counters", "error", err)
+		return
+	}
+	for _, name := range debugCounterNames {
+		if total := totals[name]; total > 0 {
 			logging.Tracew(m.log, "eBPF debug counter", "name", name, "count", total)
 		}
 	}
