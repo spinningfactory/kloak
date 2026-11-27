@@ -257,6 +257,7 @@ enum {
   DBG_VIP_DNS_UNBOUND,       // a watched host's answer left unchanged: the pod has no secret for the host
   DBG_VIP_SOCK_HOST_DENY,    // patch refused at tcp_sendmsg: the socket did not connect to the secret host's fake IP
   DBG_VIP_SOCK_ADDR_DENY,    // patch refused at tcp_sendmsg: the socket's real address or port is not the secret's
+  DBG_XOR_SHADOW_READ_FAIL,  // bpf_xor_path could not read a placeholder's bytes: skipped
   DBG_MAX,
 };
 
@@ -1781,11 +1782,28 @@ int bpf_xor_path(void *ctx) {
   sd = bpf_map_lookup_elem(&scratch, &zero);
   if (!sd) return 0;
 
-  // Read shadow bytes directly from user memory. This avoids depending on
-  // the prescan buffer size — secrets that start near the end of the buffer
-  // won't wrap around and read garbage from position 0.
-  bpf_probe_read_user(st->delta, SECRET_MAX_LEN,
-                      (void *)(sd->user_data_ptr + local_i));
+  // Read the placeholder's delta_len wire bytes directly from user memory:
+  // the prescan's chunk may hold only its start. Nothing past them: they
+  // need not be the write's, nor mapped.
+  //
+  // The rest of the buffer is zeroed first, and real is zero past its length
+  // (sync copies only the secret), so the delta is zero past the placeholder.
+  // Those bytes are never applied (tc stores back only the patch's length,
+  // and the GHASH delta masks the rest: ghash_block_delta), but they would
+  // otherwise carry the previous placeholder's delta, or the app's bytes
+  // after this one, into xor_pending and tc_pending.
+  //
+  // A read can fail though the prescan read the placeholder's start: its
+  // end may be on a page that is not present, which this program cannot
+  // fault in. On failure the helper zeroes the buffer, and the delta would
+  // be real itself: the peer would get shadow XOR real in its place. The
+  // placeholder is skipped instead, and goes out as it is.
+  __builtin_memset(st->delta, 0, SECRET_MAX_LEN);
+  if (bpf_probe_read_user(st->delta, delta_len,
+                          (void *)(sd->user_data_ptr + local_i)) < 0) {
+    dbg_inc(DBG_XOR_SHADOW_READ_FAIL);
+    goto next;
+  }
 
   val = bpf_map_lookup_elem(&secret_map, &key);
   if (!val) goto next;
