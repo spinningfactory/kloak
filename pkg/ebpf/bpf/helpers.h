@@ -349,6 +349,30 @@ HELPER_INLINE void gf128_rem4_init(__u64 r[16]) {
   }
 }
 
+// gf128_table_mul_word runs 16 steps of Shoup's method (gf128_table_mul) on
+// z, over the nibbles of w, one word of x, from its bottom nibble up. The
+// steps are unrolled: every shift of w is a constant, and the verifier walks
+// them as straight-line code, with no loop state to track (a loop would also
+// invite the negative constant pointer offsets Linux 7.2 rejects, see
+// gf128_table_init). The table indexes are 4-bit masks, which keep the reads
+// of t and r in bounds for the verifier.
+HELPER_INLINE void gf128_table_mul_word(struct gf128 *z, __u64 w,
+                                        const struct gf128_table *t,
+                                        const __u64 r[16]) {
+  __u64 zhi = z->hi, zlo = z->lo;
+#pragma GCC unroll 16
+  for (int i = 15; i >= 0; i--) {
+    __u32 n = (w >> (60 - 4 * i)) & 0xF;
+    __u32 rem = zlo & 0xF;
+    zlo = (zlo >> 4) | (zhi << 60);
+    zhi = (zhi >> 4) ^ r[rem];
+    zhi ^= t->m[n].hi;
+    zlo ^= t->m[n].lo;
+  }
+  z->hi = zhi;
+  z->lo = zlo;
+}
+
 // gf128_table_mul sets x = x * H, t being H's table (gf128_table_init) and r
 // the reduction table (gf128_rem4_init).
 //
@@ -357,38 +381,16 @@ HELPER_INLINE void gf128_rem4_init(__u64 r[16]) {
 // x^(4i), which Horner's rule computes from n_31 down: z = z * x^4 + m[n_i].
 // z * x^4 is a 4-bit right shift whose 4 bits pushed out of lo come back
 // reduced from r. 32 table steps instead of the 128 conditional XORs and
-// shifts of a bit-serial multiply.
+// shifts of a bit-serial multiply: lo's 16 nibbles, then hi's.
 //
-// Unrolled: every shift of x is a constant, and the verifier walks the 32
-// steps as straight-line code, with no loop state to track (a loop would
-// also invite the negative constant pointer offsets Linux 7.2 rejects, see
-// gf128_table_init). The table indexes are 4-bit masks, which keep the reads
-// of t and r in bounds for the verifier.
+// tc runs the two words as two iterations of a bpf_loop callback
+// (ghash_mul_iter), which halves the code the verifier walks per multiply.
 HELPER_INLINE void gf128_table_mul(struct gf128 *x, const struct gf128_table *t,
                                    const __u64 r[16]) {
-  __u64 xhi = x->hi, xlo = x->lo;
-  __u64 zhi = 0, zlo = 0;
-#pragma GCC unroll 32
-  for (int i = 31; i >= 0; i--) {
-    __u64 w = i < 16 ? xhi : xlo;
-    __u32 n = (w >> (60 - 4 * (i & 15))) & 0xF;
-    __u32 rem = zlo & 0xF;
-    zlo = (zlo >> 4) | (zhi << 60);
-    zhi = (zhi >> 4) ^ r[rem];
-    zhi ^= t->m[n].hi;
-    zlo ^= t->m[n].lo;
-  }
-  x->hi = zhi;
-  x->lo = zlo;
-}
-
-// gf128_mul_by sets x = x * y for a y without a table: it builds y's in t
-// (scratch space) first. Building is cheap next to the multiplication
-// itself: three shifts and eleven XORs of 128 bits.
-HELPER_INLINE void gf128_mul_by(struct gf128 *x, const struct gf128 *y,
-                                struct gf128_table *t, const __u64 r[16]) {
-  gf128_table_init(t, y);
-  gf128_table_mul(x, t, r);
+  struct gf128 z = {0, 0};
+  gf128_table_mul_word(&z, x->lo, t, r);
+  gf128_table_mul_word(&z, x->hi, t, r);
+  *x = z;
 }
 
 // ----------------------------------------------------------------------------
@@ -407,16 +409,17 @@ HELPER_INLINE void gf128_mul_by(struct gf128 *x, const struct gf128 *y,
 // acc = sum of D_b * H^(last + 1 - b), one table multiply per block; times
 // H^(n - last) that is the patch's tag delta. ghash_span_plan computes
 // first, the block count and exp = n - last, which is at least 1 (the length
-// block) and below 2^GHASH_POW_BITS; ghash_pow_step multiplies by H^exp one
-// set bit at a time, from the cached H^(2^i).
+// block) and below 2^GHASH_POW_BITS; tc multiplies by H^exp one set bit at a
+// time, from the cached H^(2^i) (ghash_horner_iter and ghash_pow_iter in
+// tls_uprobe.c).
 //
 // Patches add up: the record's tag delta is the XOR of its patches' (two
 // patches in one block each contribute their own bytes of it).
 // ----------------------------------------------------------------------------
 
-// ghash_pow_step's H^(2^i) cover i < GHASH_POW_BITS, so a span's exponent,
-// at most the record's ciphertext block count, must stay below
-// 2^GHASH_POW_BITS (asserted against TLS_MAX_RECORD_LEN below).
+// The cached H^(2^i) cover i < GHASH_POW_BITS, so a span's exponent, at most
+// the record's ciphertext block count, must stay below 2^GHASH_POW_BITS
+// (asserted against TLS_MAX_RECORD_LEN below).
 #define GHASH_POW_BITS 11
 #define GHASH_MAX_CT_BLOCKS ((1u << GHASH_POW_BITS) - 1)
 
@@ -482,27 +485,6 @@ HELPER_INLINE void ghash_block_delta64(const __u8 *win, __u32 win_mask,
   }
   out->hi = hi;
   out->lo = lo;
-}
-
-// One Horner step of a span: acc = (acc ^ d) * H, ht being H's table.
-HELPER_INLINE void ghash_horner_step(struct gf128 *acc, const struct gf128 *d,
-                                     const struct gf128_table *ht,
-                                     const __u64 r[16]) {
-  acc->hi ^= d->hi;
-  acc->lo ^= d->lo;
-  gf128_table_mul(acc, ht, r);
-}
-
-// Bit `bit` of a span's exponent: acc = acc * H^(2^bit) when it is set, hp
-// being H^(2^bit) and t scratch space for its table. Returns whether it
-// multiplied.
-HELPER_INLINE int ghash_pow_step(struct gf128 *acc, __u32 exp, __u32 bit,
-                                 const struct gf128 *hp, struct gf128_table *t,
-                                 const __u64 r[16]) {
-  if (!((exp >> bit) & 1))
-    return 0;
-  gf128_mul_by(acc, hp, t, r);
-  return 1;
 }
 
 // Kloak internal cipher type enum (not TLS cipher suite IDs).

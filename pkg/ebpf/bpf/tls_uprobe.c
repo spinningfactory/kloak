@@ -1131,6 +1131,11 @@ struct ghash_engine {
   __u32 len;                    // and its length
   __u32 patches;                // patches hashed into tag_delta
   __u8 delta[SECRET_MAX_LEN];   // the patch's delta (ghash_span_source)
+  // The multiply in progress (ghash_mul_iter): mul_z = mul_x * the element
+  // of table mul_tab (GHASH_TABLE_H or GHASH_TABLE_POW).
+  struct gf128 mul_x;
+  struct gf128 mul_z;
+  __u32 mul_tab;
 };
 
 // tc's per-CPU scratch (tc_egress_patch, tc_ghash_update and their bpf_loop
@@ -1881,7 +1886,8 @@ next:
 // (ghash_pow_iter: one multiply per set bit). The verifier walks each
 // callback once whatever the patch length, so its cost does not grow with
 // it; the runtime is one multiply per block plus at most GHASH_POW_BITS per
-// patch. tc_ghash_update takes the connection's H table and powers from
+// patch. Each multiply is two iterations of ghash_mul_iter, 16 table steps
+// each. tc_ghash_update takes the connection's H table and powers from
 // ghash_key_cache, or builds them once per H (ghash_square_iter).
 //
 // The state is in ghash_scratch (struct ghash_engine), looked up again in
@@ -1909,6 +1915,46 @@ static __always_inline void ghash_span_block(const struct ghash_work *w,
                       w->engine.sec_off, w->engine.len, out);
 }
 
+// The tables a multiply reads (ghash_engine.mul_tab).
+#define GHASH_TABLE_H 0   // key.ht: H's
+#define GHASH_TABLE_POW 1 // pow_table: a power of H's, built for the multiply
+
+// bpf_loop callback: half of the table multiply in progress, the 16 nibbles
+// of word i (lo, then hi) of mul_x (gf128_table_mul). Two iterations of 16
+// unrolled steps rather than one of 32: the verifier walks the callback once
+// per call site, and half the code per multiply halved tc_ghash_update's
+// verifier cost on Linux 7.2 (29807 -> 14847 instructions), for about 4% and
+// 10% more on 6.1 and 6.6 (7760 -> 8055, 7154 -> 7877) and 5-12% more run
+// time.
+static int ghash_mul_iter(__u32 i, void *_unused) {
+  __u32 zero = 0;
+  struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
+  if (!w)
+    return 1;
+  __u64 word = i == 0 ? w->engine.mul_x.lo : w->engine.mul_x.hi;
+  if (w->engine.mul_tab == GHASH_TABLE_POW)
+    gf128_table_mul_word(&w->engine.mul_z, word, &w->engine.pow_table, w->engine.rem);
+  else
+    gf128_table_mul_word(&w->engine.mul_z, word, &w->engine.key.ht, w->engine.rem);
+  return 0;
+}
+
+// ghash_mul sets up mul_z = x * table tab's element, runs it, and returns the
+// scratch again (the bpf_loop invalidates w), or NULL. The product is in
+// mul_z.
+static __always_inline struct ghash_work *ghash_mul(struct ghash_work *w,
+                                                    __u64 xhi, __u64 xlo,
+                                                    __u32 tab) {
+  __u32 zero = 0;
+  w->engine.mul_x.hi = xhi;
+  w->engine.mul_x.lo = xlo;
+  w->engine.mul_z.hi = 0;
+  w->engine.mul_z.lo = 0;
+  w->engine.mul_tab = tab;
+  bpf_loop(2, ghash_mul_iter, NULL, 0);
+  return bpf_map_lookup_elem(&ghash_scratch, &zero);
+}
+
 // bpf_loop callback: pow[i + 1] = pow[i]^2, for the H state being built.
 //
 // The index is widened to 64 bits once (barrier_var), and that register is
@@ -1924,13 +1970,16 @@ static int ghash_square_iter(__u32 idx, void *_unused) {
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
   if (!w)
     return 1;
-  struct gf128 v = w->engine.key.pow[i];
-  gf128_mul_by(&v, &w->engine.key.pow[i], &w->engine.pow_table, w->engine.rem);
-  w->engine.key.pow[i + 1] = v;
+  gf128_table_init(&w->engine.pow_table, &w->engine.key.pow[i]);
+  w = ghash_mul(w, w->engine.key.pow[i].hi, w->engine.key.pow[i].lo, GHASH_TABLE_POW);
+  if (!w)
+    return 1;
+  w->engine.key.pow[i + 1] = w->engine.mul_z;
   return 0;
 }
 
-// bpf_loop callback: block span.first + i of the patch being hashed.
+// bpf_loop callback: block span.first + i of the patch being hashed, one
+// Horner step: acc = (acc ^ D) * H.
 static int ghash_horner_iter(__u32 i, void *_unused) {
   __u32 zero = 0;
   struct ghash_work *w = bpf_map_lookup_elem(&ghash_scratch, &zero);
@@ -1938,12 +1987,16 @@ static int ghash_horner_iter(__u32 i, void *_unused) {
     return 1;
   struct gf128 d;
   ghash_span_block(w, w->engine.span.first + i, &d);
-  ghash_horner_step(&w->engine.acc, &d, &w->engine.key.ht, w->engine.rem);
+  w = ghash_mul(w, w->engine.acc.hi ^ d.hi, w->engine.acc.lo ^ d.lo, GHASH_TABLE_H);
+  if (!w)
+    return 1;
+  w->engine.acc = w->engine.mul_z;
   return 0;
 }
 
-// bpf_loop callback: bit `bit` of the patch's exponent. Stops after its top
-// bit. Its index is widened as in ghash_square_iter.
+// bpf_loop callback: bit `bit` of the patch's exponent: acc = acc * H^(2^bit)
+// when it is set (the table of H^(2^bit) is built for it). Stops after the
+// exponent's top bit. The index is widened as in ghash_square_iter.
 static int ghash_pow_iter(__u32 idx, void *_unused) {
   __u64 bit = idx;
   barrier_var(bit);
@@ -1954,8 +2007,13 @@ static int ghash_pow_iter(__u32 idx, void *_unused) {
   if (!w)
     return 1;
   __u32 exp = w->engine.span.exp;
-  ghash_pow_step(&w->engine.acc, exp, bit, &w->engine.key.pow[bit],
-                 &w->engine.pow_table, w->engine.rem);
+  if ((exp >> bit) & 1) {
+    gf128_table_init(&w->engine.pow_table, &w->engine.key.pow[bit]);
+    w = ghash_mul(w, w->engine.acc.hi, w->engine.acc.lo, GHASH_TABLE_POW);
+    if (!w)
+      return 1;
+    w->engine.acc = w->engine.mul_z;
+  }
   return (exp >> bit) <= 1;
 }
 

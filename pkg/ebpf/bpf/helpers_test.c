@@ -977,20 +977,30 @@ static void test_gf128_table_mul(void) {
   assert(x1.hi == 0x5e2ec74691706288ULL && x1.lo == 0x2c85b0685353deb7ULL);
 }
 
+// x = x * y, as tc multiplies by an element without a cached table (a power
+// of H): y's table built in scratch space (over whatever was there), then the
+// two words of x, as tc's ghash_mul_iter runs them.
+static void mul_by(struct gf128 *x, const struct gf128 *y,
+                   struct gf128_table *scratch) {
+  gf128_table_init(scratch, y);
+  struct gf128 z = {0, 0};
+  gf128_table_mul_word(&z, x->lo, scratch, rem4);
+  gf128_table_mul_word(&z, x->hi, scratch, rem4);
+  *x = z;
+}
+
 static void test_gf128_mul_by(void) {
-  // gf128_mul_by builds y's table in the scratch table it is given, over
-  // whatever was there.
   struct gf128_table scratch;
   memset(&scratch, 0x5A, sizeof(scratch));
   for (int i = 0; i < 2000; i++) {
     struct gf128 x = rng_gf128(), y = rng_gf128();
     struct gf128 want = ref_mul(&x, &y), got = x;
-    gf128_mul_by(&got, &y, &scratch, rem4);
+    mul_by(&got, &y, &scratch);
     assert(gf_eq(&want, &got));
     // Squaring, which builds the H^(2^i) powers: x and y the same element.
     want = ref_mul(&x, &x);
     got = x;
-    gf128_mul_by(&got, &x, &scratch, rem4);
+    mul_by(&got, &x, &scratch);
     assert(gf_eq(&want, &got));
   }
 }
@@ -1097,8 +1107,7 @@ static void test_ghash_block_delta64(void) {
 }
 
 // The engine's H state, as tc's per-connection cache keeps it: H's table and
-// H^(2^i) for i < GHASH_POW_BITS (squared with gf128_mul_by, as tc builds
-// them).
+// H^(2^i) for i < GHASH_POW_BITS (squared as tc's ghash_square_iter does).
 struct engine_key {
   struct gf128_table ht;
   struct gf128 pow[GHASH_POW_BITS];
@@ -1110,13 +1119,13 @@ static void engine_key_init(struct engine_key *k, const struct gf128 *h) {
   k->pow[0] = *h;
   for (int i = 1; i < GHASH_POW_BITS; i++) {
     k->pow[i] = k->pow[i - 1];
-    gf128_mul_by(&k->pow[i], &k->pow[i - 1], &scratch, rem4);
+    mul_by(&k->pow[i], &k->pow[i - 1], &scratch);
   }
 }
 
 // The tag delta of a patch, step by step as tc_ghash_update's callbacks run
-// it: one ghash_horner_step per block of the span, one ghash_pow_step per
-// exponent bit. delta is a window of win_mask + 1 bytes (see
+// it: one Horner step per block of the span (ghash_horner_iter), one multiply
+// per set exponent bit (ghash_pow_iter). delta is a window of win_mask + 1 bytes (see
 // ghash_block_delta64). Returns 0 when ghash_span_plan refuses the patch.
 static int engine_span_delta(const struct engine_key *k, const __u8 *delta,
                              __u32 win_mask, __u32 sec_off, __u32 len,
@@ -1128,11 +1137,13 @@ static int engine_span_delta(const struct engine_key *k, const __u8 *delta,
   for (__u32 i = 0; i < s.count; i++) {
     struct gf128 d;
     ghash_block_delta64(delta, win_mask, s.first + i, sec_off, len, &d);
-    ghash_horner_step(&acc, &d, &k->ht, rem4);
+    gf_xor(&acc, &d);
+    gf128_table_mul(&acc, &k->ht, rem4);
   }
   struct gf128_table scratch;
   for (__u32 bit = 0; bit < GHASH_POW_BITS; bit++)
-    ghash_pow_step(&acc, s.exp, bit, &k->pow[bit], &scratch, rem4);
+    if ((s.exp >> bit) & 1)
+      mul_by(&acc, &k->pow[bit], &scratch);
   *out = acc;
   return 1;
 }
