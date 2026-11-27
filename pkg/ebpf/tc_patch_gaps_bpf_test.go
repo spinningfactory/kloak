@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 
 	ciliumebpf "github.com/cilium/ebpf"
@@ -22,25 +24,89 @@ import (
 // The tests in this file pin down the gaps kloak#383 found in today's data
 // plane, which secrets longer than a few hundred bytes run into all the
 // time: a write or a record cut across TCP segments, records, writes or
-// retransmissions. Each one checks that the receiver gets a record it can
-// use: patched, or left as the TLS library wrote it (the placeholder goes
-// out, the request fails, nothing is corrupted). Where tc corrupts records
-// today, the test skips, saying which phase of kloak#383 fixes it, as long
-// as it sees exactly the corruption observed when it was written; any
-// other unsafe outcome fails.
+// retransmissions. Each scenario names the phase of kloak#383 by which the
+// receiver must get a record it can use (safe: patched, or left as the TLS
+// library wrote it, the placeholder going out and nothing corrupted), and
+// the phase by which it must get it patched. A phase counts as landed when
+// a marker of it is in the build under test (gapPhase), so the tests follow
+// whatever order the phases are merged in: once a phase has landed, its
+// scenarios fail on any outcome short of what it promises, which keeps a
+// regression from hiding behind the skip of the gap it brings back. Before
+// it lands, a scenario that corrupts records skips, saying which phase
+// fixes it, as long as it sees exactly the corruption observed when it was
+// written; any other unsafe outcome fails.
 
-// gapCheck judges the outcome of a gap's scenario: today is what the
-// receiver got when the test was written, phase the step of kloak#383 that
-// closes the gap.
-func gapCheck(t *testing.T, v tcVerdict, phase, scenario string, today ...recState) {
+// gapPhase is a step of kloak#383 that closes gaps, and how the tests tell
+// it is in the build: something it adds to the BPF objects or the debug
+// counters.
+type gapPhase struct {
+	name   string
+	landed func() bool
+}
+
+// tlsuprobeSpec is the build's BPF objects, read once.
+var tlsuprobeSpec = sync.OnceValues(loadTlsuprobe)
+
+// specReads reports whether a program of the build reads the map.
+func specReads(m string) bool {
+	spec, err := tlsuprobeSpec()
+	if err != nil {
+		return false
+	}
+	for _, p := range spec.Programs {
+		for _, ins := range p.Instructions {
+			if ins.Reference() == m {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func specHasMap(m string) bool {
+	spec, err := tlsuprobeSpec()
+	return err == nil && spec.Maps[m] != nil
+}
+
+var (
+	// What the data plane already does: required today.
+	phaseNow = gapPhase{"today's data plane", func() bool { return true }}
+	// Phase 0: tc refuses a patch that does not lie inside its record's
+	// application data; the uprobe refuses a placeholder cut at the end
+	// of its write. Each refusal has its debug counter.
+	phase0TC = gapPhase{"phase 0 (tc refuses patches outside their record)",
+		func() bool { return slices.Contains(debugCounterNames, "tc_patch_out_of_record") }}
+	phase0Uprobe = gapPhase{"phase 0 (the uprobe refuses placeholders cut at the end of a write)",
+		func() bool { return slices.Contains(debugCounterNames, "xor_placeholder_cut") }}
+	// Phase 1: placeholders verified, whole, against the secret store,
+	// which the data plane then reads (secret-store defines it earlier).
+	phase1 = gapPhase{"phase 1 (placeholders verified against the secret store)",
+		func() bool { return specReads("secret_chunks") }}
+	// Phase 2: the tc ledger, with its per-socket state (ledger_sk,
+	// notes/ledger-design.md).
+	phase2 = gapPhase{"phase 2 (the tc ledger)", func() bool { return specHasMap("ledger_sk") }}
+	// Phase 3: patches across records and writes.
+	// TODO(kloak#383): phase 3's marker, once its design names what it
+	// adds. Until then its scenarios only have to be safe.
+	phase3 = gapPhase{"phase 3 (patches across records and writes)", func() bool { return false }}
+)
+
+// gapCheck judges the outcome of a gap's scenario: it must be safe once
+// safeBy has landed, and patched once patchedBy has; today is what the
+// receiver got when the test was written, before safeBy.
+func gapCheck(t *testing.T, v tcVerdict, safeBy, patchedBy gapPhase, scenario string, today ...recState) {
 	t.Helper()
 	switch {
+	case patchedBy.landed() && !v.patched():
+		t.Errorf("%s: %s is in this build, so the record must be patched: %s", scenario, patchedBy.name, v)
 	case v.patched():
 		t.Logf("%s: patched (%s)", scenario, v)
-	case v.is(today...) && !v.safe():
-		t.Skipf("kloak#383 %s: %s: %s", phase, scenario, v)
 	case v.safe():
-		t.Logf("%s: not patched, but nothing is corrupted (kloak#383 %s patches it): %s", scenario, phase, v)
+		t.Logf("%s: not patched, but nothing is corrupted (kloak#383 %s patches it): %s", scenario, patchedBy.name, v)
+	case safeBy.landed():
+		t.Errorf("%s: %s is in this build, yet the receiver gets a corrupted record: %s", scenario, safeBy.name, v)
+	case v.is(today...):
+		t.Skipf("kloak#383 %s: %s: %s", safeBy.name, scenario, v)
 	default:
 		t.Errorf("%s: %s; when this test was written: %v", scenario, v, today)
 	}
@@ -105,18 +171,18 @@ func TestTCPatchGapPastMatchedRecord(t *testing.T) {
 		c := gapConn(t, vers, 100+i)
 		first := goRecordLens(vers, 1<<20)[0]
 		for _, tc := range []struct {
-			name     string
-			off, n   int
-			split    bool // each record in its own segment
-			today    []recState
-			phaseFix string
+			name              string
+			off, n            int
+			split             bool // each record in its own segment
+			safeBy, patchedBy gapPhase
+			today             []recState
 		}{
-			{"placeholder in record 2, one segment", first + 300, 24, false, []recState{recOriginal, recBadTag}, "phase 0 (refuse) / phase 3 (patch)"},
-			{"128-byte placeholder in record 2, one segment", first + 300, maxPatchLen, false, []recState{recOriginal, recBadTag}, "phase 0 (refuse) / phase 3 (patch)"},
-			{"placeholder across the records, one segment", first - 10, 24, false, []recState{recBadTag, recOriginal}, "phase 0 (refuse) / phase 3 (patch)"},
-			{"placeholder in record 2, a segment per record", first + 300, 24, true, nil, "phase 3"},
+			{"placeholder in record 2, one segment", first + 300, 24, false, phase0TC, phase3, []recState{recOriginal, recBadTag}},
+			{"128-byte placeholder in record 2, one segment", first + 300, maxPatchLen, false, phase0TC, phase3, []recState{recOriginal, recBadTag}},
+			{"placeholder across the records, one segment", first - 10, 24, false, phase0TC, phase3, []recState{recBadTag, recOriginal}},
+			{"placeholder in record 2, a segment per record", first + 300, 24, true, phaseNow, phase3, nil},
 			// Its own segment holds the first record's tag, which the patch runs over.
-			{"placeholder across the records, a segment per record", first - 10, 24, true, []recState{recBadTag, recOriginal}, "phase 0 (refuse) / phase 3 (patch)"},
+			{"placeholder across the records, a segment per record", first - 10, 24, true, phase0TC, phase3, []recState{recBadTag, recOriginal}},
 		} {
 			t.Run(fmt.Sprintf("%s/%s", tls.VersionName(vers), tc.name), func(t *testing.T) {
 				rng := rand.New(rand.NewPCG(1, uint64(tc.off)))
@@ -133,7 +199,7 @@ func TestTCPatchGapPastMatchedRecord(t *testing.T) {
 					cuts = []int{len(recs[0].wire)}
 				}
 				out := c.send(t, c.segments(stream, recs[0].seq, cuts...)...)
-				gapCheck(t, c.judge(t, out, recs, want), tc.phaseFix, tc.name, tc.today...)
+				gapCheck(t, c.judge(t, out, recs, want), tc.safeBy, tc.patchedBy, tc.name, tc.today...)
 			})
 		}
 	}
@@ -157,12 +223,13 @@ func TestTCPatchGapTruncatedPlaceholder(t *testing.T) {
 			in               int // bytes of the placeholder in the first write
 			n                int
 			oneSegment       bool // both writes' records leave in one segment
+			safeBy           gapPhase
 			today12, today13 []recState
 		}{
-			{"12 of 24 bytes", 12, 24, false, []recState{recBadTag, recOriginal}, []recState{recBadTag, recOriginal}},
-			{"23 of 24 bytes", 23, 24, false, []recState{recBadTag, recOriginal}, []recState{recWrong, recOriginal}},
-			{"8 of 128 bytes", 8, maxPatchLen, false, nil, nil},
-			{"8 of 128 bytes, one segment", 8, maxPatchLen, true, []recState{recBadTag, recBadTag}, []recState{recBadTag, recBadTag}},
+			{"12 of 24 bytes", 12, 24, false, phase0TC, []recState{recBadTag, recOriginal}, []recState{recBadTag, recOriginal}},
+			{"23 of 24 bytes", 23, 24, false, phase0TC, []recState{recBadTag, recOriginal}, []recState{recWrong, recOriginal}},
+			{"8 of 128 bytes", 8, maxPatchLen, false, phaseNow, nil, nil},
+			{"8 of 128 bytes, one segment", 8, maxPatchLen, true, phase0TC, []recState{recBadTag, recBadTag}, []recState{recBadTag, recBadTag}},
 		} {
 			today := tc.today13
 			if vers == tls.VersionTLS12 {
@@ -183,7 +250,7 @@ func TestTCPatchGapTruncatedPlaceholder(t *testing.T) {
 					cuts = []int{len(recs[0].wire)}
 				}
 				out := c.send(t, c.segments(concatRecords(recs...), recs[0].seq, cuts...)...)
-				gapCheck(t, c.judge(t, out, recs, want), "phase 0 (refuse) / phase 3 (continuation across writes)", tc.name, today...)
+				gapCheck(t, c.judge(t, out, recs, want), tc.safeBy, phase3, tc.name, today...)
 			})
 		}
 	}
@@ -213,7 +280,7 @@ func TestTCPatchGapPatchAcrossSegments(t *testing.T) {
 				r := c.seal(write)
 				c.stage(t, r.seq, len(write), p)
 				out := c.send(t, c.segments(r.wire, r.seq, tcMSS)...)
-				gapCheck(t, c.judge(t, out, []tcRecord{r}, [][]byte{tcPatched(write, p)}), "phase 2", tc.name, recOriginal)
+				gapCheck(t, c.judge(t, out, []tcRecord{r}, [][]byte{tcPatched(write, p)}), phaseNow, phase2, tc.name)
 			})
 		}
 	}
@@ -228,14 +295,15 @@ func TestTCPatchGapSplitTag(t *testing.T) {
 	for i, vers := range gapVersions {
 		c := gapConn(t, vers, 130+i)
 		for _, tc := range []struct {
-			name     string
-			writeLen int
-			cuts     func(wireLen int) []int
-			today    []recState
+			name              string
+			writeLen          int
+			cuts              func(wireLen int) []int
+			safeBy, patchedBy gapPhase
+			today             []recState
 		}{
-			{"tag whole in segment 2", 1500, func(n int) []int { return []int{n - 16} }, nil},
-			{"tag across segments 1 and 2", 1500, func(n int) []int { return []int{n - 8} }, []recState{recBadTag}},
-			{"tag across segments 2 and 3", 2500, func(n int) []int { return []int{tcMSS, n - 5} }, []recState{recBadTag}},
+			{"tag whole in segment 2", 1500, func(n int) []int { return []int{n - 16} }, phaseNow, phaseNow, nil},
+			{"tag across segments 1 and 2", 1500, func(n int) []int { return []int{n - 8} }, phase2, phase2, []recState{recBadTag}},
+			{"tag across segments 2 and 3", 2500, func(n int) []int { return []int{tcMSS, n - 5} }, phase2, phase2, []recState{recBadTag}},
 		} {
 			t.Run(fmt.Sprintf("%s/%s", tls.VersionName(vers), tc.name), func(t *testing.T) {
 				rng := rand.New(rand.NewPCG(4, uint64(tc.writeLen)))
@@ -245,10 +313,7 @@ func TestTCPatchGapSplitTag(t *testing.T) {
 				c.stage(t, r.seq, len(write), p)
 				out := c.send(t, c.segments(r.wire, r.seq, tc.cuts(len(r.wire))...)...)
 				v := c.judge(t, out, []tcRecord{r}, [][]byte{tcPatched(write, p)})
-				if tc.today == nil && !v.patched() {
-					t.Errorf("not patched: %s", v)
-				}
-				gapCheck(t, v, "phase 2", tc.name, tc.today...)
+				gapCheck(t, v, tc.safeBy, tc.patchedBy, tc.name, tc.today...)
 			})
 		}
 	}
@@ -274,7 +339,7 @@ func TestTCPatchGapRetransmit(t *testing.T) {
 			if v := c.judge(t, c.send(t, frames...), []tcRecord{r}, want); !v.patched() {
 				t.Fatalf("first transmission: %s", v)
 			}
-			gapCheck(t, c.judge(t, c.send(t, frames...), []tcRecord{r}, want), "phase 2", "the retransmission", recOriginal)
+			gapCheck(t, c.judge(t, c.send(t, frames...), []tcRecord{r}, want), phaseNow, phase2, "the retransmission")
 		})
 		for _, tc := range []struct {
 			name  string
@@ -301,7 +366,7 @@ func TestTCPatchGapRetransmit(t *testing.T) {
 				for _, s := range tc.again {
 					got[s] = c.send(t, frames[s])
 				}
-				gapCheck(t, c.judge(t, append(append([]byte{}, got[0]...), got[1]...), []tcRecord{r}, want), "phase 2", tc.name, tc.today...)
+				gapCheck(t, c.judge(t, append(append([]byte{}, got[0]...), got[1]...), []tcRecord{r}, want), phase2, phase2, tc.name, tc.today...)
 			})
 		}
 		t.Run(tls.VersionName(vers)+"/two segments, retransmitted as one", func(t *testing.T) {
@@ -313,7 +378,7 @@ func TestTCPatchGapRetransmit(t *testing.T) {
 			_ = c.send(t, c.segments(r.wire, r.seq, tcMSS)...)
 			// tcp_retrans_try_collapse merges segments of the queue.
 			out := c.send(t, c.segments(r.wire, r.seq)...)
-			gapCheck(t, c.judge(t, out, []tcRecord{r}, [][]byte{tcPatched(write, p)}), "phase 2", "the collapsed retransmission", recOriginal)
+			gapCheck(t, c.judge(t, out, []tcRecord{r}, [][]byte{tcPatched(write, p)}), phaseNow, phase2, "the collapsed retransmission")
 		})
 	}
 }
@@ -333,10 +398,11 @@ func TestTCPatchGapSecondWrite(t *testing.T) {
 		for _, tc := range []struct {
 			name     string
 			anchored bool
+			safeBy   gapPhase
 			today    []recState
 		}{
-			{"socket BIO", true, []recState{recOriginal, recPatched}},
-			{"memory BIO", false, []recState{recWrong, recOriginal}},
+			{"socket BIO", true, phaseNow, nil},
+			{"memory BIO", false, phase2, []recState{recWrong, recOriginal}},
 		} {
 			t.Run(fmt.Sprintf("%s/%s", tls.VersionName(vers), tc.name), func(t *testing.T) {
 				rng := rand.New(rand.NewPCG(6, 1))
@@ -354,7 +420,7 @@ func TestTCPatchGapSecondWrite(t *testing.T) {
 				stream := concatRecords(r1, r2)
 				out := c.send(t, c.segments(stream, r1.seq, len(r1.wire))...)
 				v := c.judge(t, out, []tcRecord{r1, r2}, [][]byte{tcPatched(w1, p1), tcPatched(w2, p2)})
-				gapCheck(t, v, "phase 2", tc.name, tc.today...)
+				gapCheck(t, v, tc.safeBy, phase2, tc.name, tc.today...)
 			})
 		}
 	}
@@ -387,8 +453,12 @@ func TestXorPathTruncatedPlaceholder(t *testing.T) {
 				if int(off+n) <= len(payload) {
 					t.Fatalf("staged %d bytes at %d, in a %d-byte write: the placeholder is cut there", n, off, len(payload))
 				}
-				t.Skipf("kloak#383 phase 0 (refuse) / phase 3 (continuation across writes): staged %d bytes at offset %d of a %d-byte write, %d past its end",
-					n, off, len(payload), int(off+n)-len(payload))
+				if phase0Uprobe.landed() {
+					t.Fatalf("%s is in this build, yet %d bytes are staged at offset %d of a %d-byte write, %d past its end",
+						phase0Uprobe.name, n, off, len(payload), int(off+n)-len(payload))
+				}
+				t.Skipf("kloak#383 %s: staged %d bytes at offset %d of a %d-byte write, %d past its end",
+					phase0Uprobe.name, n, off, len(payload), int(off+n)-len(payload))
 			})
 		}
 	}
@@ -488,8 +558,12 @@ func TestXorPathPlaceholderAcrossFrames(t *testing.T) {
 			if off != len(tc.head) || off+n <= framingAt {
 				t.Fatalf("staged %d bytes at %d: not the placeholder at %d", n, off, len(tc.head))
 			}
-			t.Skipf("kloak#383 phase 1 (verify the whole placeholder against the store): staged %d bytes at offset %d, over the %d framing bytes at %d",
-				n, off, len(tc.framing), framingAt)
+			if phase1.landed() {
+				t.Fatalf("%s is in this build, yet %d bytes are staged at offset %d, over the %d framing bytes at %d",
+					phase1.name, n, off, len(tc.framing), framingAt)
+			}
+			t.Skipf("kloak#383 %s: staged %d bytes at offset %d, over the %d framing bytes at %d",
+				phase1.name, n, off, len(tc.framing), framingAt)
 		})
 	}
 }
