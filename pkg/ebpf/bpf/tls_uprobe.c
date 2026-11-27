@@ -2016,6 +2016,10 @@ static int ghash_block_iter(__u32 block_idx, void *_unused) {
   return 0;
 }
 
+// The most GHASH blocks a patch spans: SECRET_MAX_LEN bytes starting at the
+// last byte of a block reach (SECRET_MAX_LEN + 15) / 16 blocks past it.
+#define GHASH_PATCH_MAX_BLOCKS ((SECRET_MAX_LEN + 15) / 16 + 1)
+
 // bpf_loop callback: process one patch for GHASH tag recomputation.
 // Replaces the unrolled for-loop over patches in tc_ghash_update to keep
 // verifier complexity O(1) per patch instead of O(XOR_MAX_PATCHES).
@@ -2039,7 +2043,7 @@ static int ghash_patch_iter(__u32 p, void *_unused) {
   w->ghash_first_block = sec_off / 16;
 
   __u32 num_blocks = (sec_off + sec_len - 1) / 16 - w->ghash_first_block + 1;
-  if (num_blocks > 9) num_blocks = 9;
+  if (num_blocks > GHASH_PATCH_MAX_BLOCKS) num_blocks = GHASH_PATCH_MAX_BLOCKS;
 
   bpf_loop(num_blocks, ghash_block_iter, NULL, 0);
   return 0;

@@ -92,6 +92,14 @@ HELPER_INLINE int hosts_match(const char *a, const char *b) {
   return 1;
 }
 
+// SECRET_MAX_LEN bounds every patch, and the code masks offsets into a
+// patch with SECRET_MAX_LEN - 1 (clamp_write_len, patch_delta,
+// ghash_block_delta), which only bounds them for a power of two. A multiple
+// of 8 keeps the arrays sized by it 8-byte aligned in the structs they sit in.
+_Static_assert(SECRET_MAX_LEN > 0 && (SECRET_MAX_LEN & (SECRET_MAX_LEN - 1)) == 0,
+               "SECRET_MAX_LEN must be a power of two");
+_Static_assert(SECRET_MAX_LEN % 8 == 0, "SECRET_MAX_LEN must be a multiple of 8");
+
 // Clamp a secret value length to [1, SECRET_MAX_LEN] using bitwise arithmetic.
 // For val_len in [1, SECRET_MAX_LEN], returns val_len unchanged.
 // val_len == 0 returns SECRET_MAX_LEN (unsigned underflow wraps).
