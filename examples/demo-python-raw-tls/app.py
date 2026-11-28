@@ -60,7 +60,16 @@ def send_and_echo(host, server_name, secret_allowed, secret_blocked):
         with ctx.wrap_socket(sock, server_hostname=server_name) as tls:
             payload = f"ALLOWED={secret_allowed}\nBLOCKED={secret_blocked}\n"
             tls.sendall(payload.encode())
-            return tls.recv(16384).decode()
+            # The whole echo, up to the server's close: a payload larger
+            # than a TLS record (16 KiB) comes back in several records, and
+            # one recv returns one record at most.
+            echo = []
+            while True:
+                data = tls.recv(65536)
+                if not data:
+                    break
+                echo.append(data)
+            return b"".join(echo).decode()
 
 
 def main():

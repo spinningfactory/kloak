@@ -4,6 +4,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -130,6 +131,86 @@ func TestEBPFHttp2HpackOverPadding(t *testing.T) {
 
 	if strings.Contains(out, "REAL-BLOCKED-KEY-67890") {
 		t.Errorf("blocked secret leaked despite host mismatch — host filtering regressed")
+	}
+}
+
+// e2eHTTP2SecretLengths are the lengths TestEBPFSecretLengthsHTTP2 tries.
+// Longer values are left out: demo-go sends the allowed value twice and the
+// blocked one once, and past ~6 KiB their HPACK encodings no longer fit one
+// 16 KiB HEADERS frame. Go's framer cuts the header block into CONTINUATION
+// frames, so a 9-byte frame header can land inside a placeholder's bytes.
+// TODO(kloak#383): frame-aware matching, which skips the 9-byte frame
+// header between a HEADERS frame and its CONTINUATION frames when it
+// compares and patches a placeholder. Until then this is a documented
+// limit: such a placeholder must go out unpatched, not corrupted
+// (TestXorPathPlaceholderAcrossFrames in pkg/ebpf).
+var e2eHTTP2SecretLengths = []int{8, 12, 64, 127, 128, 129, 1024, 4096}
+
+// TestEBPFSecretLengthsHTTP2 is TestEBPFSecretLengths over HTTP/2: demo-go
+// (Go crypto/tls) sends the secrets as headers to the in-cluster echo, so
+// the placeholders on the wire are HPACK-Huffman-coded. Each allowed value
+// must come back whole; cases longer than this build takes skip. A
+// placeholder whose Huffman code is shorter than a BPF key (8 bytes: an
+// 8-byte value) has no HTTP/2 entry in secret_map (huffmanEntry in
+// pkg/ebpf/sync.go), a documented limit: it must come back as the shadow.
+func TestEBPFSecretLengthsHTTP2(t *testing.T) {
+	for _, n := range e2eHTTP2SecretLengths {
+		allowed, blocked := secretOfLen("SECRET", n), secretOfLen("BLOCKE", n)
+		t.Run(fmt.Sprintf("%dbytes", n), func(t *testing.T) {
+			skipLongerThanSupported(t, n)
+			gcCtx, gcCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer gcCancel()
+			_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-allowed-kloak")
+			_ = waitForSecretAbsent(gcCtx, testNamespace, "secret-blocked-kloak")
+
+			allowedData := map[string][]byte{"api-key": []byte(allowed)}
+			blockedData := map[string][]byte{"api-key": []byte(blocked)}
+			echoFQDN := deployHTTPEchoServer(t)
+			createEnabledSecret(t, "secret-allowed", allowedData, nil, map[string]string{
+				"getkloak.io/hosts": echoFQDN,
+			})
+			createEnabledSecret(t, "secret-blocked", blockedData, nil, map[string]string{
+				"getkloak.io/hosts": "example.com",
+			})
+			shadow := string(assertShadowSecret(t, "secret-allowed", allowedData)["api-key"])
+			assertShadowSecret(t, "secret-blocked", blockedData)
+
+			demoManifest := filepath.Join(repoRoot, "examples", "demo-go", "deployment.yaml")
+			if err := applyManifestTransformed(t, demoManifest, httpEchoTargetURL(echoFQDN)); err != nil {
+				t.Fatalf("failed to deploy demo-go: %v", err)
+			}
+			t.Cleanup(func() {
+				if out, err := kubectl("delete", "-f", demoManifest, "-n", testNamespace, "--ignore-not-found"); err != nil {
+					t.Logf("demo-go cleanup failed: %v\n%s", err, out)
+				}
+			})
+			ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+			defer cancel()
+			if err := waitForDeploymentReady(ctx, testNamespace, "demo-go"); err != nil {
+				t.Fatalf("demo-go not ready: %v", err)
+			}
+
+			// The echo is the request's headers as JSON: the whole value,
+			// as the header's JSON member. The shadow has the real value's
+			// Huffman bit length.
+			want := `"X-Secret-Allowed":"` + allowed + `"`
+			tooShort := (secrets.HuffmanBits(allowed)+7)/8 < secrets.ShadowPrefixLen
+			if tooShort {
+				want = `"X-Secret-Allowed":"` + shadow + `"`
+			}
+			pollCtx, pollCancel := context.WithTimeout(context.Background(), 180*time.Second)
+			defer pollCancel()
+			out := pollDemoLogs(t, pollCtx, "app=demo-go", fmt.Sprintf("http2-length-%d", n),
+				fmt.Sprintf("demo-go's echo never carried the %d-byte case's %s", n, want[:min(len(want), 60)]),
+				func(s string) bool { return strings.Contains(s, want) })
+			t.Logf("=== demo-go (HTTP/2, %d bytes) logs ===\n%s", n, clipLog(out))
+			if tooShort && strings.Contains(out, allowed) {
+				t.Errorf("the %d-byte secret's Huffman code is shorter than a BPF key, yet it was rewritten", n)
+			}
+			if blockedCheck := blocked[:min(len(blocked), 20)]; strings.Contains(out, blockedCheck) {
+				t.Errorf("blocked secret (%d bytes) leaked despite the host mismatch: %q found", n, blockedCheck)
+			}
+		})
 	}
 }
 
