@@ -350,7 +350,7 @@ func BenchmarkTCGhash(b *testing.B) {
 		}
 		b.Skipf("eBPF objects not available: %v", err)
 	}
-	defer objs.Close()
+	defer func() { _ = objs.Close() }()
 	if err := objs.TcProgArray.Put(uint32(0), uint32(objs.TcGhashUpdate.FD())); err != nil {
 		b.Fatal(err)
 	}
