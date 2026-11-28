@@ -288,7 +288,7 @@ static __always_inline void report_secret_event(const struct secret_key *key,
 }
 
 // Debug counters for diagnosing the data plane.
-// Index: see DBG_* constants below; debugCounterNames in uprobe.go must match.
+// Index: see DBG_* constants below; dataplaneEvents in dataplane_metrics.go must match.
 enum {
   DBG_XOR_CONN_CHECK = 0,         // entry uprobe checked tls_conn_state
   DBG_XOR_CONN_HIT,           // tls_conn_state found + AES-GCM confirmed

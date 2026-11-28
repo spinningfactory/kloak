@@ -90,6 +90,7 @@ spec:
             - --node-lock=/run/kloak/lock
             - --secret-store-bytes={{ include "kloak.bytes" (.Values.controller.ebpf.secretStoreBytes | default "16Mi") }}
             - --max-secret-length={{ include "kloak.bytes" (.Values.secrets.maxLength | default "64Ki") }}
+            - --metrics-bind-address={{ if .Values.controller.metrics.port }}:{{ .Values.controller.metrics.port }}{{ else }}0{{ end }}
           env:
             - name: POD_NAME
               valueFrom:
@@ -116,6 +117,10 @@ spec:
           ports:
             - name: health
               containerPort: 8081
+            {{- if .Values.controller.metrics.port }}
+            - name: metrics
+              containerPort: {{ .Values.controller.metrics.port }}
+            {{- end }}
           volumeMounts:
             - name: cgroup
               mountPath: /host/sys/fs/cgroup

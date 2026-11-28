@@ -272,6 +272,54 @@ Authorization: Bearer kl::q7XmB2rTa9
 Authorization: Bearer sk-live-xyz123
 ```
 
+## Metrics
+
+Each controller pod serves Prometheus metrics for its node at `/metrics` on its `metrics` port (8080; Helm `controller.metrics.port`, `0` disables it), with controller-runtime's own metrics.
+
+| Metric | Type | |
+|---|---|---|
+| `kloak_dataplane_events_total{event, class}` | counter | What the node's eBPF data plane counted, summed over CPUs: one series per event. |
+| `kloak_secret_store_capacity_chunks` | gauge | Chunks the node's secret store holds at most (`controller.ebpf.secretStoreBytes`). |
+| `kloak_secret_store_used_chunks` | gauge | Chunks in use, the previous values of changed secrets included for 30 s. |
+| `kloak_secret_store_refused_entries{reason}` | gauge | Secret entries the last sync left out of the data plane: `full` (no room), `too_long` (longer than `secrets.maxLength` or what the data plane takes). Their placeholders go out unchanged. |
+
+The data plane's counters live in a pinned BPF map: they carry on across controller restarts that keep the data plane, and start again at 0 when it is loaded again (an upgrade that changes the eBPF programs), which `rate()` and `increase()` take as a counter reset.
+
+Each event has a `class`. Alert on the first three:
+
+| Class | Meaning | Events |
+|---|---|---|
+| `unrewritten` | A placeholder went out without its real value because of a failure or a limit: kloak fails closed, and the request carrying it fails upstream. | `kprobe_bridge_h_fail` (no GCM key for the connection: the write's placeholders go out as they are), `vip_dns_unchanged` (a DNS answer for a watched host kept its real addresses: the pod's connections to it get no host-restricted secret) |
+| `dropped` | A packet the data plane dropped. | none yet |
+| `refused` | The policy refused a rewrite, or a connect to a virtual IP: expected for a workload that uses a secret it should not, or sends it elsewhere. | `secret_binding_deny` (a pod redeemed a placeholder of a secret it does not reference; the controller logs which), `sni_deny` (the connection's SNI is not the secret's host), `vip_sock_host_deny` / `vip_sock_addr_deny` (the connection did not go to the secret's host, IP or port), `vip_connect_refused` (a connect to a virtual IP with no address known yet) |
+| `audit` | What `--secret-binding=audit` or `--sni-check=audit` let through, and enforcing would refuse. | `secret_binding_audit`, `sni_audit` |
+| `info` | The data plane's normal work (`tc_patched`: records rewritten), and diagnostics of its steps. | the rest |
+
+Select by class rather than by event: new failure modes join their class. Sample alerts (`pod` is the controller pod, one per node):
+
+```yaml
+groups:
+  - name: kloak
+    rules:
+      - alert: KloakPlaceholdersNotRewritten
+        expr: sum by (pod, event) (increase(kloak_dataplane_events_total{class=~"unrewritten|dropped"}[10m])) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "kloak on {{ $labels.pod }}: {{ $labels.event }}: placeholders went out without their real values"
+      - alert: KloakRewritesRefused
+        expr: sum by (pod, event) (increase(kloak_dataplane_events_total{class="refused"}[10m])) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: "kloak on {{ $labels.pod }} refused rewrites: {{ $labels.event }} (see the controller's log)"
+      - alert: KloakSecretStoreFull
+        expr: max by (pod) (kloak_secret_store_refused_entries{reason="full"}) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: "kloak on {{ $labels.pod }}: secrets left out of a full store (raise controller.ebpf.secretStoreBytes)"
+```
+
+With the Prometheus Operator, a `PodMonitor` selecting the controller pods (`app.kubernetes.io/component: controller`) on the `metrics` port scrapes them.
+
 ## Development
 
 ```bash
