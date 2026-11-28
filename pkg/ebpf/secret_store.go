@@ -109,14 +109,15 @@ type storeEntry struct {
 }
 
 // newStoreEntry returns the entry of a placeholder as on the wire, shadow,
-// and the real value as on the wire, of the same length. padBits low bits
-// of the last byte are what follows the placeholder: its delta leaves them.
-func newStoreEntry(key secretKey, val *secretValue, shadow, real []byte, padBits uint8) storeEntry {
+// and the real value as on the wire, realWire, of the same length. padBits
+// low bits of the last byte are what follows the placeholder: its delta
+// leaves them.
+func newStoreEntry(key secretKey, val *secretValue, shadow, realWire []byte, padBits uint8) storeEntry {
 	e := storeEntry{key: key, val: *val, chunks: make([]secretChunk, chunkCount(len(shadow)))}
 	for i := range shadow {
 		c := &e.chunks[i/secretChunkLen]
 		c.Shadow[i%secretChunkLen] = shadow[i]
-		c.Delta[i%secretChunkLen] = shadow[i] ^ real[i]
+		c.Delta[i%secretChunkLen] = shadow[i] ^ realWire[i]
 	}
 	if n := len(shadow); n > 0 {
 		e.chunks[(n-1)/secretChunkLen].Delta[(n-1)%secretChunkLen] &= patchTailMask(padBits)
@@ -313,7 +314,8 @@ func (s *secretStore) apply(snapshot []secrets.Secret, now time.Time) (map[strin
 	want, hosts, tooLong := s.desired(snapshot)
 	full := 0
 	written := 0
-	for _, e := range want {
+	for i := range want {
+		e := &want[i]
 		key := e.key
 		cur, ok := s.entries[key]
 		if ok && cur.valid && cur.sum == e.sum {
