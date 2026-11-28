@@ -97,3 +97,30 @@ func GF128HPower(h [16]byte, power uint32) [16]byte {
 	}
 	return result
 }
+
+// GHASHSpanDelta returns the tag delta of XORing delta into a record's
+// ciphertext at byte secOff, the record holding ctLen ciphertext bytes (TLS
+// 1.2's explicit nonce and the tag excluded), as tc's GHASH engine computes
+// it (ghash_span_plan in helpers.h, ghash_horner_iter / ghash_pow_iter in tc):
+// Horner's rule over the blocks first..last that the patch changes, then one
+// multiplication by H^(n - last), n being the record's block count. Ciphertext
+// block b enters the tag as D_b * H^(n + 1 - b) (GHASHIncrementalDelta), and
+// the Horner sum holds D_b * H^(last + 1 - b). The patch must lie inside the
+// ciphertext.
+func GHASHSpanDelta(h [16]byte, ctLen, secOff int, delta []byte) [16]byte {
+	if len(delta) == 0 || secOff < 0 || secOff+len(delta) > ctLen {
+		panic("GHASHSpanDelta: patch outside the ciphertext")
+	}
+	first, last := secOff/16, (secOff+len(delta)-1)/16
+	var acc [16]byte
+	for b := first; b <= last; b++ {
+		for i := range acc {
+			if d := b*16 + i - secOff; d >= 0 && d < len(delta) {
+				acc[i] ^= delta[d]
+			}
+		}
+		acc = GF128Mul(acc, h)
+	}
+	n := (ctLen + 15) / 16
+	return GF128Mul(acc, GF128HPower(h, uint32(n-last)))
+}

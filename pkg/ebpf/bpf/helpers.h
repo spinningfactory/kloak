@@ -93,8 +93,8 @@ HELPER_INLINE int hosts_match(const char *a, const char *b) {
 }
 
 // SECRET_MAX_LEN bounds every patch, and the code masks offsets into a
-// patch with SECRET_MAX_LEN - 1 (clamp_write_len, patch_delta,
-// ghash_block_delta), which only bounds them for a power of two. A multiple
+// patch with SECRET_MAX_LEN - 1 (clamp_write_len, patch_delta, the inline
+// window of ghash_block_delta64), which only bounds them for a power of two. A multiple
 // of 8 keeps the arrays sized by it 8-byte aligned in the structs they sit in.
 _Static_assert(SECRET_MAX_LEN > 0 && (SECRET_MAX_LEN & (SECRET_MAX_LEN - 1)) == 0,
                "SECRET_MAX_LEN must be a power of two");
@@ -190,7 +190,7 @@ HELPER_INLINE __u8 patch_tail_mask(__u8 pad_bits) {
 // real is zero past len (sync copies only the secret), so the bytes of buf
 // past the placeholder are left as they are. They are never applied anyway:
 // tc stores back only len bytes, and the GHASH delta masks the rest
-// (ghash_block_delta).
+// (ghash_block_delta64).
 //
 // The last byte is prepared before the loop rather than masked after it: its
 // bits after the placeholder are set to real's, which the loop's XOR then
@@ -215,145 +215,6 @@ HELPER_INLINE void patch_delta(__u8 buf[SECRET_MAX_LEN],
 // irreducible polynomial x^128 + x^7 + x^2 + x + 1 (R = 0xe1000...0).
 // Reference: NIST SP 800-38D Section 6.3.
 // ============================================================================
-
-// One of the 128 steps of a GF(2^128) multiply, for bit i of a (MSB-first:
-// bit 0 is the MSB of byte 0): z ^= v if the bit is set, then v = v * x, a
-// 1-bit right shift that folds the bit shifted out of v[15] back in as R.
-// Start with z = 0 and v = b; after steps 0..127, z = a * b.
-//
-// The loop is fully unrolled, so every index is a constant: left as a loop,
-// clang walks v with a pointer offset by a negative constant, which the
-// verifier rejects as an unbounded access since Linux 7.2 (it now keeps a
-// pointer's constant offset in its variable bounds). It is one pass with no
-// branch on the bit: with the branch, clang loads all of v ahead of it and
-// spills it, which takes the BPF callback's stack frame from 8 bytes to 144.
-// The reduction stays a branch, where the verifier can prune the callback's
-// repeated visits once i is dead: made branch-free too, it cost Linux 7.2's
-// verifier 60K more instructions in tc_ghash_update.
-HELPER_INLINE void gf128_mul_step(const __u8 a[16], __u8 v[16], __u8 z[16],
-                                  __u32 i) {
-  // The masks keep the index bounded for the verifier (i < 128 anyway).
-  __u8 mask = -(__u8)((a[(i >> 3) & 0xF] >> (7 - (i & 7))) & 1);
-  __u8 prev = 0;
-#pragma GCC unroll 16
-  for (int j = 0; j < 16; j++) {
-    __u8 cur = v[j];
-    z[j] ^= cur & mask;
-    v[j] = (cur >> 1) | (__u8)(prev << 7);
-    prev = cur;
-  }
-  if (prev & 1)
-    v[0] ^= 0xe1;
-}
-
-// Multiply two 128-bit elements in GF(2^128) using the GHASH bit convention.
-// result = a * b in GF(2^128) with reduction polynomial x^128 + x^7 + x^2 + x + 1.
-HELPER_INLINE void gf128_mul(const __u8 a[16], const __u8 b[16], __u8 result[16]) {
-  __u8 v[16], z[16];
-
-  __builtin_memset(z, 0, 16);
-  __builtin_memcpy(v, b, 16);
-
-  for (__u32 i = 0; i < 128; i++)
-    gf128_mul_step(a, v, z, i);
-  __builtin_memcpy(result, z, 16);
-}
-
-// Compute H^power in GF(2^128) via square-and-multiply from base H.
-// power must be >= 1. Result is written to result[16].
-HELPER_INLINE void gf128_h_power(const __u8 h[16], __u32 power, __u8 result[16]) {
-  __u8 base[16], tmp[16];
-  int i;
-
-  // Multiplicative identity in GHASH convention (NIST SP 800-38D):
-  // polynomial 1 = bit 0 set = MSB of byte 0 = 0x80.
-  __builtin_memset(result, 0, 16);
-  result[0] = 0x80;
-
-  __builtin_memcpy(base, h, 16);
-  for (i = 0; i < 11 && power > 0; i++) {
-    if (power & 1) {
-      gf128_mul(result, base, tmp);
-      __builtin_memcpy(result, tmp, 16);
-    }
-    gf128_mul(base, base, tmp);
-    __builtin_memcpy(base, tmp, 16);
-    power >>= 1;
-  }
-}
-
-// Compute H^power using a precomputed table of H^(2^i) for i=0..10.
-// Faster than gf128_h_power when the table is available.
-HELPER_INLINE void gf128_h_power_table(const __u8 h_powers[11][16],
-                                        __u32 power,
-                                        __u8 result[16]) {
-  __u8 tmp[16];
-  int i;
-
-  __builtin_memset(result, 0, 16);
-  result[0] = 0x80;
-
-  for (i = 0; i < 11 && power > 0; i++) {
-    if (power & (1u << i)) {
-      gf128_mul(result, h_powers[i], tmp);
-      __builtin_memcpy(result, tmp, 16);
-    }
-  }
-}
-
-// Variant of gf128_mul that uses caller-provided workspace buffers instead of
-// stack-allocated arrays. This avoids blowing the 512-byte BPF stack limit
-// when the function is inlined multiple times in a single BPF program.
-// ws_v and ws_z must each be 16-byte buffers (e.g., fields in a per-CPU map).
-HELPER_INLINE void gf128_mul_ws(const __u8 a[16], const __u8 b[16], __u8 result[16],
-                                 __u8 ws_v[16], __u8 ws_z[16]) {
-  __builtin_memset(ws_z, 0, 16);
-  __builtin_memcpy(ws_v, b, 16);
-
-  for (__u32 i = 0; i < 128; i++)
-    gf128_mul_step(a, ws_v, ws_z, i);
-  __builtin_memcpy(result, ws_z, 16);
-}
-
-// Variant of gf128_h_power that uses caller-provided workspace buffers.
-// ws_base and ws_tmp must each be 16-byte buffers, ws_v and ws_z for mul.
-HELPER_INLINE void gf128_h_power_ws(const __u8 h[16], __u32 power, __u8 result[16],
-                                     __u8 ws_base[16], __u8 ws_tmp[16],
-                                     __u8 ws_v[16], __u8 ws_z[16]) {
-  int i;
-
-  __builtin_memset(result, 0, 16);
-  result[0] = 0x80;
-
-  __builtin_memcpy(ws_base, h, 16);
-  for (i = 0; i < 11 && power > 0; i++) {
-    if (power & 1) {
-      gf128_mul_ws(result, ws_base, ws_tmp, ws_v, ws_z);
-      __builtin_memcpy(result, ws_tmp, 16);
-    }
-    gf128_mul_ws(ws_base, ws_base, ws_tmp, ws_v, ws_z);
-    __builtin_memcpy(ws_base, ws_tmp, 16);
-    power >>= 1;
-  }
-}
-
-// Variant of gf128_h_power_table that uses caller-provided workspace.
-HELPER_INLINE void gf128_h_power_table_ws(const __u8 h_powers[11][16],
-                                            __u32 power, __u8 result[16],
-                                            __u8 ws_v[16], __u8 ws_z[16]) {
-  __u8 tmp[16]; // 16 bytes on stack is acceptable here
-  int i;
-
-  __builtin_memset(result, 0, 16);
-  result[0] = 0x80;
-
-  for (i = 0; i < 11 && power > 0; i++) {
-    if (power & (1u << i)) {
-      gf128_mul_ws(result, h_powers[i], tmp, ws_v, ws_z);
-      __builtin_memcpy(result, tmp, 16);
-    }
-  }
-}
 
 // gf128_halve_to_h recovers the GHASH subkey H from the doubled value that
 // carry-less-multiply GHASH implementations precompute at key setup:
@@ -382,34 +243,252 @@ HELPER_INLINE void gf128_halve_to_h(__u64 lo, __u64 hi, __u8 out[16]) {
   }
 }
 
-// ghash_block_delta writes the XOR delta of GHASH block `block` (bytes
-// block * 16 .. block * 16 + 15 of the ciphertext; block is masked to 10
-// bits) to out:
-// byte i is xor_delta[pos - sec_off] when pos = block * 16 + i falls in the
-// patch [sec_off, sec_off + len), and 0 elsewhere. len is at most
-// SECRET_MAX_LEN.
+// ============================================================================
+// GHASH engine: 4-bit table multiplication and per-span tag deltas
+// (tc_ghash_update).
+//
+// An element is two 64-bit words: hi is bytes 0..7 of its 16-byte GHASH
+// string read big-endian, lo bytes 8..15. The x^0 coefficient is hi's MSB and
+// x^127 lo's LSB, so multiplying by x is a 128-bit right shift. BPF does
+// 64-bit arithmetic natively, and a word holds 16 of the 32 nibbles a table
+// multiply reads.
+// ============================================================================
+
+struct gf128 {
+  __u64 hi;
+  __u64 lo;
+};
+
+// x^128 = 1 + x + x^2 + x^7 (mod P), as a hi word: what a bit shifted out
+// past x^127 comes back as.
+#define GF128_R 0xE100000000000000ULL
+
+HELPER_INLINE __u64 gf128_load64(const __u8 p[8]) {
+  __u64 v = 0;
+  for (int i = 0; i < 8; i++)
+    v = (v << 8) | p[i];
+  return v;
+}
+
+HELPER_INLINE void gf128_store64(__u8 p[8], __u64 v) {
+  for (int i = 0; i < 8; i++)
+    p[i] = (__u8)(v >> (56 - 8 * i));
+}
+
+HELPER_INLINE void gf128_load(const __u8 b[16], struct gf128 *v) {
+  v->hi = gf128_load64(b);
+  v->lo = gf128_load64(b + 8);
+}
+
+HELPER_INLINE void gf128_store(__u8 b[16], const struct gf128 *v) {
+  gf128_store64(b, v->hi);
+  gf128_store64(b + 8, v->lo);
+}
+
+// v = v * x.
+HELPER_INLINE void gf128_mulx(struct gf128 *v) {
+  __u64 r = -(v->lo & 1) & GF128_R;
+  v->lo = (v->lo >> 1) | (v->hi << 63);
+  v->hi = (v->hi >> 1) ^ r;
+}
+
+// Shoup's 4-bit table of an element H: m[n] = n * H for every 4-bit n, read
+// MSB-first like the GHASH strings (n's bit 3, 8, is x^0, its bit 0, 1, is
+// x^3). 16 elements, 256 bytes.
+struct gf128_table {
+  struct gf128 m[16];
+};
+
+// m[a ^ b] for a and b with no bit in common.
+HELPER_INLINE void gf128_table_sum(struct gf128_table *t, int a, int b) {
+  t->m[a ^ b].hi = t->m[a].hi ^ t->m[b].hi;
+  t->m[a ^ b].lo = t->m[a].lo ^ t->m[b].lo;
+}
+
+// Written out entry by entry: as a loop, clang kept it rolled in BPF and
+// addressed m[n - top] through a pointer offset by a negative constant,
+// which the verifier rejects as an unbounded access since Linux 7.2 (it now
+// keeps a pointer's constant offset in its variable bounds).
+HELPER_INLINE void gf128_table_init(struct gf128_table *t, const struct gf128 *h) {
+  struct gf128 v = *h;
+  t->m[0].hi = 0;
+  t->m[0].lo = 0;
+  t->m[8] = v;
+  gf128_mulx(&v);
+  t->m[4] = v;
+  gf128_mulx(&v);
+  t->m[2] = v;
+  gf128_mulx(&v);
+  t->m[1] = v;
+  // Every other n is the sum of its top bit's entry and the rest's.
+  gf128_table_sum(t, 2, 1);
+  gf128_table_sum(t, 4, 1);
+  gf128_table_sum(t, 4, 2);
+  gf128_table_sum(t, 4, 3);
+  gf128_table_sum(t, 8, 1);
+  gf128_table_sum(t, 8, 2);
+  gf128_table_sum(t, 8, 3);
+  gf128_table_sum(t, 8, 4);
+  gf128_table_sum(t, 8, 5);
+  gf128_table_sum(t, 8, 6);
+  gf128_table_sum(t, 8, 7);
+}
+
+// The reduction table of gf128_table_mul: r[n] is what the 4 bits n that a
+// multiplication by x^4 (a 4-bit right shift) pushes out of lo come back as,
+// as a hi word. Bit k of n, x^(127-k), becomes x^(131-k) = x^(3-k) * x^128 =
+// x^(3-k) * (1 + x + x^2 + x^7): GF128_R shifted right by 3-k.
+HELPER_INLINE void gf128_rem4_init(__u64 r[16]) {
+  // Unrolled into 16 constant stores (load-bearing: the BPF caller runs it
+  // for every record).
+#pragma GCC unroll 16
+  for (int n = 0; n < 16; n++) {
+    __u64 v = 0;
+    for (int k = 0; k < 4; k++)
+      if ((n >> k) & 1)
+        v ^= GF128_R >> (3 - k);
+    r[n] = v;
+  }
+}
+
+// gf128_table_mul_word runs 16 steps of Shoup's method (gf128_table_mul) on
+// z, over the nibbles of w, one word of x, from its bottom nibble up. The
+// steps are unrolled: every shift of w is a constant, and the verifier walks
+// them as straight-line code, with no loop state to track (a loop would also
+// invite the negative constant pointer offsets Linux 7.2 rejects, see
+// gf128_table_init). The table indexes are 4-bit masks, which keep the reads
+// of t and r in bounds for the verifier.
+HELPER_INLINE void gf128_table_mul_word(struct gf128 *z, __u64 w,
+                                        const struct gf128_table *t,
+                                        const __u64 r[16]) {
+  __u64 zhi = z->hi, zlo = z->lo;
+  // Load-bearing: rolled, the shifts of w are no longer constants, and the
+  // verifier walks the loop iteration by iteration.
+#pragma GCC unroll 16
+  for (int i = 15; i >= 0; i--) {
+    __u32 n = (w >> (60 - 4 * i)) & 0xF;
+    __u32 rem = zlo & 0xF;
+    zlo = (zlo >> 4) | (zhi << 60);
+    zhi = (zhi >> 4) ^ r[rem];
+    zhi ^= t->m[n].hi;
+    zlo ^= t->m[n].lo;
+  }
+  z->hi = zhi;
+  z->lo = zlo;
+}
+
+// gf128_table_mul sets x = x * H, t being H's table (gf128_table_init) and r
+// the reduction table (gf128_rem4_init).
+//
+// Shoup's method: x is 32 nibbles x^4 apart, n_0 (hi's top nibble) to n_31
+// (lo's bottom one), x = sum of n_i * x^(4i), so x * H = sum of m[n_i] *
+// x^(4i), which Horner's rule computes from n_31 down: z = z * x^4 + m[n_i].
+// z * x^4 is a 4-bit right shift whose 4 bits pushed out of lo come back
+// reduced from r. 32 table steps instead of the 128 conditional XORs and
+// shifts of a bit-serial multiply: lo's 16 nibbles, then hi's.
+//
+// tc runs the two words as two iterations of a bpf_loop callback
+// (ghash_mul_iter), which halves the code the verifier walks per multiply.
+HELPER_INLINE void gf128_table_mul(struct gf128 *x, const struct gf128_table *t,
+                                   const __u64 r[16]) {
+  struct gf128 z = {0, 0};
+  gf128_table_mul_word(&z, x->lo, t, r);
+  gf128_table_mul_word(&z, x->hi, t, r);
+  *x = z;
+}
+
+// ----------------------------------------------------------------------------
+// Tag delta of a patch: Horner's rule over its span, then one power of H.
+//
+// The record's GHASH input is its AAD blocks, its n ciphertext blocks and the
+// length block, each XORed into the accumulator, which is then multiplied by
+// H. Ciphertext block b (0-based) is therefore multiplied by H once for
+// itself and once for each block after it: n - 1 - b ciphertext blocks and
+// the length block, H^(n + 1 - b) in all. Changing the ciphertext by D_b in
+// block b changes the tag by D_b * H^(n + 1 - b): the tag mask E(K, J0), the
+// AAD and the length block cancel, and the sum is linear in the D_b.
+//
+// A patch changes the contiguous blocks first..last. Horner's rule over them,
+// acc = (acc ^ D_b) * H from b = first to b = last, leaves
+// acc = sum of D_b * H^(last + 1 - b), one table multiply per block; times
+// H^(n - last) that is the patch's tag delta. ghash_span_plan computes
+// first, the block count and exp = n - last, which is at least 1 (the length
+// block) and below 2^GHASH_POW_BITS; tc multiplies by H^exp one set bit at a
+// time, from the cached H^(2^i) (ghash_horner_iter and ghash_pow_iter in
+// tls_uprobe.c).
+//
+// Patches add up: the record's tag delta is the XOR of its patches' (two
+// patches in one block each contribute their own bytes of it).
+// ----------------------------------------------------------------------------
+
+// The cached H^(2^i) cover i < GHASH_POW_BITS, so a span's exponent, at most
+// the record's ciphertext block count, must stay below 2^GHASH_POW_BITS
+// (asserted against TLS_MAX_RECORD_LEN below).
+#define GHASH_POW_BITS 11
+#define GHASH_MAX_CT_BLOCKS ((1u << GHASH_POW_BITS) - 1)
+
+struct ghash_span {
+  __u32 first; // first ciphertext block the patch changes
+  __u32 count; // blocks it changes: Horner steps
+  __u32 exp;   // the power of H that the Horner sum is multiplied by
+};
+
+// ghash_span_plan fills s for a patch of len bytes at byte sec_off of a
+// record's ct_len ciphertext bytes (TLS 1.2's explicit nonce and the tag
+// excluded). It returns 0, and the record must not be patched, when the
+// patch can't be hashed: empty, not inside the ciphertext, or the record
+// longer than any TLS record.
+HELPER_INLINE int ghash_span_plan(__u32 sec_off, __u32 len, __u32 ct_len,
+                                  struct ghash_span *s) {
+  if (len == 0 || ct_len > GHASH_MAX_CT_BLOCKS * 16 || sec_off >= ct_len ||
+      len > ct_len - sec_off)
+    return 0;
+  __u32 last = (sec_off + len - 1) / 16;
+  s->first = sec_off / 16;
+  s->count = last - s->first + 1;
+  s->exp = (ct_len + 15) / 16 - last;
+  return 1;
+}
+
+// ghash_block_delta64 returns in out what ciphertext block `block` (masked to
+// GHASH_POW_BITS bits) changes by under a patch of len bytes at sec_off:
+// byte i is the delta byte of position pos = block * 16 + i when pos is in
+// the patch, 0 elsewhere.
 //
 // The range check is arithmetic, not a comparison: BPF has no conditional
 // set, so a comparison is a branch, and 16 of them against bounds the
 // verifier doesn't know made Linux 7.2's verifier walk ~320K instructions of
-// tc_ghash_update here. d is pos - sec_off in 64 bits, negative (top bit
-// set) when pos is before the patch; the byte is in the patch when d's top
-// bit is clear and d - len's is set. The loop is unrolled so every out index
-// is a constant (see gf128_mul_step), and barrier_var keeps each byte's
-// arithmetic in its own iteration: without it clang computes all 16 up
-// front and spills them, taking the callback's stack frame from 32 bytes to
-// 248.
-HELPER_INLINE void ghash_block_delta(const __u8 xor_delta[SECRET_MAX_LEN],
-                                     __u32 block, __u32 sec_off, __u32 len,
-                                     __u8 out[16]) {
-  __u64 start = (__u64)(block & 0x3FF) * 16 - sec_off;
+// tc_ghash_update. d is pos - sec_off in 64 bits, negative (top bit set)
+// when pos is before the patch; the byte is in the patch when d's top bit is
+// clear and d - len's is set. The loop is unrolled so every shift is a
+// constant, and barrier_var keeps each byte's arithmetic in its own
+// iteration: without it clang computes all 16 up front and spills them,
+// which took the old byte-wise version's callback stack frame from 32 bytes
+// to 248.
+//
+// The delta bytes come from win, a window of win_mask + 1 bytes (a power of
+// two, a constant): patch byte d (pos - sec_off) is win[d & win_mask]. The
+// patch's inline xor_delta is such a window of SECRET_MAX_LEN bytes, which
+// holds all of it; a ring of chunks, chunk c at (c * chunk length) &
+// win_mask, is another that does not need to.
+HELPER_INLINE void ghash_block_delta64(const __u8 *win, __u32 win_mask,
+                                       __u32 block, __u32 sec_off, __u32 len,
+                                       struct gf128 *out) {
+  __u64 start = (__u64)(block & GHASH_MAX_CT_BLOCKS) * 16 - sec_off;
+  __u64 hi = 0, lo = 0;
 #pragma GCC unroll 16
   for (int i = 0; i < 16; i++) {
     __u64 d = start + i;
     barrier_var(d);
-    __u8 in = (__u8)((~d & (d - len)) >> 63);
-    out[i] = xor_delta[d & (SECRET_MAX_LEN - 1)] & -in;
+    __u64 in = (~d & (d - len)) >> 63;
+    __u64 byte = win[d & win_mask] & -in;
+    if (i < 8)
+      hi |= byte << (56 - 8 * i);
+    else
+      lo |= byte << (56 - 8 * (i - 8));
   }
+  out->hi = hi;
+  out->lo = lo;
 }
 
 // Kloak internal cipher type enum (not TLS cipher suite IDs).
@@ -434,6 +513,11 @@ HELPER_INLINE int is_aes_gcm(__u32 cipher_type) {
 // Largest legal TLSCiphertext.length (RFC 5246 §6.2.3: 2^14 + 2048). Anything
 // larger cannot be a record boundary.
 #define TLS_MAX_RECORD_LEN (16384 + 2048)
+
+// Every ciphertext block of a record, and so every span's exponent, stays
+// within the H^(2^i) that the GHASH engine keeps (ghash_span_plan).
+_Static_assert((TLS_MAX_RECORD_LEN + 15) / 16 <= GHASH_MAX_CT_BLOCKS,
+               "a TLS record has more blocks than GHASH_POW_BITS cover");
 
 // Smallest application_data record: TLS 1.3 with 0 plaintext bytes =
 // 1 (inner content type) + 16 (AEAD tag).
