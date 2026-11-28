@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
 	"github.com/spinningfactory/kloak/pkg/logging"
+	"github.com/spinningfactory/kloak/pkg/secrets"
 	webhookpkg "github.com/spinningfactory/kloak/pkg/webhook"
 )
 
@@ -30,19 +31,28 @@ var webhookCmd = &cobra.Command{
 }
 
 var (
-	webhookProbeAddr string
-	webhookCertDir   string
+	webhookProbeAddr    string
+	webhookCertDir      string
+	webhookMaxSecretLen *string
 )
 
 func init() {
 	webhookCmd.Flags().StringVar(&webhookProbeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
 	webhookCmd.Flags().StringVar(&webhookCertDir, "cert-dir", "/certs", "Directory containing TLS certs.")
+	webhookMaxSecretLen = maxSecretLengthFlag(webhookCmd)
 }
 
 func runWebhook(cmd *cobra.Command, args []string) {
 	setupLog := logging.Setup().Named("setup")
 
-	setupLog.Infow("Starting Kloak webhook")
+	maxSecretLen, err := parseMaxSecretLength(*webhookMaxSecretLen)
+	if err != nil {
+		setupLog.Errorw("invalid --max-secret-length", "error", err)
+		_ = setupLog.Sync()
+		os.Exit(1)
+	}
+	setupLog.Infow("Starting Kloak webhook", "maxSecretLength", maxSecretLen,
+		"effectiveMaxSecretLength", secrets.EffectiveMaxLen(maxSecretLen))
 
 	gracefulShutdown := 30 * time.Second
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
@@ -67,7 +77,7 @@ func runWebhook(cmd *cobra.Command, args []string) {
 		Handler: webhookpkg.NewHandler(mgr.GetClient(), setupLog),
 	})
 	hookServer.Register("/validate-secrets", &webhook.Admission{
-		Handler: webhookpkg.NewSecretValidator(setupLog),
+		Handler: webhookpkg.NewSecretValidator(setupLog, maxSecretLen),
 	})
 
 	// Add health checks

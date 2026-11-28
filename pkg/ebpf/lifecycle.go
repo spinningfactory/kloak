@@ -19,7 +19,8 @@ import (
 )
 
 // RunLifecycleSweep sweeps what kloak attached and stored for processes and
-// containers that are gone (sweep), every interval until ctx is done.
+// containers that are gone (sweep), and the secret store's generations past
+// their grace period (collectSecretStore), every interval until ctx is done.
 func (m *TLSUprobeManager) RunLifecycleSweep(ctx context.Context, interval time.Duration) error {
 	t := time.NewTicker(interval)
 	defer t.Stop()
@@ -29,6 +30,7 @@ func (m *TLSUprobeManager) RunLifecycleSweep(ctx context.Context, interval time.
 			return nil
 		case <-t.C:
 			m.sweep()
+			m.collectSecretStore(ctx)
 		}
 	}
 }

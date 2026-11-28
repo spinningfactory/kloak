@@ -233,7 +233,7 @@ sequenceDiagram
 
 ### 1. Label and Annotate Your Secrets
 
-Add `getkloak.io/enabled=true` as a label to enable Kloak. Use annotations for host and port filtering. Kloak generates a shadow secret whose values are random `kl::…` placeholders of exactly the same length as the originals.
+Add `getkloak.io/enabled=true` as a label to enable Kloak. Use annotations for host and port filtering. Kloak generates a shadow secret whose values are random `kl::…` placeholders of exactly the same length as the originals. Each value must be 8 to 128 bytes long today: the webhook rejects a Secret with a shorter or longer one (`secrets.maxLength` in the chart values sets a lower maximum). A value a pod reads as an environment variable (`env`, `envFrom`) is also bounded by the kernel: one `NAME=value` string can be at most 128 KiB (`MAX_ARG_STRLEN`), and a process's environment and arguments together at most a quarter of its stack limit (2 MiB with the usual 8 MiB). The placeholder the pod gets is exactly as long as the value, so a value that fits in an environment variable without kloak fits with it; mount longer ones as files.
 
 ```yaml
 apiVersion: v1

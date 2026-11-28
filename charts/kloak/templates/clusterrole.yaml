@@ -34,7 +34,8 @@ rules:
   - apiGroups: ["networking.k8s.io"]
     resources: ["servicecidrs"]
     verbs: ["list"]
-  # Events for debugging
-  - apiGroups: [""]
+  # Events for debugging, and the SecretReconciler's warnings on Secrets
+  # (events.k8s.io)
+  - apiGroups: ["", "events.k8s.io"]
     resources: ["events"]
     verbs: ["create", "patch"]

@@ -2,6 +2,7 @@ package yaml
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"testing"
@@ -178,7 +179,7 @@ func TestTranslate_ValidationRules(t *testing.T) {
 				Name: "x", Value: strings.Repeat("x", maxRealLen+1),
 				Inject: injectSpec{Env: "X"},
 			}}},
-			wantSub: "max is 128",
+			wantSub: fmt.Sprintf("max is %d", secrets.DataPlaneMaxLen),
 		},
 	}
 	for _, tc := range cases {
@@ -238,5 +239,38 @@ func TestTranslate_PortWithProtocol(t *testing.T) {
 	}
 	if out[0].Port != 53 || out[0].Protocol != uint8(unix.IPPROTO_UDP) {
 		t.Errorf("Port=%d Protocol=%d, want 53/udp", out[0].Port, out[0].Protocol)
+	}
+}
+
+// TestTranslate_LongValues checks entries longer than the data plane takes
+// today, with the maximum raised (as for a data plane that takes them):
+// shadowed whole and bit-exact up to 1 MiB, and refused past the maximum.
+func TestTranslate_LongValues(t *testing.T) {
+	saved := maxRealLen
+	maxRealLen = secrets.MaxLenLimit
+	t.Cleanup(func() { maxRealLen = saved })
+
+	const chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	value := func(n int) string {
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = chars[(i*7+i/13)%len(chars)]
+		}
+		return string(b)
+	}
+	for _, n := range []int{secrets.DataPlaneMaxLen + 1, 4 << 10, 64 << 10, secrets.MaxLenLimit} {
+		v := value(n)
+		out, err := translate(fileSpec{Secrets: []secretSpec{{Name: "x", Value: v, Inject: injectSpec{Env: "X"}}}}, newGen())
+		if err != nil {
+			t.Fatalf("%d bytes: %v", n, err)
+		}
+		if s := out[0].Shadow; len(s) != n || secrets.HuffmanBits(s) != secrets.HuffmanBits(v) || out[0].Real != v {
+			t.Errorf("%d bytes: shadow of %d bytes, %d Huffman bits (want %d); real kept whole: %v",
+				n, len(s), secrets.HuffmanBits(s), secrets.HuffmanBits(v), out[0].Real == v)
+		}
+	}
+	_, err := translate(fileSpec{Secrets: []secretSpec{{Name: "x", Value: value(secrets.MaxLenLimit + 1), Inject: injectSpec{Env: "X"}}}}, newGen())
+	if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("max is %d", secrets.MaxLenLimit)) {
+		t.Errorf("past the maximum: %v", err)
 	}
 }

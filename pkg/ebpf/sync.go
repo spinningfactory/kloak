@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"go.uber.org/zap"
@@ -16,16 +17,10 @@ import (
 )
 
 // syncSecrets pulls a snapshot from the given secrets.Source and applies
-// it to the BPF secret_map. The translation
-// from a semantic secrets.Secret to the wire-format secretValue lives
-// here; nothing in this file knows where the snapshot came from.
-//
-// Behavior preserved verbatim from the previous source-coupled
-// version of this function:
-//   - upsert each (real, shadow) pair under the shadow's first 8 bytes
-//   - emit an HPACK-Huffman variant for HTTP/2 interception
-//   - prune BPF map entries that no longer appear in the snapshot
-func syncSecrets(ctx context.Context, secretMap *ebpf.Map, source secrets.Source, log *zap.SugaredLogger) error {
+// it to the secret store (secretStore.apply). The translation from a
+// semantic secrets.Secret to the wire-format secretValue and chunks lives
+// in secret_store.go; nothing there knows where the snapshot came from.
+func syncSecrets(ctx context.Context, store *secretStore, source secrets.Source) error {
 	if source == nil {
 		return nil
 	}
@@ -34,7 +29,7 @@ func syncSecrets(ctx context.Context, secretMap *ebpf.Map, source secrets.Source
 	if err != nil {
 		return fmt.Errorf("snapshot secrets: %w", err)
 	}
-	_, err = applySecrets(secretMap, snapshot, log)
+	_, err = store.apply(snapshot, time.Now())
 	return err
 }
 
@@ -60,149 +55,6 @@ func (e *mapErrors) err(name string) error {
 	return fmt.Errorf("%s: %d failed map operations, the first: %w", name, e.n, e.first)
 }
 
-// applySecrets writes a snapshot to secret_map (see syncSecrets) and returns
-// the hostnames the synced secrets are restricted to, the watched hosts that
-// get virtual IPs. Split out so the manager can reuse the same snapshot for
-// the secret_acl and virtual IP syncs. A failed map operation does not stop
-// the others: the error reports it once they are all done.
-func applySecrets(secretMap *ebpf.Map, snapshot []secrets.Secret, log *zap.SugaredLogger) (map[string]struct{}, error) {
-	// newKeys tracks which keys we upsert so we can prune stale entries afterwards.
-	newKeys := make(map[secretKey]struct{})
-	hostNames := make(map[string]struct{})
-	var errs mapErrors
-
-	for i := range snapshot {
-		s := &snapshot[i]
-
-		// The BPF filter treats host_len >= MAX_HOST_LEN (64) as
-		// "no filter" (tls_uprobe.c: `val_host_len < MAX_HOST_LEN`).
-		// If we synced a too-long host, the filter would be bypassed
-		// and the secret rewritten on every destination — skip
-		// instead so the app sends the shadow placeholder and the
-		// real value stays protected in-kernel.
-		if len(s.Host) >= len(secretValue{}.AllowedHost) {
-			log.Errorw("allowed host exceeds maximum length, skipping sync (secret will not be rewritten)",
-				"owner", s.OwnerID, "key", s.Key,
-				"hostLen", len(s.Host), "max", len(secretValue{}.AllowedHost)-1)
-			continue
-		}
-
-		// Minimum shadow length is enforced by the source; defensive
-		// re-check so a misbehaving Source can't crash the sync.
-		if len(s.Shadow) < secrets.ShadowPrefixLen {
-			logging.Tracew(log, "skipping secret too short for BPF key",
-				"owner", s.OwnerID, "key", s.Key, "len", len(s.Shadow))
-			continue
-		}
-
-		var bpfKey secretKey
-		copy(bpfKey.Prefix[:], s.Shadow[:secrets.ShadowPrefixLen])
-		if _, exists := newKeys[bpfKey]; exists {
-			log.Errorw("8-byte BPF key collision detected — two secrets share the same prefix, one will be shadowed",
-				"owner", s.OwnerID, "key", s.Key, "prefix", s.Shadow[:secrets.ShadowPrefixLen])
-		}
-		newKeys[bpfKey] = struct{}{}
-
-		var val secretValue
-		val.Len = uint32(len(s.Real))
-		if val.Len > 128 {
-			logging.Tracew(log, "truncating secret value to max BPF size (128)",
-				"owner", s.OwnerID, "key", s.Key)
-			val.Len = 128
-		}
-		copy(val.RealSecret[:], s.Real[:val.Len])
-
-		// Store the full prefix (up to 42 bytes) for post-lookup verification.
-		prefixLen := len(s.Shadow)
-		if prefixLen > 42 {
-			prefixLen = 42
-		}
-		val.PrefixLen = uint32(prefixLen)
-		copy(val.FullPrefix[:], s.Shadow[:prefixLen])
-
-		// Set allowed host/IP for filtering.
-		switch {
-		case s.Host != "":
-			val.HostLen = uint32(len(s.Host))
-			copy(val.AllowedHost[:], s.Host)
-			val.IpLen = 0 // Host-based filtering
-			hostNames[s.Host] = struct{}{}
-		case s.IP != nil:
-			copy(val.AllowedIp[:], s.IP.To16())
-			val.IpLen = 16 // IP-based filtering with valid IP
-		default:
-			// HostLen == 0 and IpLen == 0 means wildcard (allow all hosts/IPs)
-			val.IpLen = 0
-		}
-
-		val.Port = s.Port
-		val.Protocol = s.Protocol
-
-		if err := secretMap.Update(&bpfKey, &val, 0); err != nil {
-			log.Errorw("failed to update BPF secret_map", "error", err,
-				"owner", s.OwnerID, "key", s.Key)
-			errs.add(err)
-		} else {
-			logging.Tracew(log, "synced secret into eBPF map",
-				"owner", s.OwnerID, "key", s.Key,
-				"hostLen", val.HostLen, "port", val.Port, "protocol", val.Protocol)
-		}
-
-		// Also store the placeholder's HPACK-Huffman form, which HTTP/2
-		// clients send in header fields (huffmanEntry).
-		huffKey, huffVal, err := huffmanEntry(s.Shadow, s.Real, &val)
-		_, taken := newKeys[huffKey]
-		switch {
-		case errors.Is(err, errHuffmanKeyTooShort):
-			logging.Tracew(log, "no HTTP/2 Huffman variant: the placeholder's Huffman code is shorter than a BPF key",
-				"owner", s.OwnerID, "key", s.Key)
-		case err != nil:
-			log.Warnw("no HTTP/2 Huffman variant, the placeholder will not be rewritten in HTTP/2 headers",
-				"owner", s.OwnerID, "key", s.Key, "reason", err)
-		case taken:
-			// Another entry of this snapshot has the key: keep the first.
-		default:
-			newKeys[huffKey] = struct{}{}
-			if err := secretMap.Update(&huffKey, &huffVal, 0); err != nil {
-				log.Errorw("failed to update BPF secret_map (Huffman)", "error", err,
-					"owner", s.OwnerID, "key", s.Key)
-				errs.add(err)
-			} else {
-				logging.Tracew(log, "synced Huffman secret into eBPF map",
-					"owner", s.OwnerID, "key", s.Key, "huffLen", huffVal.Len)
-			}
-		}
-	}
-
-	// Prune stale entries: iterate existing map keys and delete any not in newKeys.
-	var staleKeys []secretKey
-	var iterKey secretKey
-	var iterVal secretValue
-	iter := secretMap.Iterate()
-	for iter.Next(&iterKey, &iterVal) {
-		if _, exists := newKeys[iterKey]; !exists {
-			staleKeys = append(staleKeys, iterKey)
-		}
-	}
-	if err := iter.Err(); err != nil {
-		log.Errorw("error iterating BPF secret_map for pruning", "error", err)
-		errs.add(err)
-	}
-	for i := range staleKeys {
-		if err := secretMap.Delete(&staleKeys[i]); err != nil {
-			log.Errorw("failed to delete stale BPF secret_map entry", "error", err)
-			errs.add(err)
-		} else {
-			logging.Tracew(log, "pruned stale entry from eBPF map")
-		}
-	}
-
-	log.Debugw("secret sync complete",
-		"snapshotEntries", len(snapshot), "bpfKeys", len(newKeys),
-		"pruned", len(staleKeys), "watchedHosts", len(hostNames))
-	return hostNames, errs.err("secret_map")
-}
-
 // errHuffmanKeyTooShort reports a placeholder whose HPACK-Huffman code is
 // shorter than a secret_map key, so its HTTP/2 form cannot be looked up.
 var errHuffmanKeyTooShort = errors.New("placeholder's Huffman code is shorter than a BPF key")
@@ -222,23 +74,35 @@ var errHuffmanKeyTooShort = errors.New("placeholder's Huffman code is shorter th
 // rewritten, and what follows the placeholder must stay where it is. A pair
 // that does not have it gets no entry, and its HTTP/2 form is sent as is.
 func huffmanEntry(shadow, realValue string, raw *secretValue) (secretKey, secretValue, error) {
+	e, err := huffmanStoreEntry(shadow, realValue, raw)
+	return e.key, e.val, err
+}
+
+// huffmanStoreEntry is huffmanEntry's store entry: with its chunks, holding
+// Huffman(shadow) and its delta to Huffman(real), PadBits low bits of the
+// last byte left out of the delta.
+func huffmanStoreEntry(shadow, realValue string, raw *secretValue) (storeEntry, error) {
 	var key secretKey
 	var val secretValue
 	huffShadow := hpack.AppendHuffmanString(nil, shadow)
 	bits := secrets.HuffmanBits(shadow)
 	switch {
 	case len(huffShadow) < len(key.Prefix):
-		return key, val, errHuffmanKeyTooShort
+		return storeEntry{}, errHuffmanKeyTooShort
 	case bits != secrets.HuffmanBits(realValue):
 		// The bit lengths are value-derived: keep them out of the error.
-		return key, val, errors.New("shadow and real have different HPACK Huffman bit lengths")
+		return storeEntry{}, errors.New("shadow and real have different HPACK Huffman bit lengths")
 	case len(huffShadow) > len(val.RealSecret):
-		return key, val, fmt.Errorf("placeholder's Huffman code is longer than %d bytes", len(val.RealSecret))
+		// TODO(kloak#383): real_secret goes with the phase-1 switchover;
+		// the chunks take a code of any length.
+		return storeEntry{}, fmt.Errorf("placeholder's Huffman code is longer than %d bytes", len(val.RealSecret))
 	}
 	copy(key.Prefix[:], huffShadow)
 
+	// The same bit length, so the same byte length.
+	huffReal := hpack.AppendHuffmanString(nil, realValue)
 	val.Len = uint32(len(huffShadow))
-	copy(val.RealSecret[:], hpack.AppendHuffmanString(nil, realValue))
+	copy(val.RealSecret[:], huffReal)
 	val.PadBits = uint8(len(huffShadow)*8 - bits)
 	val.HostLen = raw.HostLen
 	val.AllowedHost = raw.AllowedHost
@@ -247,7 +111,7 @@ func huffmanEntry(shadow, realValue string, raw *secretValue) (secretKey, secret
 	val.Port = raw.Port
 	val.Protocol = raw.Protocol
 	val.PrefixLen = uint32(copy(val.FullPrefix[:], huffShadow))
-	return key, val, nil
+	return newStoreEntry(key, &val, huffShadow, huffReal, val.PadBits), nil
 }
 
 // syncSecretACL makes secret_acl hold exactly the entries the bindings grant

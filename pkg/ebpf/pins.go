@@ -80,10 +80,12 @@ const (
 	dispatchSlots          = 4
 )
 
-// The maps teardownGen empties to make what is left of a build inert.
+// The maps teardownGen empties to make what is left of a build inert, and
+// to take the real secrets out of the kernel.
 const (
-	vipConfigMap = "vip_config"
-	secretMapMap = "secret_map"
+	vipConfigMap    = "vip_config"
+	secretMapMap    = "secret_map"
+	secretChunksMap = "secret_chunks"
 )
 
 // buildID returns the identity of the BPF pipeline this binary embeds:
@@ -633,8 +635,11 @@ func teardownGen(dir string, log *zap.SugaredLogger) error {
 	if err := emptyPinnedMap(filepath.Join(dir, "maps", vipConfigMap), true); err != nil && !errors.Is(err, os.ErrNotExist) {
 		errs = append(errs, fmt.Errorf("disabling %s: %w", vipConfigMap, err))
 	}
-	if err := emptyPinnedMap(filepath.Join(dir, "maps", secretMapMap), false); err != nil && !errors.Is(err, os.ErrNotExist) {
-		errs = append(errs, fmt.Errorf("emptying %s: %w", secretMapMap, err))
+	// secret_map first: an entry is never left pointing at chunks gone.
+	for _, name := range []string{secretMapMap, secretChunksMap} {
+		if err := emptyPinnedMap(filepath.Join(dir, "maps", name), false); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("emptying %s: %w", name, err))
+		}
 	}
 	// The tc programs first (no packet is patched once they are gone), then
 	// the probes that feed them, then the programs and maps.

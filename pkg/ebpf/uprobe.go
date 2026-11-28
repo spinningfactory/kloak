@@ -50,6 +50,7 @@ type secretKey struct {
 // secretValue matches C struct secret_value
 type secretValue struct {
 	Len         uint32
+	Gen         uint32 // generation of the entry's secret_chunks (secret_store.go)
 	RealSecret  [128]byte
 	HostLen     uint32
 	AllowedHost [64]byte
@@ -168,6 +169,13 @@ type TLSUprobeManager struct {
 	// Close() waits on it (with a bounded timeout) before tearing down BPF
 	// objects, so a sleeping retry can't fire AttachTLS against a freed map fd.
 	retryWG sync.WaitGroup
+
+	// store writes the secrets of each sync to secret_map and
+	// secret_chunks (secret_store.go).
+	store *secretStore
+	// syncMu serializes SyncSecrets: each takes its snapshot and applies it
+	// whole, so an older snapshot can't be applied after a newer one.
+	syncMu sync.Mutex
 
 	// bindMu guards bindings, bindingMode and lastSnapshot, and serializes
 	// every secret_acl and vip_pod_host write, so a secret sync can't
@@ -376,7 +384,11 @@ func parseBPFLogLevel(s string) ebpf.LogLevel {
 // attaching it again (Adopted, FinishAdopt), and Shutdown decides what the
 // next one finds. Without it, or when the pin root is not the host's bpffs,
 // the objects go with the controller.
-func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterface string, hostRes *HostResolutionConfig, persist bool, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
+//
+// store sizes the secret store (secret_chunks is created with its budget:
+// pins of another budget are loaded again, not adopted) and bounds the
+// secrets synced.
+func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterface string, hostRes *HostResolutionConfig, store SecretStoreConfig, persist bool, log *zap.SugaredLogger) (*TLSUprobeManager, error) {
 	if hostRes == nil {
 		return nil, errors.New("no host resolution config")
 	}
@@ -385,10 +397,14 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 	if err := hostRes.validate(); err != nil {
 		return nil, err
 	}
+	if err := store.Validate(); err != nil {
+		return nil, err
+	}
 	spec, err := loadTlsuprobe()
 	if err != nil {
 		return nil, fmt.Errorf("loading eBPF collection spec: %w", err)
 	}
+	spec.Maps[secretChunksMap].MaxEntries = store.chunkEntries()
 	if err := prepareVirtualIPPins(spec, hostRes.pinPath(), log); err != nil {
 		return nil, fmt.Errorf("preparing virtual IP map pins: %w", err)
 	}
@@ -458,6 +474,17 @@ func NewTLSUprobeManager(secretSource secrets.Source, cgroupRoot, egressInterfac
 		dnsRewrite:       make(map[string]*dnsRewriteAttach),
 		dnsRewriteFailed: make(map[string]bool),
 	}
+	mgr.store = newSecretStore(objs.SecretMap, objs.SecretChunks, store.maxLen(), log)
+	if adopted {
+		// The adopted maps hold the secrets of the previous controller,
+		// which the pods' writes are rewritten with until the first sync.
+		if err := mgr.store.rebuild(time.Now()); err != nil {
+			_ = mgr.Shutdown(ShutdownKeep)
+			return nil, fmt.Errorf("reading the pinned secret store: %w", err)
+		}
+	}
+	log.Infow("secret store", "capacityChunks", objs.SecretChunks.MaxEntries(), "budgetBytes", store.bytes(),
+		"maxSecretLength", store.maxLen())
 	// The adopted maps hold the bindings of the pods running now: they are
 	// pruned once the reconciliation has bound those pods again.
 	mgr.pruneDeferred.Store(adopted)
@@ -2326,7 +2353,11 @@ func (m *TLSUprobeManager) detachAll(mode ShutdownMode) (int, ShutdownMode, erro
 			errs = append(errs, clearDispatch(m.dispatch.KloakDispatch))
 		}
 		if mode == ShutdownUninstall && m.objs != nil {
-			errs = append(errs, emptyMap(m.objs.SecretMap))
+			if m.store != nil {
+				errs = append(errs, m.store.empty())
+			} else {
+				errs = append(errs, emptyMap(m.objs.SecretMap), emptyMap(m.objs.SecretChunks))
+			}
 		}
 	}
 
@@ -2703,20 +2734,22 @@ func (m *TLSUprobeManager) PopulateTrustedDNSServers(ips []net.IP) error {
 }
 
 // SyncSecrets makes the eBPF maps hold the secret source's current secrets:
-// secret_map, the virtual IPs of their hosts, and the pod bindings over them
-// (secret_acl, vip_pod_host). A failed snapshot leaves the maps as they
+// the secret store (secret_map, secret_chunks), the virtual IPs of their
+// hosts, and the pod bindings over them (secret_acl, vip_pod_host). A failed snapshot leaves the maps as they
 // were. A failed map operation does not stop the others; the error reports
 // it, and a retry completes the maps.
 func (m *TLSUprobeManager) SyncSecrets(ctx context.Context) error {
 	if m.secretSource == nil || m.stopped.Load() {
 		return nil
 	}
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
 	snapshot, err := m.secretSource.Snapshot(ctx)
 	if err != nil {
 		// Pruning against a failed snapshot would drop every secret.
 		return fmt.Errorf("snapshot secrets: %w", err)
 	}
-	hosts, secretsErr := applySecrets(m.objs.SecretMap, snapshot, m.log)
+	hosts, secretsErr := m.store.apply(snapshot, time.Now())
 	var vipErr error
 	if m.virtualIPs != nil {
 		vipErr = m.virtualIPs.sync(hosts, time.Now())

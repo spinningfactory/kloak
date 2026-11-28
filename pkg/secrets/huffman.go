@@ -16,6 +16,11 @@ import (
 // integer bits ≥ 1).
 var huffmanBitsTable [256]int
 
+// huffmanCodes[b] is byte b's HPACK Huffman code, in its
+// huffmanBitsTable[b] low bits (the shadow generator follows a shadow's
+// code with it: shadowCode).
+var huffmanCodes [256]uint32
+
 // huffmanBuckets[k] is the list of bytes whose Huffman code is exactly
 // k bits long, restricted to the alphabet we're willing to emit in a
 // shadow tail (alphanumeric ASCII + 4 punctuation chars used to widen
@@ -65,6 +70,12 @@ func init() {
 	for b := 0; b < 256; b++ {
 		s := strings.Repeat(string([]byte{byte(b)}), 64)
 		huffmanBitsTable[b] = int(hpack.HuffmanEncodeLength(s)) * 8 / 64
+		// The code is the first bits of the byte's encoding on its own
+		// (the rest is EOS padding).
+		enc := hpack.AppendHuffmanString(nil, string([]byte{byte(b)}))
+		for i := 0; i < huffmanBitsTable[b]; i++ {
+			huffmanCodes[b] = huffmanCodes[b]<<1 | uint32(enc[i/8]>>(7-i%8)&1)
+		}
 	}
 
 	// Alphabet = all alphanumeric ASCII plus the four 8-bit punctuation
@@ -87,7 +98,8 @@ func init() {
 }
 
 // HuffmanBits returns the exact HPACK Huffman bit length of s — the sum
-// of per-byte code lengths from the static table. This is the granular
+// of per-byte code lengths from the static table (at most 30 bits a byte:
+// no overflow for any string of up to 71 MB, even with a 32-bit int). This is the granular
 // version of hpack.HuffmanEncodeLength (which returns bytes after
 // rounding up), and it's what the shadow generator needs to construct a
 // tail whose encoded length matches the real's exactly.
